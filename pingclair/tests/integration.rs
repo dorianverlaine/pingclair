@@ -15291,3 +15291,9 @@ mod request_body_plan;
 // 📊 Collection is off unless the configuration says `metrics`.
 #[path = "integration/metrics_default.rs"]
 mod metrics_default;
+
+// MARK: - Reload under traffic
+
+// ♻️ Requests keep flowing while signal reloads publish new generations.
+#[path = "integration/reload_under_traffic.rs"]
+mod reload_under_traffic;

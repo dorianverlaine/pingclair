@@ -64,6 +64,10 @@ mod goaway;
 #[path = "h3_end_to_end/header_limits.rs"]
 mod header_limits;
 
+// ♻️ Requests keep being served while reloads publish new generations.
+#[path = "h3_end_to_end/reload.rs"]
+mod reload;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {
@@ -1956,9 +1960,9 @@ async fn h3_client_auth_ca_rotation_rejects_the_previous_authority() {
         "the not-yet-trusted H3 client was accepted before rotation",
     );
 
-    listener_policy.begin_publish();
-    listener_policy.publish_client_auth(table_for(&second_path));
-    listener_policy.finish_publish();
+    // 🔐 Rotate only the trust pool; the sites stay the ones already served.
+    let routes = Arc::clone(listener_policy.generation().routes());
+    listener_policy.publish(table_for(&second_path), routes);
 
     assert_handshake_refused(
         h3_attempt(

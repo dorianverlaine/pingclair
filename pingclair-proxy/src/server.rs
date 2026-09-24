@@ -48,6 +48,7 @@ use crate::http_policy::{
     CorsDecision, ResponseContent, ResponseHeaderPolicy, evaluate_cors, generate_request_id,
     is_websocket_upgrade, rewrite_uri, sanitize_request_id, via_value,
 };
+use crate::listener_generation::RouteTable;
 use crate::metrics;
 use crate::overload::{AdmissionError, RouteAdmission, RouteProtection, UpstreamAdmission};
 use crate::upstream::{DynamicDialPlan, HostName, Scheme, UpstreamSpec};
@@ -140,6 +141,10 @@ pub trait ConfigPublisher: Send + Sync {
 pub struct RequestContext {
     /// Matched server state
     pub state: Option<Arc<ProxyState>>,
+    /// 📦 The one listener generation this request reads routes and client-auth
+    /// policy from, loaded at its first phase so a reload mid-request cannot
+    /// hand it one half of each.
+    pub(crate) generation: Option<Arc<crate::listener_generation::ListenerGeneration>>,
     /// Matched route index
     pub route_index: Option<usize>,
     /// Selected upstream (kept for connection tracking)
@@ -290,6 +295,7 @@ impl Default for RequestContext {
             .expect("generated request id is valid header bytes");
         Self {
             state: None,
+            generation: None,
             route_index: None,
             cache_ttl_secs: None,
             cache_size_tracked: false,
@@ -2161,18 +2167,13 @@ pub struct AutomaticHttpsRedirect {
 
 /// Pingclair reverse proxy
 ///
-/// `hosts`/`default` use `ArcSwap` rather than `RwLock` because they sit on
-/// the per-request hot path (`get_state` is called for every single
-/// request) while writes only happen on hot-reload — an operation measured
-/// in reloads-per-hour, not requests-per-second. `ArcSwap::load()` is a
-/// lock-free, wait-free read, so concurrent requests never contend with
-/// each other or with a config reload.
+/// 🗺️ The virtual hosts live in the listener policy's generation rather than
+/// here, published through `ArcSwap` together with the client-auth policy.
+/// Reads are lock-free and wait-free, so concurrent requests never contend
+/// with each other or with a config reload, and one load gives a request a
+/// consistent view of both.
 #[derive(Clone)]
 pub struct PingclairProxy {
-    /// Map of hostname -> server state
-    pub hosts: Arc<ArcSwap<HashMap<String, Arc<ProxyState>>>>,
-    /// Default server state (catch-all)
-    pub default: Arc<ArcSwap<Option<Arc<ProxyState>>>>,
     /// 🔄 The automatic HTTP→HTTPS redirect, when this process took the plaintext
     /// companion port.
     ///
@@ -2201,11 +2202,10 @@ pub struct PingclairProxy {
     proxy_protocol_registry: Arc<crate::proxy_protocol::ProxyProtocolRegistry>,
     /// 🚫 Rejects TCP requests that bypass the required external PROXY ingress.
     proxy_protocol_required: bool,
-    /// 🔐 The versioned handshake policy shared by H1, H2, and H3.
+    /// 🔐 The versioned routes and handshake policy shared by H1, H2, and H3.
     ///
-    /// Routing publication and client-auth rotation close this policy's gate,
-    /// swap every prepared snapshot, and reopen it. Requests therefore never
-    /// run against a half-published security generation.
+    /// A reload publishes routes and client-auth rotation as one generation,
+    /// so a request never runs against a half-published security policy.
     listener_policy: Arc<crate::client_auth::PublishedListenerPolicy>,
     /// 🔌 Shared upstream connector for inline sub-requests (`forward_auth`),
     /// with the same keepalive pool the H3 path uses.
@@ -2215,8 +2215,6 @@ pub struct PingclairProxy {
 impl Default for PingclairProxy {
     fn default() -> Self {
         Self {
-            hosts: Arc::new(ArcSwap::from_pointee(HashMap::new())),
-            default: Arc::new(ArcSwap::from_pointee(None)),
             // 🔄 Off until the runtime that bound the plaintext companion port
             // says otherwise. A proxy built by a test, or one whose
             // configuration has no automatic HTTPS, must not redirect anything.
@@ -2309,8 +2307,6 @@ impl PingclairProxy {
     /// Create a new proxy with TLS manager
     pub fn with_tls(tls_manager: Arc<pingclair_tls::manager::TlsManager>) -> Self {
         Self {
-            hosts: Arc::new(ArcSwap::from_pointee(HashMap::new())),
-            default: Arc::new(ArcSwap::from_pointee(None)),
             // 🔄 Off until the runtime that bound the plaintext companion port
             // says otherwise. A proxy built by a test, or one whose
             // configuration has no automatic HTTPS, must not redirect anything.
@@ -2355,8 +2351,6 @@ impl PingclairProxy {
         listener_policy: Arc<crate::client_auth::PublishedListenerPolicy>,
     ) -> Self {
         Self {
-            hosts: Arc::new(ArcSwap::from_pointee(HashMap::new())),
-            default: Arc::new(ArcSwap::from_pointee(None)),
             // 🔄 Off until the runtime that bound the plaintext companion port
             // says otherwise. A proxy built by a test, or one whose
             // configuration has no automatic HTTPS, must not redirect anything.
@@ -2485,10 +2479,18 @@ impl PingclairProxy {
     /// handshake name fails closed: the acceptor records one on exactly the
     /// listeners this check runs on, so its absence is a bug, not a client
     /// that happens to be fine.
-    fn strict_sni_host_rejection(&self, session: &Session, hostname: &str) -> Option<&'static str> {
-        if !self.listener_policy.requires_client_auth() {
+    ///
+    /// 📦 The revision compared is the one in the request's own generation,
+    /// the same one its routes come from.
+    fn strict_sni_host_rejection(
+        generation: &crate::listener_generation::ListenerGeneration,
+        session: &Session,
+        hostname: &str,
+    ) -> Option<&'static str> {
+        if !generation.requires_client_auth() {
             return None;
         }
+        let revision = generation.security().revision();
         let Some(ssl) = session
             .digest()
             .and_then(|digest| digest.ssl_digest.as_ref())
@@ -2503,12 +2505,12 @@ impl PingclairProxy {
             .get::<crate::tls_identity::DownstreamTlsIdentity>()
         {
             Some(identity)
-                if identity.security_revision == self.listener_policy.revision()
+                if identity.security_revision == revision
                     && identity.may_request_host(hostname) =>
             {
                 None
             }
-            Some(identity) if identity.security_revision != self.listener_policy.revision() => {
+            Some(identity) if identity.security_revision != revision => {
                 Some("TLS client-auth policy changed; reconnect")
             }
             Some(_) => Some("TLS server name and Host header name differ"),
@@ -2517,66 +2519,67 @@ impl PingclairProxy {
     }
 
     /// Add a server configuration to this proxy
+    ///
+    /// 📌 Startup only, off the request path: each call copies the route
+    /// table, which is the price of lock-free reads for every request.
     pub fn add_server(&self, config: ServerConfig) {
-        // 🏠 A site may carry several hostnames (`example.com, www.example.com`);
-        // each one is a virtual host for the same configuration. Fall back to
-        // the legacy single-name field so JSON documents written before `names`
-        // existed still register exactly as before.
+        self.listener_policy.replace_routes(|current| {
+            let mut next = RouteTable {
+                hosts: current.hosts.clone(),
+                default: current.default.clone(),
+            };
+            Self::register_site(&mut next, current, config.clone());
+            next
+        });
+    }
+
+    /// 🏠 Adds one site under each of its names, reusing state the previous
+    /// generation built for the same name.
+    ///
+    /// A site may carry several hostnames (`example.com, www.example.com`);
+    /// each one is a virtual host for the same configuration. The legacy
+    /// single-name field is the fallback so JSON documents written before
+    /// `names` existed still register exactly as before.
+    fn register_site(next: &mut RouteTable, previous: &RouteTable, config: ServerConfig) {
         let domains: Vec<&str> = if config.names.is_empty() {
             config.name.iter().map(String::as_str).collect()
         } else {
             config.names.iter().map(String::as_str).collect()
         };
         if domains.is_empty() {
-            let current = self.default.load();
-            let state = Arc::new(ProxyState::new_with_previous(
+            next.default = Some(Arc::new(ProxyState::new_with_previous(
                 config.clone(),
-                current.as_ref().as_deref(),
-            ));
-            self.default.store(Arc::new(Some(state)));
+                previous.default.as_deref(),
+            )));
             return;
         }
         for domain in domains {
             if domain == "_" || domain == "*" || domain.starts_with(':') {
-                let current = self.default.load();
-                let state = Arc::new(ProxyState::new_with_previous(
+                next.default = Some(Arc::new(ProxyState::new_with_previous(
                     config.clone(),
-                    current.as_ref().as_deref(),
-                ));
-                self.default.store(Arc::new(Some(state)));
+                    previous.default.as_deref(),
+                )));
             } else {
                 // 🔤 Canonical at publication, so a lookup never has to guess
-                // which spelling the operator used. Done here rather than in the
-                // parser because this map is the thing being keyed, and both
-                // publication paths — this one and `update_config` — have to
-                // agree with `get_state` or the agreement is decorative.
+                // which spelling the operator used. `RouteTable::get` applies
+                // the same canonicalisation to the requested name.
                 let domain = crate::http_policy::canonical_host(domain).into_owned();
-                let current = self.hosts.load();
                 let state = Arc::new(ProxyState::new_with_previous(
                     config.clone(),
-                    current.get(&domain).map(Arc::as_ref),
+                    previous.hosts.get(&domain).map(Arc::as_ref),
                 ));
-                // Read-Copy-Update: clone the current map, insert into the
-                // copy, then publish it atomically. add_server is a rare,
-                // low-frequency admin operation, so an O(n) copy here is a
-                // fair trade for wait-free reads on the request hot path.
-                self.hosts.rcu(|current| {
-                    let mut next = (**current).clone();
-                    next.insert(domain.clone(), state.clone());
-                    next
-                });
+                next.hosts.insert(domain, state);
             }
         }
     }
 
     /// 🧱 Returns the strictest pre-routing limits shared by a listener's virtual hosts.
     pub fn listener_limits(&self) -> ResourceLimitsConfig {
-        let hosts = self.hosts.load();
-        let default = self.default.load();
+        let generation = self.listener_policy.generation();
         merged_listener_limits(
-            hosts
-                .values()
-                .chain(default.iter())
+            generation
+                .routes()
+                .states()
                 .map(|state| &state.config.limits),
         )
     }
@@ -2586,52 +2589,35 @@ impl PingclairProxy {
         merged_listener_limits(servers.iter().map(|server| &server.limits))
     }
 
-    /// Replace all server configurations with a new list
-    pub fn update_config(&self, servers: Vec<ServerConfig>) {
-        let mut new_hosts = HashMap::new();
-        let mut new_default = None;
-        let old_hosts = self.hosts.load();
-        let old_default = self.default.load();
-
+    /// 🏗️ Builds the next route table without publishing it.
+    ///
+    /// This is the expensive half of a reload — every site compiles its
+    /// router and handler state — and it runs before anything is swapped, so
+    /// traffic keeps using the current generation the whole time.
+    pub fn prepare_routes(&self, servers: Vec<ServerConfig>) -> RouteTable {
+        let generation = self.listener_policy.generation();
+        let previous = generation.routes();
+        let mut next = RouteTable::default();
         for config in servers {
-            let domains: Vec<&str> = if config.names.is_empty() {
-                config.name.iter().map(String::as_str).collect()
-            } else {
-                config.names.iter().map(String::as_str).collect()
-            };
-            if domains.is_empty() {
-                let state = Arc::new(ProxyState::new_with_previous(
-                    config.clone(),
-                    old_default.as_ref().as_deref(),
-                ));
-                new_default = Some(state);
-                continue;
-            }
-            for domain in domains {
-                if domain == "_" || domain == "*" || domain.starts_with(':') {
-                    let state = Arc::new(ProxyState::new_with_previous(
-                        config.clone(),
-                        old_default.as_ref().as_deref(),
-                    ));
-                    new_default = Some(state);
-                } else {
-                    // 🔤 Same canonicalisation as `add_server` and `get_state`.
-                    let domain = crate::http_policy::canonical_host(domain).into_owned();
-                    let state = Arc::new(ProxyState::new_with_previous(
-                        config.clone(),
-                        old_hosts.get(&domain).map(Arc::as_ref),
-                    ));
-                    new_hosts.insert(domain, state);
-                }
-            }
+            Self::register_site(&mut next, previous, config);
         }
+        next
+    }
 
-        // Single atomic publish: in-flight requests keep using the Arc they
-        // already loaded; new requests see the new map. No lock is ever
-        // held, so a reload can never block or be blocked by traffic.
-        self.hosts.store(Arc::new(new_hosts));
-        self.default.store(Arc::new(new_default));
-
+    /// Replace all server configurations with a new list
+    ///
+    /// 📌 Keeps the client-auth generation. A reload that also rotates trust
+    /// goes through [`PublishedListenerPolicy::publish`] with
+    /// [`Self::prepare_routes`] instead, so both change in one swap.
+    ///
+    /// [`PublishedListenerPolicy::publish`]: crate::client_auth::PublishedListenerPolicy::publish
+    pub fn update_config(&self, servers: Vec<ServerConfig>) {
+        let next = self.prepare_routes(servers);
+        let next = Arc::new(next);
+        self.listener_policy.replace_routes(|_| RouteTable {
+            hosts: next.hosts.clone(),
+            default: next.default.clone(),
+        });
         tracing::info!("♻️ Configuration reloaded successfully");
     }
 
@@ -2748,34 +2734,22 @@ impl PingclairProxy {
     /// 2. Wildcard match (`*.example.com`) — checks all registered wildcard hosts
     /// 3. Default catch-all server
     pub(crate) fn get_state(&self, host: &str) -> Option<Arc<ProxyState>> {
-        // 🔤 The one door to the host map, so the canonicalisation lives here
-        // rather than at each caller. A name arrives as whatever bytes the client
-        // typed — `EXAMPLE.com`, `example.com.` — and the map is keyed on the
-        // canonical form written at publication. Comparing raw bytes meant
-        // `Host: EXAMPLE.com` missed its own site and fell through to the
-        // catch-all, picking up whatever policy that site has.
-        let host = crate::http_policy::canonical_host(host);
-        let hosts = self.hosts.load();
+        self.listener_policy.generation().routes().get(host)
+    }
 
-        // 1. Exact match (fast path)
-        if let Some(state) = hosts.get(host.as_ref()) {
-            return Some(state.clone());
-        }
-
-        // 2. 🃏 Wildcard patterns, registered as `*.example.com`. One label, the
-        // same rule the client-auth table and the access-log patterns use.
-        for (pattern, state) in hosts.iter() {
-            if let Some(suffix) = pattern.strip_prefix("*.")
-                && crate::http_policy::wildcard_host_matches(suffix, host.as_ref())
-            {
-                return Some(state.clone());
-            }
-        }
-
-        // 3. Default catch-all
-        // 🍃 Explicit double-deref clones only the published state Arc, not
-        // the guard or the complete configuration snapshot.
-        (**self.default.load()).clone()
+    /// 📦 Returns the generation this request reads, loading it on first use.
+    ///
+    /// Every later phase reuses the same one, which is what keeps a reload
+    /// from showing a request routes from one configuration and client-auth
+    /// policy from another.
+    fn request_generation(
+        &self,
+        ctx: &mut RequestContext,
+    ) -> Arc<crate::listener_generation::ListenerGeneration> {
+        Arc::clone(
+            ctx.generation
+                .get_or_insert_with(|| self.listener_policy.generation()),
+        )
     }
 
     /// 🔁 Selects a healthy backend outside the current request's attempted set.
@@ -6434,7 +6408,8 @@ impl ProxyHttp for PingclairProxy {
     ) -> pingora_core::Result<()> {
         let request = session.req_header();
         let host = crate::http_policy::request_host(crate::http_policy::request_authority(request));
-        let Some(state) = self.get_state(host.as_ref()) else {
+        let generation = self.request_generation(ctx);
+        let Some(state) = generation.routes().get(host.as_ref()) else {
             return Ok(());
         };
         let breach = crate::header_limits::check(
@@ -6663,15 +6638,10 @@ impl ProxyHttp for PingclairProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> pingora_core::Result<bool> {
-        // 🚧 A control-plane transaction closes every affected listener before
-        // swapping routing and handshake snapshots. Refuse during that narrow
-        // window so no request can observe a half-published security policy.
-        if self.listener_policy.is_publishing() {
-            session.as_mut().set_keepalive(None);
-            Self::write_simple_response(session, ctx, 503, "Configuration Reload In Progress")
-                .await?;
-            return Ok(true);
-        }
+        // 📦 Routes and client-auth policy come from one generation, loaded
+        // once, so a reload that lands mid-request changes neither under it.
+        // A reload therefore never has to refuse a request.
+        let generation = self.request_generation(ctx);
 
         // 🌐 Before any middleware can reshape the URI: HTTP/2 keeps the site
         // name there and a rewrite would take it with it.
@@ -6741,7 +6711,7 @@ impl ProxyHttp for PingclairProxy {
         // certificate. 421 is the status for "this connection is not the right
         // one for that host", and the connection is closed so the client opens
         // a new one with honest SNI rather than reusing this one.
-        if self.listener_policy.requires_client_auth() {
+        if generation.requires_client_auth() {
             // 🏠 Owned only on the listeners that enforce this; every other
             // request never reaches past the atomic load above.
             // 🔤 Canonical, so `Host: EXAMPLE.com.` is compared as the name it
@@ -6750,7 +6720,9 @@ impl ProxyHttp for PingclairProxy {
                 crate::http_policy::request_authority(session.req_header()),
             )
             .into_owned();
-            if let Some(reason) = self.strict_sni_host_rejection(session, &requested_host) {
+            if let Some(reason) =
+                Self::strict_sni_host_rejection(&generation, session, &requested_host)
+            {
                 tracing::warn!(
                     host = %requested_host,
                     "🚫 Rejected a request on a mutual-TLS listener: {reason}"
@@ -6870,7 +6842,7 @@ impl ProxyHttp for PingclairProxy {
             // the same header, so its answer is reused rather than looked up
             // twice. The fallback lookup keeps this phase correct on its own
             // should a request ever reach it without that earlier phase.
-            let state = match ctx.state.clone().or_else(|| self.get_state(host)) {
+            let state = match ctx.state.clone().or_else(|| generation.routes().get(host)) {
                 Some(s) => s,
                 None => {
                     // 🔄 Before falling to 404: is this the request an automatic

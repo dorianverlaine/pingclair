@@ -74,8 +74,8 @@ pub(crate) struct DynamicCertResolver {
     /// 🔐 The versioned handshake policy shared with routing and HTTP/3.
     ///
     /// `None` only for standalone resolver tests. Production listeners all
-    /// carry the handle so the publication gate can reject a handshake while
-    /// routing changes; an ordinary generation still has an empty auth table.
+    /// carry the handle so a handshake records the same generation its
+    /// requests will route by; an ordinary generation has an empty auth table.
     listener_policy: Option<Arc<PublishedListenerPolicy>>,
 }
 
@@ -226,10 +226,9 @@ impl TlsAccept for DynamicCertResolver {
         // nothing, so it falls to the catch-all policy — and the SNI-against-
         // Host check at the HTTP layer refuses it any named site afterwards.
         let security_revision = if let Some(listener_policy) = &self.listener_policy {
-            let Some(snapshot) = listener_policy.handshake_snapshot() else {
-                tracing::warn!("🚧 Refused a TLS handshake during policy publication");
-                return;
-            };
+            // 📦 One complete generation, published atomically, so a reload
+            // never leaves a handshake without a policy to admit it under.
+            let snapshot = listener_policy.handshake_snapshot();
             if let Err(error) = record_listener_security_revision(ssl, snapshot.revision()) {
                 tracing::error!(%error, "❌ Failed to record the listener-security generation");
                 return;

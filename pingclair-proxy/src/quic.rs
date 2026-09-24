@@ -503,10 +503,9 @@ fn build_ssl_context_builder(
         // The policy is picked from the name the client actually sent, so a
         // client that named nothing gets the catch-all and is then refused any
         // named site by the SNI-against-`:authority` check below.
-        let Some(snapshot) = listener_policy.handshake_snapshot() else {
-            tracing::warn!("🚧 H3: refused a TLS handshake during policy publication");
-            return Err(SelectCertError::ERROR);
-        };
+        // 📦 One complete generation, published atomically, so a reload never
+        // leaves a handshake without a policy to admit it under.
+        let snapshot = listener_policy.handshake_snapshot();
 
         // 🔤 Everything the name decides is looked up inside this block, while
         // the SNI is still borrowed from the hello, so a handshake no longer
@@ -1816,19 +1815,10 @@ impl H3App {
         // below answers `HEAD` with a header and no content.
         let head_request = req.method == "HEAD";
 
-        // 🚧 Match the TCP path's publication gate: a request waits by being
-        // refused, not by observing routing from one generation and client
-        // authentication from another.
-        if self.proxy.listener_policy_ref().is_publishing() {
-            self.queue_simple_response(
-                qconn,
-                stream_id,
-                503,
-                "Configuration Reload In Progress",
-                head_request,
-            );
-            return;
-        }
+        // 📦 Routes and client-auth policy come from one generation, loaded
+        // once here and handed to the request task, so a reload that lands
+        // mid-request changes neither under it and never has to refuse it.
+        let generation = self.proxy.listener_policy_ref().generation();
 
         // 🛡️ HTTP/3 carries its own framing, so `Transfer-Encoding` is forbidden
         // outright here rather than merely discouraged, and `Content-Length`
@@ -1852,8 +1842,8 @@ impl H3App {
         //
         // 🛡️ Parity is the whole point of doing this here. If HTTP/3 skipped
         // the check, an attacker would simply use HTTP/3.
-        if self.proxy.requires_strict_sni_host() {
-            let current_revision = self.proxy.listener_policy_ref().revision();
+        if generation.requires_client_auth() {
+            let current_revision = generation.security().revision();
             let rejection = match &self.tls_identity {
                 Some(identity) if identity.security_revision != current_revision => {
                     Some("TLS client-auth policy changed; reconnect")
@@ -1913,6 +1903,7 @@ impl H3App {
         tokio::spawn(async move {
             handle_request(
                 proxy,
+                generation,
                 connector,
                 req,
                 remote_addr,
@@ -3407,6 +3398,7 @@ async fn run_until_request_cancelled<T>(
 #[allow(clippy::too_many_arguments)]
 async fn handle_request(
     proxy: Arc<PingclairProxy>,
+    generation: Arc<crate::listener_generation::ListenerGeneration>,
     connector: Arc<pingora_core::connectors::http::Connector>,
     req: H3Request,
     remote_addr: SocketAddr,
@@ -3432,6 +3424,7 @@ async fn handle_request(
         &mut cancel_rx,
         handle_request_inner(
             &proxy,
+            &generation,
             &connector,
             &req,
             remote_ip,
@@ -3597,6 +3590,7 @@ type HandlerError = (u16, &'static str);
 #[allow(clippy::too_many_arguments)]
 async fn handle_request_inner(
     proxy: &PingclairProxy,
+    generation: &crate::listener_generation::ListenerGeneration,
     connector: &pingora_core::connectors::http::Connector,
     req: &H3Request,
     peer_ip: IpAddr,
@@ -3641,7 +3635,7 @@ async fn handle_request_inner(
     // before route matching, exactly as they do on H1/H2.
     let mut request_vars = crate::http_policy::RequestVars::default();
     let (state, route_index) = {
-        let Some(state) = proxy.get_state(&host_bare) else {
+        let Some(state) = generation.routes().get(&host_bare) else {
             return Err((404, "No Matching Virtual Host"));
         };
         for (index, rule) in state.config.vars_routes.iter().enumerate() {

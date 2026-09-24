@@ -363,34 +363,24 @@ impl RuntimeListeners {
     }
 }
 
-/// 🚧 Reopens every listener even if a debug build unwinds during publication.
+/// 🚧 Reopens the Admin API even if a debug build unwinds during publication.
+///
+/// 📌 Only the Admin API still has a gate. Listeners need none: each one's
+/// routes and client-auth policy are published as a single generation, so no
+/// request can see half of a reload.
 struct PublicationGate<'a> {
-    policies: Vec<&'a PublishedListenerPolicy>,
     admin_policy: &'a AdminPolicy,
 }
 
 impl<'a> PublicationGate<'a> {
-    fn close(
-        policies: impl Iterator<Item = &'a Arc<PublishedListenerPolicy>>,
-        admin_policy: &'a AdminPolicy,
-    ) -> Self {
-        let policies: Vec<&PublishedListenerPolicy> = policies.map(Arc::as_ref).collect();
+    fn close(admin_policy: &'a AdminPolicy) -> Self {
         admin_policy.begin_publish();
-        for policy in &policies {
-            policy.begin_publish();
-        }
-        Self {
-            policies,
-            admin_policy,
-        }
+        Self { admin_policy }
     }
 }
 
 impl Drop for PublicationGate<'_> {
     fn drop(&mut self) {
-        for policy in &self.policies {
-            policy.finish_publish();
-        }
         self.admin_policy.finish_publish();
     }
 }
@@ -453,16 +443,20 @@ impl ConfigPublisher for RuntimeListeners {
                         ),
                     });
                 };
-                targets.push((address.clone(), policy.servers.clone(), proxy));
+                // 🏗️ Every site compiles its routes here, before anything is
+                // published, so the slow part of a reload runs while traffic
+                // keeps using the current generation.
+                let routes = Arc::new(proxy.prepare_routes(policy.servers.clone()));
+                targets.push((address.clone(), Arc::clone(&policy.client_auth), routes));
             }
             targets
         };
         drop(current);
 
-        // 🚧 No fallible work remains below this gate. Requests and new
-        // handshakes are refused until routes, TLS, and Admin access all name
-        // the same generation.
-        let gate = PublicationGate::close(self.listener_policies.values(), &self.admin_policy);
+        // 🚧 No fallible work remains below this gate. Admin requests are
+        // refused until Admin access names the new generation; listeners keep
+        // serving, because each swaps routes and client-auth policy at once.
+        let gate = PublicationGate::close(&self.admin_policy);
         if let (Some(table), Some(prepared)) = (&self.h3_cert_table, prepared_h3_certs) {
             table.publish_manual_update(prepared);
         }
@@ -473,11 +467,8 @@ impl ConfigPublisher for RuntimeListeners {
         // certificate, and nothing would say why.
         self.tls_manager
             .set_public_issuance_domains(crate::certs::public_issuance_domains(config));
-        for (address, policy) in &next {
-            self.listener_policies[address].publish_client_auth(Arc::clone(&policy.client_auth));
-        }
-        for (address, servers, proxy) in targets {
-            proxy.update_config(servers);
+        for (address, client_auth, routes) in targets {
+            self.listener_policies[&address].publish(client_auth, routes);
             tracing::info!(listener = %address, "♻️ Published listener configuration");
         }
         self.admin_policy.publish(prepared_admin);

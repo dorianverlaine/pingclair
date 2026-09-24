@@ -59,8 +59,9 @@ use boring::x509::{X509, X509StoreContext, X509StoreContextRef};
 use foreign_types::ForeignTypeRef as _;
 use pingclair_core::config::{ClientAuthConfig, ClientAuthMode, TrustPool};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+
+use crate::listener_generation::{ListenerGeneration, RouteTable};
 
 use base64::Engine as _;
 
@@ -306,15 +307,17 @@ impl ListenerSecuritySnapshot {
     }
 }
 
-/// 🔐 Publishes one listener's handshake policy to H1, H2, and H3 together.
+/// 🔐 Publishes one listener's routes and handshake policy to H1, H2, and H3 together.
 ///
-/// A short publication gate refuses new handshakes and requests while routing
-/// and TLS snapshots are swapped. Connections that began before the gate carry
-/// the old revision and are refused after it, so a trust-pool rotation cannot
-/// leave a keep-alive or QUIC connection authorised by stale credentials.
+/// Both halves live in one [`ListenerGeneration`] behind one `ArcSwap`, so a
+/// reload replaces them with a single pointer swap and no reader can observe
+/// one half from the old configuration and the other from the new. That is
+/// why nothing here refuses requests during a reload. Connections that began
+/// under an earlier generation carry its revision and are refused on mutual-TLS
+/// listeners afterwards, so a trust-pool rotation cannot leave a keep-alive or
+/// QUIC connection authorised by stale credentials.
 pub struct PublishedListenerPolicy {
-    current: ArcSwap<ListenerSecuritySnapshot>,
-    publishing: AtomicBool,
+    current: ArcSwap<ListenerGeneration>,
     client_auth_reload_capable: bool,
     /// 🏷️ Startup-only certificate name for a ClientHello without SNI.
     default_sni: Option<Arc<str>>,
@@ -325,7 +328,6 @@ impl std::fmt::Debug for PublishedListenerPolicy {
         formatter
             .debug_struct("PublishedListenerPolicy")
             .field("revision", &self.revision())
-            .field("publishing", &self.is_publishing())
             .field(
                 "client_auth_reload_capable",
                 &self.client_auth_reload_capable,
@@ -336,14 +338,19 @@ impl std::fmt::Debug for PublishedListenerPolicy {
 
 impl PublishedListenerPolicy {
     /// 🏗️ Creates the generation installed before the listener begins serving.
+    ///
+    /// It starts with no sites; startup adds them with [`Self::replace_routes`]
+    /// before the listener accepts its first connection.
     pub fn new(client_auth: Arc<ClientAuthTable>) -> Self {
         let client_auth_reload_capable = !client_auth.is_empty();
         Self {
-            current: ArcSwap::from_pointee(ListenerSecuritySnapshot {
-                client_auth,
-                revision: 0,
+            current: ArcSwap::from_pointee(ListenerGeneration {
+                security: Arc::new(ListenerSecuritySnapshot {
+                    client_auth,
+                    revision: 0,
+                }),
+                routes: Arc::new(RouteTable::default()),
             }),
-            publishing: AtomicBool::new(false),
             client_auth_reload_capable,
             default_sni: None,
         }
@@ -362,21 +369,6 @@ impl PublishedListenerPolicy {
         self.default_sni.as_deref()
     }
 
-    /// 🚦 Closes the listener's publication gate before any snapshot changes.
-    pub fn begin_publish(&self) {
-        self.publishing.store(true, Ordering::Release);
-    }
-
-    /// 🚦 Reopens the listener after every routing and TLS snapshot is live.
-    pub fn finish_publish(&self) {
-        self.publishing.store(false, Ordering::Release);
-    }
-
-    /// 🚧 Reports whether the listener is between two complete generations.
-    pub fn is_publishing(&self) -> bool {
-        self.publishing.load(Ordering::Acquire)
-    }
-
     /// 🔁 Reports whether resumption was disabled when this TLS context began.
     ///
     /// Enabling mTLS later is unsafe when the original context issued tickets:
@@ -388,33 +380,51 @@ impl PublishedListenerPolicy {
 
     /// 🪪 Reports whether the active generation asks any client for a certificate.
     pub fn requires_client_auth(&self) -> bool {
-        !self.current.load().client_auth.is_empty()
+        self.current.load().requires_client_auth()
     }
 
     /// 🔢 Returns the currently published listener-security generation.
     pub fn revision(&self) -> u64 {
-        self.current.load().revision
+        self.current.load().security.revision
     }
 
-    /// 🤝 Loads one complete generation for a new handshake.
+    /// 📦 Loads the complete current generation.
     ///
-    /// `None` means publication is in progress; callers must fail the
-    /// handshake closed rather than fall back to a certificate-only context.
-    pub fn handshake_snapshot(&self) -> Option<Arc<ListenerSecuritySnapshot>> {
-        if self.is_publishing() {
-            None
-        } else {
-            Some(self.current.load_full())
-        }
+    /// A request calls this once and answers every routing and admission
+    /// question from the result, which is what makes a reload atomic for it.
+    pub fn generation(&self) -> Arc<ListenerGeneration> {
+        self.current.load_full()
     }
 
-    /// 📣 Publishes a fully compiled client-auth table as the next generation.
-    pub fn publish_client_auth(&self, client_auth: Arc<ClientAuthTable>) {
-        let revision = self.current.load().revision.wrapping_add(1);
-        self.current.store(Arc::new(ListenerSecuritySnapshot {
-            client_auth,
-            revision,
+    /// 🤝 Loads the client-authentication half of the current generation for a handshake.
+    pub fn handshake_snapshot(&self) -> Arc<ListenerSecuritySnapshot> {
+        Arc::clone(&self.current.load().security)
+    }
+
+    /// 📣 Publishes the next generation: new routes and a new client-auth table at once.
+    ///
+    /// The revision always advances, so every connection admitted before this
+    /// call is asked to reconnect on a mutual-TLS listener.
+    pub fn publish(&self, client_auth: Arc<ClientAuthTable>, routes: Arc<RouteTable>) {
+        let revision = self.current.load().security.revision.wrapping_add(1);
+        self.current.store(Arc::new(ListenerGeneration {
+            security: Arc::new(ListenerSecuritySnapshot {
+                client_auth,
+                revision,
+            }),
+            routes,
         }));
+    }
+
+    /// 🗺️ Replaces only the routes, keeping the client-auth generation.
+    ///
+    /// Used while startup registers sites one by one, before any connection
+    /// exists that a revision would need to invalidate.
+    pub(crate) fn replace_routes(&self, update: impl Fn(&RouteTable) -> RouteTable) {
+        self.current.rcu(|current| ListenerGeneration {
+            security: Arc::clone(&current.security),
+            routes: Arc::new(update(&current.routes)),
+        });
     }
 }
 

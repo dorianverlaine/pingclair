@@ -112,6 +112,24 @@ restart; before, only the configuration the process started with counted.
 
 (#32)
 
+### ♻️ A reload no longer refuses requests
+
+A reload (`SIGUSR1`, `pingclair reload`, or the Admin API) used to answer
+every request that arrived while it was publishing with
+`503 Configuration Reload In Progress` and close the connection, and to
+refuse new TLS and HTTP/3 handshakes in the same window. On a busy server
+that was a burst of failures per reload: with 64 sites, a debug build held
+the window for 6 to 13 ms, and a test sending traffic through eight reloads
+saw 353 of 2,150 requests fail. Each listener's routes and client-certificate
+policy are now published together as one snapshot, so a request sees either
+the old configuration or the new one and is always served. The slow part of
+a reload, compiling every site, now runs before anything is swapped.
+
+📌 Upgrading: nothing to change. On a listener with `client_auth`, a reload
+still asks connections admitted under the previous policy to reconnect, as
+before. The Admin API itself still answers `503` for the moment a reload is
+publishing.
+
 ### 🏷️ A build of `main` says it is a dev build
 
 `main` now carries version `0.0.0`, and a release is a single commit off
