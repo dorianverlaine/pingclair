@@ -47,6 +47,17 @@ and then match nothing, so a block list with a typo let the address through.
 Matching an address against a four-range guard went from about 106 ns to
 about 23 ns in the router microbenchmark. (#192)
 
+### 🧩 Nested sibling handles are mutually exclusive
+
+Nested sibling `handle` and `handle_path` blocks now run only the first
+matching block, even when that block writes no response. This applies inside
+`handle`, `route`, `handle_path`, and `handle_errors`. Directive sorting and
+explicit `route` order are preserved. (#43)
+
+**Upgrade note:** If a matched nested handle only sets headers or rewrites the
+request, later sibling handles no longer provide a fallback response. Put the
+response inside the selected block or after the sibling group.
+
 ### 🧮 Static-file cache budgets are shared across routes
 
 All `file_server` instances now share process-wide limits of 64 MiB for

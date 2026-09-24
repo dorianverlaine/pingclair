@@ -753,7 +753,7 @@ fn collect_subroute_elements(
     if sorted {
         sort_handle_elements(&mut elements, &local, order);
     }
-    Ok(elements)
+    Ok(super::handle_groups::group_siblings(elements))
 }
 
 /// 🔢 Sorts `handle` elements the way the reference's `sortRoutes` does:

@@ -4696,11 +4696,18 @@ mod handle_errors_tests {
         let routes = error_routes_of(
             "example.com {\n\thandle_errors 404 {\n\t\thandle /en/* {\n\t\t\trespond \"en\"\n\t\t}\n\t\thandle {\n\t\t\trespond \"default\"\n\t\t}\n\t}\n}",
         );
-        assert_eq!(routes[0].handlers.len(), 2);
-        assert!(matches!(
-            routes[0].handlers[0].handler,
-            HandlerConfig::Pipeline { .. }
-        ));
+        let [group] = routes[0].handlers.as_slice() else {
+            panic!("sibling handles must form one group");
+        };
+        let HandlerConfig::FirstMatch { handlers } = &group.handler else {
+            panic!("siblings must stop after the first match");
+        };
+        assert_eq!(handlers.len(), 2);
+        assert!(
+            handlers
+                .iter()
+                .all(|element| matches!(element.handler, HandlerConfig::Pipeline { .. }))
+        );
     }
 
     #[test]
@@ -5053,6 +5060,12 @@ mod matcher_inside_route_body_tests {
              \t}\n\
              }",
         );
+        let [group] = handlers.as_slice() else {
+            panic!("nested siblings must form one group");
+        };
+        let HandlerConfig::FirstMatch { handlers } = &group.handler else {
+            panic!("nested siblings must stop after the first match");
+        };
         assert_eq!(handlers.len(), 2);
         assert_eq!(
             path_matcher(&handlers[0]),

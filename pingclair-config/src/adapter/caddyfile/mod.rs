@@ -38,6 +38,7 @@
 mod addresses;
 mod args;
 mod directives;
+mod handle_groups;
 mod logs;
 mod matchers;
 mod options;
@@ -51,6 +52,8 @@ mod tls;
 
 #[cfg(test)]
 mod forward_auth_tls_tests;
+#[cfg(test)]
+mod handle_groups_tests;
 #[cfg(test)]
 mod tests;
 

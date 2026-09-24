@@ -122,31 +122,36 @@ private.example {
         {
           "handlers": [
             {
-              "matcher": {
-                "path": {
-                  "patterns": [
-                    "/en/*"
+              "type": "first_match",
+              "handlers": [
+                {
+                  "matcher": {
+                    "path": {
+                      "patterns": [
+                        "/en/*"
+                      ]
+                    }
+                  },
+                  "type": "pipeline",
+                  "handlers": [
+                    {
+                      "type": "respond",
+                      "status": 404,
+                      "body": "not found",
+                      "headers": {}
+                    }
                   ]
-                }
-              },
-              "type": "pipeline",
-              "handlers": [
+                },
                 {
-                  "type": "respond",
-                  "status": 404,
-                  "body": "not found",
-                  "headers": {}
-                }
-              ]
-            },
-            {
-              "type": "pipeline",
-              "handlers": [
-                {
-                  "type": "respond",
-                  "status": 200,
-                  "body": "default not found",
-                  "headers": {}
+                  "type": "pipeline",
+                  "handlers": [
+                    {
+                      "type": "respond",
+                      "status": 200,
+                      "body": "default not found",
+                      "headers": {}
+                    }
+                  ]
                 }
               ]
             }

@@ -358,6 +358,7 @@ pub(super) fn adapt_server(
                             "at least one directive is required".into(),
                         ));
                     }
+                    let handlers = super::handle_groups::group_siblings(handlers);
                     server.error_routes.push(ErrorRouteConfig {
                         codes,
                         hundreds,
@@ -863,7 +864,7 @@ pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
         Handler::TryFiles(_) => "try_files",
         Handler::BasicAuth(_) => "basic_auth",
         Handler::Templates => "templates",
-        Handler::Handle(_) => "handle",
+        Handler::Handle(_) | Handler::HandleGroup(_) => "handle",
         Handler::HandlePath { .. } => "handle_path",
         // 🐘 `php_fastcgi` expands to a pipeline too, but it ranks as itself,
         // after `respond`; ranking it as `route` let it answer requests a
@@ -923,6 +924,7 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
         | Handler::Metrics { .. } => true,
         Handler::Pipeline(handlers)
         | Handler::Handle(handlers)
+        | Handler::HandleGroup(handlers)
         | Handler::HandlePath { handlers, .. } => handlers
             .iter()
             .any(|element| handler_has_terminal(&element.handler)),
@@ -974,6 +976,7 @@ fn is_site_middleware(handler: &Handler) -> bool {
         | Handler::Metrics { .. }
         | Handler::Pipeline(_)
         | Handler::Handle(_)
+        | Handler::HandleGroup(_)
         | Handler::HandlePath { .. }
         | Handler::Plugin { .. } => false,
     }

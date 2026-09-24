@@ -692,8 +692,11 @@ pub enum Handler {
     /// Caddy-compatible template rendering
     Templates,
 
-    /// Exclusive routing group of matcher-guarded elements (sorted)
+    /// 🧩 A handle body remains sequential after directive sorting.
     Handle(Vec<HandlerElement>),
+
+    /// 🧩 Sibling handles stop at the first match, even without a response.
+    HandleGroup(Vec<HandlerElement>),
 
     /// 🛣️ Exclusive routing group that strips the matched prefix first.
     ///
