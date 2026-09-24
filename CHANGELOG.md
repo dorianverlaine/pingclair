@@ -20,16 +20,17 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
-### 🧾 An oversized HTTP/3 header section no longer closes the connection
+### 🧾 An oversized header section gets a named 431 on HTTP/2 and HTTP/3
 
-`max_header_bytes` was handed to quiche as the HTTP/3 field-section limit,
-and quiche answers a section over it by closing the whole connection with
-`H3_EXCESSIVE_LOAD`, failing every other request sharing it. quiche now gets
-a looser but still bounded limit (twice `max_header_bytes`, plus 32 bytes
-for each field the site allows), so the site's own check decides: the one
-request gets a 431, naming the field when a single field is at fault, and
-the rest of the connection carries on. A section beyond the looser limit
-is still refused by quiche as before.
+`max_header_bytes` was handed to the protocol libraries as their own
+header-list limit, so they refused an oversized request before the site's
+check ran: HTTP/2 answered with an empty 431, and HTTP/3 closed the whole
+connection with `H3_EXCESSIVE_LOAD`, failing every other request sharing
+it. Both libraries now get a looser but still bounded limit (twice
+`max_header_bytes`, plus 32 bytes for each field the site allows), so the
+site's own check decides: the one request gets a 431, naming the field when
+a single field is at fault, and the rest of the connection carries on. A
+section beyond the looser limit is still refused by the library as before.
 
 ### ⚠️ Startup warns when keepalive pools can outgrow the descriptor limit
 
@@ -288,10 +289,8 @@ When one header field alone is larger than `max_header_bytes`, the 431 body
 now names that field (never its value), as RFC 6585 §5 asks; when only the
 total is too large, no field is named. The body used to read `431 Error`, and
 a site's `error_page 431` was never used because the check ran before the
-site had been recorded for the request; both are fixed. Over HTTP/2 and
-HTTP/3 the same limit is enforced earlier, by the protocol libraries, so an
-oversized field still gets a bodiless 431 on HTTP/2 and a closed connection
-on HTTP/3.
+site had been recorded for the request; both are fixed. HTTP/2 and HTTP/3
+now answer the same way; see the entry on oversized header sections above.
 
 ### 🚦 A rate-limit rejection says why
 

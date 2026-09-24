@@ -141,9 +141,7 @@ fn header_limited_site(extra: &str) -> String {
 /// named nothing. When the total is over but no single field is, nothing is
 /// named, because any name would be a guess.
 ///
-/// 📌 HTTP/1.1 only. The same limit is advertised to HTTP/2 clients as
-/// SETTINGS_MAX_HEADER_LIST_SIZE, and the h2 library answers an oversized
-/// header list with its own bodiless 431 before this proxy sees the request.
+/// 📌 HTTP/1.1 here; the HTTP/2 case follows.
 #[tokio::test]
 async fn test_431_names_the_single_field_that_is_too_large() {
     let mut server = TestServer::new_pingclairfile(&header_limited_site(""));
@@ -177,6 +175,49 @@ async fn test_431_names_the_single_field_that_is_too_large() {
         spread.text().await.unwrap(),
         "431 Request Header Fields Too Large",
         "no single field is at fault, so none may be named"
+    );
+}
+
+/// 🔎 Over HTTP/2 the 431 names the field too, and only that stream fails.
+///
+/// Before the fix `max_header_bytes` was also the listener's
+/// SETTINGS_MAX_HEADER_LIST_SIZE, so the h2 library refused the oversized
+/// request itself with an empty 431 before the site's check could name the
+/// field. The ordinary request sent alongside it on the same connection
+/// shows the refusal stays on its own stream.
+#[tokio::test]
+async fn test_431_names_the_field_over_http2() {
+    let mut server = TestServer::new_pingclairfile(&header_limited_site(""));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let url = server.url(0, "/");
+    let (oversized, ordinary) = tokio::join!(
+        client.get(&url).header("X-Big", "x".repeat(2000)).send(),
+        client.get(&url).header("X-Small", "fine").send(),
+    );
+    let (oversized, ordinary) = (oversized.unwrap(), ordinary.unwrap());
+    let summary = (
+        oversized.version(),
+        oversized.status().as_u16(),
+        oversized.text().await.unwrap(),
+        ordinary.status().as_u16(),
+        ordinary.text().await.unwrap(),
+    );
+    assert_eq!(
+        summary,
+        (
+            reqwest::Version::HTTP_2,
+            431,
+            "431 Request Header Fields Too Large: the x-big field alone exceeds the header size limit"
+                .to_string(),
+            200,
+            "admitted".to_string(),
+        )
     );
 }
 

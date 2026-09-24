@@ -117,7 +117,7 @@ const MAX_CONFIGURABLE_FIELDS: usize = 256;
 /// the compiler's ceilings (1 MiB, 256 fields) the result is under 2.1 MiB.
 ///
 /// 📌 Computed once per listener at startup, never per request.
-pub(crate) fn protocol_header_list_limit(limits: &ResourceLimitsConfig) -> Option<usize> {
+pub fn protocol_header_list_limit(limits: &ResourceLimitsConfig) -> Option<usize> {
     let fields = limits
         .max_header_count
         .unwrap_or(MAX_CONFIGURABLE_FIELDS)

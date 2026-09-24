@@ -74,8 +74,12 @@ impl ResourceGuardedProxy {
         server_options: HttpServerOptions,
     ) -> Self {
         let mut h2_options = server::default_h2_options();
-        if let Some(max_header_bytes) = limits.max_header_bytes {
-            h2_options.max_header_list_size(max_header_bytes as u32);
+        // 🧾 Deliberately looser than `max_header_bytes`: the h2 library
+        // answers an oversized list with its own bodiless 431, before the
+        // per-site check that names the field can run. See
+        // `protocol_header_list_limit` for the bound that still applies.
+        if let Some(list_limit) = pingclair_proxy::protocol_header_list_limit(&limits) {
+            h2_options.max_header_list_size(u32::try_from(list_limit).unwrap_or(u32::MAX));
         }
         proxy.server_options = Some(server_options);
         proxy.h2_options = Some(h2_options);
