@@ -16,6 +16,7 @@ use super::matchers::{
 };
 use super::options::is_wildcard_host;
 use super::order::DirectiveOrder;
+use super::route_order::{RouteOrderKey, directive_order};
 use super::tls::adapt_tls_directive;
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::Directive;
@@ -702,13 +703,27 @@ pub(super) fn adapt_server(
             )
         };
 
+        // 🧭 Keys for the ordered route list (issue #18, stage 1), one per
+        // arm, aligned with the arms through the sort below.
+        let mut route_keys: Vec<RouteOrderKey> = Vec::new();
         if let Some(routes) = server.routes.as_mut() {
+            // 🏷️ Keyed while the arms are still in file order and before site
+            // middleware is composed in, because both erase what the key reads.
+            let mut keyed: Vec<(Node<RouteArm>, RouteOrderKey)> =
+                std::mem::take(&mut routes.inner.arms)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(file_index, arm)| {
+                        let key = RouteOrderKey::for_arm(order, &arm.inner, file_index);
+                        (arm, key)
+                    })
+                    .collect();
             // 🧭 Matched routes sort the same way, with middleware first: a
             // non-terminal route must run before a terminal route that would
             // otherwise shadow it, and equally ranked routes order by matcher
             // specificity (exact before glob, longer before shorter) like
             // Caddy's sorting algorithm.
-            routes.inner.arms.sort_by(|left, right| {
+            keyed.sort_by(|(left, _), (right, _)| {
                 let left_terminal = handler_has_terminal(&left.inner.handler);
                 let right_terminal = handler_has_terminal(&right.inner.handler);
                 left_terminal.cmp(&right_terminal).then_with(|| {
@@ -722,6 +737,7 @@ pub(super) fn adapt_server(
                         .then_with(|| right_specificity.1.cmp(&left_specificity.1))
                 })
             });
+            (routes.inner.arms, route_keys) = keyed.into_iter().unzip();
             // 🧩 A terminal route skips the site's default pipeline. Prepend
             // unmatched site middleware so it still applies to that route;
             // route-local middleware runs afterward and can override it.
@@ -752,8 +768,10 @@ pub(super) fn adapt_server(
         }
 
         if !default_handlers.is_empty() {
+            route_keys.push(RouteOrderKey::for_catch_all(order, &default_handlers));
             add_route(&mut server, None, final_handler);
         }
+        server.directive_order = directive_order(&route_keys);
 
         // 🧰 `vars` rules sort least specific first, the reverse of route
         // priority: every matching rule runs, so the most specific value is

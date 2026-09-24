@@ -250,6 +250,16 @@ pub struct ServerBlock {
     /// 🧰 Site-level `vars` rules, least specific first.
     pub vars_routes: Vec<VarsRule>,
 
+    /// 🧭 The order the reference implementation would try `routes` in:
+    /// indices into `routes.arms`, first entry tried first, first match that
+    /// answers wins. Empty means the arms are already in that order.
+    ///
+    /// 📌 Built beside the router and not yet consulted by it (issue #18,
+    /// stage 1). Today the router still picks the most specific path; the
+    /// list exists so the two models can be compared before one replaces
+    /// the other.
+    pub directive_order: Vec<usize>,
+
     /// Other directives (including macro calls)
     pub directives: Vec<Directive>,
 
@@ -1243,6 +1253,7 @@ impl ServerBlock {
             error_pages: Vec::new(),
             error_routes: Vec::new(),
             vars_routes: Vec::new(),
+            directive_order: Vec::new(),
             directives: Vec::new(),
             limits: ResourceLimitsConfig::default(),
         }

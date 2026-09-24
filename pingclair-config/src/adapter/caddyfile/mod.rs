@@ -21,6 +21,7 @@
 //! | Module | Owns |
 //! | --- | --- |
 //! | [`sites`] | A site block becomes a server: routes, ordering, defaults. |
+//! | [`route_order`] | 🧭 The order a site's routes are tried in, as one list. |
 //! | [`options`] | The global block. |
 //! | [`addresses`] | What a site address means. |
 //! | [`matchers`] | The matcher token rule, and matcher definitions. |
@@ -44,6 +45,7 @@ mod order;
 pub mod registry;
 mod retry_expr;
 mod reverse_proxy;
+mod route_order;
 mod sites;
 mod tls;
 
