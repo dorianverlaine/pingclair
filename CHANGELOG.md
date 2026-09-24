@@ -315,7 +315,25 @@ which it may retry elsewhere; a request opened after that is refused with
 with `H3_NO_ERROR` once its last response has been acknowledged. New QUIC
 connections are ignored while the process drains. HTTP/3 never sent `GOAWAY`
 before, not even at shutdown.
-||||||| parent of be037b7 (🔐 feat(config): honour auto_https ignore_loaded_certs)
+### 🧰 A `vars` matcher key may be a placeholder
+
+`@m vars {http.request.method} GET` was refused, so a Caddyfile using a
+placeholder as a `vars` key could not load. The key is now stored exactly as
+written, and the braces are what decides how it is read: `{http.request.method}`
+asks the request's placeholder engine, while a bare key names an entry in the
+request's `vars` map. That is Caddy's rule, and its own adapted JSON carries the
+braces through for the same reason.
+
+The placeholder form is checked against the same list a `try_files` candidate is,
+and for the same reason: a name the matcher cannot resolve answers the empty
+string on every request, so the matcher would compile, load, and silently never
+match. A name outside the list is refused with the list in the message —
+`{env.HOME}` is the usual one, because the matcher runs in the router and the
+process environment is not reachable from there.
+
+**Upgrading:** nothing to do. A `vars` matcher whose key was previously refused
+now compiles; one whose key was a bare name behaves exactly as before.
+
 ### 🔐 `auto_https ignore_loaded_certs` loads, and does what it names
 
 A Caddyfile carrying this option was refused outright, so a configuration using

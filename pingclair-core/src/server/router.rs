@@ -449,17 +449,41 @@ fn evaluate_matcher_inner(
                 .iter()
                 .any(|protocol| protocol.eq_ignore_ascii_case(request.protocol)),
         ),
-        // 🧰 The `vars` matcher reads a request-scoped variable and matches
-        // when its value equals any listed value. A request with no visible
-        // variables never matches, which is the fail-closed reading of a
-        // variable that has not been set.
-        Matcher::Vars { name, values } => bool_verdict(
-            request
-                .vars
-                .as_deref_mut()
-                .and_then(|vars| vars.get(name))
-                .is_some_and(|value| values.iter().any(|candidate| candidate == value)),
-        ),
+        // 🧰 The `vars` matcher matches when one request-scoped value equals any
+        // listed value. Which value is asked for depends on how the key is
+        // spelled, and the two spellings read from different places — this is
+        // Caddy's rule, written down at `modules/caddyhttp/vars.go:187-193` and
+        // in the type's own doc comment there: a key surrounded by braces is a
+        // *placeholder*, resolved against the request, while a bare key is a
+        // name looked up in the request's variable map.
+        //
+        // 📌 The count matters: `{a}{b}` has two braces and is therefore a
+        // variable name, not a placeholder. Caddy spells the test out
+        // (`strings.Count(key, "{") == 1`) because the alternative reading —
+        // "strip the outer braces and resolve what is left" — would silently
+        // turn a name nobody can set into a lookup nobody intended.
+        //
+        // 🚫 A request with no visible variables never matches on the bare
+        // spelling, which is the fail-closed reading of a variable that has not
+        // been set.
+        Matcher::Vars { name, values } => {
+            let placeholder = name
+                .strip_prefix('{')
+                .and_then(|rest| rest.strip_suffix('}'))
+                .filter(|rest| !rest.contains('{') && !rest.contains('}'));
+            let value = match placeholder {
+                Some(placeholder) => {
+                    resolve_matcher_placeholder(placeholder, request, request.path)
+                }
+                None => request
+                    .vars
+                    .as_deref()
+                    .and_then(|vars| vars.get(name))
+                    .cloned()
+                    .unwrap_or_default(),
+            };
+            bool_verdict(values.iter().any(|candidate| candidate == &value))
+        }
         // 🔍 A regexp matcher records its capture groups as `{re.*}`
         // placeholders before answering, exactly like upstream: numeric
         // groups under the matcher's name (or bare when unnamed), and named
@@ -773,16 +797,22 @@ fn set_file_placeholders(request: &mut MatcherRequest<'_>, candidate: &FileCandi
     );
 }
 
-/// 🧭 The placeholder names a `file` matcher candidate may use.
+/// 🧭 The placeholder names a matcher may resolve.
 ///
 /// Every name here is answerable from [`MatcherRequest`] alone. That is the
-/// whole rule, and it is why the list is short: the matcher runs in this
-/// crate, which knows nothing about the proxy's request type, so a name that
-/// needs the listener's scheme or the process environment cannot be resolved
-/// here at all. `validate_config` refuses any other name rather than letting
-/// it stand as a literal — a candidate spelled `{env.HOME}` would otherwise be
-/// looked up as a file whose name contains braces, find nothing, and fall
-/// through, which is indistinguishable from a missing file.
+/// whole rule, and it is why the list is short: a matcher runs in this crate,
+/// which knows nothing about the proxy's request type, so a name that needs
+/// the listener's scheme or the process environment cannot be resolved here at
+/// all. `validate_config` refuses any other name rather than letting it stand
+/// as a literal — a candidate spelled `{env.HOME}` would otherwise be looked up
+/// as a file whose name contains braces, find nothing, and fall through, which
+/// is indistinguishable from a missing file.
+///
+/// 📌 Two matchers read this list, and they read it for the same reason. A
+/// `file` matcher's candidates interpolate it (`expand_file_pattern`), and a
+/// `vars` matcher's `{placeholder}` key is resolved through it. The failure a
+/// name outside the list produces is identical in both: something that
+/// compiles, loads, and silently never matches.
 ///
 /// 🤔 Evaluated and rejected on 2026-08-11: sharing
 /// `pingclair_proxy::server::resolve_single_placeholder`, which understands a
@@ -791,7 +821,7 @@ fn set_file_placeholders(request: &mut MatcherRequest<'_>, candidate: &FileCandi
 /// type moving into the router. The second is the right end state and is worth
 /// its own session; doing it here would have put a hot-path type change inside
 /// a `try_files` commit.
-pub const FILE_MATCHER_PLACEHOLDERS: &[&str] = &[
+pub const MATCHER_PLACEHOLDERS: &[&str] = &[
     "path",
     "uri",
     "query",
@@ -812,11 +842,11 @@ pub const FILE_MATCHER_PLACEHOLDERS: &[&str] = &[
     "http.request.remote.host",
 ];
 
-/// 🧭 The placeholder prefixes a `file` matcher candidate may use.
+/// 🧭 The placeholder prefixes a matcher may resolve.
 ///
 /// These are open-ended families rather than single names: any header, any
 /// `vars` entry, any regexp capture.
-pub const FILE_MATCHER_PLACEHOLDER_PREFIXES: &[&str] = &[
+pub const MATCHER_PLACEHOLDER_PREFIXES: &[&str] = &[
     "http.request.header.",
     "http.vars.",
     "http.request.orig_uri.",
@@ -848,20 +878,26 @@ fn expand_file_pattern(pattern: &str, request: &MatcherRequest<'_>, path: &str) 
             break;
         };
         let name = &rest[start + 1..start + end];
-        push_glob_safe(&mut out, &resolve_file_placeholder(name, request, path));
+        push_glob_safe(&mut out, &resolve_matcher_placeholder(name, request, path));
         rest = &rest[start + end + 1..];
     }
     out.push_str(rest);
     out
 }
 
-/// 🧭 Resolves one `file` matcher placeholder from the request.
+/// 🧭 Resolves one matcher placeholder from the request.
+///
+/// 📌 `path` is the caller's notion of the request's path, and the two callers
+/// mean different things by it. A `file` matcher passes the candidate it is
+/// testing, because `{path}` there is the part of the request path that
+/// candidate was built from. The `vars` matcher passes the request's own path,
+/// because it is naming the request and not a candidate.
 ///
 /// An unknown name resolves to the empty string, matching every other
 /// placeholder site in this project. It is not reachable from a Pingclairfile,
 /// because `validate_config` refuses names outside
-/// [`FILE_MATCHER_PLACEHOLDERS`], but a JSON configuration can still get here.
-fn resolve_file_placeholder(name: &str, request: &MatcherRequest<'_>, path: &str) -> String {
+/// [`MATCHER_PLACEHOLDERS`], but a JSON configuration can still get here.
+fn resolve_matcher_placeholder(name: &str, request: &MatcherRequest<'_>, path: &str) -> String {
     if let Some(header) = name.strip_prefix("http.request.header.") {
         return request
             .headers

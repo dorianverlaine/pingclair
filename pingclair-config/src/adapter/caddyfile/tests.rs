@@ -4728,14 +4728,46 @@ mod vars_tests {
         ));
     }
 
+    /// 🧰 A `{placeholder}` key is a key like any other, and survives as written.
+    ///
+    /// 🚩 The braces are the whole point, so the assertion is on them: a matcher
+    /// that stored the stripped name would look identical at this layer and
+    /// then read the request's `vars` map for a key spelled
+    /// `http.request.method`, which nothing ever sets — a matcher that compiles,
+    /// loads, and never matches. Caddy carries the braces through its adapted
+    /// JSON for the same reason (`modules/caddyhttp/vars.go:187-193` decides by
+    /// looking at them at match time).
     #[test]
-    fn the_vars_matcher_refuses_placeholder_keys() {
-        let error = compile(
+    fn the_vars_matcher_keeps_a_placeholder_key_as_written() {
+        let config = compile(
             "example.com {\n\t@m vars \"{http.request.uri}\" \"/x\"\n\trespond @m \"hit\"\n}",
         )
-        .expect_err("a placeholder key must be refused")
-        .to_string();
-        assert!(error.contains("placeholder"), "{error}");
+        .expect("a placeholder key must be accepted");
+        assert!(
+            matches!(
+                &config.servers[0].routes[0].matcher,
+                Some(Matcher::Vars { name, values })
+                    if name == "{http.request.uri}" && values == &["/x".to_string()]
+            ),
+            "the key has to keep its braces: {:?}",
+            config.servers[0].routes[0].matcher
+        );
+    }
+
+    /// 🛡️ A placeholder key outside the resolvable set is refused, by name.
+    ///
+    /// Accepting it would be worse than refusing: the resolver answers the
+    /// empty string for a name it does not know, so the matcher would load and
+    /// then never match, which reads to the operator as "this route is never
+    /// taken" rather than "this name is wrong".
+    #[test]
+    fn a_vars_matcher_key_naming_an_unresolvable_placeholder_is_refused() {
+        let error =
+            compile("example.com {\n\t@m vars \"{env.HOME}\" \"/x\"\n\trespond @m \"hit\"\n}")
+                .expect_err("a name no matcher can resolve must be refused")
+                .to_string();
+        assert!(error.contains("env.HOME"), "{error}");
+        assert!(error.contains("http.request.method"), "{error}");
     }
 }
 

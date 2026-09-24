@@ -17,8 +17,8 @@ use pingclair_core::config::{
     default_gzip_types,
 };
 use pingclair_core::server::{
-    FILE_MATCHER_PLACEHOLDER_PREFIXES, FILE_MATCHER_PLACEHOLDERS, MAX_BCRYPT_COST,
-    argon2id_hash_valid, bcrypt_hash_cost,
+    MATCHER_PLACEHOLDER_PREFIXES, MATCHER_PLACEHOLDERS, MAX_BCRYPT_COST, argon2id_hash_valid,
+    bcrypt_hash_cost,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
@@ -1119,9 +1119,9 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
             validate_subrequest_handler(&route.handler)?;
             reject_unimplemented_handler(&route.handler)?;
             if let Some(matcher) = &route.matcher {
-                validate_file_matcher(matcher)?;
+                validate_matcher(matcher)?;
             }
-            validate_file_matchers_under(&route.handler)?;
+            validate_matchers_under(&route.handler)?;
         }
         for error_route in &server.error_routes {
             for element in &error_route.handlers {
@@ -1129,9 +1129,9 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
                 validate_subrequest_handler(&element.handler)?;
                 reject_unimplemented_handler(&element.handler)?;
                 if let Some(matcher) = &element.matcher {
-                    validate_file_matcher(matcher)?;
+                    validate_matcher(matcher)?;
                 }
-                validate_file_matchers_under(&element.handler)?;
+                validate_matchers_under(&element.handler)?;
             }
         }
 
@@ -1920,27 +1920,27 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
     Ok(())
 }
 
-/// 🛡️ Walks a handler tree and validates every `file` matcher it guards.
+/// 🛡️ Walks a handler tree and validates every matcher it guards.
 ///
 /// The matcher is what `try_files` compiles to, so the rules that used to sit
 /// on the `try_files` handler have to live here or the Pingclairfile path
 /// would lose them entirely.
-fn validate_file_matchers_under(handler: &HandlerConfig) -> CompileResult<()> {
+fn validate_matchers_under(handler: &HandlerConfig) -> CompileResult<()> {
     match handler {
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             for element in handlers {
                 if let Some(matcher) = &element.matcher {
-                    validate_file_matcher(matcher)?;
+                    validate_matcher(matcher)?;
                 }
-                validate_file_matchers_under(&element.handler)?;
+                validate_matchers_under(&element.handler)?;
             }
         }
         HandlerConfig::HandleErrors { errors } => {
             for handlers in errors.values() {
                 for handler in handlers {
-                    validate_file_matchers_under(handler)?;
+                    validate_matchers_under(handler)?;
                 }
             }
         }
@@ -1951,7 +1951,7 @@ fn validate_file_matchers_under(handler: &HandlerConfig) -> CompileResult<()> {
                 validate_try_files_candidate(candidate)?;
             }
             if let Some(fallback) = fallback {
-                validate_file_matchers_under(fallback)?;
+                validate_matchers_under(fallback)?;
             }
         }
         // 📁 The index is joined onto a directory after the request path has
@@ -1967,8 +1967,8 @@ fn validate_file_matchers_under(handler: &HandlerConfig) -> CompileResult<()> {
     Ok(())
 }
 
-/// 🛡️ Validates the candidates of every `file` matcher in one matcher tree.
-fn validate_file_matcher(matcher: &pingclair_core::config::Matcher) -> CompileResult<()> {
+/// 🛡️ Validates every rule this build has about the matchers in one tree.
+fn validate_matcher(matcher: &pingclair_core::config::Matcher) -> CompileResult<()> {
     match matcher {
         pingclair_core::config::Matcher::File {
             try_files,
@@ -2002,12 +2002,54 @@ fn validate_file_matcher(matcher: &pingclair_core::config::Matcher) -> CompileRe
         }
         pingclair_core::config::Matcher::And(left, right)
         | pingclair_core::config::Matcher::Or(left, right) => {
-            validate_file_matcher(left)?;
-            validate_file_matcher(right)
+            validate_matcher(left)?;
+            validate_matcher(right)
         }
-        pingclair_core::config::Matcher::Not(inner) => validate_file_matcher(inner),
+        // 🧰 A `vars` matcher key in braces is a placeholder, and the same
+        // short list answers it that answers a `file` matcher candidate.
+        pingclair_core::config::Matcher::Vars { name, .. } => validate_vars_matcher_key(name),
+        pingclair_core::config::Matcher::Not(inner) => validate_matcher(inner),
         _ => Ok(()),
     }
+}
+
+/// 🛡️ Rejects a `vars` matcher key that names a placeholder nothing resolves.
+///
+/// Two spellings mean two different things, and only one of them is a
+/// placeholder. Braces are the placeholder form — `{http.request.method}` —
+/// and a bare key is a variable name the request's own `vars` map is asked for,
+/// so any name is legal there: whether it was set is decided per request by
+/// `vars` rules this same configuration writes.
+///
+/// 🚫 The brace form is checked against [`MATCHER_PLACEHOLDERS`] for the same
+/// reason a `try_files` candidate is. A name the resolver does not know does
+/// not fail — it resolves to the empty string on every request — so the
+/// matcher would compile, load, and silently never match. That is the shape
+/// this build refuses rather than ships, and it is checked here rather than in
+/// the adapter because the Admin API deserialises straight into the canonical
+/// types and never sees the adapter at all.
+fn validate_vars_matcher_key(key: &str) -> CompileResult<()> {
+    let Some(placeholder) = key
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .filter(|rest| !rest.contains('{') && !rest.contains('}'))
+    else {
+        return Ok(());
+    };
+    let known = MATCHER_PLACEHOLDERS.contains(&placeholder)
+        || MATCHER_PLACEHOLDER_PREFIXES
+            .iter()
+            .any(|prefix| placeholder.starts_with(prefix));
+    if known {
+        return Ok(());
+    }
+    Err(CompileError::InvalidRoute {
+        message: format!(
+            "vars matcher key `{key}` names a placeholder a matcher cannot resolve; it \
+             understands {}",
+            MATCHER_PLACEHOLDERS.join(", ")
+        ),
+    })
 }
 
 /// 🛡️ Rejects a candidate that could leave the document root or that names a
@@ -2025,7 +2067,7 @@ fn validate_file_matcher(matcher: &pingclair_core::config::Matcher) -> CompileRe
 /// resolve would be looked up as a file whose name contains braces, find
 /// nothing, and fall through — a misconfiguration that behaves exactly like a
 /// missing file. The set it checks against is the matcher's own, so the two
-/// cannot drift: see `FILE_MATCHER_PLACEHOLDERS`.
+/// cannot drift: see `MATCHER_PLACEHOLDERS`.
 /// 🚫 Refuses a `file_server` index that could name something outside the root.
 ///
 /// An index is a **filename**, not a path to go looking with — `index.html`,
@@ -2103,8 +2145,8 @@ fn validate_try_files_candidate(candidate: &str) -> CompileResult<()> {
             });
         };
         let name = &rest[start + 1..start + end];
-        let known = FILE_MATCHER_PLACEHOLDERS.contains(&name)
-            || FILE_MATCHER_PLACEHOLDER_PREFIXES
+        let known = MATCHER_PLACEHOLDERS.contains(&name)
+            || MATCHER_PLACEHOLDER_PREFIXES
                 .iter()
                 .any(|prefix| name.starts_with(prefix));
         if !known {
@@ -2112,7 +2154,7 @@ fn validate_try_files_candidate(candidate: &str) -> CompileResult<()> {
                 message: format!(
                     "try_files candidate `{candidate}` uses `{{{name}}}`, which a file matcher \
                      cannot resolve; it understands {}",
-                    FILE_MATCHER_PLACEHOLDERS.join(", ")
+                    MATCHER_PLACEHOLDERS.join(", ")
                 ),
             });
         }

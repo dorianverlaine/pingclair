@@ -3177,6 +3177,53 @@ async fn test_vars_rules_placeholders_and_matcher() {
 }
 
 #[tokio::test]
+async fn test_pingclairfile_vars_matcher_placeholder_key_matches_by_method() {
+    // 🧰 A `vars` matcher whose key is a `{placeholder}` reads the request's
+    // placeholder engine, not its variable map. The distinction is only
+    // visible at runtime: the configuration compiles either way, and a matcher
+    // reading the wrong one never matches anything.
+    //
+    // 📌 The request pair is the assertion. `{http.request.method}` expands to
+    // `GET` for a GET and to `POST` for a POST, so the same matcher has to hit
+    // once and miss once. An implementation that compared the literal text
+    // would miss both, and one that always matched would hit both.
+    let config = r#"
+        {
+            admin off
+        }
+
+        :__PINGCLAIR_TEST_PORT__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            @m vars {http.request.method} GET
+            respond @m "MATCHED"
+            respond "NO-MATCH"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let url = server.url(0, "/probe");
+    let resp = client.get(url.clone()).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.text().await.unwrap(),
+        "MATCHED",
+        "a GET resolves {{http.request.method}} to GET, which is the listed value"
+    );
+
+    let resp = client.post(url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.text().await.unwrap(),
+        "NO-MATCH",
+        "the same matcher must not match a method it does not list"
+    );
+}
+
+#[tokio::test]
 async fn test_regexp_capture_placeholders() {
     // 🔍 `path_regexp` and `header_regexp` with a name record their capture
     // groups, and `{re.<name>.N}` reads them back in the response.

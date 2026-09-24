@@ -696,16 +696,18 @@ pub(super) fn parse_single_matcher_at(
                     "malformed vars matcher: expected at least one value".into(),
                 ));
             }
-            // 🚫 A `{placeholder}` key resolves against the request's
-            // placeholder engine, which this matcher cannot reach from the
-            // router; refusing is honest, and a literal-brace comparison
-            // would be a matcher that silently never matches.
-            if name.starts_with('{') && name.ends_with('}') {
-                return Err(AdapterError::UnsupportedFeature(
-                    "vars matcher".into(),
-                    "placeholder keys are not implemented yet; use a variable name".into(),
-                ));
-            }
+            // 🧰 The key is stored exactly as written, braces and all, because
+            // the braces are the instruction: `{http.request.method}` asks the
+            // request's placeholder engine for a value, while a bare key names
+            // an entry in the request's `vars` map. Upstream keeps the same
+            // distinction in the same place — its matcher decides by looking at
+            // the key's braces at match time (`modules/caddyhttp/vars.go:187-193`),
+            // and its adapted JSON carries the braces through unchanged.
+            //
+            // 🚫 Whether the placeholder is one a matcher can actually resolve
+            // is not decided here. It is a rule about the compiled router, so
+            // it lives in `validate_config` where a JSON configuration reaches
+            // it too — see `validate_vars_matcher_key`.
             Ok(Matcher::Vars {
                 name: name.clone(),
                 values: values.to_vec(),
