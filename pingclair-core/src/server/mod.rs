@@ -6,6 +6,7 @@
 mod file_glob;
 mod handlers;
 mod redirect;
+mod route_candidates;
 mod router;
 
 pub use self::handlers::{

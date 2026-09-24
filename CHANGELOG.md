@@ -29,6 +29,36 @@ uses atomic accounting without adding request-path locks; a route serves misses
 uncached when other routes occupy the budget. File eligibility and HTTP behavior
 are unchanged. These fixed limits are not a total process-memory ceiling. (#33)
 
+### 🧭 Directive order, not the most specific path, decides which route answers
+
+**Breaking.** A site's routes are now tried as one list, ordered the way
+Caddy orders them, and the first route that matches answers. Until now the
+most specific path won wherever it was written. So this site answers
+`hello` for `/assets/a.txt`, where it used to serve the file:
+
+```caddyfile
+example.com {
+    root * /srv
+    file_server /assets/*
+    respond "hello" 200
+}
+```
+
+`respond` ranks ahead of `file_server` in the directive order, and ahead
+of `reverse_proxy` and `php_fastcgi`; `redir`, `handle` and `route` rank
+ahead of `respond`. Between routes of the same directive, the one whose
+single path is longer once a trailing `*` is removed goes first (`/foobar*`
+before `/foo`), then exact before wildcard (`/foo` before `/foo*`), then
+file order. A matcher with several paths, or none, goes after every
+single-path sibling. `handle` blocks sort their contents by the same rule.
+
+**Upgrading:** a configuration where a narrower directive sits below a
+broader one of an earlier rank now answers differently. To keep the old
+answer, give the narrower route an earlier rank — wrap both in `handle`
+blocks, which are exclusive and put the one with a path first, or move a
+directive with the `order` global option (`order file_server first`) —
+or list them in a `route` block, which keeps written order. (#18)
+
 ### 📁 A globbed `try_files` candidate sees every file in the directory
 
 A `file` matcher or `try_files` candidate containing a glob could not

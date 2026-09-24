@@ -139,80 +139,50 @@ pub struct CompiledRoute {
     pub matcher_precompile: MatcherPrecompile,
 }
 
-/// High-performance router using radix tree
+/// 🧭 Picks the route that answers a request: the **first** route in list
+/// order whose path and matcher accept it (issue #18).
+///
+/// The radix tree only narrows the list. Each node holds, in list order, the
+/// indices of every route that can match a path landing there (see
+/// `route_candidates`), so a lookup is one tree walk and a scan of a short
+/// slice — never a scan of the whole site and never a sort.
 pub struct Router {
-    /// Radix tree for path matching
-    path_router: RadixRouter<Vec<CompiledRoute>>,
-    /// Default routes (no specific path)
-    default_routes: Vec<CompiledRoute>,
+    /// Candidate indices per radix node, ascending.
+    path_router: RadixRouter<Box<[usize]>>,
+    /// Routes with no path constraint, ascending: the candidates for a path
+    /// that lands on no node.
+    default_routes: Box<[usize]>,
     /// All routes for iteration
     all_routes: Vec<RouteConfig>,
-    /// Compiled routes indexed the same way as `all_routes`.
+    /// Compiled routes, indexed like `all_routes`; list order is index order.
     compiled_routes: Vec<CompiledRoute>,
 }
 
 impl Router {
-    /// Create a new router from route configurations
+    /// 🏗️ Compiles the routes and precomputes every node's candidate list.
     pub fn new(routes: Vec<RouteConfig>) -> Self {
-        let mut path_router = RadixRouter::new();
-        let mut default_routes = Vec::new();
-        let mut path_groups: HashMap<String, Vec<CompiledRoute>> = HashMap::new();
-        let mut compiled_routes = Vec::new();
-
-        for (index, config) in routes.iter().enumerate() {
-            // Pre-compile matcher if present
-            let compiled_matcher = config.matcher.as_ref().map(CompiledMatcher::compile);
-
-            let compiled = CompiledRoute {
+        let compiled_routes: Vec<CompiledRoute> = routes
+            .iter()
+            .enumerate()
+            .map(|(index, config)| CompiledRoute {
                 config: config.clone(),
                 index,
-                compiled_matcher,
+                compiled_matcher: config.matcher.as_ref().map(CompiledMatcher::compile),
                 matcher_precompile: precompile_handler(&config.handler),
-            };
-            compiled_routes.push(compiled.clone());
+            })
+            .collect();
 
-            // Normalize path for radix tree
-            let path = Self::normalize_path(&config.path);
-
-            if path == "/*" || path == "/" {
-                default_routes.push(compiled);
-            } else {
-                path_groups.entry(path).or_default().push(compiled);
-            }
-        }
-
-        // Insert path groups into radix router
-        for (path, routes) in path_groups {
-            // Convert glob patterns to matchit format
-            let matchit_path = Self::glob_to_matchit(&path);
-
-            // A glob like "/proxy/*" must also match the bare directory it
-            // was written to catch — both "/proxy/" and "/proxy" — with
-            // nothing after the prefix. That's how Caddy's own `*` glob and
-            // Nginx's prefix `location` both behave, and hitting the exact
-            // directory is an extremely common request. matchit's `{*rest}`
-            // wildcard requires at least one character after the prefix, and
-            // treats "/proxy" and "/proxy/" as distinct paths, so without
-            // these extra static registrations the bare forms fall through
-            // to the server's default route instead of matching —
-            // previously surfacing as a 500 ConnectNoRoute inside
-            // upstream_peer() when the default route had no upstream.
-            for bare in Self::bare_prefixes(&path) {
-                if let Err(e) = path_router.insert(bare.clone(), routes.clone()) {
-                    // A conflict here just means an explicit route already
-                    // owns that exact path; that route legitimately wins.
-                    tracing::debug!("Skipping bare-prefix route {}: {}", bare, e);
-                }
-            }
-
-            if let Err(e) = path_router.insert(&matchit_path, routes) {
-                tracing::warn!("🧭 Failed to insert route {}: {}", path, e);
+        let candidates = super::route_candidates::build(&routes);
+        let mut path_router = RadixRouter::new();
+        for (pattern, indices) in candidates.nodes {
+            if let Err(e) = path_router.insert(&pattern, indices) {
+                tracing::warn!("🧭 Failed to insert route {}: {}", pattern, e);
             }
         }
 
         Self {
             path_router,
-            default_routes,
+            default_routes: candidates.any,
             all_routes: routes,
             compiled_routes,
         }
@@ -224,23 +194,21 @@ impl Router {
         self.compiled_routes.get(index)
     }
 
-    /// Match a request path and return matching routes
+    /// 🔎 The routes a path could match, in the order they would be tried.
     pub fn match_path(&self, path: &str) -> Vec<&CompiledRoute> {
-        let mut matches = Vec::new();
+        self.candidates(path)
+            .iter()
+            .map(|&index| &self.compiled_routes[index])
+            .collect()
+    }
 
-        // Try radix tree match first
-        if let Ok(matched) = self.path_router.at(path) {
-            for route in matched.value.iter() {
-                matches.push(route);
-            }
+    /// 🌲 The precomputed candidate slice for a path: its node's list, or the
+    /// catch-alls when it lands on no node.
+    fn candidates(&self, path: &str) -> &[usize] {
+        match self.path_router.at(path) {
+            Ok(matched) => matched.value,
+            Err(_) => &self.default_routes,
         }
-
-        // Add default routes
-        for route in &self.default_routes {
-            matches.push(route);
-        }
-
-        matches
     }
 
     /// 🧭 Matches a request after normalizing paths supplied by direct callers.
@@ -297,18 +265,12 @@ impl Router {
             vars,
         };
 
-        // 🌲 Consult the radix match before catch-all routes while borrowing
-        // both collections directly; the old candidate Vec allocated once per
-        // request only to iterate it immediately.
-        if let Ok(matched) = self.path_router.at(path) {
-            for route in matched.value {
-                if Self::route_matches(route, &mut request) {
-                    return Some(route);
-                }
-            }
-        }
-        self.default_routes
+        // 🌲 One tree walk, then the first candidate that agrees. The slice
+        // already holds catch-alls in their list position, so nothing is
+        // merged, sorted, or allocated here.
+        self.candidates(path)
             .iter()
+            .map(|&index| &self.compiled_routes[index])
             .find(|route| Self::route_matches(route, &mut request))
     }
 
@@ -361,50 +323,6 @@ impl Router {
         match query {
             Some(query) => format!("{normalized}?{query}"),
             None => normalized,
-        }
-    }
-
-    /// Normalize path for consistent matching
-    fn normalize_path(path: &str) -> String {
-        let path = if path.is_empty() { "/" } else { path };
-        path.to_string()
-    }
-
-    /// The bare (non-wildcard) prefixes a glob path should also match.
-    ///
-    /// `/proxy/*` → `["/proxy", "/proxy/"]` so a request to either the bare
-    /// directory or its trailing-slash form still hits the route.
-    /// `/foo*`    → `["/foo"]`.
-    /// Non-glob paths yield nothing.
-    fn bare_prefixes(path: &str) -> Vec<String> {
-        if let Some(prefix) = path.strip_suffix("/*") {
-            // "/proxy/*" -> prefix "/proxy": match both "/proxy" and "/proxy/".
-            if prefix.is_empty() {
-                // "/*" is the catch-all; leave it to default_routes.
-                Vec::new()
-            } else {
-                vec![prefix.to_string(), format!("{}/", prefix)]
-            }
-        } else if let Some(prefix) = path.strip_suffix('*') {
-            // "/foo*" -> prefix "/foo".
-            if prefix.is_empty() {
-                Vec::new()
-            } else {
-                vec![prefix.to_string()]
-            }
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Convert glob pattern to matchit format
-    fn glob_to_matchit(path: &str) -> String {
-        if let Some(prefix) = path.strip_suffix("/*") {
-            format!("{prefix}/{{*rest}}")
-        } else if let Some(prefix) = path.strip_suffix('*') {
-            format!("{prefix}{{*rest}}")
-        } else {
-            path.to_string()
         }
     }
 

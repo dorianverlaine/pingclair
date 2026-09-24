@@ -12,9 +12,9 @@
 //! second model.
 //!
 //! 📌 The site adapter sorts its routes by [`RouteOrderKey`] once, at load,
-//! and emits them in that order (issue #18, stage 2). The router still picks
-//! the most specific path first and reads this order only among routes of
-//! one path.
+//! and emits them in that order (issue #18, stage 2). The router tries them
+//! in that order and the first that matches answers; its radix tree only
+//! narrows which of them a path can reach.
 //!
 //! The ordering key, in priority order:
 //!
@@ -214,8 +214,8 @@ fn collect_paths<'a>(
 
 // MARK: - Tests
 
-/// 🧪 The order a site's compiled routes come out in, which is the order the
-/// router will try them.
+/// 🧪 The order a site's compiled routes come out in, and what the router
+/// answers from that order.
 #[cfg(test)]
 mod tests {
     use pingclair_core::config::{HandlerConfig, RouteConfig};
@@ -242,6 +242,24 @@ mod tests {
         }
     }
 
+    /// 🧭 The label of the route the real router picks for `path`.
+    fn answer(source: &str, path: &str) -> String {
+        let headers = http::HeaderMap::new();
+        let router = pingclair_core::server::Router::new(routes(source));
+        let route = router
+            .match_request(
+                path,
+                "GET",
+                &headers,
+                "example.com",
+                "127.0.0.1",
+                "HTTP/1.1",
+                None,
+            )
+            .expect("some route answers");
+        body(&route.config.handler).unwrap_or("proxy").to_string()
+    }
+
     fn bodies(source: &str) -> Vec<String> {
         routes(source)
             .iter()
@@ -255,6 +273,7 @@ mod tests {
         // `file_server`, so the catch-all comes first.
         let source = "example.com {\n    root * /srv\n    file_server /assets/*\n    respond \"hello\" 200\n}";
         assert_eq!(paths(source), ["/*", "/assets/*"]);
+        assert_eq!(answer(source, "/assets/a.txt"), "hello");
     }
 
     #[test]
@@ -295,6 +314,8 @@ mod tests {
             "}",
         );
         assert_eq!(paths(source), ["/a*", "/a", "/b"]);
+        assert_eq!(answer(source, "/a"), "a glob");
+        assert_eq!(answer(source, "/b"), "both");
     }
 
     #[test]
@@ -316,6 +337,8 @@ mod tests {
         assert_eq!(body(&routes[0].handler), Some("ready"));
         assert!(routes[1].matcher.is_some(), "the `header @rest` route");
         assert!(routes[2].matcher.is_none(), "the catch-all");
+        assert_eq!(answer(source, "/ready"), "ready");
+        assert_eq!(answer(source, "/page"), "proxy");
     }
 
     #[test]

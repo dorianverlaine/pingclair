@@ -42,6 +42,10 @@ mod started_response;
 #[path = "integration/cache_vary.rs"]
 mod cache_vary;
 
+// 🧭 Directive order, not path specificity, decides which route answers.
+#[path = "integration/route_order.rs"]
+mod route_order;
+
 // 🔌 WebSocket handshakes spelled across several field lines.
 #[path = "integration/websocket_upgrade.rs"]
 mod websocket_upgrade;
@@ -4488,8 +4492,13 @@ async fn test_pingclairfile_sibling_handle_blocks_remain_exclusive() {
         }
 
         http://__PINGCLAIR_TEST_LISTEN__ {
+            # 🧭 `handle` ranks ahead of `respond`, and the first route in
+            # directive order answers (issue #18), so the probe is a `handle`
+            # too; its path puts it ahead of the catch-all block.
             @readiness path __PINGCLAIR_TEST_READINESS_PATH__
-            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            handle @readiness {
+                respond "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            }
 
             handle /shared/* {
                 header X-Which first
@@ -8854,6 +8863,9 @@ async fn test_redirect_expands_host_and_uri_placeholders() {
     let config = r#"
         {
             admin off
+            # 🧭 A catch-all below ranks ahead of `respond`, and the first route in
+            # directive order answers (issue #18), so the probe must move first.
+            order respond first
         }
 
         :__PINGCLAIR_TEST_PORT__ {
@@ -8902,6 +8914,9 @@ async fn test_route_element_matchers_gate_handlers() {
     let config = r#"
         {
             admin off
+            # 🧭 A catch-all below ranks ahead of `respond`, and the first route in
+            # directive order answers (issue #18), so the probe must move first.
+            order respond first
         }
 
         :__PINGCLAIR_TEST_PORT__ {
@@ -14054,6 +14069,9 @@ async fn test_file_server_pass_thru_falls_through_to_the_next_handler() {
         r#"
         {{
             admin off
+            # 🧭 A catch-all below ranks ahead of `respond`, and the first route in
+            # directive order answers (issue #18), so the probe must move first.
+            order respond first
         }}
 
         :__PINGCLAIR_TEST_PORT__ {{
@@ -14502,6 +14520,9 @@ async fn test_try_files_policy_status_and_glob_candidates() {
         r#"
         {{
             admin off
+            # 🧭 A catch-all below ranks ahead of `respond`, and the first route in
+            # directive order answers (issue #18), so the probe must move first.
+            order respond first
         }}
 
         :__PINGCLAIR_TEST_PORT__ {{
