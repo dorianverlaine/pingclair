@@ -2165,7 +2165,7 @@ pub struct PingclairProxy {
     /// enabled (`None` = do not advertise, e.g. plain-HTTP listeners).
     /// Stored behind `ArcSwap` so it can be flipped without restarting the
     /// Pingora service.
-    pub alt_svc: Arc<ArcSwap<Option<String>>>,
+    pub alt_svc: Arc<ArcSwap<Option<crate::alt_svc::Advertisement>>>,
     /// 🛡️ Immutable policy used by every protocol to resolve client identity.
     trusted_proxies: Arc<TrustedProxyPolicy>,
     /// 🧭 Trusted transport claims keyed by the private ingress tunnel sockets.
@@ -2407,10 +2407,17 @@ impl PingclairProxy {
 
     /// Advertise HTTP/3 availability for this listener via the `Alt-Svc`
     /// response header (added by the downstream module registered in
-    /// `init_downstream_modules`).
-    pub fn set_alt_svc(&self, port: u16) {
+    /// `init_downstream_modules`). 🚫 `excluded` names the sites that turned
+    /// HTTP/3 off; their responses carry no advertisement.
+    pub fn set_alt_svc<I, S>(&self, port: u16, excluded: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         self.alt_svc
-            .store(Arc::new(Some(crate::alt_svc::alt_svc_value(port))));
+            .store(Arc::new(Some(crate::alt_svc::Advertisement::new(
+                port, excluded,
+            ))));
     }
 
     /// 🚫 Stops advertising HTTP/3 on this listener.

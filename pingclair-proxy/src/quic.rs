@@ -370,7 +370,7 @@ impl CertTable {
 }
 
 /// 🔤 DNS spelling must not change certificate selection or exclusion.
-fn certificate_name(name: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn certificate_name(name: &str) -> std::borrow::Cow<'_, str> {
     let name = name.strip_suffix('.').unwrap_or(name);
     if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
         std::borrow::Cow::Owned(name.to_ascii_lowercase())
@@ -383,8 +383,9 @@ fn certificate_name(name: &str) -> std::borrow::Cow<'_, str> {
 ///
 /// The rule the certificate lookup already uses: an exact match, or a
 /// `*.suffix` pattern the name ends with. Kept next to `lookup` so the two
-/// cannot disagree about what a site name means.
-fn covered_by(patterns: &HashSet<String>, servername: &str) -> bool {
+/// cannot disagree about what a site name means. 📣 The `Alt-Svc` writer asks
+/// the same question, so a name refused here is never advertised either.
+pub(crate) fn covered_by(patterns: &HashSet<String>, servername: &str) -> bool {
     if patterns.contains(servername) {
         return true;
     }

@@ -102,6 +102,10 @@ mod forwarded_identity;
 #[path = "integration/strict_transport.rs"]
 mod strict_transport;
 
+// 🚫 `Alt-Svc` stays off the responses of a site with `http3 off`.
+#[path = "integration/alt_svc_opt_out.rs"]
+mod alt_svc_opt_out;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the

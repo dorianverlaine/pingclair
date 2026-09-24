@@ -865,7 +865,7 @@ pub(crate) fn run_server(
                     })?;
                     https_ports.push((addr.clone(), socket_addr, socket));
                     http3_enabled = true;
-                    proxy_logic.set_alt_svc(socket_addr.port());
+                    proxy_logic.set_alt_svc(socket_addr.port(), &h3_excluded_domains);
                 }
             } else {
                 service.add_tcp(&service_address);

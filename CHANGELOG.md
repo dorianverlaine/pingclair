@@ -20,6 +20,17 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🚫 A site with `http3 off` is no longer advertised over HTTP/3
+
+`tls { http3 off }` made the QUIC handshake for that site fail on purpose,
+but the `Alt-Svc: h3=…` header was chosen once per listener, so the site's
+HTTP/1.1 and HTTP/2 responses still invited clients to HTTP/3. A client that
+believed it retried the doomed handshake on every new connection for the
+advertised 24 hours. The header is now withheld from responses for an
+opted-out name, matched by the same rule (exact name or `*.` wildcard, any
+letter case, trailing dot ignored) that refuses its handshake; other sites on
+the same port keep it. (#104)
+
 ### 🔐 `Strict-Transport-Security` follows the connection, not the `tls` block
 
 The header tells a browser to use HTTPS only, and RFC 6797 forbids it on a

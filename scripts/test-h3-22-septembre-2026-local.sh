@@ -377,6 +377,11 @@ if [[ "${alt_svc}" == *h3=* ]]; then
 else
     fail "Alt-Svc missing or without h3: '${alt_svc}'"
 fi
+# 🚫 The opted-out site shares the port, but its QUIC handshake is refused, so
+# advertising h3 for it would send clients to a doomed handshake for a day.
+opted_out_alt_svc="$("${curl_bin}" --noproxy '*' -ksSI --resolve "${opted_out_host}:${h3_port}:127.0.0.1" \
+    "https://${opted_out_host}:${h3_port}/ready" 2>/dev/null | tr -d '\r' | grep -i '^alt-svc:' || true)"
+check_eq "http3 off site carries no Alt-Svc" "" "${opted_out_alt_svc}"
 
 log ""
 log "🔎 Static bodies across packet boundaries"
