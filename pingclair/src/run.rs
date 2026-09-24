@@ -17,9 +17,7 @@
 //! captured values. That is a change worth reviewing on its own terms, so it
 //! has a TRIAGE row instead of being smuggled in here.
 
-use crate::certs::{
-    DynamicCertResolver, eager_issuance_domains, h3_excluded_domains, refresh_h3_cert_table,
-};
+use crate::certs::{DynamicCertResolver, eager_issuance_domains, h3_excluded_domains};
 use crate::listen::{
     automatic_http_companion, can_bind_automatic_http_port, explicit_http_names,
     normalize_listen_addr, reserve_private_listener_address, server_requires_tls,
@@ -37,6 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod certificates;
+mod http3;
 #[cfg(unix)]
 mod reload;
 mod server_conf;
@@ -202,37 +201,9 @@ pub(crate) fn run_server(
     let port_proxies = std::collections::HashMap::new();
     let port_proxies = std::sync::Arc::new(parking_lot::RwLock::new(port_proxies));
 
-    // HTTP/3 startup inputs, captured before `config.servers` is consumed:
-    // - the global on/off switch (HTTPS ports only ever start H3),
-    // - the domains whose certificates seed the SNI cert table,
-    // - the upstream pool size + L4 blocklist kept consistent with H1/H2.
-    let http3_globally_enabled = config.global.http3;
-    let h3_domains: Vec<String> = config
-        .servers
-        .iter()
-        .filter_map(|s| s.name.clone())
-        .filter(|n| !n.is_empty() && n != "_" && n != "*" && !n.starts_with(':'))
-        .collect();
-    let manual_h3_domains: HashSet<&str> = config
-        .servers
-        .iter()
-        .filter(|server| {
-            server
-                .tls
-                .as_ref()
-                .is_some_and(|tls| tls.cert.is_some() && tls.key.is_some())
-        })
-        .filter_map(|server| server.name.as_deref())
-        .collect();
-    let h3_periodic_domains: Vec<String> = h3_domains
-        .iter()
-        .filter(|name| !manual_h3_domains.contains(name.as_str()))
-        .cloned()
-        .collect();
     // 🚫 Sites that asked to stay off HTTP/3; see `h3_excluded_domains`.
     let h3_excluded_domains = h3_excluded_domains(&config);
-    let h3_pool_size = config.global.upstream_keepalive_pool_size.unwrap_or(512);
-    let h3_blocked_ips = config.global.blocked_ips.clone();
+    let http3_globally_enabled = config.global.http3;
     let trusted_proxies = config.global.trusted_proxies.clone();
     // 🧭 Which listen addresses require a PROXY header, resolved once. The
     // compiler has already rejected any address two servers disagree about, so
@@ -603,86 +574,16 @@ pub(crate) fn run_server(
         admin_listener: config.admin.as_ref().is_some_and(|admin| admin.enabled),
     });
 
-    // 📜 One certificate table is retained by the runtime publisher so a
-    // manual rotation reaches QUIC in the same transaction as TCP TLS.
-    let h3_cert_table =
-        (!https_ports.is_empty()).then(|| Arc::new(pingclair_proxy::quic::CertTable::new()));
-
-    // Start HTTP/3 (QUIC) servers for HTTPS ports
-    if let Some(cert_table) = h3_cert_table.clone() {
-        cert_table.set_excluded_names(h3_excluded_domains.clone());
-        tracing::info!(
-            "🚀 Starting HTTP/3 servers for {} port(s)",
-            https_ports.len()
-        );
-
-        // Shared SNI certificate table: populated from the TLS manager
-        // (manual certs + already-issued ACME certs), then refreshed
-        // periodically so renewals reach new handshakes without a restart.
-        // 🔐 Seed synchronously before Admin can publish a rotation; an
-        // asynchronous startup read could otherwise overwrite the first new
-        // manual generation after `/load` had already reported success.
-        tls_runtime.block_on(refresh_h3_cert_table(
-            &cert_table,
-            &tls_manager,
-            &h3_domains,
-        ));
-        let table_for_task = cert_table.clone();
-        let tls_for_task = tls_manager.clone();
-        let proxies_for_task = port_proxies.clone();
-        let periodic_domains_for_task = h3_periodic_domains.clone();
-        let blocked_for_task = h3_blocked_ips.clone();
-        bg_handle.spawn(async move {
-            for (addr_str, socket_addr, socket) in https_ports {
-                let proxy = {
-                    let guard = proxies_for_task.read();
-                    guard.get(&addr_str).map(|p| std::sync::Arc::new(p.clone()))
-                };
-                let Some(proxy) = proxy else {
-                    tracing::error!("❌ No proxy found for HTTP/3 address {}", addr_str);
-                    continue;
-                };
-
-                let advertiser = Arc::clone(&proxy);
-                let server = pingclair_proxy::quic::QuicServer::new(
-                    socket_addr,
-                    proxy,
-                    table_for_task.clone(),
-                    h3_pool_size,
-                    blocked_for_task.clone(),
-                )
-                .with_socket(socket);
-
-                tokio::spawn(async move {
-                    let outcome = server.run().await;
-                    // 🚫 Whatever ended the QUIC server, the port no longer
-                    // answers it, so this listener stops saying it does.
-                    advertiser.clear_alt_svc();
-                    match outcome {
-                        Ok(()) => tracing::warn!(
-                            "🌐 HTTP/3 server on {} stopped; Alt-Svc withdrawn",
-                            socket_addr
-                        ),
-                        Err(e) => tracing::error!(
-                            "🌐 HTTP/3 server on {} failed; Alt-Svc withdrawn: {}",
-                            socket_addr,
-                            e
-                        ),
-                    }
-                });
-            }
-
-            // 🔁 Periodic refresh picks up ACME and internal renewals. Manual
-            // pairs are excluded because the synchronous config publisher
-            // installs them under its generation gate; an older periodic read
-            // must never overwrite a completed rotation.
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                refresh_h3_cert_table(&table_for_task, &tls_for_task, &periodic_domains_for_task)
-                    .await;
-            }
-        });
-    }
+    // 🌐 Turn the bound UDP sockets into QUIC servers; see `http3`.
+    let h3_cert_table = http3::start(
+        &config,
+        https_ports,
+        &h3_excluded_domains,
+        &tls_runtime,
+        &tls_manager,
+        &port_proxies,
+        &bg_handle,
+    );
 
     // 🛑 `POST /stop` notifies this; the shutdown task treats it like SIGTERM.
     let admin_shutdown = Arc::new(tokio::sync::Notify::new());
