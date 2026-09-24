@@ -580,10 +580,26 @@ pub static UPSTREAM_HEALTHY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 
 // MARK: - Initialization
 
-/// Initialize metrics
+/// 📊 Applies the configuration's `metrics` switch, at startup and on reload.
 ///
-/// Registers all defined metrics with the global registry.
-/// Should be called once at application startup.
+/// Collection is off unless a configuration asks for it, so this is the one
+/// place that decides whether request paths do metric work at all. They read
+/// the answer through [`enabled`], a single atomic load, rather than
+/// re-deriving it from the configuration per request.
+///
+/// 🔁 Calling it on reload is what makes adding `metrics` to a running server
+/// take effect, and removing it stop collection, without a restart.
+pub fn configure(enabled: bool) {
+    if enabled {
+        init();
+    } else {
+        ENABLED.store(false, Ordering::Release);
+    }
+}
+
+/// 📊 Switches collection on and registers every family with the registry.
+///
+/// Registration happens once per process; later calls only flip the switch.
 pub fn init() {
     ENABLED.store(true, Ordering::Release);
     REGISTER.call_once(|| {
@@ -734,6 +750,12 @@ pub const SCRAPE_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 ///
 /// - Returns: A string containing the Prometheus-formatted metrics.
 pub fn gather() -> String {
+    // 🚫 Collection switched off serves an empty exposition, including after a
+    // reload that turned it off: families registered while it was on would
+    // otherwise keep answering scrapes with numbers frozen at the reload.
+    if !enabled() {
+        return String::new();
+    }
     let mut buffer = Vec::new();
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();

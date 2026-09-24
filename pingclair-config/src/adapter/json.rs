@@ -51,4 +51,14 @@ mod tests {
         assert!(config.servers.is_empty());
         assert!(config.admin.is_none());
     }
+
+    /// 📊 A JSON document that leaves out `metrics` means off, the same as a
+    /// Pingclairfile that never says it, so converting one format to the other
+    /// cannot switch collection on by accident.
+    #[test]
+    fn json_and_pingclairfile_agree_that_silence_means_no_metrics() {
+        let json = JsonAdapter::parse("{}").expect("empty config is valid");
+        let dsl = crate::compile(":80 {\n    respond \"ok\"\n}").expect("compiles");
+        assert_eq!((json.global.metrics, dsl.global.metrics), (false, false));
+    }
 }

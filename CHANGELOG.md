@@ -63,6 +63,9 @@ below, which ends with what to write instead.
 - **Static-file ETags change once** on upgrade, so caches revalidate each file
   one time.
   → [Static-file ETags describe one exact body](#️-static-file-etags-describe-one-exact-body)
+- **Metrics are off unless `metrics` is set.** Add the global `metrics`
+  option to keep collecting; without it the scrape endpoints answer empty.
+  → [Metrics are collected only when `metrics` is set](#-metrics-are-collected-only-when-metrics-is-set)
 
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
@@ -82,6 +85,32 @@ What this release deliberately does not do, so the rest can converge:
 - OpenMetrics exposition (#45).
 - Plugins; `pingclair-plugin` stays an unwired skeleton, and a
   plugin handler is refused.
+
+### 📊 Metrics are collected only when `metrics` is set
+
+**Breaking for anyone scraping `/metrics` without asking for it.** A
+configuration that never says `metrics` now collects nothing, as in Caddy.
+Until now collection was on by default and the DSL had no way to switch it
+off, so every Pingclairfile-configured server paid for metrics it had not
+asked for, and the benchmark shape (metrics off) could not be written down.
+The global `metrics` option, or `servers { metrics }`, turns it on; in a JSON
+config `"metrics": true` does, and a JSON document without the field now
+means off, the same as a Pingclairfile that is silent.
+
+When it is off, request paths skip metric work entirely, and both the admin
+API's `/metrics` and a site's `metrics` handler answer `200` with an empty
+body. A reload that adds or removes `metrics` now takes effect without a
+restart; before, only the configuration the process started with counted.
+
+📌 Upgrading: add `metrics` to the global options block to keep collecting:
+
+```caddyfile
+{
+    metrics
+}
+```
+
+(#32)
 
 ### 🏷️ A build of `main` says it is a dev build
 

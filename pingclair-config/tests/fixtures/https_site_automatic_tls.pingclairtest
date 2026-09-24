@@ -85,7 +85,7 @@ https://example.com {
     "email": null,
     "http_port": 80,
     "https_port": 443,
-    "metrics": true,
+    "metrics": false,
     "auto_https": "on",
     "blocked_ips": [],
     "trusted_proxies": [],

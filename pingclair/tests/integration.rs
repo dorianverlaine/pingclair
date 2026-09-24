@@ -1968,7 +1968,7 @@ async fn test_overload_and_circuit_breaker_fail_fast_and_survive_reload() {
         }
     });
     let config = serde_json::json!({
-        "global": { "http3": false },
+        "global": { "http3": false, "metrics": true },
         "admin": { "enabled": true, "listen": "127.0.0.1:0" },
         "servers": [{
             "listen": ["127.0.0.1:0"],
@@ -15285,3 +15285,9 @@ mod listener_wrappers;
 // the replacement's bytes, its declared length, and how long a stall is allowed.
 #[path = "integration/request_body_plan.rs"]
 mod request_body_plan;
+
+// MARK: - Metrics default
+
+// 📊 Collection is off unless the configuration says `metrics`.
+#[path = "integration/metrics_default.rs"]
+mod metrics_default;

@@ -165,10 +165,12 @@ pub struct GlobalConfig {
     #[serde(default = "default_https_port")]
     pub https_port: u16,
 
-    /// 📊 Whether Prometheus metrics are collected and served. Enabled by
-    /// default to preserve existing deployments; `{ metrics }` in a
-    /// Pingclairfile enables it explicitly.
-    #[serde(default = "default_bool_true")]
+    /// 📊 Whether Prometheus metrics are collected and served. Off unless
+    /// asked for, matching Caddy: `{ metrics }` (or `servers { metrics }`) in a
+    /// Pingclairfile, or `"metrics": true` in JSON, turns it on. A JSON document
+    /// without the field means off, so the two formats agree on what silence
+    /// means.
+    #[serde(default)]
     pub metrics: bool,
 
     /// 📊 How much detail the collected metrics carry.
@@ -462,7 +464,7 @@ impl Default for GlobalConfig {
             tls_resolvers: Vec::new(),
             http_port: default_http_port(),
             https_port: default_https_port(),
-            metrics: default_bool_true(),
+            metrics: false,
             auto_https: AutoHttpsMode::default(),
             local_certs: false,
             blocked_ips: Vec::new(),

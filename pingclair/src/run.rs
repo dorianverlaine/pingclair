@@ -69,12 +69,10 @@ pub(crate) fn run_server(
     tracing::info!("📄 Loaded configuration from: {}", config_path);
     tracing::info!("🔧 Configured {} server(s)", config.servers.len());
 
-    // 📊 Register Prometheus metrics with the global registry so the admin
-    // /metrics endpoint has data to expose. `{ metrics }` can turn collection
-    // on explicitly; it stays on by default for existing deployments.
-    if config.global.metrics {
-        pingclair_proxy::metrics::init();
-    }
+    // 📊 Collection is off unless the configuration says `metrics`, matching
+    // Caddy. Deciding it here, once, is what lets request paths skip metric
+    // work with a single atomic load instead of consulting the configuration.
+    pingclair_proxy::metrics::configure(config.global.metrics);
 
     // 📡 OTLP push is parsed so a configuration written elsewhere still loads
     // and still says what it meant, but nothing here exports it. Refusing beats

@@ -482,6 +482,9 @@ impl ConfigPublisher for RuntimeListeners {
         }
         self.admin_policy.publish(prepared_admin);
         pingclair_proxy::access_log::register_channels(&config.logging.channels);
+        // 🔁 A reload that adds or removes `metrics` takes effect here, not at
+        // the next restart.
+        pingclair_proxy::metrics::configure(config.global.metrics);
         pingclair_proxy::metrics::configure_host_labels(
             &config.global.metrics_options,
             config

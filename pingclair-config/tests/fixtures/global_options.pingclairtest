@@ -83,7 +83,7 @@ example.com {
     "email": null,
     "http_port": 8080,
     "https_port": 8443,
-    "metrics": true,
+    "metrics": false,
     "auto_https": "off",
     "blocked_ips": [],
     "trusted_proxies": [],

@@ -5979,6 +5979,12 @@ fn response_cache_lock() -> &'static CacheKeyLockImpl {
 fn record_cache_outcome(session: &Session, host: &str, route: &str) {
     use pingora_cache::CachePhase;
 
+    // 🍃 Off by default, so a cached site pays nothing here unless the
+    // configuration asked for metrics.
+    if !metrics::enabled() {
+        return;
+    }
+
     // 🏷️ `Bypass` covers everything deliberately refused storage, which is the
     // outcome an operator most often needs to explain ("why is nothing being
     // cached?"). Phases that mean the request never reached a decision are not
