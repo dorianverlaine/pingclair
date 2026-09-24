@@ -14,11 +14,74 @@ fact.
 
 ## [Unreleased]
 
-📦 Everything below is on `main` and not yet a final release. The first
-release candidate, `0.2.0-rc.1`, was tagged on 2026-08-20, the second,
-`0.2.0-rc.2`, on 2026-09-19, and the third was `0.2.0-rc.3`. This section
-covers changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals
-below are decided.
+📦 This section becomes `## [0.2.0]` when 0.2.0 is cut, and its text is the
+release notes of that tag. It covers every change since `v0.1.7`, including
+the three release candidates (`0.2.0-rc.1` on 2026-08-20, `0.2.0-rc.2` on
+2026-09-19, `0.2.0-rc.3`).
+
+0.2.0 is the release where a Caddyfile means what it means upstream. Route
+selection, address parsing, matchers, compression, request limits and the TLS
+store now follow Caddy's rules, and a directive that is not implemented is
+refused by name instead of being accepted and ignored. The same release makes
+the HTTP layer conform to the RFCs it implements — caching, conditional and
+range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
+makes startup, reload and shutdown fail closed and drop no request.
+
+### ⚠️ Before you upgrade
+
+Most configurations keep working unchanged. These are the changes most
+likely to alter what an existing configuration does; each links to its entry
+below, which ends with what to write instead.
+
+- **Routes are chosen in directive order**, not by the most specific path.
+  A `redir`, `route` or `handle` catch-all can now answer requests that a more
+  specific `respond` used to take.
+  → [Directive order decides which route answers](#-directive-order-not-the-most-specific-path-decides-which-route-answers)
+- **Nothing is compressed unless `encode` asks.** Sites that relied on the old
+  gzip-by-default must add `encode gzip`.
+  → [A site compresses only where `encode` asks](#️-a-site-compresses-only-where-encode-asks)
+- **No request-body ceiling by default.** The old 1 MiB limit is gone; set
+  `request_body { max_size … }` to keep one.
+  → [No request-body ceiling unless the configuration asks for one](#-no-request-body-ceiling-unless-the-configuration-asks-for-one)
+- **`remote_ip` matches the connection's peer.** Behind `trusted_proxies`, use
+  `client_ip` to match the forwarded client.
+  → [`remote_ip` matches the connection's peer, `client_ip` the client](#-remote_ip-matches-the-connections-peer-client_ip-the-client)
+- **A site address with a port and no scheme is HTTPS**, as upstream:
+  `example.com:8080` needs `http://` in front to stay plaintext.
+  → [Breaking](#️-breaking)
+- **`*.example.com` covers one label**, not any depth.
+  → [Breaking](#️-breaking)
+- **Startup refuses a taken port** — HTTP, HTTP/3 (UDP) and admin alike —
+  instead of logging and carrying on.
+  → [A taken admin port stops startup](#-a-taken-admin-port-stops-startup-instead-of-being-logged)
+- **The internal CA moves** to `pki/authorities/local/` and is not migrated;
+  run `pingclair trust` again after upgrading.
+  → [The local TLS store is filed the way Caddy files it](#️-the-local-tls-store-is-filed-the-way-caddy-files-it)
+- **Automatic retries only repeat idempotent methods** once the upstream has
+  seen the request.
+  → [The retry policy has one implementation](#-the-retry-policy-has-one-implementation)
+- **Static-file ETags change once** on upgrade, so caches revalidate each file
+  one time.
+  → [Static-file ETags describe one exact body](#️-static-file-etags-describe-one-exact-body)
+
+The full list of breaking changes is under [Breaking](#️-breaking); the one
+known defect that ships is under
+[Known defect — WebSocket upgrades under load](#-known-defect--websocket-upgrades-under-load).
+
+### 🚫 Non-goals for 0.2.0
+
+What this release deliberately does not do, so the rest can converge:
+
+- A layer-4 TCP proxy or TLS ClientHello routing (#183).
+- Per-listener `servers <address> { … }` options beyond
+  `metrics` (#47); an addressed block that sets anything else is refused.
+- Caddy's native JSON config as an input format (#138); the
+  Caddyfile is the compatibility surface.
+- Conditional response header groups, `header { match { … } }`
+  (#41).
+- OpenMetrics exposition (#45).
+- Plugins; `pingclair-plugin` stays an unwired skeleton, and a
+  plugin handler is refused.
 
 ### 🏷️ A build of `main` says it is a dev build
 
@@ -1249,15 +1312,6 @@ clients only.
 📌 No advisory accompanies this, by the 2026-08-17 decision: with no patch and
 no maintained branch, an advisory would only describe a hole nobody can close.
 The behaviour change is recorded; the abandoned release is not.
-
-### 🚫 Non-goals for 0.2.0
-
-What this release deliberately does **not** try to do. A release with 51
-entries and no stated non-goals has no edge: every plausible idea is still
-inside the scope, so nothing can be finished. Naming what is out is what
-lets the rest converge.
-
-- TBD — Dorian to fill in during scope cut
 
 ### 🐛 Known defect — WebSocket upgrades under load
 
