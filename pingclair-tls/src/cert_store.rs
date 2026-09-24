@@ -769,14 +769,16 @@ mod tests {
     fn a_site_renewal_window_covers_its_names_by_the_handshakes_wildcard_rule() {
         use crate::auto_https::AutoHttpsConfig;
 
-        let mut config = AutoHttpsConfig::default();
-        config.renewal_window_ratio = 0.5;
-        config
-            .renewal_windows
-            .insert("short.example".to_string(), 0.1);
-        config
-            .renewal_windows
-            .insert("*.wild.example".to_string(), 0.2);
+        let config = AutoHttpsConfig {
+            renewal_window_ratio: 0.5,
+            renewal_windows: [
+                ("short.example".to_string(), 0.1),
+                ("*.wild.example".to_string(), 0.2),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
 
         let temp_dir = tempfile::tempdir().unwrap();
         let store = CertStore::from_auto_https(&config, temp_dir.path());
@@ -813,11 +815,11 @@ mod tests {
     fn a_certificates_window_comes_from_a_name_it_serves() {
         use crate::auto_https::AutoHttpsConfig;
 
-        let mut config = AutoHttpsConfig::default();
-        config.renewal_window_ratio = 0.5;
-        config
-            .renewal_windows
-            .insert("second.example".to_string(), 0.25);
+        let config = AutoHttpsConfig {
+            renewal_window_ratio: 0.5,
+            renewal_windows: [("second.example".to_string(), 0.25)].into_iter().collect(),
+            ..Default::default()
+        };
 
         let temp_dir = tempfile::tempdir().unwrap();
         let store = CertStore::from_auto_https(&config, temp_dir.path());
