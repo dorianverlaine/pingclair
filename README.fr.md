@@ -818,6 +818,19 @@ une ligne — déplacer ces chemins dans leur propre bloc de site — et le refu
 dit, plutôt que de rapporter le matcher comme un codage inconnu, ce qui
 enverrait chercher une faute d'orthographe.
 
+🧮 Toutes les instances de `file_server` du processus partagent des limites
+fixes : **64 MiB de corps compressés, 16 MiB de corps bruts et 4 096 entrées de
+métadonnées**, y compris pendant un rechargement. La mémoire est allouée à la
+demande. Les fichiers admissibles et les réponses HTTP restent identiques.
+Chaque route évince ses propres entrées ; si les autres routes occupent toute
+la capacité, la réponse est servie sans être mise en cache. La destruction
+d'une route rend sa capacité. Ces limites excluent les corps en cours d'envoi,
+les clés et le surcoût de l'allocateur ; les métadonnées sont comptées en entrées,
+pas en octets. Elles ne s'adaptent pas à la RAM de la machine ou du conteneur et
+ne sont pas configurables. Le
+[`file_server`](https://caddyserver.com/docs/caddyfile/directives/file_server)
+standard de Caddy n'a pas d'option équivalente de budget de cache.
+
 🏷️ L'`ETag` d'un fichier statique dérive de **sa taille et de son mtime en
 nanosecondes** — `"<taille hex>-<mtime ns hex>"`, avec `-gzip` et compagnie
 ajouté pour une représentation codée — ou d'un fichier sidecar quand le site en

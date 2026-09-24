@@ -28,6 +28,7 @@ use http::HeaderValue;
 use super::FileServer;
 #[cfg(test)]
 use super::FileServerConfig;
+use super::budget::{Budget, Reservation};
 use super::validators::{EntityTags, SidecarTag};
 
 // MARK: - Keys
@@ -65,6 +66,8 @@ pub(super) struct FileKey {
 /// strings on every request — the dominant per-request header allocation on
 /// the small-file benchmark path.
 pub(super) struct FileMeta {
+    /// 🧮 Snapshots and active readers keep their slot until the last owner drops.
+    reservation: Option<Reservation>,
     pub(super) content_type: HeaderValue,
     pub(super) last_modified: Option<HeaderValue>,
     /// 🏷️ One strong tag per content coding; see [`EntityTags`].
@@ -101,15 +104,21 @@ pub(super) struct MetaKey {
 /// entries instead of serving old bytes. Bounded by total bytes so the cache
 /// cannot grow without limit; least-recently-used entries are evicted first.
 pub(super) struct BodyCache {
-    pub(super) entries: HashMap<FileKey, Bytes>,
+    pub(super) entries: HashMap<FileKey, CachedBody>,
     /// Recency order, front = least recently used.
     lru: VecDeque<FileKey>,
     bytes: usize,
-    budget: usize,
+    budget: Arc<Budget>,
+}
+
+/// 🧮 Eviction releases the retained-byte charge; response clones are in-flight memory.
+pub(super) struct CachedBody {
+    value: Bytes,
+    _reservation: Reservation,
 }
 
 impl BodyCache {
-    pub(super) fn new(budget: usize) -> Self {
+    pub(super) fn new(budget: Arc<Budget>) -> Self {
         Self {
             entries: HashMap::new(),
             lru: VecDeque::new(),
@@ -126,7 +135,7 @@ impl BodyCache {
     }
 
     pub(super) fn get(&mut self, key: &FileKey) -> Option<Bytes> {
-        if let Some(v) = self.entries.get(key).cloned() {
+        if let Some(v) = self.entries.get(key).map(|entry| entry.value.clone()) {
             self.touch(key);
             Some(v)
         } else {
@@ -136,40 +145,46 @@ impl BodyCache {
 
     pub(super) fn insert(&mut self, key: FileKey, value: Bytes) {
         let size = value.len();
-        // A single entry larger than the whole budget is never worth caching —
-        // it would immediately evict everything including itself.
-        if size > self.budget {
+        // 🧮 Oversized entries must not flush useful cached bodies.
+        if size > self.budget.limit() {
             return;
         }
-        if let Some(old) = self.entries.insert(key.clone(), value) {
-            self.bytes -= old.len();
+        if let Some(old) = self.entries.remove(&key) {
+            self.bytes -= old.value.len();
             if let Some(pos) = self.lru.iter().position(|k| k == &key) {
                 self.lru.remove(pos);
             }
         }
+        // 🧮 Evict only this route's LRU entries. If other routes hold the budget,
+        // serve uncached rather than introducing a cross-route request lock.
+        let reservation = loop {
+            if let Some(reservation) = self.budget.reserve(size) {
+                break reservation;
+            }
+            let Some(evicted) = self.lru.pop_front() else {
+                return;
+            };
+            if let Some(old) = self.entries.remove(&evicted) {
+                self.bytes -= old.value.len();
+            }
+        };
+        self.entries.insert(
+            key.clone(),
+            CachedBody {
+                value,
+                _reservation: reservation,
+            },
+        );
         self.bytes += size;
         self.lru.push_back(key);
-
-        while self.bytes > self.budget {
-            match self.lru.pop_front() {
-                Some(evicted) => {
-                    if let Some(v) = self.entries.remove(&evicted) {
-                        self.bytes -= v.len();
-                    }
-                }
-                None => break,
-            }
-        }
     }
 }
 
 // MARK: - Response metadata cache
 
 impl FileServer {
-    /// Maximum number of file identities whose response metadata is cached.
-    /// Each entry holds a handful of small `HeaderValue`s, so even a busy
-    /// site with thousands of files stays well under a megabyte.
-    const META_CACHE_CAP: usize = 4096;
+    /// 🧮 Process-wide metadata entry limit; this is not a byte or RSS limit.
+    pub(super) const META_CACHE_CAP: usize = 4096;
 
     /// Return the prebuilt response metadata for `file_path`, building and
     /// caching it on the first request and on every mtime/size change.
@@ -205,22 +220,27 @@ impl FileServer {
             return Ok(meta.clone());
         }
 
-        let meta = Arc::new(Self::build_meta(
-            file_path,
-            metadata,
-            size,
-            &self.config.etag_file_extensions,
-        ));
+        let mut meta =
+            Self::build_meta(file_path, metadata, size, &self.config.etag_file_extensions);
         let _guard = self.meta_write.lock().unwrap();
         // Whoever published first wins; the double-check avoids rebuilding
         // the map after a concurrent miss already inserted the entry.
         if let Some(meta) = self.meta_cache.load().get(&key) {
             return Ok(meta.clone());
         }
-        let mut cache = (**self.meta_cache.load()).clone();
-        if cache.len() >= Self::META_CACHE_CAP {
-            cache.clear();
+        let mut reservation = self.meta_budget.reserve(1);
+        if reservation.is_none() {
+            // 🧮 Drop this route's old snapshot before retrying. Active readers
+            // retain their slots, so a full budget may deliberately skip admission.
+            self.meta_cache.store(Arc::new(HashMap::new()));
+            reservation = self.meta_budget.reserve(1);
         }
+        let Some(reservation) = reservation else {
+            return Ok(Arc::new(meta));
+        };
+        meta.reservation = Some(reservation);
+        let meta = Arc::new(meta);
+        let mut cache = (**self.meta_cache.load()).clone();
         cache.insert(key, meta.clone());
         self.meta_cache.store(Arc::new(cache));
         Ok(meta)
@@ -262,6 +282,7 @@ impl FileServer {
         // media type comes from `mime_guess`'s static table (plus a fixed
         // charset suffix) and the date from `httpdate`'s fixed format.
         FileMeta {
+            reservation: None,
             content_type: HeaderValue::try_from(mime_type)
                 .expect("a mime_guess media type is a valid header value"),
             last_modified: last_modified
@@ -356,7 +377,7 @@ mod compress_cache_tests {
 
     #[test]
     fn hit_and_miss() {
-        let mut c = BodyCache::new(1024);
+        let mut c = BodyCache::new(Budget::new(1024));
         let k = key("/a", 1, "gzip");
         assert!(c.get(&k).is_none(), "empty cache must miss");
         c.insert(k.clone(), Bytes::from(vec![0u8; 10]));
@@ -369,7 +390,7 @@ mod compress_cache_tests {
 
     #[test]
     fn distinct_encodings_and_mtimes_are_distinct_entries() {
-        let mut c = BodyCache::new(1024);
+        let mut c = BodyCache::new(Budget::new(1024));
         c.insert(key("/a", 1, "gzip"), Bytes::from(vec![1u8; 4]));
         c.insert(key("/a", 1, "br"), Bytes::from(vec![2u8; 6]));
         // A newer mtime is a different key — the old compression is stale and
@@ -384,7 +405,7 @@ mod compress_cache_tests {
 
     #[test]
     fn evicts_least_recently_used_when_over_budget() {
-        let mut c = BodyCache::new(30); // room for ~3x 10-byte entries
+        let mut c = BodyCache::new(Budget::new(30)); // 🧮 Three bodies fill this budget.
         c.insert(key("/a", 1, "gzip"), Bytes::from(vec![0u8; 10]));
         c.insert(key("/b", 1, "gzip"), Bytes::from(vec![0u8; 10]));
         c.insert(key("/c", 1, "gzip"), Bytes::from(vec![0u8; 10]));
@@ -406,7 +427,7 @@ mod compress_cache_tests {
 
     #[test]
     fn total_bytes_never_exceed_budget() {
-        let mut c = BodyCache::new(100);
+        let mut c = BodyCache::new(Budget::new(100));
         for i in 0..50 {
             c.insert(key("/f", i, "gzip"), Bytes::from(vec![0u8; 25]));
             assert!(
@@ -419,7 +440,7 @@ mod compress_cache_tests {
 
     #[test]
     fn reinsert_same_key_does_not_double_count_bytes() {
-        let mut c = BodyCache::new(1000);
+        let mut c = BodyCache::new(Budget::new(1000));
         let k = key("/a", 1, "gzip");
         c.insert(k.clone(), Bytes::from(vec![0u8; 10]));
         c.insert(k.clone(), Bytes::from(vec![0u8; 40]));
@@ -429,7 +450,7 @@ mod compress_cache_tests {
 
     #[test]
     fn entry_larger_than_budget_is_not_cached() {
-        let mut c = BodyCache::new(100);
+        let mut c = BodyCache::new(Budget::new(100));
         c.insert(key("/big", 1, "gzip"), Bytes::from(vec![0u8; 200]));
         assert!(c.get(&key("/big", 1, "gzip")).is_none());
         assert_eq!(c.bytes, 0);

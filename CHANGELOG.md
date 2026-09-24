@@ -20,6 +20,15 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🧮 Static-file cache budgets are shared across routes
+
+All `file_server` instances now share process-wide limits of 64 MiB for
+compressed bodies, 16 MiB for raw bodies, and 4,096 metadata entries, including
+during reload. Adding routes no longer multiplies these budgets. Cache admission
+uses atomic accounting without adding request-path locks; a route serves misses
+uncached when other routes occupy the budget. File eligibility and HTTP behavior
+are unchanged. These fixed limits are not a total process-memory ceiling. (#33)
+
 ### 📁 A globbed `try_files` candidate sees every file in the directory
 
 A `file` matcher or `try_files` candidate containing a glob could not

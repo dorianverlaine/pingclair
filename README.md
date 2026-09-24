@@ -786,6 +786,18 @@ into their own site block — and the refusal says so rather than reporting the
 matcher as an unknown coding, which would send the operator hunting for a
 spelling mistake.
 
+🧮 All `file_server` instances in a process share fixed cache limits: **64 MiB
+of compressed bodies, 16 MiB of raw bodies, and 4,096 metadata entries**,
+including overlapping configurations during reload. These are allocated on
+demand, not reserved at startup. File eligibility and HTTP responses are
+unchanged. Each route evicts its own entries; if other routes hold the available
+capacity, a miss is served without caching. Dropping a route returns capacity.
+These limits exclude in-flight bodies, keys, and allocator overhead; the metadata
+limit counts entries, not bytes. They do not adapt to host or container RAM and
+have no configuration knob. Caddy's standard
+[`file_server`](https://caddyserver.com/docs/caddyfile/directives/file_server)
+has no equivalent cache-budget option.
+
 🏷️ A static file's `ETag` is derived from **its size and its modification time
 in nanoseconds** — `"<size hex>-<mtime nanos hex>"`, with `-gzip` and friends
 appended for a coded representation — or from a sidecar file when the site keeps

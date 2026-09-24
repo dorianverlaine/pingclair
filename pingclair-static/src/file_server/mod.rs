@@ -35,6 +35,9 @@
 //! were sitting inside the request handler where nothing distinguished them
 //! from formatting.
 
+mod budget;
+#[cfg(test)]
+mod budget_tests;
 mod cache;
 mod encode;
 mod listing;
@@ -51,6 +54,7 @@ use std::sync::{Arc, Mutex};
 
 use http::HeaderValue;
 
+use budget::Budget;
 use cache::{BodyCache, FileKey, FileMeta, MetaKey};
 pub use preconditions::FileRequest;
 pub use stream::StreamingFile;
@@ -293,6 +297,8 @@ pub struct FileServer {
     /// only contended on a cache miss. Bounded by a hard entry cap.
     meta_cache: ArcSwap<HashMap<MetaKey, Arc<FileMeta>>>,
     meta_write: Mutex<()>,
+    /// 🧮 All routes compete for the same metadata slots, including during reload.
+    meta_budget: Arc<Budget>,
     /// Cache of already-compressed file bodies (see [`BodyCache`]).
     /// Behind a `Mutex` because `FileServer` is shared (`Arc`) across all
     /// worker threads; the lock is only ever held for a tiny map operation,
@@ -380,26 +386,27 @@ pub struct NotModified {
 }
 
 impl FileServer {
-    /// Total compressed bytes to retain across all cached files.
+    /// 🧮 Process-wide retained compressed-body limit; bodies allocate on demand.
     const COMPRESS_CACHE_BUDGET: usize = 64 * 1024 * 1024;
 
-    /// Total raw bytes to retain across all cached small files.
-    ///
-    /// Larger than the metadata cache and smaller than the compression cache:
-    /// this one holds actual bodies, and the files it can hold are by
-    /// definition below the streaming threshold. 16 MiB holds thousands of the
-    /// sub-256 KiB assets a document root is mostly made of, while staying a
-    /// bounded, predictable claim on a small host's memory.
+    /// 🧮 Process-wide retained small-file limit; eligibility stays unchanged.
     const CONTENT_CACHE_BUDGET: usize = 16 * 1024 * 1024;
 
-    /// Create a new file server
+    /// 🧮 Creates route-local caches backed by the process-wide admission budgets.
     pub fn new(config: FileServerConfig) -> Self {
+        static COMPRESSED: std::sync::LazyLock<Arc<Budget>> =
+            std::sync::LazyLock::new(|| Budget::new(FileServer::COMPRESS_CACHE_BUDGET));
+        static CONTENT: std::sync::LazyLock<Arc<Budget>> =
+            std::sync::LazyLock::new(|| Budget::new(FileServer::CONTENT_CACHE_BUDGET));
+        static METADATA: std::sync::LazyLock<Arc<Budget>> =
+            std::sync::LazyLock::new(|| Budget::new(FileServer::META_CACHE_CAP));
         Self {
             config,
+            meta_budget: METADATA.clone(),
             meta_cache: ArcSwap::from_pointee(HashMap::new()),
             meta_write: Mutex::new(()),
-            compress_cache: Mutex::new(BodyCache::new(Self::COMPRESS_CACHE_BUDGET)),
-            content_cache: Mutex::new(BodyCache::new(Self::CONTENT_CACHE_BUDGET)),
+            compress_cache: Mutex::new(BodyCache::new(COMPRESSED.clone())),
+            content_cache: Mutex::new(BodyCache::new(CONTENT.clone())),
             in_flight: Mutex::new(HashMap::new()),
         }
     }

@@ -732,6 +732,16 @@ example.com {
 替代寫法只有一行——把那些路徑搬進自己的 site 區塊——而拒絕訊息就是這樣說的，
 而不是把 matcher 當成未知的編碼，那樣會讓 operator 去找一個不存在的拼字。
 
+🧮 同一程序的所有 `file_server` 共用固定快取上限：**壓縮內容 64 MiB、
+原始內容 16 MiB，以及 metadata 4,096 筆**，重新載入時並存的新舊設定也共用。
+快取按需配置，不會在啟動時預留這些記憶體；檔案快取資格與 HTTP 回應不變。
+每條路由淘汰自己的項目；若其他路由占滿容量，未命中的請求照常服務但不加入快取。
+路由釋放時歸還容量。這些上限不含處理中的回應內容、索引鍵與配置器額外開銷；
+metadata 限制的是筆數而非位元組。上限不隨主機或容器 RAM 調整，也沒有設定選項。
+Caddy 標準的
+[`file_server`](https://caddyserver.com/docs/caddyfile/directives/file_server)
+沒有對應的快取預算選項。
+
 🏷️ 靜態檔案的 `ETag` 由**檔案大小與奈秒級 mtime** 推導
 （`"<size hex>-<mtime nanos hex>"`；有編碼的回應會加上 `-gzip` 之類的後綴），
 若站台有 sidecar 檔則以它為準。Caddy 送的是內容的短雜湊，所以在兩者之間搬移
