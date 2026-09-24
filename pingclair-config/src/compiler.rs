@@ -949,11 +949,22 @@ fn validate_cache_ceiling_agrees(config: &PingclairConfig) -> CompileResult<()> 
 }
 
 pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
-    for rule in &config.global.trusted_proxies {
-        if rule.parse::<ipnet::IpNet>().is_err() && rule.parse::<std::net::IpAddr>().is_err() {
-            return Err(CompileError::InvalidServer {
-                message: format!("trusted_proxies contains invalid IP or CIDR `{rule}`"),
-            });
+    // 🛡️ Both lists are refused here rather than at listener setup, so
+    // `pingclair validate`, the Admin `/load` endpoint and a reload all reject
+    // a bad entry. `blocked_ips` used to be checked by nobody: the listener
+    // logged a warning and dropped the entry, so a typo in a block list
+    // silently let the address it meant to block through.
+    let network_lists = [
+        ("trusted_proxies", &config.global.trusted_proxies),
+        ("blocked_ips", &config.global.blocked_ips),
+    ];
+    for (option, rules) in network_lists {
+        for rule in rules {
+            if rule.parse::<ipnet::IpNet>().is_err() && rule.parse::<std::net::IpAddr>().is_err() {
+                return Err(CompileError::InvalidServer {
+                    message: format!("{option} contains invalid IP or CIDR `{rule}`"),
+                });
+            }
         }
     }
     // 🚧 An Admin listen address that cannot be parsed is a typo, and a typo has
@@ -3502,6 +3513,24 @@ mod tests {
             validate_config(&config).is_err(),
             "a chain preference this build cannot request must be refused, not logged"
         );
+    }
+
+    /// 🚫 A malformed `blocked_ips` entry is refused by the one validation
+    /// path, so no entry point can install a block list with a hole in it.
+    #[test]
+    fn blocked_ips_refuses_an_entry_that_is_not_a_network() {
+        let mut config = PingclairConfig::default();
+        config.global.blocked_ips = vec!["10.0.0.0/8".to_string(), "not-an-ip".to_string()];
+        let message = validate_config(&config)
+            .expect_err("a malformed block-list entry must be refused")
+            .to_string();
+        assert!(
+            message.contains("blocked_ips contains invalid IP or CIDR `not-an-ip`"),
+            "the refusal must name the option and the entry: {message}"
+        );
+
+        config.global.blocked_ips = vec!["10.0.0.0/8".to_string(), "192.0.2.7".to_string()];
+        assert!(validate_config(&config).is_ok());
     }
 
     #[test]

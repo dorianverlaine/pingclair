@@ -21,6 +21,15 @@ use std::time::Duration;
 /// socket address, and the UDP socket bound for it.
 pub(super) type BoundH3Port = (String, std::net::SocketAddr, std::net::UdpSocket);
 
+/// 🌐 The UDP side of startup: the sockets to serve and the block list that
+/// applies to every one of them.
+pub(super) struct H3Sockets<'a> {
+    pub(super) ports: Vec<BoundH3Port>,
+    /// 🛡️ Parsed once at startup and shared in meaning with the TCP
+    /// listeners' connection filter.
+    pub(super) blocked_networks: &'a [ipnet::IpNet],
+}
+
 /// 🌐 Starts a QUIC server for every bound port and returns the certificate
 /// table they share, or `None` when no port asked for HTTP/3.
 ///
@@ -29,13 +38,17 @@ pub(super) type BoundH3Port = (String, std::net::SocketAddr, std::net::UdpSocket
 /// overwritten by a late startup read.
 pub(super) fn start(
     config: &pingclair_core::config::PingclairConfig,
-    https_ports: Vec<BoundH3Port>,
+    sockets: H3Sockets<'_>,
     h3_excluded_domains: &[String],
     tls_runtime: &tokio::runtime::Runtime,
     tls_manager: &Arc<pingclair_tls::manager::TlsManager>,
     port_proxies: &Arc<RwLock<HashMap<String, PingclairProxy>>>,
     bg_handle: &tokio::runtime::Handle,
 ) -> Option<Arc<pingclair_proxy::quic::CertTable>> {
+    let H3Sockets {
+        ports: https_ports,
+        blocked_networks,
+    } = sockets;
     // 📜 The domains whose certificates seed the SNI cert table, and the
     // upstream pool size and L4 blocklist kept consistent with H1/H2.
     let h3_domains: Vec<String> = config
@@ -61,7 +74,6 @@ pub(super) fn start(
         .cloned()
         .collect();
     let h3_pool_size = config.global.upstream_keepalive_pool_size.unwrap_or(512);
-    let h3_blocked_ips = config.global.blocked_ips.clone();
 
     // 📜 One certificate table is retained by the runtime publisher so a
     // manual rotation reaches QUIC in the same transaction as TCP TLS.
@@ -87,7 +99,7 @@ pub(super) fn start(
         let tls_for_task = tls_manager.clone();
         let proxies_for_task = port_proxies.clone();
         let periodic_domains_for_task = h3_periodic_domains.clone();
-        let blocked_for_task = h3_blocked_ips.clone();
+        let blocked_for_task = blocked_networks.to_vec();
         bg_handle.spawn(async move {
             for (addr_str, socket_addr, socket) in https_ports {
                 let proxy = {

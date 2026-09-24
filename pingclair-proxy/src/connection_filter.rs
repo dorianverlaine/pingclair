@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use ipnet::IpNet;
 use pingora_core::listeners::ConnectionFilter;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 // MARK: - Connection Filter
 
@@ -15,31 +15,18 @@ pub struct PingclairConnectionFilter {
 }
 
 impl PingclairConnectionFilter {
-    /// Create a new connection filter with a list of blocked IP addresses/CIDRs.
+    /// 🛡️ Creates a filter over networks that were parsed once at startup.
     ///
-    /// - Parameter blocked_ips: A list of strings representing IP addresses or CIDR blocks to deny.
-    /// - Returns: A configured `PingclairConnectionFilter`.
-    pub fn new(blocked_ips: &[String]) -> Self {
-        let mut blocked_cidrs = Vec::new();
-
-        for ip_str in blocked_ips {
-            match ip_str.parse::<IpNet>() {
-                Ok(cidr) => blocked_cidrs.push(cidr),
-                Err(_) => {
-                    // Try parsing as single IP
-                    if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                        blocked_cidrs.push(IpNet::from(ip));
-                    } else {
-                        tracing::warn!("⚠️ Invalid blocked IP/CIDR: {}", ip_str);
-                    }
-                }
-            }
-        }
-
+    /// 📌 Parsing belongs to configuration: `validate_config` refuses an entry
+    /// that is not an address or CIDR, so every string reaching the listener
+    /// is already a network. This used to parse again here and drop a bad
+    /// entry with a warning, which turned a typo in a block list into an
+    /// address that was never blocked.
+    pub fn new(blocked_cidrs: Vec<IpNet>) -> Self {
         if !blocked_cidrs.is_empty() {
             tracing::info!(
-                "🛡️ Initialized L4 connection filter with {} blocked CIDR(s)",
-                blocked_cidrs.len()
+                count = blocked_cidrs.len(),
+                "🛡️ Initialized L4 connection filter"
             );
         }
 
@@ -92,8 +79,11 @@ mod tests {
     #[tokio::test]
     async fn test_connection_filter() {
         // Block loopback and a specific CIDR
-        let blocked = vec!["127.0.0.1".to_string(), "192.168.1.0/24".to_string()];
-        let filter = PingclairConnectionFilter::new(&blocked);
+        let blocked = vec![
+            "127.0.0.1/32".parse().unwrap(),
+            "192.168.1.0/24".parse().unwrap(),
+        ];
+        let filter = PingclairConnectionFilter::new(blocked);
 
         // Blocked IPs
         let addr1: SocketAddr = "127.0.0.1:8080".parse().unwrap();
@@ -113,7 +103,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_filter() {
-        let filter = PingclairConnectionFilter::new(&[]);
+        let filter = PingclairConnectionFilter::new(Vec::new());
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         assert!(filter.should_accept(Some(&addr)).await);
     }

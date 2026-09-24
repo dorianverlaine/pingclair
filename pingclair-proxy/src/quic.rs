@@ -1395,14 +1395,14 @@ impl QuicServer {
     /// - `certs`: SNI certificate table consulted by every new handshake.
     /// - `upstream_keepalive_pool_size`: Pingora upstream pool size, kept
     ///   consistent with the H1/H2 path.
-    /// - `blocked_ips`: L4 blocklist, same semantics as the TCP listener's
-    ///   connection filter.
+    /// - `blocked_networks`: 🛡️ L4 blocklist, parsed once at startup and
+    ///   shared in meaning with the TCP listener's connection filter.
     pub fn new(
         listen: SocketAddr,
         proxy: Arc<PingclairProxy>,
         certs: Arc<CertTable>,
         upstream_keepalive_pool_size: usize,
-        blocked_ips: Vec<String>,
+        blocked_networks: Vec<ipnet::IpNet>,
     ) -> Self {
         let options = pingora_core::connectors::ConnectorOptions::new(upstream_keepalive_pool_size);
         Self {
@@ -1412,7 +1412,7 @@ impl QuicServer {
             connector: Arc::new(pingora_core::connectors::http::Connector::new(Some(
                 options,
             ))),
-            filter: PingclairConnectionFilter::new(&blocked_ips),
+            filter: PingclairConnectionFilter::new(blocked_networks),
             socket: None,
         }
     }

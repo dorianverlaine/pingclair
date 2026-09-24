@@ -114,6 +114,10 @@ mod strict_transport;
 #[path = "integration/alt_svc_opt_out.rs"]
 mod alt_svc_opt_out;
 
+// 🛡️ A malformed `blocked_ips` entry is refused at the Admin door.
+#[path = "integration/blocked_ips.rs"]
+mod blocked_ips;
+
 /// 🩺 The exact body `GET /health` serves on the admin listener
 /// (`pingclair-api/src/server.rs`). Readiness compares against this rather
 /// than against "some response arrived", so a 404 from a stale listener on the

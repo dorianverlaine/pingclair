@@ -22,7 +22,6 @@ use std::sync::Arc;
 
 /// 🛡️ What the listener phase reads, all of it decided by earlier phases.
 pub(super) struct ListenerInputs<'a> {
-    pub(super) config: &'a pingclair_core::config::PingclairConfig,
     pub(super) port_proxies: &'a RwLock<HashMap<String, PingclairProxy>>,
     pub(super) tls_listeners: &'a HashSet<String>,
     pub(super) proxy_protocol_addresses: &'a HashSet<String>,
@@ -50,7 +49,6 @@ pub(super) fn register(
     inputs: ListenerInputs<'_>,
 ) -> anyhow::Result<BoundListeners> {
     let ListenerInputs {
-        config,
         port_proxies,
         tls_listeners,
         proxy_protocol_addresses,
@@ -62,6 +60,12 @@ pub(super) fn register(
         h3_excluded_domains,
         bg_handle,
     } = inputs;
+    // 🛡️ One filter for every listener, built from networks parsed once.
+    let connection_filter = (!blocked_client_networks.is_empty()).then(|| {
+        std::sync::Arc::new(pingclair_proxy::PingclairConnectionFilter::new(
+            blocked_client_networks.to_vec(),
+        ))
+    });
     let mut https_ports: Vec<BoundH3Port> = Vec::new();
     let mut private_listener_reservations = Vec::new();
     {
@@ -95,13 +99,13 @@ pub(super) fn register(
                 app,
             );
 
-            // Add L4 Connection Filter (Global Blocked IPs)
-            let blocked_ips = &config.global.blocked_ips;
-            if !requires_proxy_protocol && !blocked_ips.is_empty() {
-                let filter = std::sync::Arc::new(pingclair_proxy::PingclairConnectionFilter::new(
-                    blocked_ips,
-                ));
-                service.set_connection_filter(filter);
+            // 🛡️ The global block list, shared by every listener. A PROXY
+            // listener filters at its public ingress instead, where the real
+            // client address is known.
+            if let Some(filter) = connection_filter.as_ref()
+                && !requires_proxy_protocol
+            {
+                service.set_connection_filter(filter.clone());
             }
 
             // 🛡️ The address is bound here first, and the probe listener is

@@ -20,6 +20,15 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🛡️ A malformed `blocked_ips` entry is refused
+
+An entry in the global `blocked_ips` list that is neither an address nor a
+CIDR used to pass `pingclair validate` and the Admin `/load` endpoint, and
+the listener then dropped it with a warning, so the address it was meant to
+block got through. It is now refused by the shared validation step, naming
+the entry, wherever a configuration comes in. A configuration that loaded
+before with such an entry no longer does.
+
 ### 🏷️ A handshake for a name this server does not serve says so
 
 A TLS client asking for a hostname no site configures used to be refused

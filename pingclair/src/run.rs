@@ -244,7 +244,6 @@ pub(crate) fn run_server(
     } = listeners::register(
         &mut server,
         listeners::ListenerInputs {
-            config: &config,
             port_proxies: &port_proxies,
             tls_listeners: &tls_listeners,
             proxy_protocol_addresses: &proxy_protocol_addresses,
@@ -271,7 +270,10 @@ pub(crate) fn run_server(
     // 🌐 Turn the bound UDP sockets into QUIC servers; see `http3`.
     let h3_cert_table = http3::start(
         &config,
-        https_ports,
+        http3::H3Sockets {
+            ports: https_ports,
+            blocked_networks: &blocked_client_networks,
+        },
         &h3_excluded_domains,
         &tls_runtime,
         &tls_manager,
