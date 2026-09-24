@@ -43,6 +43,9 @@ serde_json.workspace = true
 bcrypt.workspace = true
 argon2 = { version = "0.5", features = ["rand"] }
 parking_lot = "0.12"
+# 🧭 Names the parsed PROXY-protocol and blocklist networks that startup
+# hands from `run_server` to the listener phase.
+ipnet.workspace = true
 
 
 [target.'cfg(unix)'.dependencies]

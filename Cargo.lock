@@ -2527,6 +2527,7 @@ dependencies = [
  "flate2",
  "h2",
  "http",
+ "ipnet",
  "libc",
  "parking_lot",
  "pingclair-api",
