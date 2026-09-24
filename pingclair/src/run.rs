@@ -22,7 +22,6 @@ use crate::listen::{
     automatic_http_companion, can_bind_automatic_http_port, explicit_http_names,
     normalize_listen_addr, reserve_private_listener_address, server_requires_tls,
 };
-use crate::paths::tls_store_dir_with;
 use crate::runtime_listeners::{
     RuntimeListeners, RuntimePublisherInputs, prepare_listener_policies,
 };
@@ -34,6 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod admin;
 mod certificates;
 mod http3;
 #[cfg(unix)]
@@ -626,47 +626,16 @@ pub(crate) fn run_server(
             prepared_listener_policies,
         ));
 
-    // Start Admin API if enabled
-    if let Some(admin_config) = &config.admin
-        && admin_config.enabled
-    {
-        let listen = admin_config.listen.clone();
-        let shutdown_for_admin = admin_shutdown.clone();
-        let autosave =
-            tls_store_dir_with(config.global.storage_path.as_deref()).join("autosave.json");
-        // 🧭 The admin traversal endpoints read and write one shared config
-        // document; it starts as the exact configuration that was loaded.
-        let document = active_document.clone();
-        let publisher_for_admin = config_publisher.clone();
-        let policy_for_admin = admin_policy.clone();
-
-        // 🚫 Bound here, synchronously, like the TCP and UDP listeners above: a
-        // taken admin port stops startup and names the address. Binding inside
-        // the admin thread used to log the failure to stdout and carry on, so
-        // the server looked healthy while refusing every `/load` and `/config`.
-        // `validate_config` already refuses an address that does not parse;
-        // this re-checks rather than panicking if one ever reaches here.
-        let addr = pingclair_core::config::parse_listen_addr(&listen)
-            .ok_or_else(|| anyhow::anyhow!("admin API address `{listen}` is not bindable"))?;
-        let admin_listener = std::net::TcpListener::bind(addr)
-            .map_err(|error| anyhow::anyhow!("failed to bind admin API on {listen}: {error}"))?;
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create admin runtime");
-            rt.block_on(async {
-                let options = pingclair_api::AdminServerOptions {
-                    document,
-                    shutdown: shutdown_for_admin,
-                    autosave: Some(autosave),
-                    publisher: Some(publisher_for_admin),
-                    policy: policy_for_admin,
-                };
-                if let Err(e) = pingclair_api::run_admin_server(admin_listener, options).await {
-                    tracing::error!("🔧 Admin server error: {}", e);
-                }
-            });
-        });
-    }
+    // 🔧 Admin API, bound now so a taken port stops startup; see `admin`.
+    admin::start(
+        &config,
+        admin::AdminShared {
+            document: active_document.clone(),
+            shutdown: admin_shutdown.clone(),
+            publisher: config_publisher.clone(),
+            policy: admin_policy.clone(),
+        },
+    )?;
 
     // 🔔 SIGUSR1 reloads the configuration file; see `reload`.
     #[cfg(unix)]
