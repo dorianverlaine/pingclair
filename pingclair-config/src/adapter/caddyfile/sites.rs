@@ -1155,8 +1155,12 @@ mod directive_order_tests {
         ));
     }
 
+    /// 📏 Two `handle` blocks whose paths are equal once the trailing `*` is
+    /// trimmed: the exact one goes first. This is the fourth step of the
+    /// directive-order key in `route_order`, not a rule that exact paths beat
+    /// globs — a longer glob (`/foobar*`) still goes ahead of `/foo`.
     #[test]
-    fn exact_handle_precedes_glob_handle() {
+    fn equal_trimmed_handles_put_the_exact_path_first() {
         let config = compile(
             "example.com {\n    handle /foo* {\n respond \"glob\"\n }\n    handle /foo {\n respond \"exact\"\n }\n}",
         )

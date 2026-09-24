@@ -354,4 +354,44 @@ mod tests {
         );
         assert_eq!(bodies(source), ["hello", "proxy"]);
     }
+
+    #[test]
+    fn templates_does_not_rank_the_default_pipeline() {
+        // 📄 `templates` ranks ahead of `respond`, but it only rewrites what
+        // `file_server` produces, so the pair answers at `file_server`'s
+        // rank. Ranked as `templates`, the catch-all would lead and serve
+        // `/x` from disk instead of letting `respond /x` answer.
+        let source = concat!(
+            "example.com {\n",
+            "    root * /srv\n",
+            "    templates\n",
+            "    file_server\n",
+            "    respond /x \"x\"\n",
+            "}",
+        );
+        assert_eq!(bodies(source), ["x", "proxy"]);
+        assert_eq!(answer(source, "/x"), "x");
+    }
+
+    #[test]
+    fn equal_length_different_patterns_keep_file_order() {
+        // 📜 A deliberate difference from the reference, which orders two
+        // different patterns of equal trimmed length alphabetically and so
+        // puts `/*/bx` first whichever is written first (`*` sorts before
+        // `a`). Here file order decides; issue #18 records the decision.
+        //
+        // ⚠️ Only a `*` in the middle lets two such patterns match the same
+        // request (`/a/bx` matches both), and a route path does not match a
+        // mid-pattern `*` at all today, so the two orders cannot yet produce
+        // different answers. This asserts the list, not an answer.
+        let written = |first: &str, second: &str| {
+            format!(
+                "example.com {{\n    @a path /a/*x\n    @b path /*/bx\n    respond {first}\n    respond {second}\n}}"
+            )
+        };
+        let a = "@a \"a\"";
+        let b = "@b \"b\"";
+        assert_eq!(bodies(&written(a, b)), ["a", "b"]);
+        assert_eq!(bodies(&written(b, a)), ["b", "a"]);
+    }
 }

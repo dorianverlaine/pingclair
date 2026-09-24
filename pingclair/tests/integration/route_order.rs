@@ -106,3 +106,75 @@ async fn test_a_single_path_sibling_goes_ahead_of_a_multi_path_matcher() {
     let b = client.get(server.url(0, "/b")).send().await.unwrap();
     assert_eq!(b.text().await.unwrap(), "both");
 }
+
+/// 🔀 File order decides nothing that directive order already decides.
+/// Two servers write the same directives in opposite orders and must
+/// answer every request identically. `redir /old/*` answers `/old/keep`
+/// ahead of the exact `respond /old/keep`, because `redir` ranks earlier;
+/// the router used to pick the exact path. `header` runs before `respond`
+/// wherever it is written.
+#[tokio::test]
+async fn test_reversing_file_order_changes_no_answer() {
+    let config = |body: &str| {
+        format!(
+            r#"
+            {{
+                admin off
+            }}
+
+            http://__PINGCLAIR_TEST_LISTEN__ {{
+                @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+                respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+                {body}
+            }}
+            "#
+        )
+    };
+    let respond_written_first = r#"
+                respond "catch-all" 200
+                respond /old/keep "kept" 200
+                header X-Order on
+                redir /old/* /new 308
+    "#;
+    let redir_written_first = r#"
+                redir /old/* /new 308
+                header X-Order on
+                respond /old/keep "kept" 200
+                respond "catch-all" 200
+    "#;
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let mut answers = Vec::new();
+    for body in [respond_written_first, redir_written_first] {
+        let mut server = TestServer::new_pingclairfile(&config(body));
+        assert!(server.wait_until_ready().await, "server failed to start");
+        let mut seen = Vec::new();
+        for path in ["/old/keep", "/page"] {
+            let reply = client.get(server.url(0, path)).send().await.unwrap();
+            let header = |name: &str| {
+                reply
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            };
+            let status = reply.status().as_u16();
+            let (location, order) = (header("location"), header("x-order"));
+            seen.push((status, location, order, reply.text().await.unwrap()));
+        }
+        server.stop();
+        answers.push(seen);
+    }
+
+    assert_eq!(answers[0], answers[1], "file order changed an answer");
+    assert_eq!(answers[0][0].0, 308, "`redir` answers `/old/keep`");
+    assert_eq!(answers[0][0].1.as_deref(), Some("/new"));
+    assert_eq!(
+        answers[0][1],
+        (200, None, Some("on".to_string()), "catch-all".to_string())
+    );
+}
