@@ -170,7 +170,14 @@ pub struct GlobalConfig {
     #[serde(default, skip_serializing_if = "is_false")]
     pub local_certs: bool,
 
-    /// Blocked IP addresses (CIDR supported)
+    /// 🚫 Addresses and CIDR ranges whose connections are dropped before any
+    /// TLS or HTTP is read, on the TCP listeners and the HTTP/3 UDP listener.
+    ///
+    /// 📌 JSON-only and connection-level: it compares the socket peer, so it
+    /// never sees a client behind a trusted proxy, and it has no Pingclairfile
+    /// spelling because Caddy has no global block list. A Pingclairfile blocks
+    /// clients per site with `@blocked client_ip 203.0.113.0/24` followed by
+    /// `abort @blocked`, which matches the verified client address instead.
     #[serde(default)]
     pub blocked_ips: Vec<String>,
 

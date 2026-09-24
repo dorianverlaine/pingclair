@@ -985,6 +985,32 @@ up (`pingclair_access_log_dropped_total`). Normal shutdown gives accepted record
 a shared 250 ms drain budget; this is not a durability guarantee. Writing every
 request to a system journal also incurs the journal receiver's processing cost.
 
+#### Blocking client addresses
+
+🚫 To refuse a range of clients, name it with a `client_ip` matcher and
+`abort` it, exactly as in Caddy. A matching request gets no response at all:
+the connection is closed on HTTP/1.1 and HTTP/2, and only that request's stream
+is reset on HTTP/3.
+
+```caddyfile
+example.com {
+    @blocked client_ip 203.0.113.0/24 2001:db8::/32
+    abort @blocked
+
+    respond "hello"
+}
+```
+
+`client_ip` matches the verified client address described above: behind a
+proxy listed in `trusted_proxies` it is the forwarded client, and from anyone
+else it is the socket peer, so a forged `X-Forwarded-For` cannot move a client
+into or out of the block. 📌 Caddy's `remote_ip` always means the socket peer;
+here it currently matches the same verified address as `client_ip`, so write
+`client_ip` when you mean the client. There is no global block list in a
+Pingclairfile, because Caddy has none; the `blocked_ips` field exists only in
+the JSON configuration and drops a connection from a matching socket peer,
+HTTP/3 included, before any TLS or HTTP is read.
+
 ### What is not supported yet
 
 Pingclair calls itself Caddyfile-compatible, so the honest half of that claim

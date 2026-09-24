@@ -414,6 +414,33 @@ rejette tous. Les deux orthographes signifient ici la même chose, et c'est la
 stricte : le `proxy_protocol { fallback_policy require }` d'en amont, où une
 connexion sans en-tête est refusée plutôt que servie.
 
+#### Bloquer des adresses clientes
+
+🚫 Pour refuser une plage de clients, nommez-la avec un matcher `client_ip` et
+appliquez-lui `abort`, exactement comme dans Caddy. Une requête qui correspond
+ne reçoit aucune réponse : la connexion est fermée en HTTP/1.1 et HTTP/2, et
+seul le flux de cette requête est réinitialisé en HTTP/3.
+
+```caddyfile
+example.com {
+    @blocked client_ip 203.0.113.0/24 2001:db8::/32
+    abort @blocked
+
+    respond "hello"
+}
+```
+
+`client_ip` compare l'adresse client vérifiée décrite plus haut : derrière un
+proxy listé dans `trusted_proxies`, c'est le client transmis, et pour tout
+autre pair c'est le pair de la socket ; un `X-Forwarded-For` forgé ne peut donc
+ni faire entrer ni faire sortir un client du blocage. 📌 Le `remote_ip` de Caddy
+désigne toujours le pair de la socket ; ici il compare pour l'instant la même
+adresse vérifiée que `client_ip`, donc écrivez `client_ip` quand vous visez le
+client. Une Pingclairfile n'a pas de liste de blocage globale, parce que Caddy
+n'en a pas ; le champ `blocked_ips` n'existe que dans la configuration JSON et
+coupe une connexion dont le pair de la socket correspond, HTTP/3 compris, avant
+toute lecture TLS ou HTTP.
+
 ### Limites de ressources et délais
 
 **Il n'y a pas de plafond de corps de requête, sauf si la configuration en

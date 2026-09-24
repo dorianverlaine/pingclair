@@ -365,6 +365,29 @@ protocol 不適用於 UDP HTTP/3 listener。
 嚴格的那一邊：上游的 `proxy_protocol { fallback_policy require }`——沒帶標頭的
 連線會被拒絕，而不是被服務。
 
+#### 封鎖用戶端位址
+
+🚫 要拒絕某個範圍的用戶端，用 `client_ip` matcher 指名它，再對它 `abort`，寫法與
+Caddy 完全相同。符合的請求完全得不到回應：HTTP/1.1 與 HTTP/2 會關閉連線，
+HTTP/3 只重設那一個請求的 stream。
+
+```caddyfile
+example.com {
+    @blocked client_ip 203.0.113.0/24 2001:db8::/32
+    abort @blocked
+
+    respond "hello"
+}
+```
+
+`client_ip` 比對的是上面說的已驗證 client IP：來自 `trusted_proxies` 列出的
+proxy 時是轉送過來的 client，來自其他任何人時就是 socket peer，所以偽造的
+`X-Forwarded-For` 沒辦法把 client 移進或移出封鎖範圍。📌 Caddy 的 `remote_ip`
+永遠指 socket peer；這裡目前它和 `client_ip` 比對同一個已驗證位址，所以要比對
+client 時請寫 `client_ip`。Pingclairfile 沒有全域封鎖清單，因為 Caddy 也沒有；
+`blocked_ips` 欄位只存在於 JSON 設定，會在讀取任何 TLS 或 HTTP 之前丟掉 socket peer
+符合的連線，HTTP/3 也一樣。
+
 store 的位置是設定決定：全域的 `storage file_system <path>` 會指名那個目錄，
 優先序高於 `PINGCLAIR_TLS_STORE` 與平台慣例。只實作檔案後端——遠端或共享
 backend 會以名字被拒絕而不是被收下，因為收下只會讓 store 留在原地，讀起來卻像

@@ -982,6 +982,47 @@ async fn h3_abort_resets_only_its_own_stream() {
     assert_eq!(after.status, 200, "an abort must not poison the listener");
 }
 
+/// 🚫 `client_ip` + `abort`, the Pingclairfile way to block addresses, holds on
+/// H3: a request from a blocked range gets no response, anyone else is served.
+///
+/// 📌 The test client is always loopback, so each block is scoped to one path:
+/// `/blocked` proves the matcher sees the H3 peer, and `/elsewhere` proves a
+/// range that does not contain it lets the request through.
+#[tokio::test]
+async fn h3_client_ip_abort_blocks_only_the_named_range() {
+    let source = r#":443 {
+            @blocked {
+                client_ip 127.0.0.0/8 ::1
+                path /blocked*
+            }
+            abort @blocked
+            @elsewhere {
+                client_ip 203.0.113.0/24 2001:db8::/32
+                path /elsewhere*
+            }
+            abort @elsewhere
+            respond "served" 200
+        }"#;
+    let compiled = pingclair_config::compile(source).unwrap();
+    let site = compiled.servers[0].clone();
+    let server = spawn_h3_server_with(|address| ServerConfig {
+        listen: vec![address.to_string()],
+        ..site
+    })
+    .await;
+
+    let blocked = h3_get(server, "/blocked").await;
+    assert!(
+        blocked.is_err(),
+        "a client in the blocked range must get no response; got {:?}",
+        blocked.map(|response| response.status)
+    );
+
+    let allowed = h3_get(server, "/elsewhere").await.unwrap();
+    assert_eq!(allowed.status, 200);
+    assert_eq!(allowed.body, b"served");
+}
+
 /// 🧾 Reads one whole chunked HTTP/1 request from a backend socket and returns
 /// its body frames.
 ///
