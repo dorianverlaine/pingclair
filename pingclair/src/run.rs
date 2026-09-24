@@ -3,19 +3,29 @@
 
 //! 🚀 Everything between a compiled configuration and a serving process.
 //!
-//! One function, because it is one sequence with an order that matters: build
-//! the Pingora server, prove the certificate store is writable, load manual
-//! certificates as a set, derive and bind listeners, start HTTP/3, start the
-//! Admin API, install signal handlers, and only then announce readiness.
-//! Several of those steps are ordering constraints rather than steps —
-//! announcing readiness before the listeners exist is what makes a rolling
-//! deploy drop requests, and it is a one-line mistake to make.
+//! `run_server` is one sequence with an order that matters: build the Pingora
+//! server, prepare every certificate source, place sites on addresses, bind
+//! and register listeners, start HTTP/3, start the Admin API, install signal
+//! handlers, and only then announce readiness. Several of those steps are
+//! ordering constraints rather than steps — announcing readiness before the
+//! listeners exist is what makes a rolling deploy drop requests, and it is a
+//! one-line mistake to make.
 //!
-//! 🚧 This module is over the size the rest of the binary aims for, and that is
-//! recorded rather than hidden: the split that moved it here was a move, and
-//! carving `run_server` into phases means inventing signatures for six or seven
-//! captured values. That is a change worth reviewing on its own terms, so it
-//! has a TRIAGE row instead of being smuggled in here.
+//! 🧭 So the order stays here, readable top to bottom, and each phase's body
+//! lives in the submodule that owns it:
+//!
+//! - `server_conf` — the Pingora knobs this process runs with.
+//! - `certificates` — the TLS store, the manager, internal and manual
+//!   certificates, and which ACME challenge proves which name.
+//! - `sites` — which site answers on which address.
+//! - `listeners` — bind-probing, TLS, the HTTP/3 UDP socket and the
+//!   PROXY-protocol ingress for each address.
+//! - `http3` — QUIC servers over the sockets `listeners` bound.
+//! - `admin` — the Admin API.
+//! - `reload` — the SIGUSR1 reload listener.
+//!
+//! 🛑 Shutdown lives in `crate::shutdown` and the descriptor check in
+//! `crate::fd_budget`, because neither is only a startup concern.
 
 use crate::certs::{eager_issuance_domains, h3_excluded_domains};
 use crate::listen::can_bind_automatic_http_port;
