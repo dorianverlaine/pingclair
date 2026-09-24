@@ -20,6 +20,23 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🔌 `remote_ip` matches the connection's peer, `client_ip` the client
+
+**Breaking for `remote_ip` behind `trusted_proxies`.** The two matchers now
+read different addresses, as in Caddy. `client_ip` matches the client after
+`trusted_proxies` is applied: the forwarded address when the connection comes
+from a trusted proxy. `remote_ip` matches the connection's own peer, whatever
+any header says; behind a trusted load balancer that is the balancer. Until
+now both matched the forwarded client.
+
+📌 Upgrading: a site without `trusted_proxies` sees no change, because there
+the two addresses are the same. A site with `trusted_proxies` that used
+`remote_ip` to match clients (for example to block a range) must now write
+`client_ip`, or the rule will compare the balancer's address instead. In a
+JSON config the `remote_ip` matcher key changes meaning the same way, and the
+new `client_ip` key holds the old one; a PROXY-protocol listener's declared
+source counts as the peer. Both HTTP/1.1–2 and HTTP/3 behave alike. (#191)
+
 ### 🌐 IP matcher ranges are parsed once, and a malformed one is refused
 
 `remote_ip` and `client_ip` ranges are now parsed when the configuration

@@ -19,12 +19,41 @@ pub struct MatcherRequest<'a> {
     pub method: &'a str,
     pub headers: &'a http::HeaderMap,
     pub host: &'a str,
-    pub remote_ip: &'a str,
+    pub addresses: RequestAddresses,
     pub protocol: &'a str,
     /// 🧰 Request-scoped variables and regexp captures, written and read by
     /// the `vars` and regexp matchers. `None` means nothing is visible,
     /// which matches nothing.
     pub vars: Option<&'a mut std::collections::BTreeMap<String, String>>,
+}
+
+/// 🌐 The two addresses a request is known by, which the `client_ip` and
+/// `remote_ip` matchers deliberately read differently.
+///
+/// Behind a trusted load balancer they differ: the connection comes from the
+/// balancer (`remote_ip`), and the balancer vouches for the real client in a
+/// forwarded header (`client_ip`). Without a trusted proxy in front they are
+/// the same address. `None` means the address is not known at that point of
+/// the request, and a matcher that needs it matches nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestAddresses {
+    /// 🛡️ The client after `trusted_proxies` has been applied: the forwarded
+    /// address when the immediate peer is trusted, the peer otherwise.
+    pub client_ip: Option<std::net::IpAddr>,
+    /// 🔌 The immediate peer of the connection, whatever any header claims. A
+    /// PROXY-protocol listener's declared source counts as the peer, because
+    /// that header replaces the connection's address rather than forwarding it.
+    pub remote_ip: Option<std::net::IpAddr>,
+}
+
+impl RequestAddresses {
+    /// 🔌 A request with no proxy in front, so both addresses are the peer.
+    pub fn direct(peer: std::net::IpAddr) -> Self {
+        Self {
+            client_ip: Some(peer),
+            remote_ip: Some(peer),
+        }
+    }
 }
 
 /// Pre-compiled matcher with cached regex
@@ -224,7 +253,7 @@ impl Router {
         method: &str,
         headers: &http::HeaderMap,
         host: &str,
-        remote_ip: &str,
+        addresses: RequestAddresses,
         protocol: &str,
         vars: Option<&mut std::collections::BTreeMap<String, String>>,
     ) -> Option<&CompiledRoute> {
@@ -234,7 +263,7 @@ impl Router {
             method,
             headers,
             host,
-            remote_ip,
+            addresses,
             protocol,
             vars,
         )
@@ -253,7 +282,7 @@ impl Router {
         method: &str,
         headers: &http::HeaderMap,
         host: &str,
-        remote_ip: &str,
+        addresses: RequestAddresses,
         protocol: &str,
         vars: Option<&mut std::collections::BTreeMap<String, String>>,
     ) -> Option<&CompiledRoute> {
@@ -262,7 +291,7 @@ impl Router {
             method,
             headers,
             host,
-            remote_ip,
+            addresses,
             protocol,
             vars,
         };
@@ -412,7 +441,9 @@ fn evaluate_matcher_inner(
                 .iter()
                 .any(|host| host.eq_ignore_ascii_case(request.host)),
         ),
-        Matcher::RemoteIp(ips) => bool_verdict(remote_ip_matches(ips, request.remote_ip)),
+        // 🌐 Same ranges, different address: see `RequestAddresses`.
+        Matcher::RemoteIp(ranges) => bool_verdict(ip_matches(ranges, request.addresses.remote_ip)),
+        Matcher::ClientIp(ranges) => bool_verdict(ip_matches(ranges, request.addresses.client_ip)),
         Matcher::Protocol(protocols) => bool_verdict(
             protocols
                 .iter()
@@ -906,7 +937,13 @@ fn resolve_file_placeholder(name: &str, request: &MatcherRequest<'_>, path: &str
             .map(|(_, port)| port.to_string())
             .unwrap_or_default(),
         "method" | "http.request.method" => request.method.to_string(),
-        "remote_ip" | "remote_host" | "http.request.remote.host" => request.remote_ip.to_string(),
+        // 📌 These placeholders have always resolved to the verified client;
+        // only the matchers were split by #191.
+        "remote_ip" | "remote_host" | "http.request.remote.host" => request
+            .addresses
+            .client_ip
+            .map(|ip| ip.to_string())
+            .unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -1109,14 +1146,11 @@ fn evaluate_condition(
     }
 }
 
-/// 🌐 Matches the remote/client IP against ranges parsed when the
-/// configuration loaded, as Caddy's `remote_ip`/`client_ip` matchers do.
-/// Only the request's own address is parsed here; an address that does not
-/// parse matches nothing.
-fn remote_ip_matches(ranges: &IpRanges, remote_ip: &str) -> bool {
-    remote_ip
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|remote| ranges.contains(remote))
+/// 🌐 Matches an address against ranges parsed when the configuration
+/// loaded, as Caddy's `remote_ip`/`client_ip` matchers do. An unknown address
+/// matches nothing.
+fn ip_matches(ranges: &IpRanges, address: Option<std::net::IpAddr>) -> bool {
+    address.is_some_and(|address| ranges.contains(address))
 }
 
 /// Check if path matches a glob pattern
@@ -1164,6 +1198,11 @@ mod tests {
     use crate::config::HandlerConfig;
     use http::HeaderMap;
     use std::collections::BTreeMap;
+
+    /// 🔌 A request straight from `ip`, with no proxy in front.
+    fn peer(ip: &str) -> RequestAddresses {
+        RequestAddresses::direct(ip.parse().expect("test address parses"))
+    }
 
     fn make_route(path: &str) -> RouteConfig {
         RouteConfig {
@@ -1277,7 +1316,7 @@ mod tests {
                     "GET",
                     &headers,
                     "example.com",
-                    "10.0.0.1",
+                    peer("10.0.0.1"),
                     "https",
                     None,
                 )
@@ -1315,7 +1354,7 @@ mod tests {
                     "GET",
                     &headers,
                     "example.com",
-                    "10.0.0.1",
+                    peer("10.0.0.1"),
                     "https",
                     None,
                 )
@@ -1353,7 +1392,7 @@ mod tests {
                 method: "GET",
                 headers,
                 host: "example.com",
-                remote_ip: "10.0.0.1",
+                addresses: peer("10.0.0.1"),
                 protocol: "https",
                 vars: None,
             }
@@ -1392,7 +1431,7 @@ mod tests {
                     "GET",
                     &headers,
                     "example.com",
-                    "10.0.0.1",
+                    peer("10.0.0.1"),
                     "https",
                     None,
                 )
@@ -1440,7 +1479,7 @@ mod tests {
                     "GET",
                     &headers,
                     "e.com",
-                    "10.0.0.1",
+                    peer("10.0.0.1"),
                     "https",
                     None
                 )
@@ -1449,7 +1488,13 @@ mod tests {
         assert!(
             suffix
                 .match_request(
-                    "/site.js", "GET", &headers, "e.com", "10.0.0.1", "https", None
+                    "/site.js",
+                    "GET",
+                    &headers,
+                    "e.com",
+                    peer("10.0.0.1"),
+                    "https",
+                    None
                 )
                 .is_none()
         );
@@ -1462,7 +1507,7 @@ mod tests {
                     "GET",
                     &headers,
                     "e.com",
-                    "10.0.0.1",
+                    peer("10.0.0.1"),
                     "https",
                     None
                 )
@@ -1477,7 +1522,7 @@ mod tests {
                     "GET",
                     &headers,
                     "e.com",
-                    "10.0.0.1",
+                    peer("10.0.0.1"),
                     "https",
                     None
                 )
@@ -1492,7 +1537,7 @@ mod tests {
                     "GET",
                     &headers,
                     "e.com",
-                    "10.0.0.1",
+                    peer("10.0.0.1"),
                     "https",
                     None
                 )
@@ -1505,7 +1550,7 @@ mod tests {
                     "GET",
                     &headers,
                     "e.com",
-                    "10.0.0.1",
+                    peer("10.0.0.1"),
                     "https",
                     None
                 )
@@ -1539,7 +1584,7 @@ mod tests {
                     "GET",
                     &headers,
                     "e.com",
-                    "10.0.0.1",
+                    peer("10.0.0.1"),
                     "https",
                     None
                 )
@@ -1552,7 +1597,7 @@ mod tests {
                     "GET",
                     &headers,
                     "e.com",
-                    "10.0.0.1",
+                    peer("10.0.0.1"),
                     "https",
                     None
                 )
@@ -1586,7 +1631,7 @@ mod tests {
                 "GET",
                 &headers,
                 "e.com",
-                "10.0.0.1",
+                peer("10.0.0.1"),
                 "https",
                 None,
             )
@@ -1597,7 +1642,7 @@ mod tests {
                 "GET",
                 &headers,
                 "e.com",
-                "10.0.0.1",
+                peer("10.0.0.1"),
                 "https",
                 None,
             )
@@ -1628,12 +1673,28 @@ mod tests {
 
         assert!(
             router
-                .match_request("/", "GET", &headers, "e.com", "10.1.2.3", "https", None)
+                .match_request(
+                    "/",
+                    "GET",
+                    &headers,
+                    "e.com",
+                    peer("10.1.2.3"),
+                    "https",
+                    None
+                )
                 .is_some()
         );
         assert!(
             router
-                .match_request("/", "GET", &headers, "e.com", "192.168.1.1", "https", None)
+                .match_request(
+                    "/",
+                    "GET",
+                    &headers,
+                    "e.com",
+                    peer("192.168.1.1"),
+                    "https",
+                    None
+                )
                 .is_none()
         );
     }
@@ -1659,13 +1720,29 @@ mod tests {
         let mut headers = HeaderMap::new();
         assert!(
             router
-                .match_request("/", "GET", &headers, "e.com", "10.0.0.1", "https", None)
+                .match_request(
+                    "/",
+                    "GET",
+                    &headers,
+                    "e.com",
+                    peer("10.0.0.1"),
+                    "https",
+                    None
+                )
                 .is_some()
         );
         headers.insert("Foo", "bar".parse().unwrap());
         assert!(
             router
-                .match_request("/", "GET", &headers, "e.com", "10.0.0.1", "https", None)
+                .match_request(
+                    "/",
+                    "GET",
+                    &headers,
+                    "e.com",
+                    peer("10.0.0.1"),
+                    "https",
+                    None
+                )
                 .is_none()
         );
     }
@@ -1694,7 +1771,7 @@ mod tests {
             method: "GET",
             headers: &headers,
             host: "example.com",
-            remote_ip: "10.0.0.1",
+            addresses: peer("10.0.0.1"),
             protocol: "http",
             vars: Some(&mut vars),
         };
@@ -1733,7 +1810,7 @@ mod tests {
             method: "GET",
             headers: &headers,
             host: "example.com",
-            remote_ip: "10.0.0.1",
+            addresses: peer("10.0.0.1"),
             protocol: "http",
             vars: Some(&mut vars),
         };
@@ -1764,7 +1841,7 @@ mod tests {
             method: "GET",
             headers: &headers,
             host: "example.com",
-            remote_ip: "10.0.0.1",
+            addresses: peer("10.0.0.1"),
             protocol: "http",
             vars: Some(&mut vars),
         };
@@ -1807,7 +1884,7 @@ mod tests {
             method: "GET",
             headers: &headers,
             host: "example.com",
-            remote_ip: "10.0.0.1",
+            addresses: peer("10.0.0.1"),
             protocol: "https",
             vars: Some(&mut vars),
         };
@@ -2071,7 +2148,7 @@ mod tests {
             method: "GET",
             headers: &headers,
             host: "example.com",
-            remote_ip: "10.0.0.1",
+            addresses: peer("10.0.0.1"),
             protocol: "http",
             vars: Some(&mut vars),
         };
@@ -2157,7 +2234,7 @@ mod tests {
             method: "GET",
             headers: &headers,
             host: "example.com",
-            remote_ip: "10.0.0.1",
+            addresses: peer("10.0.0.1"),
             protocol: "http",
             vars: Some(&mut vars),
         };
@@ -2188,7 +2265,7 @@ mod tests {
             method: "GET",
             headers: &headers,
             host: "example.com",
-            remote_ip: "10.0.0.1",
+            addresses: peer("10.0.0.1"),
             protocol: "http",
             vars: Some(&mut vars),
         };
@@ -2204,7 +2281,7 @@ mod tests {
             method: "GET",
             headers: &headers,
             host: "example.com",
-            remote_ip: "10.0.0.1",
+            addresses: peer("10.0.0.1"),
             protocol: "http",
             vars: Some(&mut vars),
         };

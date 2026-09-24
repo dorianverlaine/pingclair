@@ -518,8 +518,11 @@ pub enum Matcher {
     /// Match by host: host("example.com" | "*.example.com")
     Host(Vec<String>),
 
-    /// Match by remote IP: remote_ip("1.2.3.4" | "192.168.1.0/24")
+    /// 🔌 Match the connection's immediate peer: remote_ip("1.2.3.4" | "192.168.1.0/24")
     RemoteIp(Vec<String>),
+
+    /// 🛡️ Match the client after `trusted_proxies`: client_ip("1.2.3.4" | "192.168.1.0/24")
+    ClientIp(Vec<String>),
 
     /// Match by protocol: protocol("https" | "http")
     Protocol(Vec<String>),

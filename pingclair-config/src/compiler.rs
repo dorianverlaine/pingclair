@@ -2539,6 +2539,19 @@ fn path_patterns(
     }
 }
 
+/// 🚫 Parses an IP matcher's ranges once, here, so a malformed range stops the
+/// configuration instead of becoming a range that silently matches nothing.
+fn compile_ip_ranges(
+    matcher: &str,
+    ranges: &[String],
+) -> CompileResult<pingclair_core::config::IpRanges> {
+    pingclair_core::config::IpRanges::parse(ranges.iter().map(String::as_str)).map_err(|error| {
+        CompileError::InvalidRoute {
+            message: format!("{matcher} matcher: {error}"),
+        }
+    })
+}
+
 fn compile_matcher(
     matcher: &Matcher,
     matchers: &HashMap<String, Matcher>,
@@ -2605,13 +2618,8 @@ fn compile_matcher(
         Matcher::Host(hosts) => CoreMatcher::Host(hosts.clone()),
         // 🚫 Parsed here, once, so a malformed range stops the configuration
         // instead of becoming a range that silently matches nothing.
-        Matcher::RemoteIp(ips) => CoreMatcher::RemoteIp(
-            pingclair_core::config::IpRanges::parse(ips.iter().map(String::as_str)).map_err(
-                |error| CompileError::InvalidRoute {
-                    message: format!("remote_ip/client_ip matcher: {error}"),
-                },
-            )?,
-        ),
+        Matcher::RemoteIp(ips) => CoreMatcher::RemoteIp(compile_ip_ranges("remote_ip", ips)?),
+        Matcher::ClientIp(ips) => CoreMatcher::ClientIp(compile_ip_ranges("client_ip", ips)?),
         Matcher::Protocol(protocols) => CoreMatcher::Protocol(protocols.clone()),
         Matcher::Vars { name, values } => CoreMatcher::Vars {
             name: name.clone(),

@@ -10,8 +10,8 @@ use pingclair_core::config::{
     ReverseProxyConfig, ServerConfig,
 };
 use pingclair_core::server::{
-    CompiledMatcher, MatcherPrecompile, MatcherRequest, MatcherVerdict, Router, evaluate,
-    evaluate_verdict,
+    CompiledMatcher, MatcherPrecompile, MatcherRequest, MatcherVerdict, RequestAddresses, Router,
+    evaluate, evaluate_verdict,
 };
 
 use async_trait::async_trait;
@@ -161,6 +161,10 @@ pub struct RequestContext {
     pub streaming_response: bool,
     /// 🛡️ Client IP resolved through the trusted-proxy policy.
     pub verified_client_ip: Option<IpAddr>,
+    /// 🔌 The connection's own peer, never taken from a forwarded header; what
+    /// the `remote_ip` matcher compares. A PROXY-protocol source counts as the
+    /// peer, because that header replaces the connection's address.
+    pub remote_ip: Option<IpAddr>,
     /// 🌐 Verified downstream request scheme forwarded to the upstream.
     pub request_scheme: &'static str,
     /// Upstream response status (for access log)
@@ -285,6 +289,7 @@ impl Default for RequestContext {
             negotiated_encoding: None,
             streaming_response: false,
             verified_client_ip: None,
+            remote_ip: None,
             request_scheme: "http",
             response_status: 0,
             response_bytes: 0,
@@ -2608,10 +2613,10 @@ impl PingclairProxy {
         path: &str,
         method: &str,
         headers: &pingora_http::RequestHeader,
-        remote_ip: &str,
+        addresses: RequestAddresses,
         vars: Option<&mut std::collections::BTreeMap<String, String>>,
     ) -> Option<(Arc<ProxyState>, Option<usize>, Option<HandlerConfig>)> {
-        self.match_route_index(host, path, method, headers, remote_ip, vars)
+        self.match_route_index(host, path, method, headers, addresses, vars)
             .map(|(state, route_index)| {
                 let handler = route_index
                     .and_then(|index| state.config.routes.get(index))
@@ -2627,7 +2632,7 @@ impl PingclairProxy {
         path: &str,
         method: &str,
         headers: &pingora_http::RequestHeader,
-        remote_ip: &str,
+        addresses: RequestAddresses,
         vars: Option<&mut std::collections::BTreeMap<String, String>>,
     ) -> Option<(Arc<ProxyState>, Option<usize>)> {
         // 🏠 Resolves the immutable state published for this virtual host.
@@ -2643,7 +2648,7 @@ impl PingclairProxy {
                 method,
                 &headers.headers,
                 host,
-                remote_ip,
+                addresses,
                 protocol,
                 vars,
             )
@@ -4529,13 +4534,15 @@ impl PingclairProxy {
         let host = crate::http_policy::request_host(crate::http_policy::request_authority(
             session.req_header(),
         ));
-        let remote_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
         let mut request = MatcherRequest {
             path,
             method: session.req_header().method.as_str(),
             headers: &session.req_header().headers,
             host: host.as_ref(),
-            remote_ip: remote_ip.as_deref().unwrap_or(""),
+            addresses: RequestAddresses {
+                client_ip: ctx.verified_client_ip,
+                remote_ip: ctx.remote_ip,
+            },
             protocol: ctx.request_scheme,
             vars: Some(ctx.request_vars.values_mut()),
         };
@@ -4560,13 +4567,15 @@ impl PingclairProxy {
         let host = crate::http_policy::request_host(crate::http_policy::request_authority(
             session.req_header(),
         ));
-        let remote_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
         let mut request = MatcherRequest {
             path,
             method: session.req_header().method.as_str(),
             headers: &session.req_header().headers,
             host: host.as_ref(),
-            remote_ip: remote_ip.as_deref().unwrap_or(""),
+            addresses: RequestAddresses {
+                client_ip: ctx.verified_client_ip,
+                remote_ip: ctx.remote_ip,
+            },
             protocol: ctx.request_scheme,
             vars: Some(ctx.request_vars.values_mut()),
         };
@@ -6826,8 +6835,16 @@ impl ProxyHttp for PingclairProxy {
             }
 
             // 🛡️ Resolve proxy headers only when the immediate peer is trusted.
-            let (transport_peer_ip, _transport_client_ip, verified_client_ip) =
+            let (transport_peer_ip, transport_client_ip, verified_client_ip) =
                 self.downstream_identity(session, &request_header.headers);
+            // 🌐 `remote_ip` matches the connection's peer and `client_ip` the
+            // client a trusted proxy vouched for, as in Caddy. A PROXY-protocol
+            // source is the peer: that header replaces the connection address.
+            let addresses = RequestAddresses {
+                client_ip: Some(verified_client_ip),
+                remote_ip: Some(transport_client_ip),
+            };
+            ctx.remote_ip = addresses.remote_ip;
             let remote_ip_len = write_ip(verified_client_ip, &mut remote_ip_buf);
             let remote_ip = std::str::from_utf8(&remote_ip_buf[..remote_ip_len])
                 .expect("formatted IP addresses are ASCII");
@@ -6889,7 +6906,7 @@ impl ProxyHttp for PingclairProxy {
                             method,
                             headers: &request_header.headers,
                             host,
-                            remote_ip,
+                            addresses,
                             protocol,
                             vars: Some(ctx.request_vars.values_mut()),
                         };
@@ -6916,7 +6933,7 @@ impl ProxyHttp for PingclairProxy {
                 method,
                 &request_header.headers,
                 host,
-                remote_ip,
+                addresses,
                 protocol,
                 Some(ctx.request_vars.values_mut()),
             ) {

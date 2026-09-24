@@ -134,6 +134,10 @@ mod alt_svc_opt_out;
 #[path = "integration/blocked_ips.rs"]
 mod blocked_ips;
 
+// 🌐 `remote_ip` matches the connection's peer, `client_ip` the forwarded client.
+#[path = "integration/ip_matchers.rs"]
+mod ip_matchers;
+
 // 📁 Filenames that are not valid UTF-8; 🐧 Linux only, APFS refuses them.
 #[cfg(target_os = "linux")]
 #[path = "integration/non_utf8_paths.rs"]

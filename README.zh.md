@@ -382,9 +382,9 @@ example.com {
 
 `client_ip` 比對的是上面說的已驗證 client IP：來自 `trusted_proxies` 列出的
 proxy 時是轉送過來的 client，來自其他任何人時就是 socket peer，所以偽造的
-`X-Forwarded-For` 沒辦法把 client 移進或移出封鎖範圍。📌 Caddy 的 `remote_ip`
-永遠指 socket peer；這裡目前它和 `client_ip` 比對同一個已驗證位址，所以要比對
-client 時請寫 `client_ip`。Pingclairfile 沒有全域封鎖清單，因為 Caddy 也沒有；
+`X-Forwarded-For` 沒辦法把 client 移進或移出封鎖範圍。📌 `remote_ip` 和 Caddy
+一樣永遠比對 socket peer：在受信任的負載平衡器後面，比對到的就是那台負載平衡器，
+所以要比對 client 時請寫 `client_ip`。Pingclairfile 沒有全域封鎖清單，因為 Caddy 也沒有；
 `blocked_ips` 欄位只存在於 JSON 設定，會在讀取任何 TLS 或 HTTP 之前丟掉 socket peer
 符合的連線，HTTP/3 也一樣。
 

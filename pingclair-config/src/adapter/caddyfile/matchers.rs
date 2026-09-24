@@ -269,6 +269,7 @@ pub(super) fn merge_matcher_set(matchers: Vec<Matcher>) -> Matcher {
     let mut methods: Vec<HttpMethod> = Vec::new();
     let mut hosts: Vec<String> = Vec::new();
     let mut remote_ips: Vec<String> = Vec::new();
+    let mut client_ips: Vec<String> = Vec::new();
     let mut others: Vec<Matcher> = Vec::new();
 
     for matcher in matchers {
@@ -289,6 +290,7 @@ pub(super) fn merge_matcher_set(matchers: Vec<Matcher>) -> Matcher {
             Matcher::Method(m) => methods.extend(m),
             Matcher::Host(h) => hosts.extend(h),
             Matcher::RemoteIp(ips) => remote_ips.extend(ips),
+            Matcher::ClientIp(ips) => client_ips.extend(ips),
             other => others.push(other),
         }
     }
@@ -321,6 +323,9 @@ pub(super) fn merge_matcher_set(matchers: Vec<Matcher>) -> Matcher {
     }
     if !remote_ips.is_empty() {
         parts.push(Matcher::RemoteIp(remote_ips));
+    }
+    if !client_ips.is_empty() {
+        parts.push(Matcher::ClientIp(client_ips));
     }
     parts.extend(others);
 
@@ -543,10 +548,14 @@ pub(super) fn parse_single_matcher_at(
             if d.args.is_empty() {
                 return Err(AdapterError::ArgumentCount(d.name.clone(), 1, 0));
             }
-            // 🧭 `client_ip` matches the verified client address; Pingclair
-            // resolves that before routing, so both spellings share the same
-            // remote-address evaluation for now.
-            Ok(Matcher::RemoteIp(d.args.clone()))
+            // 🌐 The two names read different addresses, as in Caddy: behind a
+            // trusted load balancer `remote_ip` sees the balancer and
+            // `client_ip` sees the client it vouches for.
+            if d.name == "remote_ip" {
+                Ok(Matcher::RemoteIp(d.args.clone()))
+            } else {
+                Ok(Matcher::ClientIp(d.args.clone()))
+            }
         }
         "header" => {
             if d.args.is_empty() {

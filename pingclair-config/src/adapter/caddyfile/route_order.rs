@@ -204,6 +204,7 @@ fn collect_paths<'a>(
         | Matcher::Query(_)
         | Matcher::Host(_)
         | Matcher::RemoteIp(_)
+        | Matcher::ClientIp(_)
         | Matcher::Protocol(_)
         | Matcher::Vars { .. }
         | Matcher::PathRegexp { .. }
@@ -254,7 +255,9 @@ mod tests {
                 "GET",
                 &headers,
                 "example.com",
-                "127.0.0.1",
+                pingclair_core::server::RequestAddresses::direct(
+                    std::net::Ipv4Addr::LOCALHOST.into(),
+                ),
                 "HTTP/1.1",
                 None,
             )

@@ -79,7 +79,7 @@ use crate::server::{PingclairProxy, ProxyState, error_reason, resolve_caddy_plac
 use crate::server::{is_streaming_content_type, wants_immediate_flush};
 use crate::tls_name_alert::install_name_alert;
 use pingclair_core::server::{
-    MatcherPrecompile, MatcherRequest, MatcherVerdict, evaluate, evaluate_verdict,
+    MatcherPrecompile, MatcherRequest, MatcherVerdict, RequestAddresses, evaluate, evaluate_verdict,
 };
 
 /// Maximum UDP payload we ask quiche to send (standard Ethernet MTU-safe).
@@ -2447,7 +2447,7 @@ fn h3_element_matcher_verdict(
     element_precompile: Option<&MatcherPrecompile>,
     request_header: &RequestHeader,
     effective_uri: &str,
-    verified_client_ip: &str,
+    addresses: RequestAddresses,
     request_vars: &mut crate::http_policy::RequestVars,
 ) -> MatcherVerdict {
     let Some(compiled) = element_precompile.and_then(|node| node.element_matcher.as_ref()) else {
@@ -2464,7 +2464,7 @@ fn h3_element_matcher_verdict(
         method: request_header.method.as_str(),
         headers: &request_header.headers,
         host,
-        remote_ip: verified_client_ip,
+        addresses,
         protocol: "https",
         vars: Some(request_vars.values_mut()),
     };
@@ -2482,7 +2482,7 @@ fn h3_resolve_try_files(
     root: Option<&str>,
     request_header: &RequestHeader,
     effective_uri: &str,
-    verified_client_ip: &str,
+    addresses: RequestAddresses,
     request_vars: &mut crate::http_policy::RequestVars,
 ) -> Option<String> {
     let host = request_header
@@ -2496,7 +2496,7 @@ fn h3_resolve_try_files(
         method: request_header.method.as_str(),
         headers: &request_header.headers,
         host,
-        remote_ip: verified_client_ip,
+        addresses,
         protocol: "https",
         vars: Some(request_vars.values_mut()),
     };
@@ -2551,6 +2551,7 @@ async fn h3_raise_status(
     effective_uri: &mut String,
     response_policy: &mut ResponseHeaderPolicy,
     verified_client_ip: &str,
+    addresses: RequestAddresses,
     handling_error: bool,
     request_vars: &mut crate::http_policy::RequestVars,
     response_handlers: &mut Option<Vec<pingclair_core::config::ResponseHandlerConfig>>,
@@ -2568,6 +2569,7 @@ async fn h3_raise_status(
         effective_uri,
         response_policy,
         verified_client_ip,
+        addresses,
         None,
         handling_error,
         request_vars,
@@ -2593,6 +2595,7 @@ async fn plan_h3_handler_with_connector(
     effective_uri: &mut String,
     response_policy: &mut ResponseHeaderPolicy,
     verified_client_ip: &str,
+    addresses: RequestAddresses,
     precompile: Option<&MatcherPrecompile>,
     handling_error: bool,
     request_vars: &mut crate::http_policy::RequestVars,
@@ -2613,7 +2616,7 @@ async fn plan_h3_handler_with_connector(
                     element_precompile,
                     request_header,
                     effective_uri,
-                    verified_client_ip,
+                    addresses,
                     request_vars,
                 ) {
                     MatcherVerdict::Match => {}
@@ -2628,6 +2631,7 @@ async fn plan_h3_handler_with_connector(
                             effective_uri,
                             response_policy,
                             verified_client_ip,
+                            addresses,
                             handling_error,
                             request_vars,
                             response_handlers,
@@ -2647,6 +2651,7 @@ async fn plan_h3_handler_with_connector(
                     effective_uri,
                     response_policy,
                     verified_client_ip,
+                    addresses,
                     element_precompile,
                     handling_error,
                     request_vars,
@@ -2671,7 +2676,7 @@ async fn plan_h3_handler_with_connector(
                     element_precompile,
                     request_header,
                     effective_uri,
-                    verified_client_ip,
+                    addresses,
                     request_vars,
                 ) {
                     MatcherVerdict::Match => {}
@@ -2686,6 +2691,7 @@ async fn plan_h3_handler_with_connector(
                             effective_uri,
                             response_policy,
                             verified_client_ip,
+                            addresses,
                             handling_error,
                             request_vars,
                             response_handlers,
@@ -2707,6 +2713,7 @@ async fn plan_h3_handler_with_connector(
                     effective_uri,
                     response_policy,
                     verified_client_ip,
+                    addresses,
                     element_precompile,
                     handling_error,
                     request_vars,
@@ -2738,7 +2745,7 @@ async fn plan_h3_handler_with_connector(
                     element_precompile,
                     request_header,
                     effective_uri,
-                    verified_client_ip,
+                    addresses,
                     request_vars,
                 ) {
                     MatcherVerdict::Match => {}
@@ -2753,6 +2760,7 @@ async fn plan_h3_handler_with_connector(
                             effective_uri,
                             response_policy,
                             verified_client_ip,
+                            addresses,
                             handling_error,
                             request_vars,
                             response_handlers,
@@ -2774,6 +2782,7 @@ async fn plan_h3_handler_with_connector(
                     effective_uri,
                     response_policy,
                     verified_client_ip,
+                    addresses,
                     element_precompile,
                     handling_error,
                     request_vars,
@@ -3133,6 +3142,7 @@ async fn plan_h3_handler_with_connector(
                         effective_uri,
                         response_policy,
                         verified_client_ip,
+                        addresses,
                         precompile,
                         true,
                         request_vars,
@@ -3233,7 +3243,7 @@ async fn plan_h3_handler_with_connector(
             root.as_deref(),
             request_header,
             effective_uri,
-            verified_client_ip,
+            addresses,
             request_vars,
         ) {
             Some(target) => {
@@ -3256,6 +3266,7 @@ async fn plan_h3_handler_with_connector(
                         effective_uri,
                         response_policy,
                         verified_client_ip,
+                        addresses,
                         fallback_precompile,
                         handling_error,
                         request_vars,
@@ -3303,6 +3314,15 @@ async fn plan_h3_handler(
         effective_uri,
         response_policy,
         verified_client_ip,
+        // 🧪 Unit tests plan handlers with no connection, so the one address
+        // they name stands for both.
+        {
+            let address = verified_client_ip.parse().ok();
+            RequestAddresses {
+                client_ip: address,
+                remote_ip: address,
+            }
+        },
         precompile,
         handling_error,
         request_vars,
@@ -3557,6 +3577,12 @@ async fn handle_request_inner(
     let peer_address = peer_ip;
     let verified_client_ip = proxy.verified_client_ip(peer_address, &header.headers);
     let verified_client_ip_text = verified_client_ip.to_string();
+    // 🌐 QUIC has no PROXY-protocol ingress, so the connection's peer is
+    // always the `remote_ip` address.
+    let addresses = RequestAddresses {
+        client_ip: Some(verified_client_ip),
+        remote_ip: Some(peer_address),
+    };
 
     // 🔤 Canonical once, then used for the virtual-host map, the route matchers
     // and the access log alike — the three had to agree and only the first was
@@ -3580,7 +3606,7 @@ async fn handle_request_inner(
                         method: req.method.as_str(),
                         headers: &header.headers,
                         host: &host_bare,
-                        remote_ip: &verified_client_ip_text,
+                        addresses,
                         protocol: "https",
                         vars: Some(request_vars.values_mut()),
                     };
@@ -3608,7 +3634,7 @@ async fn handle_request_inner(
                 req.method.as_str(),
                 &header.headers,
                 &host_bare,
-                &verified_client_ip_text,
+                addresses,
                 "https",
                 Some(request_vars.values_mut()),
             )
@@ -3743,6 +3769,7 @@ async fn handle_request_inner(
         &mut effective_uri,
         response_policy,
         &verified_client_ip_text,
+        addresses,
         route_precompile,
         false,
         &mut request_vars,

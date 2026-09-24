@@ -10,7 +10,7 @@
 
 use divan::black_box;
 use pingclair_core::config::{HandlerConfig, IpRanges, Matcher, MatcherCondition, RouteConfig};
-use pingclair_core::server::Router;
+use pingclair_core::server::{RequestAddresses, Router};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
@@ -71,7 +71,7 @@ fn select(path: &str) -> Option<usize> {
             "GET",
             &headers,
             "example.com",
-            "127.0.0.1",
+            RequestAddresses::direct(std::net::Ipv4Addr::LOCALHOST.into()),
             "HTTP/1.1",
             None,
         )
@@ -131,7 +131,9 @@ fn ip_guard_miss() -> Option<usize> {
             "GET",
             &headers,
             "example.com",
-            black_box("203.0.113.9"),
+            black_box(RequestAddresses::direct(
+                std::net::Ipv4Addr::new(203, 0, 113, 9).into(),
+            )),
             "HTTP/1.1",
             None,
         )

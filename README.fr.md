@@ -433,9 +433,9 @@ example.com {
 `client_ip` compare l'adresse client vérifiée décrite plus haut : derrière un
 proxy listé dans `trusted_proxies`, c'est le client transmis, et pour tout
 autre pair c'est le pair de la socket ; un `X-Forwarded-For` forgé ne peut donc
-ni faire entrer ni faire sortir un client du blocage. 📌 Le `remote_ip` de Caddy
-désigne toujours le pair de la socket ; ici il compare pour l'instant la même
-adresse vérifiée que `client_ip`, donc écrivez `client_ip` quand vous visez le
+ni faire entrer ni faire sortir un client du blocage. 📌 `remote_ip`, comme dans
+Caddy, compare toujours le pair de la socket : derrière un répartiteur de charge
+de confiance, c'est le répartiteur, donc écrivez `client_ip` quand vous visez le
 client. Une Pingclairfile n'a pas de liste de blocage globale, parce que Caddy
 n'en a pas ; le champ `blocked_ips` n'existe que dans la configuration JSON et
 coupe une connexion dont le pair de la socket correspond, HTTP/3 compris, avant

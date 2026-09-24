@@ -1051,8 +1051,8 @@ example.com {
 `client_ip` matches the verified client address described above: behind a
 proxy listed in `trusted_proxies` it is the forwarded client, and from anyone
 else it is the socket peer, so a forged `X-Forwarded-For` cannot move a client
-into or out of the block. 📌 Caddy's `remote_ip` always means the socket peer;
-here it currently matches the same verified address as `client_ip`, so write
+into or out of the block. 📌 `remote_ip`, as in Caddy, always matches the socket
+peer instead: behind a trusted load balancer that is the balancer, so write
 `client_ip` when you mean the client. There is no global block list in a
 Pingclairfile, because Caddy has none; the `blocked_ips` field exists only in
 the JSON configuration and drops a connection from a matching socket peer,

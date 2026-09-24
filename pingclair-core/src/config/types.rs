@@ -1137,8 +1137,15 @@ pub enum Matcher {
     /// Match by host
     Host(Vec<String>),
 
-    /// Match by remote IP
+    /// 🔌 Match the immediate peer of the connection, as Caddy's `remote_ip`
+    /// does: behind a trusted load balancer this is the balancer. Before
+    /// #191 this variant read the forwarded client instead, which is now
+    /// `ClientIp`.
     RemoteIp(IpRanges),
+
+    /// 🛡️ Match the client after `trusted_proxies` has been applied, as
+    /// Caddy's `client_ip` does.
+    ClientIp(IpRanges),
 
     /// Match by protocol
     Protocol(Vec<String>),
@@ -1230,6 +1237,7 @@ impl<'de> Deserialize<'de> for Matcher {
             },
             Host(Vec<String>),
             RemoteIp(Vec<String>),
+            ClientIp(Vec<String>),
             Protocol(Vec<String>),
             Vars {
                 name: String,
@@ -1303,6 +1311,9 @@ impl<'de> Deserialize<'de> for Matcher {
                 // 🚫 Parsed after the shape is recognized, so a bad range is
                 // reported by name instead of as "not a matcher at all".
                 Matcher::RemoteIp(IpRanges::parse(ips).map_err(serde::de::Error::custom)?)
+            }
+            Repr::Tagged(Tagged::ClientIp(ips)) => {
+                Matcher::ClientIp(IpRanges::parse(ips).map_err(serde::de::Error::custom)?)
             }
             Repr::Tagged(Tagged::Protocol(protocols)) => Matcher::Protocol(protocols),
             Repr::Tagged(Tagged::Vars { name, values }) => Matcher::Vars { name, values },
@@ -3697,6 +3708,7 @@ mod tests {
             },
             Matcher::Host(vec!["example.com".into()]),
             Matcher::RemoteIp(IpRanges::parse(["10.0.0.1"]).unwrap()),
+            Matcher::ClientIp(IpRanges::parse(["10.0.0.0/8"]).unwrap()),
             Matcher::Protocol(vec!["https".into()]),
             Matcher::And(Box::new(path("/a")), Box::new(path("/b"))),
             Matcher::Or(Box::new(path("/a")), Box::new(path("/b"))),
@@ -3815,6 +3827,12 @@ mod tests {
                 IpRanges::parse(addresses.clone()).unwrap()
             )),
             Matcher::RemoteIp(_)
+        ));
+        assert!(matches!(
+            round_trip(&Matcher::ClientIp(
+                IpRanges::parse(addresses.clone()).unwrap()
+            )),
+            Matcher::ClientIp(_)
         ));
         assert!(matches!(
             round_trip(&Matcher::Protocol(addresses.clone())),
