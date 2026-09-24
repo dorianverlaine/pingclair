@@ -455,7 +455,7 @@ Additional ownership semantics that prevent real mistakes:
   issues for compatibility behavior and remaining gaps.
 
 User-facing documentation changes with the behavior it describes; update
-README.md, README.zh.md, and CHANGELOG.md together when
+README.md and CHANGELOG.md together when
 applicable.
 
 ## 🔒 Maintainer planning workflow

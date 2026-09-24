@@ -203,30 +203,15 @@ pub fn is_implemented_directive(name: &str) -> bool {
 /// 🚩 Every directive and global option the format defines and this crate
 /// refuses, in table order.
 ///
-/// 📌 Exposed so the READMEs' "not supported" list can be checked against the
-/// table rather than maintained by hand. A promise of compatibility is only
-/// worth what its stated limits are worth, and a limits list nobody verifies
-/// goes stale in the direction that flatters us — it keeps naming things we
-/// have since implemented and stops naming things we never did.
+/// 📌 Exposed so adapter tests and user-facing capability surfaces can read the
+/// table that decides. A promise of compatibility is only worth what its
+/// stated limits are worth, and a second hand-written registry would
+/// eventually disagree with the parser.
 pub fn recognised_but_unimplemented() -> impl Iterator<Item = &'static str> {
     DIRECTIVES
         .iter()
         .chain(GLOBAL_OPTIONS.iter())
         .filter(|spec| spec.support == Support::Recognised)
-        .map(|spec| spec.name)
-}
-
-/// ✅ Every directive and global option this crate implements, in table order.
-///
-/// 📌 The counterpart of [`recognised_but_unimplemented`], and exposed for the
-/// same reason read from the other end: a limits list goes stale in *both*
-/// directions, and only one of them was being checked. It kept naming seven
-/// working features as unsupported, in three languages, until 2026-08-13.
-pub fn implemented_names() -> impl Iterator<Item = &'static str> {
-    DIRECTIVES
-        .iter()
-        .chain(GLOBAL_OPTIONS.iter())
-        .filter(|spec| spec.support == Support::Implemented)
         .map(|spec| spec.name)
 }
 

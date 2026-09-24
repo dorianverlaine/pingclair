@@ -414,15 +414,11 @@ fn is_known_tls_option(name: &str) -> bool {
     RECOGNISED_TLS_OPTIONS.contains(&name)
 }
 
-/// 🚫 Every `tls { … }` option the format defines and this crate refuses, in
-/// the order the READMEs list them.
+/// 🚫 Every `tls { … }` option the format defines and this crate refuses.
 ///
-/// 📌 A table rather than a `matches!` because the list has a second reader: the
-/// READMEs name each of these so a migrated configuration does not discover
-/// them one directive at a time, and a list maintained by hand in three
-/// languages goes stale in the direction that flatters us. The doc test reads
-/// this array, so adding an option here fails until the READMEs say so.
-pub const RECOGNISED_TLS_OPTIONS: [&str; 15] = [
+/// 📌 A table rather than a `matches!` keeps recognition explicit and makes the
+/// refusal path easy to audit when the supported surface changes.
+const RECOGNISED_TLS_OPTIONS: [&str; 15] = [
     "protocols",
     "ciphers",
     "curves",

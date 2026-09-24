@@ -1,17 +1,12 @@
 <div align="center">
 
-<img src="assets/logo.png" alt="Pingclair" width="520">
+<a href="https://pingclair.com"><img src="assets/logo.png" alt="Pingclair" width="520"></a>
 
-**A modern, high-performance web server and reverse proxy built on Pingora**  
-*Cloudflare Pingora's raw performance, wrapped in Caddy's minimalist developer experience*
+**A Rust web server and reverse proxy built on Cloudflare Pingora.**
 
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Documentation](https://img.shields.io/badge/docs-pingclair.com-blue.svg)](https://pingclair.com)
-[![Rust](https://img.shields.io/badge/rust-1.98%2B-orange.svg)](https://www.rust-lang.org/)
-[![Status](https://img.shields.io/badge/status-active-green.svg)]()
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dorianverlaine/pingclair/pulls)
-
-**English** · [繁體中文](README.zh.md)
+[![Release](https://img.shields.io/github/v/release/dorianverlaine/pingclair?include_prereleases)](https://github.com/dorianverlaine/pingclair/releases/latest)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 </div>
 
@@ -19,1235 +14,239 @@
 
 ## 📖 Overview
 
-**Pingclair** is a next-generation web server and reverse proxy. Its core idea is to take the power of **Cloudflare Pingora** — the Rust proxy framework that serves trillions of requests — and wrap it in a shell as approachable as **Caddy**.
+Pingclair serves static content and proxies HTTP applications through one
+configuration model. It supports HTTP/1.1 and HTTP/2 over TCP, HTTP/3 over
+QUIC, automatic HTTPS, health-aware load balancing, and configuration reloads.
 
-Nginx configuration is notoriously cryptic, while Caddy is pleasant to use but built on Go. Pingclair aims to fill that gap: **100% Rust**, **memory-safe**, **fast**, and **intuitive to configure**.
+The primary configuration format is the Pingclairfile, a deliberately bounded
+implementation of commonly used Caddyfile syntax. Unsupported Caddy features
+are rejected during configuration loading rather than accepted as no-ops.
 
-Whether you need a simple static file server or an enterprise gateway with load balancing, automatic HTTPS, and HTTP/3, Pingclair handles it.
+Pingclair is currently distributed as a release candidate. Review the
+[project status](https://pingclair.com/project/status/) before using it for a
+production deployment.
 
-The published documentation — installation, the Pingclairfile reference, and the
-benchmark methodology — lives at <https://pingclair.com>.
+## ✨ Highlights
 
-## ✨ Features
+- **HTTP/1.1, HTTP/2, and HTTP/3** — Serve all three protocols from one
+  configuration, with QUIC provided by Cloudflare quiche.
+- **Automatic HTTPS** — Obtain public certificates through ACME, operate a
+  persistent internal certificate authority, or load certificates from files.
+- **Reverse proxying** — Route to multiple upstreams with load-balancing
+  policies, active health checks, retries, circuit breakers, and bounded
+  overload queues.
+- **Static files and FastCGI** — Serve files with conditional and range
+  requests, apply gzip or Zstandard compression, and run PHP through FastCGI.
+- **Fail-closed configuration** — Validate policy before publication and keep
+  the last-known-good configuration when a reload cannot be applied safely.
+- **Operational visibility** — Export Prometheus metrics and structured access
+  logs without requiring an external module.
 
-*   🚀 **Powered by Pingora** — Standing on the shoulders of giants, backed by Cloudflare's battle-tested infrastructure for enterprise-grade stability and throughput. Plaintext listeners accept HTTP/1.1 and prior-knowledge h2c; TLS listeners negotiate HTTP/2 through ALPN.
-*   🔒 **Memory safe** — Rust eliminates buffer overflows and the rest of the classic memory-safety vulnerability class.
-*   📝 **Caddyfile-compatible config** — A minimal configuration DSL with **automatic HTTPS**, **multiple listeners**, and **named matchers**, compatible with mainstream Caddyfile syntax.
-*   ⚡ **Native HTTP/3 (QUIC)** — Built on [quiche](https://github.com/cloudflare/quiche), the production QUIC stack that powers Cloudflare's edge. Lower latency and better connection migration on unreliable networks. Explicit `tls` configuration enables HTTPS and H3 on any listen port; 443 and 8443 remain automatic conventions. Declared request trailers are not forwarded on any downstream protocol: Pingclair returns `501` before response commitment or resets an already committed H3 stream. Upstream responses advertising trailers return `502` until end-to-end trailer forwarding is supported. Pingclair is a reverse proxy and opens no tunnels: `CONNECT` gets `405` with `Allow` on every protocol, and extended CONNECT is never offered. A client without SNI uses the listener’s `default_sni`; without one, the handshake is refused. Unknown explicit names never fall back to another site’s certificate.
-*   🔄 **Smart load balancing** — Several built-in algorithms (round-robin, least-connections, and more) with health checks and automatic failover.
-*   🔐 **Automatic and private HTTPS** — Built-in ACME (Let's Encrypt) support issues public certificates, while `tls internal` provides a persistent local CA for private origins and tunnels.
-*   📁 **Fast static file serving** — Gzip and Zstandard compression, range requests (including `416` for a range that cannot be satisfied), and efficient file transfer. Brotli is **not** implemented: `encode br` is refused by name, as it is by a standard Caddy build.
-*   📊 **Observability** — Prometheus metrics export out of the box.
+## 📦 Install
 
-## ⚡ Benchmarks
+### Linux release package
 
-Latest comparison: Pingclair `v0.2.0-rc.3` (the release binary) against nginx
-1.31.6 and Caddy 2.11.4, measured on one Apple M2 laptop with OrbStack. Every
-candidate runs in a container capped at **2 CPUs** with the same worker count
-and the same 1 KiB payload; the reverse-proxy backend sits in its own
-container on the same Docker network; the load generator runs natively.
-HTTP/1.1, HTTPS/1.1 and HTTP/2 use a native `h2load`; HTTP/3 uses the
-ngtcp2-enabled `h2load` inside the same network. Each value is the median of
-three interleaved 50,000-request rounds, and a row counts only when every
-request succeeded.
-
-| Scenario | Pingclair | nginx 1.31.6 | Caddy 2.11.4 |
-| --- | ---: | ---: | ---: |
-| HTTP/1.1 static | 46,125 | 39,478 | 18,266 |
-| HTTPS/1.1 static | 40,721 | 31,508 | 19,978 |
-| HTTP/2 static | 92,369 | 41,972 | 17,424 |
-| HTTP/3 static | 56,180 | 55,638 | 22,912 |
-| HTTP/1.1 reverse proxy | 20,856 | 22,584 | 17,117 |
-| HTTPS/1.1 reverse proxy | 20,297 | 21,944 | 16,660 |
-| HTTP/2 reverse proxy | 23,181 | 20,396 | not completed |
-| HTTP/3 reverse proxy | 28,078 | 22,213 | not completed |
-
-Pingclair is ahead on the HTTP/1.1, HTTPS/1.1 and HTTP/2 static rows (1.2×,
-1.3× and 2.2× respectively), while HTTP/3 is effectively level. On the
-reverse-proxy workload it is 14 % ahead on HTTP/2 and 26 % ahead on HTTP/3,
-while HTTP/1.1 and HTTPS/1.1 remain about 8 % behind nginx.
-
-On this host and harness, Caddy did not complete the proxied HTTP/2 and HTTP/3
-rows because upstream connection churn exhausted the container's available
-ephemeral ports at the tested concurrency, so those cells are reported as
-incomplete rather than compared under a different workload. Absolute requests
-per second on this laptop are not capacity claims; these ratios describe
-relative performance under this specific controlled workload, and the rows are
-meant for within-protocol comparisons between servers — because the HTTP/3
-load generator runs in a different environment, absolute throughput should not
-be compared across protocols.
-
-## 📦 Installation
-
-### Prerequisites
-
-*   **Rust toolchain** — Rust 1.98 or newer.
-
-### Build from source
-
-Building from source is recommended, since it produces a binary tuned for your CPU:
-
-```bash
-# 1. Clone the repository
-git clone https://github.com/dorianverlaine/pingclair.git
-cd pingclair
-
-# 2. Build and install (release mode)
-cargo install --path ./pingclair
-```
-
-Once installed, the `pingclair` command is available on your `PATH`.
-
-### One-line install on Linux
-
-> 📦 **The default install is `v0.2.0-rc.3`, a release candidate.** It is what
-> `releases/latest` now resolves to, deliberately: `v0.1.7` predates HTTP/3
-> parity, mutual TLS, the Admin API and most of the security fixes listed in
-> [`CHANGELOG.md`](CHANGELOG.md), and is not a version to start from. The
-> [release notes](https://github.com/dorianverlaine/pingclair/releases/tag/v0.2.0-rc.3)
-> carry what changed in this candidate and the defects known at tagging time.
-> The script prints the tag it is installing and verifies the published SHA-256
-> checksum before unpacking.
->
-> 🪦 **`v0.1.x` is unmaintained.** There will be no `v0.1.8`: no fixes, no
-> backports and no security advisories for that line, so staying on it means
-> staying on a version nobody will patch. One of the reasons to move is that its
-> Admin API authenticated nothing — a `v0.1.x` configuration parsed `api_key` and
-> then never read it, so the field protected nothing. If you are running
-> `v0.1.7`, upgrade.
-
-On any Linux distribution the install script works — it downloads (or builds) the binary, sets up a `systemd` service, and creates an unprivileged `pingclair` user that binds low ports via `setcap`. After installation, manage the service with the `pc` command (short for `pingclair`).
+The installer downloads the latest published release, verifies its SHA-256
+checksum, creates an unprivileged service account, and installs the `pingclair`
+and `pc` commands:
 
 ```bash
 curl -fsSL https://pingclair.com/install.sh | sudo bash
 ```
 
-The script accepts one flag for tracking `main` instead of the stable release.
-Clone main and compile it locally (requires Rust 1.98+):
+The current release is `v0.2.0-rc.3`. It is a release candidate, not a stable
+release. The `v0.1.x` line is unmaintained and should not be used for a new
+deployment.
+
+After installation, inspect the service before loading a configuration:
 
 ```bash
-curl -fsSL https://pingclair.com/install.sh | sudo bash -s -- --main
+pc service status
+pingclair version
 ```
 
-### Production deployment with Docker Compose
+The installer starts a systemd service with its configuration at
+`/etc/Pingclair/Pingclairfile`. After replacing the placeholder configuration,
+validate and reload it with:
 
-For a production-style container deployment, run the config-file mode and
-keep the TLS store on a persistent volume (it holds certificates, ACME
-account keys, and the internal CA — deleting it means re-issuing everything):
-
-```yaml
-services:
-  pingclair:
-    image: ghcr.io/dorianverlaine/pingclair:latest
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"   # HTTP/3
-    volumes:
-      - ./conf:/etc/pingclair:ro
-      - ./site:/srv
-      - pingclair_tls:/var/lib/pingclair/.local/share/pingclair
-    command: ["pingclair", "run", "/etc/pingclair/Pingclairfile"]
-
-volumes:
-  pingclair_tls:
-```
-
-Place your `Pingclairfile` in `./conf/`, static files under `./site/`, and
-reference them with `root /srv` in the config. The container runs Pingclair
-with the configuration file, so HTTPS, automatic port-80 redirects and
-HTTP/3 all behave exactly like a host deployment.
-
-### Trusting `tls internal` roots
-
-`tls internal` signs leaves with a persistent local CA. Clients that verify
-certificates must trust its root, published at
-`$PINGCLAIR_TLS_STORE/pki/authorities/local/root.crt` (inside a container:
-`docker compose cp pingclair:/var/lib/pingclair/.local/share/pingclair/pki/authorities/local/root.crt
-./root.crt`). Install it into the system trust store:
-
-- Linux: copy to `/usr/local/share/ca-certificates/root.crt` and run
-  `sudo update-ca-certificates`.
-- macOS: `sudo security add-trusted-cert -d -r trustRoot -k
-  /Library/Keychains/System.keychain root.crt`.
-- Browsers that keep their own trust store (Firefox, Chrome on some
-  platforms) need the root imported manually under Authorities.
-
-Only do this for origins you control; the internal CA is not a public
-authority.
-
-### Where the TLS store keeps things
-
-The layout is Caddy's, so a backup, an expiry report or a certificate audit
-written against a Caddy data directory reads this one the same way:
-
-```
-<pki>        pki/authorities/local/root.crt          root certificate
-             pki/authorities/local/root.key          root private key
-             pki/authorities/local/intermediate.crt  signing certificate
-             pki/authorities/local/intermediate.key  signing private key
-certificates/local/<site>/<site>.crt                   leaf chain
-certificates/local/<site>/<site>.key                   leaf private key
-certificates/local/<site>/<site>.json                  subject names, not secret
-```
-
-A wildcard site is filed under Caddy's spelling of it: `*.example.com` becomes
-`certificates/local/wildcard_.example.com/`.
-
-📌 **Upgrading from a store written before this layout.** The old `internal/`
-tree is neither read nor migrated, by design. On the next start the server finds
-no authority where it now looks, creates a new one, and re-issues the
-certificates it needs. It logs a warning when it finds the old tree, so the
-change is not silent. Every client that trusted the old root must be given the
-new one — the commands above are that step. If your configuration also obtains
-certificates from a public CA, note that re-issuing them counts against that
-CA's rate limits.
-
-## 🏃 Quick start
-
-Pingclair runs in two modes: **CLI mode** for quick tests, and **config-file mode** for production.
-
-### 1. CLI mode
-
-**Serve static files**  
-Serve the current directory over HTTP on port 8080:
 ```bash
-pingclair file-server --listen :8080 --root .
+sudo pingclair validate /etc/Pingclair/Pingclairfile
+sudo pc service reload
 ```
 
-**Run a reverse proxy**  
-Forward traffic from local port 8080 to a backend on port 3000:
+See the [installation guide](https://pingclair.com/start/install/) for Docker,
+service management, verification, removal, and troubleshooting.
+
+### Build from source
+
+Building the current branch requires the repository's pinned Rust toolchain:
+
 ```bash
-pingclair reverse-proxy --from :8080 --to localhost:3000
+git clone https://github.com/dorianverlaine/pingclair.git
+cd pingclair
+cargo +1.98.1 install --locked --path pingclair
 ```
 
-**Manage the system service (Linux)**  
-After installation, the built-in commands manage the `systemd` unit:
+The source build needs a C/C++ toolchain, CMake, Clang, and the development
+headers used by BoringSSL and bindgen. The
+[installation guide](https://pingclair.com/start/install/) lists the packages
+for supported Linux distributions and documents the container image when a
+host build is not appropriate.
+
+Source builds describe the checked-out commit, which may contain changes not
+present in the latest release. Consult the [changelog](CHANGELOG.md) before
+upgrading a running deployment from a source build.
+
+## 🚀 Quick start
+
+Create a file named `Pingclairfile`:
+
+```caddyfile
+http://localhost:8080 {
+    respond "Hello from Pingclair"
+}
+```
+
+Validate it before starting the server:
+
 ```bash
-pc service start    # start
-pc service stop     # stop
-pc service status   # status
-pc service reload   # graceful config reload (SIGUSR1)
-pc service restart  # restart
+pingclair validate Pingclairfile
 ```
 
-### 2. Config-file mode (recommended)
-
-Create a file named `Pingclairfile` in your project root, then run:
+Run Pingclair in the foreground:
 
 ```bash
 pingclair run Pingclairfile
 ```
 
-`run` with no argument looks for `Pingclairfile` in the working directory,
-then `Caddyfile`, so a migrated configuration works without a flag. If neither
-is there, **the process exits 1** with a message naming both candidates and the
-directory it searched.
+Verify the response from another terminal:
 
-📌 Caddy differs here, deliberately: `caddy run` with no configuration starts an
-empty server and waits for the Admin API to be given one. That suits
-orchestration which starts a process and posts its configuration later. This
-build refuses instead, because an operator who typed `run` in the wrong
-directory gets an error rather than a server that quietly serves nothing. If you
-need Caddy's behaviour, start with any minimal configuration and load the real
-one over the Admin API.
+```bash
+curl --noproxy '*' http://localhost:8080/
+```
 
-## 🛠️ Configuration (Pingclairfile)
+The response is:
 
-The Pingclair DSL is a structured configuration language purpose-built for describing server behavior. Like Caddy's `Caddyfile`, its conventional filename is `Pingclairfile`.
+```text
+Hello from Pingclair
+```
 
-### Basic structure
-
-The simplest configuration is one or more site blocks:
+For a reverse proxy, replace `respond` with an upstream:
 
 ```caddyfile
-# A server listening on localhost
-localhost:8080 {
-    # Static file serving
-    file_server ./public
+http://localhost:8080 {
+    reverse_proxy localhost:3000
 }
 ```
 
-### Automatic HTTPS for public names
-
-`tls auto` obtains and renews a public certificate over ACME (Let's Encrypt).
-No `listen` is needed:
+For a public hostname, Pingclair can obtain and renew the certificate and
+serve HTTP/1.1, HTTP/2, and HTTP/3:
 
 ```caddyfile
-{
-    email admin@example.com
-}
-
 example.com {
     tls auto
-    reverse_proxy app:8080
+    reverse_proxy localhost:3000
 }
 ```
 
-That is the whole configuration. A site with TLS and no `listen` serves HTTPS on
-443, and Pingclair provisions a second, plaintext listener on port 80 that does
-two jobs: it answers the ACME HTTP-01 challenge, which the CA fetches over
-**cleartext** HTTP on that exact port (RFC 8555 §8.3), and it redirects every
-other request to HTTPS with a 308. Port 80 therefore stays unencrypted even
-inside a block that configures TLS — a TLS listener there would reject the CA's
-plaintext probe and no certificate could ever be issued.
+Public automatic HTTPS requires the hostname to resolve to the server and the
+required TCP and UDP ports to be reachable. Follow the
+[HTTPS guide](https://pingclair.com/start/https/) before enabling it on a live
+host.
 
-Control it from the global block:
+### Command-line modes
 
-| `auto_https` | Effect |
+For temporary local use, Pingclair also provides direct commands that do not
+require a Pingclairfile:
+
+```bash
+pingclair file-server --listen :8080 --root .
+pingclair reverse-proxy --from :8080 --to localhost:3000
+```
+
+Configuration-file mode is recommended for services because it is reviewable,
+validatable, and reloadable. A configuration can be inspected without starting
+the server:
+
+```bash
+pingclair adapt --config Pingclairfile --pretty
+```
+
+The [quickstart](https://pingclair.com/start/quickstart/) covers validation,
+adaptation, startup, verification, and migration into the system service.
+
+## 📚 Documentation
+
+The documentation site is the authoritative source for installation,
+configuration, deployment behavior, compatibility boundaries, and performance
+methodology.
+
+| Topic | Description |
 | --- | --- |
-| `on` (default) | Provision port 80, answer ACME challenges, redirect to HTTPS. |
-| `disable_redirects` | Provision port 80 and answer ACME challenges, but do not redirect. |
-| `ignore_loaded_certs` | As `on`, except that a site which loaded its own certificate is automated anyway instead of being left to that file. |
-| `off` | Provision nothing; certificate management is disabled too. |
-
-Writing your own `listen :80` in the block opts out of the automatic listener —
-Pingclair then serves that port exactly as configured. If port 80 cannot be
-bound (already in use, or unprivileged), the automatic listener is skipped with
-a warning and HTTPS still serves; ACME HTTP-01 validation will not work.
-
-An address that names a port but no scheme is served over **HTTPS**: a listener
-that is not on the HTTP port is not a plaintext listener, which is the rule
-upstream applies. `secure.example:8443` therefore gets an automatic certificate
-just as `secure.example` does. `http://` in front of the address is how
-plaintext is asked for, on any port, and `tls off` also works. Two sites sharing
-a port must agree about TLS, or the configuration is refused rather than one of
-them silently winning.
-
-A block may mix explicit schemes, for example
-`http://example.com, https://example.com { … }`. Pingclair shares the handlers
-but keeps independent listener policy: HTTP stays plaintext and serves the
-configured route, while HTTPS still obtains its automatic certificate. The
-same rule keeps hostnames scoped correctly when the HTTP and HTTPS addresses
-name different hosts. `tls off` is authoritative even on port 443.
-
-The certificate Pingclair installs includes the intermediates the CA issued with
-it. A server that sends only its leaf certificate appears to work in a browser —
-browsers cache intermediates and fetch missing ones over AIA — while `curl`, Go,
-and Java reject it outright.
-
-To redirect by hand, `redir` expands `{host}` and `{uri}`. Quote the target so
-the `{` is not read as the start of a block:
-
-```caddyfile
-http://example.com {
-    redir "https://{host}{uri}" 308
-}
-```
-
-### Internal TLS for private origins
-
-Use `tls internal` when the TLS client is a trusted tunnel, load balancer, or
-private service and public ACME validation is unavailable:
-
-```caddyfile
-https://origin.example.test:6688 {
-    tls internal
-    reverse_proxy app:8080
-}
-```
-
-Pingclair persists one ten-year local authority and renewable 90-day leaf
-certificates below `PINGCLAIR_TLS_STORE` — a bare binary defaults to
-`$XDG_DATA_HOME/pingclair` (`~/.local/share/pingclair`), the container image
-to `/var/lib/pingclair/.local/share/pingclair`. Install
-`$PINGCLAIR_TLS_STORE/pki/authorities/local/root.crt` in clients that verify
-the origin; the authority's private keys remain in the owner-only
-`root.key` and `intermediate.key` beside it.
-H1/H2 and H3 use the same persisted leaf. `tls internal` requires a concrete
-site name and cannot be combined with `tls auto`, ACME email, or manual
-certificate paths.
-
-Where that store lives is a configuration decision: a global
-`storage file_system <path>` names the directory, and it takes precedence over
-`PINGCLAIR_TLS_STORE` and over the platform convention. Only the file-backed
-module is implemented — a remote or shared backend is refused by name rather
-than accepted, because accepting it would leave the store exactly where it is
-while reading as if it had moved. The resolved path is logged at startup, since
-two deployments that name different stores mint separate trust roots with no
-other visible difference.
-
-OCSP stapling is not performed by this build. The global `ocsp_stapling off` is
-accepted because it names precisely that state, and a startup line says so when
-it is written; `on` and the bare option are refused, since they would ask for
-stapling that does not exist here. (Caddy refuses those two spellings as well,
-so nothing that loads upstream is turned away.)
-
-A `tls { … }` block accepts `auto`, `internal`, `cert`/`key`, `acme_email`
-(`email`), `http3`, `default_sni`, `client_auth`, `renewal_window_ratio`, and
-the DNS-01 cluster
-(`dns`, `resolvers`, `dns_ttl`, `propagation_delay`, `propagation_timeout`,
-`dns_challenge_override_domain`). Every other option Caddy defines is **refused
-by name** rather than ignored, and the full list is in
-[What is not supported yet](#what-is-not-supported-yet) — so a migrated
-configuration fails at the line that uses one instead of loading with a setting
-that was silently dropped. Protocol, cipher and curve selection is the largest
-of those gaps: there is no way to narrow what the listener negotiates from a
-Pingclairfile.
-
-The global `local_certs` option applies the same choice to every site that
-has no certificate management of its own: all default automation uses the
-persisted local authority instead of public ACME.
-
-When Pingclair is behind a load balancer or CDN that you operate, list only
-those proxy networks in the global block. Untrusted peers cannot supply
-`X-Forwarded-For`, `X-Real-IP`, or `X-Forwarded-Proto` identity:
-
-```caddyfile
-{
-    trusted_proxies 10.0.0.0/8 2001:db8::/32
-}
-
-example.com {
-    listen :8443 proxy_protocol
-    reverse_proxy app:8080
-}
-```
-
-The verified client IP is shared by access control, rate limiting, IP-hash
-load balancing, upstream forwarding, placeholders, and access logs. Changes
-to `trusted_proxies` currently require a restart. `listen … proxy_protocol`
-requires PROXY v1 or v2 on that listener and rejects transport peers outside
-`trusted_proxies` before TLS or HTTP parsing. It is per-listener, as in nginx,
-so a port behind an L4 balancer and a port reached directly can coexist in one
-server. XFF and RFC 7239 `Forwarded`
-chains are bounded; malformed or conflicting identities fail closed. PROXY
-protocol does not apply to the UDP HTTP/3 listener.
-
-`servers { listener_wrappers { proxy_protocol } }` is the Caddy spelling of
-"every listener this Caddyfile declares", and it is accepted as exactly that;
-`listen … proxy_protocol` stays the way to require the header on one listener,
-and `servers <address> { listener_wrappers { proxy_protocol } }` demands it on
-that one listener — which is the spelling to use when a deployment terminates
-PROXY protocol on one port and serves another directly. The address must name a
-listener the configuration has: an address that matches nothing is refused
-rather than ignored, because a block that silently applies to no listener is
-exactly the shape this option exists to stop being. One addressed block per
-address, and the options it can carry are `listener_wrappers`, `protocols`,
-`trusted_proxies` and `metrics`; anything process-wide written there is refused.
-Both spellings mean the same thing here, and it is the strict one: upstream's
-`proxy_protocol { fallback_policy require }`, under which a connection without
-the header is refused rather than served.
-
-### Resource limits and timeouts
-
-Set downstream limits at site scope and upstream timeout phases inside
-`reverse_proxy`. Durations require a unit. Long-connection overrides apply to
-WebSocket upgrades, `flush_interval -1`, and `text/event-stream`; `off`
-explicitly removes that long-connection deadline.
-
-```caddyfile
-example.com {
-    limits {
-        header_timeout 5s
-        body_timeout 30s
-        idle_timeout 30s
-        request_timeout 2m
-        max_headers 100
-        max_header_bytes 65536
-        max_connections 10000
-        upload_bytes_per_sec 10485760
-        download_bytes_per_sec 52428800
-        long_connections {
-            idle_timeout 5m
-            request_timeout off
-        }
-    }
-
-    reverse_proxy app:8080 {
-        retry {
-            max_attempts 4
-            total_timeout 2s
-            backoff 50ms
-            status_codes 429 502 503 504
-            methods GET HEAD
-        }
-        overload {
-            max_in_flight 256
-            max_pending 64
-            pending_timeout 250ms
-            upstream_max_connections 64
-        }
-        circuit_breaker {
-            consecutive_failures 5
-            error_rate_percent 50
-            minimum_requests 20
-            window_requests 100
-            open_for 30s
-            half_open_requests 1
-            failure_statuses 429 502 503 504
-        }
-        transport http {
-            connect_timeout 3s
-            first_byte_timeout 30s
-            between_reads_timeout 15s
-        }
-    }
-}
-```
-
-`max_attempts` includes the initial attempt. Connect failures remain safe to
-retry because no request bytes reached that peer, whatever the method. Once
-the upstream has seen the request, a retry needs an idempotent method (`GET`,
-`HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE`) and an actually bodyless request;
-a `POST` or `PATCH` named in `lb_retry_match` is honoured only for connection
-failures. Pingclair never buffers or replays a request body for this policy. Omitting `retry` preserves
-the legacy connect-failover limit and does not retry response statuses.
-
-`max_in_flight` bounds work executing inside the route, while `max_pending`
-adds a bounded wait queue. A full queue fails fast with 429 and an expired
-pending wait returns 503. `upstream_max_connections` is a conservative
-per-backend request-occupancy cap; it also bounds multiplexed H2 use rather
-than attempting to count physical sockets. Circuit breakers track each
-concrete backend independently. They open on either configured threshold,
-fail fast with 503, and admit only the configured number of half-open probes
-after `open_for`. An empty `failure_statuses` list counts every 5xx response.
-Compatible Admin/SIGUSR1 reloads retain live circuit state; changing the
-protection policy or configured upstream set starts fresh state.
-
-There is **no request-body ceiling unless the configuration asks for one**,
-which is what Caddy does. A site that wants a limit writes
-`request_body { max_size <size> }` on the route that accepts uploads, or sets
-`request_body { max_size <size> }` at site level — the JSON field behind it is
-`client_max_body_size`, which has no Caddyfile spelling — and `0` means
-unlimited. A body over a
-configured limit is refused with `413` on the chunk that crosses it.
-
-The same block carries the other three options Caddy gives it.
-`read_timeout` and `write_timeout` bound reading the body and writing the
-response for that route; a stalled upload is answered with `408` once the
-read deadline passes, instead of holding the connection until the client
-gives up. `set "<body>"` replaces the request body outright — placeholders in
-the value are expanded for the request, and the length sent upstream is the
-replacement's. The replaced bytes are discarded as they arrive rather than
-read into memory, so a 20 MB upload replaced by `set "tiny"` costs four bytes
-of upstream body and no buffer, and the site's body limit still bounds what
-the client may send.
-
-Exceeded header, body, and request budgets receive an explicit HTTP error when
-the protocol can still send one; idle transports and excess HTTP/2 or HTTP/3
-connections are closed. Pingora 0.9.0 exposes one upstream read timer for H1/H2,
-so the stricter of `first_byte_timeout` and `between_reads_timeout` governs
-both phases there. The H3 bridge switches timers after receiving the response
-header. Changing the H1/H2 pre-routing `header_timeout`, H2 field-section cap,
-or H1/H2 connection limit currently requires a listener restart.
-
-Admin `/load`, `pingclair reload`, SIGUSR1, and `run --watch` publish compatible
-changes as one prepared transaction. API keys, origins, Admin disablement,
-existing-listener routes, manual certificate contents, and an existing mTLS
-trust pool take effect before success is reported; connections admitted by an
-older mTLS generation must reconnect. A change that needs sockets or TLS
-contexts rebuilt — including adding/removing a listener, adding a TLS hostname,
-changing captured transport policy, or enabling mTLS on a previously resumable
-listener — is rejected with the last-known-good configuration intact. The
-Admin API returns `409` with `"restart_required": true`, and does not autosave
-the rejected document.
-
-### Routing and matching
-
-Pingclair has a powerful matcher system — route requests by path, host, headers, and more.
-
-```caddyfile
-example.com {
-    # 1. A named matcher for API paths
-    @api {
-        path /api/v1/*
-    }
-
-    # Logic for API requests
-    handle @api {
-        header {
-            set Content-Type "application/json"
-        }
-        reverse_proxy localhost:3000
-    }
-
-    # 2. Match static assets
-    handle /assets/* {
-        header {
-            set Cache-Control "public, max-age=86400"
-        }
-        file_server ./assets
-    }
-
-    # 3. Fallback
-    handle {
-        respond "Page Not Found" 404
-    }
-}
-```
-
-#### 🧭 Which route answers
-
-A site's directives form one list, and the first entry that matches the
-request answers. The list is sorted by directive, not by how specific a
-path is, so `respond "hello"` answers `/assets/a.txt` even when
-`file_server /assets/*` is written beside it: `respond` comes earlier in
-the directive order. The order puts `redir`, `rewrite`, `handle` and `route`
-ahead of `respond`, and `respond` ahead of `reverse_proxy`, `php_fastcgi`
-and `file_server`; the `order` global option moves a directive, and a
-`route` block keeps what it contains in written order.
-
-Between two entries of the same directive, the one whose single path is
-longer once a trailing `*` is removed goes first (`/foobar*` before
-`/foo`), then an exact path before a wildcard (`/foo` before `/foo*`), then
-file order. A matcher with several paths, or none, goes after every
-single-path sibling. `handle` blocks sort their contents the same way.
-
-Three kinds of entry take the rank of something other than their own name:
-
-- 🧩 A matched middleware directive such as `header @api …` has nothing to
-  answer with, so it runs in front of the site's unmatched directives and
-  ranks where their answering directive does — usually `reverse_proxy` or
-  `file_server`.
-- 🐘 `php_fastcgi` expands into several steps but ranks as `php_fastcgi`,
-  after `respond`.
-- 📄 `templates` only rewrites what `file_server` produces, so a site whose
-  unmatched directives are `templates` and `file_server` ranks as
-  `file_server`.
-
-📌 One deliberate difference from Caddy: two different paths of equal
-length (after removing a trailing `*`) keep file order, where Caddy sorts
-them alphabetically. Two such paths can only match the same request when a
-`*` sits in the middle of one, which route paths do not support yet, so the
-difference is not observable today.
-
-### Advanced: macros
-
-Macros are one of Pingclair's most powerful features. Define a macro to encapsulate a repeated configuration fragment, then reuse it across servers and routes to keep configuration DRY.
-
-```rust
-// A macro that adds security headers
-macro security_headers!() {
-    headers {
-        remove: ["Server", "X-Powered-By"];
-        set: {
-            "X-Frame-Options": "DENY",
-            "X-XSS-Protection": "1; mode=block",
-            "Strict-Transport-Security": "max-age=31536000",
-        };
-    }
-}
-
-// A shared logging macro
-macro standard_log!(path) {
-    log {
-        output: File(path);
-        format: Json;
-        level: Info;
-    }
-}
-
-server "blog.example.com" {
-    listen: "0.0.0.0:443";
-
-    // Use the macros
-    use security_headers!();
-    use standard_log!("/var/log/pingclair/blog.log");
-
-    route {
-        _ => { file_server "./blog"; }
-    }
-}
-
-server "shop.example.com" {
-    listen: "0.0.0.0:443";
-
-    // Reuse the same security configuration
-    use security_headers!();
-    use standard_log!("/var/log/pingclair/shop.log");
-
-    route {
-        _ => { proxy "http://shop-backend:8000"; }
-    }
-}
-```
-
-### Reverse proxy and load balancing
-
-```caddyfile
-:80 :8080 {
-    reverse_proxy {
-        lb_policy least_conn
-        to 10.0.0.1:8080 {
-            weight 3
-        }
-        to 10.0.0.2:8080
-        # 🛟 Used only when every primary is unavailable.
-        to 10.0.0.3:8080 {
-            backup
-        }
-        health_check {
-            path /health
-            interval 5s
-            timeout 2s
-            status 200 204
-            consecutive_failure 3
-            consecutive_success 2
-            max_response_body_bytes 65536
-            slow_start 30s
-        }
-    }
-}
-```
-
-A proxied response carries two identification headers, and **this proxy rewrites
-both**: the upstream's `Server` is replaced with `Pingclair` — not passed through
-— and `Via` carries `1.1 Pingclair`. A per-response `x-request-id` is added as
-well, on responses as well as requests. This is a deliberate difference from
-Caddy, which forwards the upstream's `Server` untouched and sends `Via: 1.1
-Caddy`; it is stated here because a monitoring rule that keys on either string
-gets a different answer without the configuration having changed. The strip
-direction is available from the DSL — `header -Server` removes the header
-entirely — and `header Server <value>` sets your own, but forwarding the
-upstream's exact value is not implemented: nothing exposes the upstream's
-response headers as a placeholder.
-
-Active checks run out of band, so an idle failed backend leaves rotation before
-a user request reaches it and rejoins after the configured successful probes.
-Checks support a custom method, Host, headers, status set, bounded body match,
-health port, connection reuse, thresholds, and slow-start. HTTPS checks reuse
-the route's pinned CA, client certificate, SNI, and protocol policy.
-
-### Exact local rate limiting
-
-```caddyfile
-api.example.com {
-    @api path /api/*
-    route @api {
-        rate_limit 100 60s {
-            burst 20
-            key tenant X-Tenant-ID
-        }
-        reverse_proxy app:8080
-    }
-}
-```
-
-The token bucket reports exact `RateLimit-Limit`, `RateLimit-Remaining`, and
-`RateLimit-Reset` response fields, with `Retry-After` on a rejected request.
-Use `dry_run` in the block to count and report without returning 429. Keys may
-be `ip`, `global`, `route`, `api_key`, `header <name>`, or `tenant [name]`.
-This limiter is process-local; Redis-backed distributed limiting is outside
-v0.2.
-
-The upstream scheme selects the connection protocol: a bare address or `http://`
-uses HTTP/1.1, `https://` negotiates HTTP/2 with HTTP/1.1 fallback through ALPN,
-`h2c://` requires prior-knowledge plaintext HTTP/2, and `h2://` requires HTTP/2
-over TLS. Use `h2c://` or `h2://` for native gRPC so response trailers remain
-end-to-end metadata.
-
-A Unix-socket upstream is written `unix//path/to.sock` and dials that socket;
-`unix+h2c//path/to.sock` speaks prior-knowledge HTTP/2 over it. Unix upstreams
-are never handed to the DNS refresher.
-
-Upstreams can also be discovered from DNS while the server runs:
-`dynamic a name port` resolves every address record of `name`, and
-`dynamic srv _svc._tcp.example.com` resolves SRV records whose targets carry
-their own ports. Each source's `refresh` interval is independent; an omitted
-interval follows the global `dns_refresh`. An omitted `resolvers` option uses
-the host's system DNS configuration. For SRV sources, `grace_period` keeps the
-last successful peer set only from the first failed refresh until that bounded
-window expires; without it, failed discovery withdraws the dynamic peers.
-`dial_fallback_delay` is rejected because Hickory has no exact RFC 6555 hook
-for dialing an explicitly configured DNS server; it is never accepted as a no-op.
-Lookups happen on a background scheduler, never on the request path. A dial may also contain request placeholders —
-`reverse_proxy {re.dial.1}` — expanded per request and cached by host and port.
-
-Retry policy accepts Caddy's `lb_retry_match` spellings: `method`, `path`,
-`header`, and CEL expressions. Method, path, and status-code expressions are
-evaluated at runtime; expressions the runtime cannot evaluate are kept in the
-compiled configuration and logged at startup. `lb_policy weighted_round_robin`
-carries one weight per upstream, and a reverse_proxy `method`/`rewrite` block
-changes the upstream request before it is sent.
-
-`request_buffers <size>` and `response_buffers <size>` read that side's body
-into memory before passing it on, so a slow peer occupies this proxy instead of
-a backend worker. Sizes follow the SI/IEC split — `1MB` is a million bytes,
-`1MiB` is 1,048,576 — and `unlimited` is accepted. **`unlimited` does not mean
-unbounded memory here.** Buffering stops at a fixed 8 MiB ceiling and the rest
-of the body streams, which is reported at startup and again, once, when a body
-actually outgrows its buffer. Bodies always arrive complete either way; what
-changes is when they start moving. A `fastcgi` transport is buffered the same
-way, on every protocol.
-
-`reverse_proxy` also accepts `handle_response` blocks with response matchers
-(`@name status …` / `@name header …`), `replace_status`, `copy_response`, and
-`copy_response_headers`. The decision is made from the response header alone;
-a replacement emits its static body once and discards the upstream body chunk
-by chunk, so interception never buffers a whole response. `intercept { … }`
-registers the same handlers for proxied responses.
-
-Site-level middleware without a matcher, such as `header`, `request_header`,
-`basic_auth`, and `request_body`, also runs for self-answering `handle` routes.
-Middleware inside a route runs afterward and can override site defaults.
-
-`forward_auth <gateway> { uri …; copy_headers … }` runs one auth round trip
-before the request continues to the backend. A 2xx copies the listed response
-headers onto their configured request destinations — deleting those
-destinations before any copy, including renamed ones — and anything else is
-answered to the client directly. Header names containing `_`
-are dropped from incoming requests, matching Caddy's default. The shortcut is
-compiled into a bodyless GET proxy subrequest that forwards the original
-method and URI; H1, H2, and H3 share the same streamed exchange.
-The block also accepts `transport http { … }` with `tls`, `tls_server_name`,
-`tls_trusted_ca_certs`, `tls_client_auth`, and `tls_insecure_skip_verify`, using
-the same upstream TLS rules as `reverse_proxy`. Other transport options remain
-unsupported in `forward_auth`.
-
-Upstreams written as hostnames are re-resolved while the server runs, so a
-container that restarts on a new address is picked up without a reload. A
-lookup that fails leaves the previous address in rotation — a resolver outage
-should not take the site down — and a name that does not resolve at startup
-joins the pool as soon as it does, which lets the proxy start before its app.
-IP literals never reach a resolver at all.
-
-```caddyfile
-{
-    # ⏱️ Default 30s. `dns_refresh off` pins ordinary hostnames and dynamic
-    # ⏱️ sources without their own `refresh`; an explicit source interval remains
-    # ⏱️ active. A unit is required: `30` is not `30s`.
-    dns_refresh 15s
-}
-```
-
-### Single-page applications: `try_files`
-
-`try_files` rewrites the request to the first candidate that exists under the
-site `root`, and serves nothing itself — the `file_server` after it does that.
-The standard single-page-application pattern works as written:
-
-```caddyfile
-example.com {
-    root * /srv
-    encode gzip
-    try_files {path} /index.html
-    file_server
-}
-```
-
-A request for a real file gets that file; anything else is rewritten to
-`/index.html` so the application can route it. The query string survives the
-rewrite.
-
-🚫 `encode` takes no matcher here. Caddy's documented form is
-`encode [<matcher>] <formats…>`, and a matcher is refused with a message saying
-why: compression is configured **per server**, so there is nowhere to record
-"gzip, but only under `/assets`". The workaround is one line — move those paths
-into their own site block — and the refusal says so rather than reporting the
-matcher as an unknown coding, which would send the operator hunting for a
-spelling mistake.
-
-🧮 All `file_server` instances in a process share fixed cache limits: **64 MiB
-of compressed bodies, 16 MiB of raw bodies, and 4,096 metadata entries**,
-including overlapping configurations during reload. These are allocated on
-demand, not reserved at startup. File eligibility and HTTP responses are
-unchanged. Each route evicts its own entries; if other routes hold the available
-capacity, a miss is served without caching. Dropping a route returns capacity.
-These limits exclude in-flight bodies, keys, and allocator overhead; the metadata
-limit counts entries, not bytes. They do not adapt to host or container RAM and
-have no configuration knob. Caddy's standard
-[`file_server`](https://caddyserver.com/docs/caddyfile/directives/file_server)
-has no equivalent cache-budget option.
-
-🏷️ A static file's `ETag` is derived from **its size and its modification time
-in nanoseconds** — `"<size hex>-<mtime nanos hex>"`, with `-gzip` and friends
-appended for a coded representation — or from a sidecar file when the site keeps
-one. Caddy sends a short hash of the content instead, so moving a site between
-the two changes every file's validator at once and every `If-None-Match` that
-would have answered `304` answers `200` on the next request. Matching Caddy
-would mean reading each file to hash it, which is a request-path cost that has
-not been measured; the format is stated here so the migration is a known event
-rather than a bandwidth surprise.
-
-📦 **Compression is opt-in**, as it is in Caddy: a site compresses only where an
-`encode` directive asks for it, and the example above is what turns it on.
-`encode gzip` — or `encode zstd gzip`, which lists preferences in order — covers
-the whole site, and a `text/*` response is then compressed whenever the client's
-`Accept-Encoding` allows it, with `Content-Encoding` and a `-gzip`-suffixed
-`ETag`. Only responses above a size floor are compressed at all. A site with no
-`encode` serves the bytes as they sit on disk, even when the client offers gzip;
-to turn compression off again on a site that does have codings, write
-`encode off`, and to exempt a single file server put `file_server { compress off }`
-inside it. A JSON configuration keeps the older behaviour — `encodings` absent
-means gzip — so a stored document written before that field existed keeps
-answering exactly the way it was written.
-
-A proxied response is left exactly as the
-upstream sent it when it is partial (`206`, or any `Content-Range`), answers a
-`HEAD`, has no body (`204`, `304`), or carries `Cache-Control: no-transform`;
-when one is compressed, `Accept-Encoding` is added to its existing `Vary`
-rather than replacing it, and the origin's digest fields (`Content-Digest`,
-`Repr-Digest`, `Digest`, `Content-MD5`) are removed because they no longer
-describe the bytes. `Accept-Ranges: bytes` is advertised on a file server's
-compressed response too, and a `Range` request is still answerable: an on-the-fly
-compression is skipped whenever a range is being served, so the `206` that comes
-back is the identity file's bytes at the offsets the header promised rather than
-offsets into the gzip stream.
-
-A candidate ending in `/` matches only a directory, and one without matches
-only a regular file — the trailing slash that decides is the one in the
-configuration, not the one the request arrived with.
-
-`try_files {path} {path}/ /index.html` works too: the second candidate matches
-a directory, so a request for `/docs` finds `/docs/` and the file server takes
-it from there.
-
-The directive is shorthand rather than a handler of its own. It expands to a
-`file` matcher plus a rewrite to whatever that matcher picked, which is where
-the rest of its behaviour comes from:
-
-```caddyfile
-example.com {
-    root * /srv
-
-    # 🔍 A glob names the one hashed bundle on disk without knowing its hash.
-    try_files /build/app.*.js
-
-    # 🎲 A selection policy, when "the first one that exists" is not the rule.
-    try_files {path} {path}.html {
-        policy most_recently_modified
-    }
-
-    # 🚨 A candidate that is a status code raises it instead of matching.
-    try_files {path} =404
-
-    file_server
-}
-```
-
-The five policies are `first_exist` (the default), `first_exist_fallback`,
-`smallest_size`, `largest_size`, and `most_recently_modified`. A candidate may
-name any placeholder the request can answer — `{path}`, `{uri}`, `{query}`,
-`{host}`, `{method}`, `{http.request.header.*}`, `{http.vars.*}`, `{re.*}` and
-the rest — and a candidate carrying a query string (`/index.php?{query}`)
-replaces the request's query when it is the one that matched.
-
-Three things still **fail closed**, with a message naming the reason rather
-than compiling into something subtly different:
-
-| Refused | Why |
-| --- | --- |
-| A `..` segment in a candidate | Confinement is lexical, so a candidate that could leave the root is refused outright rather than checked per request. |
-| A placeholder the matcher cannot resolve (`{env.HOME}`, `{scheme}`) | It would be looked up as a filename containing braces — a misconfiguration indistinguishable from a missing file. |
-| An unrecognised `policy`, or any other subdirective | An unknown policy matches nothing, which on a live site reads as "none of these files exist". |
-
-🛡️ Glob metacharacters that arrive *in a placeholder value* are escaped, so a
-request for `/*` cannot turn `try_files /files/{path}` into a directory
-listing. Only the configured text decides whether a candidate globs.
-
-### Path surgery: `uri`
-
-```caddyfile
-example.com {
-    uri strip_prefix /api
-    uri strip_suffix .php
-    uri path_regexp /{2,} /
-    reverse_proxy 127.0.0.1:3000
-}
-```
-
-`uri replace` and `uri query` are **refused by name**. `replace` substitutes a
-substring of the path in Caddy, while Pingclair's rewrite replaces the whole
-path; accepting it would compile and serve a different URL than the one
-written, so it errors instead. Query-string rewriting does not exist here yet.
-
-### Caddy parity controls
-
-```caddyfile
-example.com {
-    error_page 404 /srv/errors/404.html
-
-    @legacy path /legacy/*
-    redir @legacy https://example.com/new permanent
-
-    handle /api/* {
-        cors https://app.example.com {
-            methods GET POST
-            allow_credentials
-        }
-        access_control {
-            allow_ip 10.0.0.0/8
-            deny_user_agent "(?i)bot"
-        }
-        # Regex captures use $1, $2, ... and preserve query strings.
-        rewrite "^/api/(.*)$" "/v1/$1"
-        reverse_proxy 127.0.0.1:3000
-    }
-}
-```
-
-### What `adapt` produces, and what it does not
-
-`pingclair adapt -c Pingclairfile` compiles the configuration and prints it as
-JSON. That document is **Pingclair's own format**, not Caddy's: its top level is
-`debug`/`servers`/`admin`/`global`/`logging`, where Caddy's is `{"apps":{…}}`,
-and its handlers are named `{"type":"respond"}` where Caddy's are
-`{"handler":"static_response"}`. The two share no top-level key and no handler
-name, so:
-
-- The output **is** loadable by this server — `pingclair validate <file.json>`,
-  `run --config <file.json>`, and `POST /load` all take it, and `adapt` checks
-  it before printing for exactly that reason.
-- The output is **not** loadable by Caddy, and `caddy adapt`'s output is not
-  loadable here. A `caddy adapt` artifact kept in a repository is a record of
-  the Caddy configuration, not something this server can read; migrating means
-  keeping the Caddyfile, which is what both servers parse.
-- A `Pingclairfile` translated *by hand* into `pingclair adapt`'s output is
-  portable between Pingclair installations — a container, a GitOps repository,
-  another machine — which is the case the JSON format exists for.
-
-### Snippets and imports
-
-A snippet is a reusable fragment `(name) { … }` pulled in with `import name`.
-An import can hand the snippet a block, which is spliced where the snippet
-writes `{block}`; named sub-blocks are addressed as `{blocks.<key>}`:
-
-```caddyfile
-(site) {
-    https://{args[0]} {
-        {block}
-    }
-}
-
-import site test.domain {
-    reverse_proxy 127.0.0.1:3000 {
-        header_up Host {host}
-    }
-}
-```
-
-A placeholder fed nothing splices nothing, so a snippet written with `{block}`
-still compiles when a call supplies no block. A placeholder inside an argument
-list is refused: Caddy's token layer re-parses the line after splicing, while
-the directive tree cannot, so Pingclair says so instead of guessing. Snippet
-definitions in an imported file are visible to imports that come later.
-
-### Logging grammar
-
-`log <name> { … }` follows Caddy: the block configures a **named per-site
-logger**, and the name is its handle. `log <name>` without a block still
-references a global channel declared in the global options, and a bare `log`
-enables the site's default access sink. Log blocks accept `hostnames`,
-`include`/`exclude` (global), `sampling`, and the file rotation options
-(`mode`, `dir_mode`, `roll_*`); `log_skip` excludes matching requests from
-access logging.
-
-🧭 An **unnamed** global `log { … }` block — the one that configures Caddy's
-process-wide default logger — points this server's own records at a sink:
-`output file <path>` (created if missing, mode 0600, no colour escapes),
-`output stdout`, `output stderr`, `format json|text`, and `level`. It is applied
-when the configuration is read and again on every reload, and one line names the
-destination at startup. `RUST_LOG` still outranks a configured `level`, which is
-what makes it usable to quieten one module without editing the configuration.
-The `🚀 Pingclair running...` banner stays on stdout either way — supervisors
-read it there, and a configuration that sends its records to a file must not
-blind the thing watching the process.
-
-📝 For sustained access traffic, use `log { output file /var/log/pingclair/access.log }`
-with a rotation policy; runtime diagnostics can stay on stderr. Configured access
-sinks batch complete records up to 64 KiB and schedule a flush after 5 ms, before
-rotation, or at an explicit flush barrier. Larger individual records bypass the
-buffer. Fields and sampling defaults are unchanged. A bounded queue still drops and counts records if its sink cannot keep
-up (`pingclair_access_log_dropped_total`). Normal shutdown gives accepted records
-a shared 250 ms drain budget; this is not a durability guarantee. Writing every
-request to a system journal also incurs the journal receiver's processing cost.
-
-#### Blocking client addresses
-
-🚫 To refuse a range of clients, name it with a `client_ip` matcher and
-`abort` it, exactly as in Caddy. A matching request gets no response at all:
-the connection is closed on HTTP/1.1 and HTTP/2, and only that request's stream
-is reset on HTTP/3.
-
-```caddyfile
-example.com {
-    @blocked client_ip 203.0.113.0/24 2001:db8::/32
-    abort @blocked
-
-    respond "hello"
-}
-```
-
-`client_ip` matches the verified client address described above: behind a
-proxy listed in `trusted_proxies` it is the forwarded client, and from anyone
-else it is the socket peer, so a forged `X-Forwarded-For` cannot move a client
-into or out of the block. 📌 `remote_ip`, as in Caddy, always matches the socket
-peer instead: behind a trusted load balancer that is the balancer, so write
-`client_ip` when you mean the client. There is no global block list in a
-Pingclairfile, because Caddy has none; the `blocked_ips` field exists only in
-the JSON configuration and drops a connection from a matching socket peer,
-HTTP/3 included, before any TLS or HTTP is read.
-
-### What is not supported yet
-
-Pingclair calls itself Caddyfile-compatible, so the honest half of that claim
-is saying where it stops. The names in the lists below are **recognised**:
-writing one is an error that names the feature rather than the word, never an
-`Unknown directive`, and a configuration using one does not start.
-
-📌 The promise is about **these names and nothing else**. It says nothing about
-a sub-option or about a spelling *inside* a block, and that is not a loophole —
-each of those has its own treatment stated where it belongs. The `tls { … }`
-block lists its refused options below; the Logging grammar section says which
-shapes a `log` block takes; and
-a directive can be accepted at one level and refused at another. A sentence that
-claimed more would be promising a property of the whole configuration surface,
-which is the kind of claim this section exists to avoid making.
-
-Directives:
-
-  `fs` `invoke` `log_append` `log_name` `map`
-  `push` `skip_log` `tracing`
-
-Global options:
-
-  `acme_ca` `acme_ca_root` `acme_eab` `cert_issuer`
-  `cert_lifetime` `ech` `events` `fallback_sni`
-  `filesystem` `frankenphp` `key_type` `ocsp_interval`
-  `on_demand_tls` `preferred_chains` `renew_interval`
-  `shutdown_delay` `storage_clean_interval`
-
-`tls` block options:
-
-  `protocols` `ciphers` `curves` `alpn`
-  `load` `ca` `ca_root` `key_type`
-  `eab` `issuer` `get_certificate` `on_demand`
-  `reuse_private_keys` `insecure_secrets_log` `force_automate`
-
-One `servers { … }` sub-option is refused **by name** rather than read as a
-typo: `timeouts`. Caddy loads it, so a migrating configuration meets it, and
-this build has no per-listener timeouts — the message says which capability is
-missing instead of `Unknown directive`.
-
-`listener_wrappers` is accepted for one wrapper and refuses the others by name.
-`proxy_protocol` requires a PROXY protocol header on every listener the
-Caddyfile declares, which is what the addressless block means upstream; the
-sources trusted to send it are the `trusted_proxies` ranges, as they are for the
-per-listener spelling. **This is upstream's `fallback_policy require`**, and the
-difference from the bare name upstream is worth knowing before migrating: there
-the bare `proxy_protocol` defaults to `fallback_policy ignore` and answers a
-request that carries no header (measured on `caddy v2.11.4`), where here that
-connection is refused. `fallback_policy require` is accepted because it names
-this behaviour; the permissive policies (`ignore`, `use`, `reject`, `skip`) and
-the `timeout` and `allow`/`deny` options are refused by name with the reason,
-never ignored. `tls` and `http_redirect` are refused with the reason: TLS here is
-chosen per site by automatic HTTPS rather than by a listener wrapper, and the
-HTTP-to-HTTPS redirect belongs to the companion plaintext port automatic HTTPS
-creates, so a listener declared with `listen` would not redirect.
-`servers <address> { listener_wrappers { … } }` accepts `proxy_protocol` and
-refuses the other wrappers by name, because a `servers` block's options can only
-reach one listener and a wrapper this build does not implement has nowhere to
-apply.
-
-Names sit between the lists above and full support, so they are named here
-rather than in either. `copy_response` and `copy_response_headers` are
-`handle_response` subdirectives and work there; written as directives of their
-own they are refused, which is why they were in the list. `pki` and
-`acme_server` parse, validate and serialize —
-a configuration carrying them loads and runs — but Pingclair will not act as a
-certificate authority for other clients, and says so instead of silently
-issuing nothing. `dns` and `acme_dns` are implemented for Cloudflare; any other
-provider name is refused at startup rather than accepted and ignored.
-
-Three consequences worth stating plainly, because they decide whether
-Pingclair fits at all rather than being details you discover later:
-
-- **DNS-01 ships one provider: Cloudflare.** In a site-level `tls { … }` block,
-  include both `auto` and `dns cloudflare <token>`; `auto` authorises public
-  issuance, while `dns` selects how that issuance proves control. The global
-  `acme_dns` option moves every automatic site onto DNS-01 and works on a host
-  where port 80 is unreachable. A `*.example.com` site orders that wildcard and
-  serves every name under it from the one leaf; list the apex beside it
-  (`example.com`) if the site answers there too, because a wildcard covers
-  exactly one label. Any other provider name is refused at startup
-  by name — the server will not fall back to HTTP-01, because HTTP-01 cannot
-  prove control of a wildcard and the failure would surface at renewal as a
-  validation error that never mentions the option you set.
-- **PHP runs through `php_fastcgi` over FastCGI** on HTTP/1.1 and HTTP/2;
-  HTTP/3 refuses FastCGI routes with 501 until the H3 planner grows its own
-  FastCGI client.
-- **Certificates and state are stored on local disk only** (`storage`), so
-  several instances cannot share one certificate store.
-
-`handle_errors` deserves its own line, and this paragraph previously got it
-backwards: it said the block "exists in this codebase and does nothing, so it
-is refused rather than accepted". It is accepted, and it runs — the block
-handles the raised status, and inside it `{err.status_code}`,
-`{err.status_text}` and `{err.message}` carry the error that entered the
-handler. The long spellings `{http.error.*}` resolve from the same values,
-because Caddy's own adapter rewrites the short form into them. `{err.trace}`
-and `{err.id}` are the two that are *not* implemented: nothing here records the
-error's origin or an occurrence identifier, so those two resolve to the empty
-string. A custom error page can also come from `error_page`, which is a
-Pingclair directive rather than a Caddy one.
-
-> 🔁 A test fails if the parser refuses a name this file never mentions, so
-> the list cannot quietly fall behind the table the parser consults. A README
-> that claims support the binary does not have is worse than one that claims
-> less.
-
-### A known defect: WebSocket upgrades fail under load
-
-Pingclair proxies WebSocket, and roughly **10–15 % of upgrades fail when the
-machine is busy**. This is stated here rather than in the list above because
-the feature is not missing — it works, and then intermittently does not.
-
-The fault is in `pingora-proxy 0.9.0`, not in this project's own handling of
-the upgrade: a trace confirms the request reaches the upstream carrying
-`Connection: Upgrade` and `Upgrade: websocket`. Upstream issue:
-[cloudflare/pingora#946](https://github.com/cloudflare/pingora/issues/946),
-open as of 2026-09-10. The proposed fix,
-[cloudflare/pingora#947](https://github.com/cloudflare/pingora/pull/947), is
-still awaiting maintainer review.
-
-What goes wrong, in one sentence: an upgrade request is a `GET` with no body,
-and the end of *that empty body* is mistaken for the end of the tunnel — but
-only when the upstream's `101` is read first, which is a race the proxy loses
-more often the less idle the machine is.
-
-That ordering is why it hides. On an idle ten-core machine the upgrade test
-passes forty times out of forty; in a two-core container it fails six times out
-of forty; and inserting any delay at all before the upstream's `101` — even a
-bare yield — makes the failures disappear entirely. So a developer machine will
-tell you this defect does not exist.
-
-There is no configuration that avoids it. What a failure looks like from
-outside is a connection torn down immediately after the `101`, with both ends
-seeing EOF and no error.
-
-## 🏗️ Architecture
-
-Pingclair is organized as a modular Cargo workspace:
-
-| Crate | Description |
-|-------|-------------|
-| **`pingclair`** | **CLI entry point.** Parses arguments, initializes logging, bootstraps the system. |
-| **`pingclair-core`** | **Core runtime.** Core data structures, traits, and server lifecycle management. |
-| **`pingclair-config`** | **Configuration compiler.** Lexes, parses, and semantically checks the `Pingclairfile`, producing runtime config objects. |
-| **`pingclair-proxy`** | **Proxy implementation.** HTTP/TCP proxy logic built on Pingora's proxy trait, including the load balancer, plus the HTTP/3 (QUIC) listener built on Cloudflare's quiche. |
-| **`pingclair-static`** | **Static file serving.** Efficient file reads, MIME type inference, and streaming. |
-| **`pingclair-tls`** | **TLS management.** Manual certificates, persistent internal CA issuance, and automatic ACME issuance (Let's Encrypt). |
-| **`pingclair-api`** | **Admin API.** A RESTful interface for inspecting state and hot-reloading configuration at runtime. |
-| **`pingclair-plugin`** | 🚧 **Stub — not usable.** A skeleton for a future plugin interface, with no callers anywhere in the workspace. A configuration naming a `plugin` handler is **rejected**, rather than accepted and silently ignored. Planned for v0.3. |
+| [Install](https://pingclair.com/start/install/) | Release packages, Docker, source builds, verification, and removal. |
+| [Quickstart](https://pingclair.com/start/quickstart/) | Write, validate, inspect, run, and verify a Pingclairfile. |
+| [HTTPS](https://pingclair.com/start/https/) | Public ACME, DNS-01, internal certificates, and certificate files. |
+| [Pingclairfile](https://pingclair.com/reference/pingclairfile/) | Addresses, matchers, route ordering, snippets, and imports. |
+| [Directives](https://pingclair.com/reference/directives/) | Supported directives, syntax, defaults, and failure behavior. |
+| [Command line](https://pingclair.com/reference/command-line/) | Commands, flags, service control, and configuration tools. |
+| [Project status](https://pingclair.com/project/status/) | Release support, unsupported names, known limitations, and upcoming changes. |
+| [Benchmarks](https://pingclair.com/project/benchmarks/) | Current results, test conditions, and interpretation limits. |
+
+The repository [changelog](CHANGELOG.md) records upgrade-relevant changes on
+`main` and between releases. It should be read before changing a deployed
+version.
+
+Documentation is published in English, Simplified Chinese, and Traditional
+Chinese. The English pages define the terminology when translations differ;
+all three editions describe the same commands and configuration surface.
+
+## 📌 Release status
+
+The latest published version is `v0.2.0-rc.3`. The source tree may contain
+unreleased behavior, so release documentation and `main` must not be treated as
+interchangeable.
+
+Important boundaries include:
+
+- Pingclair implements a practical subset of Caddyfile syntax; it is not a
+  drop-in replacement for every Caddy configuration.
+- Unsupported directives and options fail configuration loading explicitly.
+  The complete current lists are maintained on the
+  [project status page](https://pingclair.com/project/status/).
+- Certificate and runtime state use a local file-backed store. Multiple
+  instances do not share one distributed certificate store.
+- Pingclair is an HTTP server and reverse proxy. It does not provide generic
+  `CONNECT` tunnels or advertise extended CONNECT support.
+- Request trailers are not forwarded to an upstream. Applications that depend
+  on request trailers should not be placed behind this release.
+
+Known defects, release-specific limitations, and differences between the
+latest release and `main` are tracked on the
+[project status page](https://pingclair.com/project/status/) and in the
+[changelog](CHANGELOG.md). Performance results are published only with their
+measurement conditions on the
+[benchmarks page](https://pingclair.com/project/benchmarks/).
 
 ## 🤝 Contributing
 
-Contributions are very welcome — whether you're fixing a bug, adding a feature, or just improving the docs.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. It
+describes the development workflow, test requirements, commit conventions,
+and architectural constraints.
 
-Read **[CONTRIBUTING.md](CONTRIBUTING.md)** first. It covers the four-command gate every commit has to pass, what counts as adequately tested for a web server, and the architecture constraints that are not obvious from the code (BoringSSL linking, the HTTP/3 path, bounded memory).
+Useful project resources:
 
-What changed between releases — and what is on `main` but not released yet — is in **[CHANGELOG.md](CHANGELOG.md)**.
+- [Issue tracker](https://github.com/dorianverlaine/pingclair/issues) for
+  confirmed defects and feature requests.
+- [Discussions](https://github.com/dorianverlaine/pingclair/discussions) for
+  design questions and general project conversation.
+- [Changelog](CHANGELOG.md) for released and unreleased behavior changes.
+- [CLA](CLA.md) for the one-time contributor agreement.
 
-First-time contributors sign a one-time [CLA](CLA.md). You keep the copyright to your work.
+Security-sensitive reports should follow the repository's published security
+policy when one is available. Do not include credentials, private keys, access
+tokens, or private infrastructure details in a public issue.
 
 ## 📄 License
 
-Licensed under the **Apache License 2.0**. See [LICENSE](LICENSE) for the full terms and [NOTICE](NOTICE) for attribution requirements and third-party components.
-
----
-
-<div align="center">
-  <sub>Built with ❤️ and Rust</sub>
-</div>
+Pingclair is licensed under the [Apache License 2.0](LICENSE). See
+[NOTICE](NOTICE) for attribution requirements and third-party notices.
