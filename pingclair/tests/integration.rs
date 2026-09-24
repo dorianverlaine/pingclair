@@ -94,6 +94,10 @@ mod max_forwards;
 #[path = "integration/connect.rs"]
 mod connect;
 
+// 🧱 `request_buffers`/`response_buffers` on the FastCGI transport.
+#[path = "integration/fastcgi_buffering.rs"]
+mod fastcgi_buffering;
+
 // 🚫 What a locally raised error status says about itself.
 #[path = "integration/error_responses.rs"]
 mod error_responses;

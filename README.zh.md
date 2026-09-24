@@ -648,7 +648,7 @@ retry 政策接受 Caddy 的 `lb_retry_match` 拼法：`method`、`path`、`head
 `unlimited`。**這裡的 `unlimited` 不等於無上限的記憶體**：緩衝到固定的 8 MiB
 上限就停，其餘照舊串流；上限一事在啟動時會說，body 真的超過時再說一次
 （只說一次）。兩種情況下 body 都會完整送達，差別只在什麼時候開始送。
-`fastcgi` transport 不受緩衝影響，這件事啟動時同樣會說。
+`fastcgi` transport 也以同樣方式緩衝，所有協定皆然。
 
 `reverse_proxy` 也接受 `handle_response` 區塊，搭配 response matcher
 （`@name status …`／`@name header …`）、`replace_status`、`copy_response` 與

@@ -4632,6 +4632,11 @@ async fn fastcgi_upstream(
         .map(|value| request_started + Duration::from_millis(value));
     let mut counted = 0u64;
     let mut upload_pacer = limits.upload_bytes_per_sec.map(StreamPacer::new);
+    // 🧱 `request_buffers`, the same state machine and ceiling as the H1/H2
+    // FastCGI exchange and the HTTP proxy paths. Limits, pacing and the 413
+    // still apply to each chunk as it arrives, before it is held.
+    let buffering = state.buffering(route_index);
+    let mut request_buffer = buffering.request.map(crate::body_buffer::BufferedBody::new);
     if !bodyless {
         loop {
             let next = match limits.body_timeout_ms {
@@ -4660,6 +4665,13 @@ async fn fastcgi_upstream(
                 }
                 tokio::time::sleep(delay).await;
             }
+            let chunk = match request_buffer.as_mut() {
+                Some(buffer) => match buffer.offer_reporting(chunk, "request") {
+                    Some(released) => released,
+                    None => continue,
+                },
+                None => chunk,
+            };
             exchange.send_body(&chunk).await.map_err(exchange_error)?;
         }
     }
@@ -4674,6 +4686,9 @@ async fn fastcgi_upstream(
         );
         exchange.abort().await;
         return Err((400, "Bad Request"));
+    }
+    if let Some(held) = request_buffer.as_mut().and_then(|buffer| buffer.finish()) {
+        exchange.send_body(&held).await.map_err(exchange_error)?;
     }
     exchange.finish_body().await.map_err(exchange_error)?;
     let response = exchange
@@ -4866,13 +4881,32 @@ async fn fastcgi_upstream(
     send_headers(resp_tx, stream_id, h3_headers, false).await;
 
     let mut download_pacer = limits.download_bytes_per_sec.map(StreamPacer::new);
+    // 🧱 `response_buffers` holds records until the responder finishes or the
+    // ceiling is reached, so a slow reader stops pinning the php-fpm worker.
+    let mut response_buffer = buffering
+        .response
+        .map(crate::body_buffer::BufferedBody::new);
     loop {
         match exchange.read_body_chunk().await {
             Ok(Some(bytes)) => {
+                let bytes = match response_buffer.as_mut() {
+                    Some(buffer) => match buffer.offer_reporting(bytes, "response") {
+                        Some(released) => released,
+                        None => continue,
+                    },
+                    None => bytes,
+                };
                 pace_h3_body(&mut download_pacer, request_deadline, bytes.len()).await?;
                 send_body(resp_tx, stream_id, bytes, false).await;
             }
-            Ok(None) => break,
+            Ok(None) => {
+                // 📤 End of stream releases whatever is still held.
+                if let Some(held) = response_buffer.as_mut().and_then(|buffer| buffer.finish()) {
+                    pace_h3_body(&mut download_pacer, request_deadline, held.len()).await?;
+                    send_body(resp_tx, stream_id, held, false).await;
+                }
+                break;
+            }
             Err(error) => {
                 tracing::warn!(%error, "🧵 H3 FastCGI response stream failed");
                 break;

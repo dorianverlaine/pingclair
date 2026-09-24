@@ -20,6 +20,16 @@ reports `0.2.0-rc.3`. The first release candidate, `0.2.0-rc.1`, was tagged on
 changes since `v0.1.7` and becomes `## [0.2.0]` when the non-goals below are
 decided.
 
+### 🧱 Body buffering reaches the FastCGI transport
+
+`request_buffers` and `response_buffers` were accepted on a `fastcgi`
+transport (and so inside `php_fastcgi`) and then ignored, with a startup
+warning saying so: FastCGI writes and reads its own records and never
+passed through the code that buffers HTTP bodies. Both now apply there
+too, over HTTP/1.1, HTTP/2 and HTTP/3, with the same 8 MiB ceiling past
+which the rest streams, so a slow client or reader no longer holds a
+php-fpm worker for its whole transfer. The startup warning is gone. (#16)
+
 ### 🔌 `CONNECT` gets the same 405 on every protocol
 
 This server is a reverse proxy and opens no tunnels, but each transport

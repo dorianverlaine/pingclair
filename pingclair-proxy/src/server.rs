@@ -1622,19 +1622,6 @@ impl ProxyState {
                             "🧱 {explanation}"
                         );
                     }
-                    // 🧵 FastCGI never enters either HTTP proxy body path — it
-                    // reads and writes its own records — so buffering does not
-                    // reach it. Saying so is the whole rule this project has
-                    // about knobs: an operator is never left believing a
-                    // setting took effect when it did not.
-                    if configured.is_some() && proxy_config.fastcgi.is_some() {
-                        tracing::warn!(
-                            route = %route.path,
-                            directive = name,
-                            "🧵 Body buffering has no effect on a FastCGI transport; \
-                             that body streams"
-                        );
-                    }
                 }
 
                 // ⚠️ Accepted, but only partly honoured, so it is said at load.
@@ -3679,6 +3666,11 @@ impl PingclairProxy {
             proxy_error(502, "FastCGI exchange failed")
         };
         exchange.begin(&env).await.map_err(protocol_error)?;
+        // 🧱 `request_buffers` holds the body here, where FastCGI writes its own
+        // records, with the same state machine and ceiling as the HTTP body
+        // filter: a slow client keeps a php-fpm worker waiting only once it
+        // has sent the whole body or outgrown the buffer.
+        let mut request_buffer = ctx.request_buffer.take();
         if !bodyless {
             while let Some(bytes) = session.read_request_body().await? {
                 // 🛡️ FastCGI is the one upstream path that never enters
@@ -3692,8 +3684,18 @@ impl PingclairProxy {
                     exchange.abort().await;
                     return Err(error);
                 }
+                let bytes = match request_buffer.as_mut() {
+                    Some(buffer) => match buffer.offer_reporting(bytes, "request") {
+                        Some(released) => released,
+                        None => continue,
+                    },
+                    None => bytes,
+                };
                 exchange.send_body(&bytes).await.map_err(protocol_error)?;
             }
+        }
+        if let Some(held) = request_buffer.as_mut().and_then(|buffer| buffer.finish()) {
+            exchange.send_body(&held).await.map_err(protocol_error)?;
         }
         exchange.finish_body().await.map_err(protocol_error)?;
 
@@ -3772,11 +3774,26 @@ impl PingclairProxy {
 
         // 🌊 The normal path streams the CGI body record by record; a client
         // that leaves mid-response aborts the FastCGI request.
+        //
+        // 🧱 With `response_buffers`, records are held until the responder
+        // finishes or the ceiling is reached, so a slow reader stops pinning
+        // the php-fpm worker. What is held is released at end of stream.
+        let mut response_buffer = ctx.response_buffer.take();
         session
             .write_response_header(Box::new(response), false)
             .await?;
         loop {
-            match exchange.read_body_chunk().await {
+            let read = match exchange.read_body_chunk().await {
+                Ok(Some(chunk)) => match response_buffer.as_mut() {
+                    Some(buffer) => match buffer.offer_reporting(chunk, "response") {
+                        Some(released) => Ok(Some(released)),
+                        None => continue,
+                    },
+                    None => Ok(Some(chunk)),
+                },
+                other => other,
+            };
+            match read {
                 Ok(Some(chunk)) => {
                     if session
                         .write_response_body(Some(chunk), false)
@@ -3787,7 +3804,14 @@ impl PingclairProxy {
                         break;
                     }
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    // 📤 End of stream releases whatever is still held.
+                    if let Some(held) = response_buffer.as_mut().and_then(|buffer| buffer.finish())
+                    {
+                        session.write_response_body(Some(held), false).await?;
+                    }
+                    break;
+                }
                 Err(error) => {
                     tracing::warn!(%error, "🧵 FastCGI body read failed");
                     break;

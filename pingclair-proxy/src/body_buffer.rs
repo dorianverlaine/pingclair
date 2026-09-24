@@ -193,6 +193,22 @@ impl BufferedBody {
         None
     }
 
+    /// 📥 [`Self::offer`], plus the one overflow report a body is owed when
+    /// this chunk is the one that tips it into streaming. `direction` is
+    /// `"request"` or `"response"`, as the report names it.
+    pub(crate) fn offer_reporting(
+        &mut self,
+        chunk: Bytes,
+        direction: &'static str,
+    ) -> Option<Bytes> {
+        let was_streaming = self.overflowed;
+        let released = self.offer(chunk);
+        if !was_streaming && self.overflowed {
+            report_overflow(direction, self.limit);
+        }
+        released
+    }
+
     /// 📤 Everything still held, at end of stream.
     ///
     /// Returns `None` when there is nothing left, which is both the "body was

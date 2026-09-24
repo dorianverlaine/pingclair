@@ -44,6 +44,10 @@ mod max_forwards;
 #[path = "h3_end_to_end/connect.rs"]
 mod connect;
 
+// 🧱 Body buffering on the FastCGI transport.
+#[path = "h3_end_to_end/fastcgi_buffering.rs"]
+mod fastcgi_buffering;
+
 // 🚫 What a locally raised error status says about itself.
 #[path = "h3_end_to_end/error_responses.rs"]
 mod error_responses;

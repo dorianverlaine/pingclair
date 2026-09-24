@@ -716,8 +716,8 @@ a backend worker. Sizes follow the SI/IEC split — `1MB` is a million bytes,
 unbounded memory here.** Buffering stops at a fixed 8 MiB ceiling and the rest
 of the body streams, which is reported at startup and again, once, when a body
 actually outgrows its buffer. Bodies always arrive complete either way; what
-changes is when they start moving. Buffering has no effect on a `fastcgi`
-transport, which the server also says at startup.
+changes is when they start moving. A `fastcgi` transport is buffered the same
+way, on every protocol.
 
 `reverse_proxy` also accepts `handle_response` blocks with response matchers
 (`@name status …` / `@name header …`), `replace_status`, `copy_response`, and
