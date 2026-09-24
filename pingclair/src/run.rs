@@ -29,13 +29,16 @@ use crate::paths::tls_store_dir_with;
 use crate::runtime_listeners::{
     RuntimeListeners, RuntimePublisherInputs, prepare_listener_policies,
 };
-use crate::systemd::{notify_systemd_ready, notify_systemd_status};
+use crate::systemd::notify_systemd_ready;
 use parking_lot::RwLock;
 use pingclair_proxy::client_auth::PublishedListenerPolicy;
 use pingora_core::listeners::tls::TlsSettings;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(unix)]
+mod reload;
 
 pub(crate) fn run_server(
     config_path: String,
@@ -1088,128 +1091,14 @@ pub(crate) fn run_server(
         });
     }
 
-    // ========================================
-    // 🔔 Signal Handling for SIGUSR1 (Reload)
-    // ========================================
+    // 🔔 SIGUSR1 reloads the configuration file; see `reload`.
     #[cfg(unix)]
     if !config_path.is_empty() {
-        let config_path = config_path.clone();
-        let publisher_for_reload = config_publisher.clone();
-        let api_changed_for_reload = api_changed.clone();
-
-        bg_handle.spawn(async move {
-            use tokio::signal::unix::{SignalKind, signal};
-
-            // 🚦 SIGUSR1 is Caddy's reload signal; SIGHUP is deliberately
-            // ignored, matching Caddy's signal table.
-            // 🙈 Claiming the stream registers the handler, so the default
-            // terminate-on-SIGHUP action never fires; the signal is dropped.
-            let mut _hup_ignored = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("❌ Failed to create SIGHUP listener: {}", e);
-                    return;
-                }
-            };
-            let mut usr1_stream = match signal(SignalKind::user_defined1()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("❌ Failed to create SIGUSR1 listener: {}", e);
-                    return;
-                }
-            };
-
-            tracing::info!(
-                "📡 Reload listener active (SIGUSR1, Config: {})",
-                config_path
-            );
-
-            loop {
-                let signal_name = tokio::select! {
-                    _ = usr1_stream.recv() => "SIGUSR1",
-                };
-                if api_changed_for_reload.load(std::sync::atomic::Ordering::SeqCst) {
-                    tracing::warn!(
-                        "🚫 SIGUSR1 reload disabled: the configuration was changed through \
-                         the Admin API after startup (Caddy semantics)"
-                    );
-                    // 📣 An operator who sent the signal deserves to know it was
-                    // ignored rather than inferring it from a status line that
-                    // never changes.
-                    notify_systemd_status(
-                        "Serving (SIGUSR1 reload ignored: the Admin API owns the configuration since it last changed it)",
-                    );
-                    continue;
-                }
-                let reload_start = std::time::Instant::now();
-                tracing::info!(
-                    "🔔 Received {signal_name}, reloading configuration from: {}",
-                    config_path
-                );
-                // Step 1: Validate and load new configuration
-                tracing::info!("📋 Step 1/3: Validating configuration...");
-                let result = if std::path::Path::new(&config_path).is_dir() {
-                    pingclair_config::compile_directory(&config_path)
-                } else {
-                    pingclair_config::compile_file(&config_path)
-                };
-
-                match result {
-                    Ok(new_config) => {
-                        tracing::info!("✅ Step 1/3: Configuration validation successful");
-                        tracing::info!("📋 Step 2/3: Preparing configuration update...");
-                        tracing::info!("📋 Step 3/3: Publishing prepared configuration...");
-                        match publisher_for_reload.publish_config(&new_config, None) {
-                            Ok(success_count) => {
-                                let reload_duration = reload_start.elapsed();
-                                tracing::info!(
-                                    "✅ Configuration reload completed successfully in {:?}",
-                                    reload_duration
-                                );
-                                tracing::info!("   📊 {} listener(s) updated", success_count);
-                                println!(
-                                    "✅ Configuration reloaded successfully ({success_count} \
-                                     listeners updated in {reload_duration:?})"
-                                );
-                                // 📣 `systemctl reload` only learned that the
-                                // signal was delivered; this is where the answer
-                                // it can never see gets published.
-                                notify_systemd_status(&format!(
-                                    "Serving (reloaded {success_count} listener(s) in {reload_duration:?})"
-                                ));
-                            }
-                            Err(error) => {
-                                let reload_duration = reload_start.elapsed();
-                                tracing::error!(
-                                    kind = ?error.kind,
-                                    "❌ Configuration reload rejected after {:?}: {}",
-                                    reload_duration,
-                                    error
-                                );
-                                tracing::error!(
-                                    "   💡 Previous configuration remains active, unchanged"
-                                );
-                                eprintln!("❌ Configuration reload rejected: {error}");
-                                eprintln!("   💡 Previous configuration remains active, unchanged");
-                                notify_systemd_status(&format!("Reload rejected: {error}"));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let reload_duration = reload_start.elapsed();
-                        tracing::error!(
-                            "❌ Configuration reload failed after {:?}: {}",
-                            reload_duration,
-                            e
-                        );
-                        tracing::error!("   💡 Previous configuration remains active");
-                        eprintln!("❌ Configuration reload failed: {e}");
-                        eprintln!("   💡 Previous configuration remains active");
-                        notify_systemd_status(&format!("Reload failed: {e}"));
-                    }
-                }
-            }
-        });
+        bg_handle.spawn(reload::listen_for_reload(
+            config_path.clone(),
+            config_publisher.clone(),
+            api_changed.clone(),
+        ));
     }
 
     // 🔄 ========================================
