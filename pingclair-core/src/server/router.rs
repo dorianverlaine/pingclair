@@ -841,7 +841,6 @@ pub const MATCHER_PLACEHOLDERS: &[&str] = &[
     "hostport",
     "port",
     "method",
-    "remote_ip",
     "remote_host",
     "client_ip",
     "http.request.uri.path",
@@ -986,9 +985,9 @@ fn resolve_matcher_placeholder(name: &str, request: &MatcherRequest<'_>, path: &
             .map(|(_, port)| port.to_string())
             .unwrap_or_default(),
         "method" | "http.request.method" => request.method.to_string(),
-        // 🛡️ `{client_ip}` is the client after `trusted_proxies`, and
-        // `{remote_ip}` is our older spelling of it.
-        "client_ip" | "http.request.client_ip" | "remote_ip" => request
+        // 🛡️ `{client_ip}` is the client after `trusted_proxies`; the old
+        // `{remote_ip}` spelling is refused when the configuration loads.
+        "client_ip" | "http.request.client_ip" => request
             .addresses
             .client_ip
             .map(|ip| ip.to_string())

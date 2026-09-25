@@ -36,7 +36,7 @@ pub enum CompileError {
     UnsupportedFeature { feature: String },
 }
 
-type CompileResult<T> = Result<T, CompileError>;
+pub(crate) type CompileResult<T> = Result<T, CompileError>;
 
 /// Compile AST to PingclairConfig
 pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
@@ -993,6 +993,8 @@ fn validate_cache_ceiling_agrees(config: &PingclairConfig) -> CompileResult<()> 
 }
 
 pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
+    // 🚫 `{remote_ip}` is refused wherever it appears (see that module).
+    crate::retired_placeholders::refuse_retired_placeholders(config)?;
     // 🛡️ Both lists are refused here rather than at listener setup, so
     // `pingclair validate`, the Admin `/load` endpoint and a reload all reject
     // a bad entry. `blocked_ips` used to be checked by nobody: the listener

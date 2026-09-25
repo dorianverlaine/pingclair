@@ -8517,7 +8517,7 @@ mod tests {
     async fn h3_respond_expands_placeholders_like_h1_h2() {
         let handler = HandlerConfig::Respond {
             status: 200,
-            body: Some("path={path} scheme={scheme} host={host} remote={remote_ip}".to_string()),
+            body: Some("path={path} scheme={scheme} host={host} remote={client_ip}".to_string()),
             headers: BTreeMap::new(),
         };
         let state = proxy_state(handler.clone());

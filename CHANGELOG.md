@@ -49,6 +49,9 @@ below, which ends with what to write instead.
 - **`{remote_host}` is the connection's peer.** Behind `trusted_proxies`, use
   `{client_ip}` for the forwarded client, e.g. in `header_up X-Real-IP`.
   → [`{remote_host}` is the connection's peer, `{client_ip}` the client](#-remote_host-is-the-connections-peer-client_ip-the-client)
+- **`{remote_ip}` is refused at load.** It was never Caddy's; write
+  `{client_ip}` for the client or `{remote_host}` for the peer.
+  → [`{remote_ip}` is refused](#-remote_ip-is-refused-write-remote_host-or-client_ip)
 - **A site address with a port and no scheme is HTTPS**, as upstream:
   `example.com:8080` needs `http://` in front to stay plaintext.
   → [Breaking](#️-breaking)
@@ -115,6 +118,19 @@ restart; before, only the configuration the process started with counted.
 
 (#32)
 
+### 🚫 `{remote_ip}` is refused; write `{remote_host}` or `{client_ip}`
+
+**Breaking for any configuration that writes `{remote_ip}`.** Caddy has no
+such placeholder; it was this project's own, and it meant the verified client
+while the `remote_ip` matcher means the connection's peer. The same word
+naming two different addresses made `header_up X-Real-IP {remote_ip}`
+impossible to read correctly. A Pingclairfile or JSON config that uses it
+anywhere now fails to load, and the error names where it appeared.
+
+📌 Upgrading: write `{client_ip}` for the client after `trusted_proxies`
+(what `{remote_ip}` meant), or `{remote_host}` for the connection's peer.
+(#200)
+
 ### 🔌 `{remote_host}` is the connection's peer, `{client_ip}` the client
 
 **Breaking for `{remote_host}` behind `trusted_proxies`.** The placeholders
@@ -128,12 +144,9 @@ balancer could never name the balancer.
 
 `{remote_port}` / `{http.request.remote.port}` and `{remote}` /
 `{http.request.remote}` (`host:port`) are new and also describe the peer.
-They used to render empty, on HTTP/3 as well as HTTP/1.1–2. `{remote_ip}`,
-this project's own spelling, keeps meaning the verified client. A file or
+They used to render empty, on HTTP/3 as well as HTTP/1.1–2. A file or
 `vars` matcher reads `{remote_host}` and `{client_ip}` the same way. FastCGI
-`REMOTE_ADDR` was already the peer and stays so; in a `php_fastcgi` `env`
-template, `{remote_ip}` is now the verified client as everywhere else, where
-it used to be the peer.
+`REMOTE_ADDR` was already the peer and stays so.
 
 📌 Upgrading: a site without `trusted_proxies` sees no change, because there
 the two addresses are the same. A site with `trusted_proxies` that relied on

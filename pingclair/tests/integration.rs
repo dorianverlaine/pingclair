@@ -3940,7 +3940,7 @@ async fn test_untrusted_forwarding_headers_are_sanitized_upstream() {
                     "upstreams": [format!("http://{upstream_address}")],
                     "load_balance": { "strategy": "round_robin" },
                     "headers_up": {
-                        "X-Verified-Placeholder": "{remote_ip}"
+                        "X-Verified-Placeholder": "{client_ip}"
                     },
                     "headers_down": {}
                 }

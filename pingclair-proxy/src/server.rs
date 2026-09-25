@@ -5995,7 +5995,7 @@ fn record_cache_outcome(session: &Session, host: &str, route: &str) {
 /// Supported placeholders:
 /// - `{http.request.header.Header-Name}` → value of the named request header
 /// - `{host}`                            → request Host header
-/// - 🛡️ `{client_ip}`                    → verified client IP (`{remote_ip}` too)
+/// - 🛡️ `{client_ip}`                    → verified client IP
 /// - 🔌 `{remote_host}` / `{remote_port}` → the connection's immediate peer
 /// - `{http.request.method}`             → HTTP method
 /// - `{http.request.uri}`                → full URI
@@ -6227,11 +6227,9 @@ fn resolve_single_placeholder(
         }
         // 🛡️ `{client_ip}` is the client after `trusted_proxies`: the forwarded
         // address when the peer is a trusted proxy, the peer otherwise. An
-        // untrusted `X-Forwarded-For` cannot forge it. `{remote_ip}` is our own
-        // older spelling of the same value and keeps its meaning.
-        "client_ip" | "http.request.client_ip" | "remote_ip" => {
-            verified_client_ip.unwrap_or("").to_string()
-        }
+        // untrusted `X-Forwarded-For` cannot forge it. Our old `{remote_ip}`
+        // spelling of it is refused when the configuration loads.
+        "client_ip" | "http.request.client_ip" => verified_client_ip.unwrap_or("").to_string(),
         // 🔌 `{remote_host}`, `{remote_port}` and `{remote}` are the socket
         // peer, whatever any header claims, as in Caddy. Behind a load
         // balancer they name the balancer, which is what makes them useful for
