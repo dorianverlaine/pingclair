@@ -2387,20 +2387,25 @@ impl PingclairProxy {
         &self,
         session: &Session,
         headers: &http::HeaderMap,
-    ) -> (IpAddr, IpAddr, IpAddr) {
+    ) -> (IpAddr, SocketAddr, IpAddr) {
         if let Some(identity) = self.proxy_protocol_identity(session) {
             let client = self.trusted_proxies.verified_client_ip_with_fallback(
                 identity.transport_peer.ip(),
                 identity.client.ip(),
                 headers,
             );
-            return (identity.transport_peer.ip(), identity.client.ip(), client);
+            return (identity.transport_peer.ip(), identity.client, client);
         }
-        let peer = session_peer_ip(session);
+        // 🔌 Port 0 stands for "no port" on a Unix-socket peer, which
+        // `{remote_port}` renders as empty.
+        let peer = session_inet_addresses(session).map_or_else(
+            || SocketAddr::new(session_peer_ip(session), 0),
+            |(peer, _)| peer,
+        );
         (
+            peer.ip(),
             peer,
-            peer,
-            self.trusted_proxies.verified_client_ip(peer, headers),
+            self.trusted_proxies.verified_client_ip(peer.ip(), headers),
         )
     }
 
@@ -3671,6 +3676,7 @@ impl PingclairProxy {
                 request: &prepared_request,
                 remote_ip,
                 remote_port,
+                verified_client_ip: verified_client_ip.as_deref(),
                 scheme: ctx.request_scheme,
                 original_uri: ctx
                     .orig_uri
@@ -5989,7 +5995,8 @@ fn record_cache_outcome(session: &Session, host: &str, route: &str) {
 /// Supported placeholders:
 /// - `{http.request.header.Header-Name}` → value of the named request header
 /// - `{host}`                            → request Host header
-/// - 🛡️ `{remote_ip}`                    → verified client IP
+/// - 🛡️ `{client_ip}`                    → verified client IP (`{remote_ip}` too)
+/// - 🔌 `{remote_host}` / `{remote_port}` → the connection's immediate peer
 /// - `{http.request.method}`             → HTTP method
 /// - `{http.request.uri}`                → full URI
 /// - `{http.request.uri.path}`           → URI path only
@@ -6218,13 +6225,32 @@ fn resolve_single_placeholder(
                 .unwrap_or(&"")
                 .to_string()
         }
-        // 🧭 `{remote_host}` is the portable spelling of the client address and
-        // `{remote_ip}` is ours. Both resolve to the *verified* address, never
-        // to the raw socket peer, so an untrusted `X-Forwarded-For` cannot
-        // forge it.
-        "remote_ip" | "remote_host" | "http.request.remote.host" => {
+        // 🛡️ `{client_ip}` is the client after `trusted_proxies`: the forwarded
+        // address when the peer is a trusted proxy, the peer otherwise. An
+        // untrusted `X-Forwarded-For` cannot forge it. `{remote_ip}` is our own
+        // older spelling of the same value and keeps its meaning.
+        "client_ip" | "http.request.client_ip" | "remote_ip" => {
             verified_client_ip.unwrap_or("").to_string()
         }
+        // 🔌 `{remote_host}`, `{remote_port}` and `{remote}` are the socket
+        // peer, whatever any header claims, as in Caddy. Behind a load
+        // balancer they name the balancer, which is what makes them useful for
+        // telling one hop from another; the client is `{client_ip}`.
+        "remote_host" | "http.request.remote.host" => vars
+            .remote()
+            .map(|remote| remote.ip().to_string())
+            .unwrap_or_default(),
+        "remote_port" | "http.request.remote.port" => vars
+            .remote()
+            .filter(|remote| remote.port() != 0)
+            .map(|remote| remote.port().to_string())
+            .unwrap_or_default(),
+        // 🌐 `SocketAddr` renders IPv6 bracketed (`[::1]:443`), the same
+        // `host:port` shape Go gives a request's remote address.
+        "remote" | "http.request.remote" => vars
+            .remote()
+            .map(|remote| remote.to_string())
+            .unwrap_or_default(),
         "method" | "http.request.method" => req.method.as_str().to_string(),
         // 🧭 `{scheme}` is what the *client* used, which is why it is passed in
         // rather than derived here: a request arriving over a plaintext
@@ -6927,9 +6953,10 @@ impl ProxyHttp for PingclairProxy {
             // source is the peer: that header replaces the connection address.
             let addresses = RequestAddresses {
                 client_ip: Some(verified_client_ip),
-                remote_ip: Some(transport_client_ip),
+                remote_ip: Some(transport_client_ip.ip()),
             };
             ctx.remote_ip = addresses.remote_ip;
+            ctx.request_vars.set_remote(transport_client_ip);
             let remote_ip_len = write_ip(verified_client_ip, &mut remote_ip_buf);
             let remote_ip = std::str::from_utf8(&remote_ip_buf[..remote_ip_len])
                 .expect("formatted IP addresses are ASCII");
@@ -7855,7 +7882,7 @@ impl ProxyHttp for PingclairProxy {
             let xff = if self.trusted_proxies.contains(transport_peer_ip) {
                 let value = self.trusted_proxies.forwarded_for_with_fallback(
                     transport_peer_ip,
-                    transport_client_ip,
+                    transport_client_ip.ip(),
                     &downstream_headers.headers,
                 );
                 http::HeaderValue::from_str(&value).map_err(|_| {

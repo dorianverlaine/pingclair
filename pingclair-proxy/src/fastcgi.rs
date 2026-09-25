@@ -164,6 +164,9 @@ pub(crate) struct EnvironmentInput<'a> {
     pub(crate) request: &'a RequestHeader,
     pub(crate) remote_ip: IpAddr,
     pub(crate) remote_port: Option<u16>,
+    /// 🛡️ The client after `trusted_proxies`, which `{client_ip}` in an `env`
+    /// template reports. `REMOTE_ADDR` stays the socket peer, as in Caddy.
+    pub(crate) verified_client_ip: Option<&'a str>,
     pub(crate) scheme: &'static str,
     pub(crate) original_uri: &'a str,
     pub(crate) request_vars: &'a RequestVars,
@@ -345,12 +348,11 @@ pub(crate) fn build_environment(
     }
 
     // 🧰 Operator variables override CGI defaults after placeholder expansion.
-    let verified_client_ip = input.remote_ip.to_string();
     for (key, template) in &config.env {
         let resolved = crate::server::resolve_caddy_placeholders(
             template,
             request,
-            Some(&verified_client_ip),
+            input.verified_client_ip,
             input.scheme,
             input.request_vars,
         );
@@ -575,6 +577,7 @@ mod tests {
                 request: &request,
                 remote_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 4)),
                 remote_port: Some(44321),
+                verified_client_ip: None,
                 scheme: "https",
                 original_uri: "/original.php?x=1",
                 request_vars: &RequestVars::default(),
@@ -615,6 +618,7 @@ mod tests {
                 request: &request,
                 remote_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 4)),
                 remote_port: Some(44321),
+                verified_client_ip: None,
                 scheme: "https",
                 original_uri: "/index.php",
                 request_vars: &RequestVars::default(),
@@ -661,6 +665,7 @@ mod tests {
                 request: &prepared,
                 remote_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 4)),
                 remote_port: Some(44321),
+                verified_client_ip: None,
                 scheme: "https",
                 original_uri: "/index.php",
                 request_vars: &variables,

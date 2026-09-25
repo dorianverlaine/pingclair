@@ -1027,6 +1027,37 @@ async fn h3_client_ip_abort_blocks_only_the_named_range() {
     assert_eq!(allowed.body, b"served");
 }
 
+/// 🔌 `{remote}`, `{remote_host}` and `{remote_port}` name the QUIC peer. H3
+/// records the peer separately from the verified client, so without it these
+/// placeholders rendered empty here while H1/H2 filled them in.
+///
+/// 📌 This harness builds its proxy without `trusted_proxies`, so the
+/// forwarded-client half of the split is covered by the H1 integration test;
+/// here the untrusted `X-Forwarded-For` must simply leave `{client_ip}` alone.
+#[tokio::test]
+async fn h3_remote_placeholders_name_the_quic_peer() {
+    let source = r#":443 {
+            respond "{remote_host}|{client_ip}|{remote_port}|{remote}" 200
+        }"#;
+    let compiled = pingclair_config::compile(source).unwrap();
+    let site = compiled.servers[0].clone();
+    let server = spawn_h3_server_with(|address| ServerConfig {
+        listen: vec![address.to_string()],
+        ..site
+    })
+    .await;
+
+    let response = h3_get_with_headers(server, "/", &[("x-forwarded-for", "203.0.113.7")])
+        .await
+        .unwrap();
+    let body = String::from_utf8(response.body).unwrap();
+    let fields: Vec<&str> = body.split('|').collect();
+    assert_eq!(fields[..2], ["127.0.0.1", "127.0.0.1"], "{body}");
+    let port: u16 = fields[2].parse().expect(&body);
+    assert_ne!(port, 0, "{body}");
+    assert_eq!(fields[3], format!("127.0.0.1:{port}"), "{body}");
+}
+
 /// 🧾 Reads one whole chunked HTTP/1 request from a backend socket and returns
 /// its body frames.
 ///

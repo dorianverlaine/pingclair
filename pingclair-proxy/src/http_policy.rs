@@ -36,9 +36,27 @@ pub(crate) use strict_transport::StrictTransport;
 #[derive(Debug, Clone, Default)]
 pub struct RequestVars {
     values: BTreeMap<String, String>,
+    /// 🔌 The connection's immediate peer, which `{remote_host}`,
+    /// `{remote_port}` and `{remote}` report. It rides here because every
+    /// placeholder expansion already receives this struct on both transports,
+    /// and a `SocketAddr` is copied in place rather than formatted up front, so
+    /// a request that never names these placeholders pays nothing for them.
+    remote: Option<std::net::SocketAddr>,
 }
 
 impl RequestVars {
+    /// 🔌 Records the immediate peer once per request, before any handler
+    /// expands a placeholder.
+    pub(crate) fn set_remote(&mut self, remote: std::net::SocketAddr) {
+        self.remote = Some(remote);
+    }
+
+    /// 🔌 The immediate peer, or `None` when the connection has no IP
+    /// address (a Unix socket) or nothing recorded one.
+    pub(crate) fn remote(&self) -> Option<std::net::SocketAddr> {
+        self.remote
+    }
+
     /// 🧩 Sets one variable, replacing any value an earlier rule wrote.
     pub fn set(&mut self, name: impl Into<String>, value: impl Into<String>) {
         self.values.insert(name.into(), value.into());

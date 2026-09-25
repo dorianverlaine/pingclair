@@ -46,6 +46,9 @@ below, which ends with what to write instead.
 - **`remote_ip` matches the connection's peer.** Behind `trusted_proxies`, use
   `client_ip` to match the forwarded client.
   → [`remote_ip` matches the connection's peer, `client_ip` the client](#-remote_ip-matches-the-connections-peer-client_ip-the-client)
+- **`{remote_host}` is the connection's peer.** Behind `trusted_proxies`, use
+  `{client_ip}` for the forwarded client, e.g. in `header_up X-Real-IP`.
+  → [`{remote_host}` is the connection's peer, `{client_ip}` the client](#-remote_host-is-the-connections-peer-client_ip-the-client)
 - **A site address with a port and no scheme is HTTPS**, as upstream:
   `example.com:8080` needs `http://` in front to stay plaintext.
   → [Breaking](#️-breaking)
@@ -111,6 +114,31 @@ restart; before, only the configuration the process started with counted.
 ```
 
 (#32)
+
+### 🔌 `{remote_host}` is the connection's peer, `{client_ip}` the client
+
+**Breaking for `{remote_host}` behind `trusted_proxies`.** The placeholders
+now split the same way the matchers did in #191, as in Caddy.
+`{remote_host}` and `{http.request.remote.host}` are the connection's own
+peer, whatever any header says; behind a trusted load balancer that is the
+balancer. `{client_ip}` and `{http.request.client_ip}` are the client after
+`trusted_proxies` is applied. Until now `{remote_host}` printed the forwarded
+client, so a log line or `header_up X-Real-IP {remote_host}` behind a
+balancer could never name the balancer.
+
+`{remote_port}` / `{http.request.remote.port}` and `{remote}` /
+`{http.request.remote}` (`host:port`) are new and also describe the peer.
+They used to render empty, on HTTP/3 as well as HTTP/1.1–2. `{remote_ip}`,
+this project's own spelling, keeps meaning the verified client. A file or
+`vars` matcher reads `{remote_host}` and `{client_ip}` the same way. FastCGI
+`REMOTE_ADDR` was already the peer and stays so; in a `php_fastcgi` `env`
+template, `{remote_ip}` is now the verified client as everywhere else, where
+it used to be the peer.
+
+📌 Upgrading: a site without `trusted_proxies` sees no change, because there
+the two addresses are the same. A site with `trusted_proxies` that relied on
+`{remote_host}` meaning the client — `header_up X-Real-IP {remote_host}`,
+a log field, a `respond` body — must write `{client_ip}` instead. (#194)
 
 ### ♻️ A reload no longer refuses requests
 

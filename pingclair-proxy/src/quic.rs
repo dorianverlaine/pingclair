@@ -3634,6 +3634,8 @@ async fn handle_request_inner(
     // state is resolved by host first so site-level `vars` rules can run
     // before route matching, exactly as they do on H1/H2.
     let mut request_vars = crate::http_policy::RequestVars::default();
+    // 🔌 `{remote_host}` and friends name the QUIC peer, as on H1/H2.
+    request_vars.set_remote(std::net::SocketAddr::new(peer_address, peer_port));
     let (state, route_index) = {
         let Some(state) = generation.routes().get(&host_bare) else {
             return Err((404, "No Matching Virtual Host"));
@@ -4711,6 +4713,7 @@ async fn fastcgi_upstream(
             request: &prepared_request,
             remote_ip: peer_ip,
             remote_port: Some(peer_port),
+            verified_client_ip: Some(verified_client_ip),
             scheme: "https",
             original_uri: &req.path,
             request_vars,
@@ -8552,9 +8555,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn h3_redirect_expands_the_verified_remote_ip() {
+    async fn h3_redirect_expands_the_verified_client_ip() {
         let handler = HandlerConfig::Redirect {
-            to: "https://{host}/from/{remote_host}".to_string(),
+            to: "https://{host}/from/{client_ip}".to_string(),
             code: 302,
         };
         let state = proxy_state(handler.clone());

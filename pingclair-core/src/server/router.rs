@@ -832,6 +832,7 @@ pub const MATCHER_PLACEHOLDERS: &[&str] = &[
     "method",
     "remote_ip",
     "remote_host",
+    "client_ip",
     "http.request.uri.path",
     "http.request.uri",
     "http.request.uri.query",
@@ -840,6 +841,7 @@ pub const MATCHER_PLACEHOLDERS: &[&str] = &[
     "http.request.port",
     "http.request.method",
     "http.request.remote.host",
+    "http.request.client_ip",
 ];
 
 /// 🧭 The placeholder prefixes a matcher may resolve.
@@ -973,11 +975,18 @@ fn resolve_matcher_placeholder(name: &str, request: &MatcherRequest<'_>, path: &
             .map(|(_, port)| port.to_string())
             .unwrap_or_default(),
         "method" | "http.request.method" => request.method.to_string(),
-        // 📌 These placeholders have always resolved to the verified client;
-        // only the matchers were split by #191.
-        "remote_ip" | "remote_host" | "http.request.remote.host" => request
+        // 🛡️ `{client_ip}` is the client after `trusted_proxies`, and
+        // `{remote_ip}` is our older spelling of it.
+        "client_ip" | "http.request.client_ip" | "remote_ip" => request
             .addresses
             .client_ip
+            .map(|ip| ip.to_string())
+            .unwrap_or_default(),
+        // 🔌 `{remote_host}` is the socket peer, the same split the
+        // `remote_ip` and `client_ip` matchers make.
+        "remote_host" | "http.request.remote.host" => request
+            .addresses
+            .remote_ip
             .map(|ip| ip.to_string())
             .unwrap_or_default(),
         _ => String::new(),

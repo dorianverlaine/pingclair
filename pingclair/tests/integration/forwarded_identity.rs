@@ -5,7 +5,7 @@
 //!
 //! The test client connects from loopback and loopback is a trusted proxy, so
 //! whatever the client writes into `X-Forwarded-For` and `Forwarded` is read
-//! as a proxy's report. The site answers with `{remote_host}`, which is the
+//! as a proxy's report. The site answers with `{client_ip}`, which is the
 //! verified address, so each response says exactly which identity won.
 
 use super::{TestServer, no_proxy_client};
@@ -24,7 +24,10 @@ fn echo_identity_server() -> TestServer {
             @readiness path __PINGCLAIR_TEST_READINESS_PATH__
             respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
 
-            respond "{remote_host}"
+            @addresses path /addresses
+            respond @addresses "{remote_host} {http.request.remote.host} {client_ip} {http.request.client_ip} {remote_port}"
+
+            respond "{client_ip}"
         }
     "#;
     TestServer::new_pingclairfile(config)
@@ -114,4 +117,35 @@ async fn test_an_unreadable_header_leaves_the_other_one_usable() {
             "X-Forwarded-For: {xff:?} / Forwarded: {forwarded:?}"
         );
     }
+}
+
+/// 🔌 `{remote_host}` is the connection's peer and `{client_ip}` the client a
+/// trusted proxy vouched for. Both used to print the forwarded client, so a
+/// log line behind a load balancer could not name the balancer at all.
+#[tokio::test]
+async fn test_remote_host_is_the_peer_and_client_ip_the_forwarded_client() {
+    let mut server = echo_identity_server();
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let body = no_proxy_client()
+        .get(server.url(0, "/addresses"))
+        .header("X-Forwarded-For", "203.0.113.7")
+        .send()
+        .await
+        .expect("request")
+        .text()
+        .await
+        .expect("body");
+
+    let fields: Vec<&str> = body.split(' ').collect();
+    assert_eq!(
+        fields[..4],
+        ["127.0.0.1", "127.0.0.1", "203.0.113.7", "203.0.113.7"],
+        "{body}"
+    );
+    // 🔌 The port is the client socket's ephemeral port, so only its shape is
+    // knowable ahead of time.
+    assert!(
+        fields[4].parse::<u16>().is_ok_and(|port| port != 0),
+        "{body}"
+    );
 }
