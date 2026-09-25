@@ -1209,43 +1209,15 @@ fn ip_matches(ranges: &IpRanges, address: Option<std::net::IpAddr>) -> bool {
     address.is_some_and(|address| ranges.contains(address))
 }
 
-/// Check if path matches a glob pattern
+/// 🧩 A `path` matcher pattern against the request path, with the same
+/// wildcard rules a route path follows (see `path_pattern`).
+///
+/// 🏎️ The pattern is classified on every call rather than at load: that is
+/// a count of its `*` characters, a few bytes, and it allocates nothing.
+/// Compiling matcher patterns ahead of time would mean threading them
+/// through `CompiledMatcher`, which is a larger change than this one.
 fn path_matches(path: &str, pattern: &str) -> bool {
-    glob_match(pattern, path)
-}
-
-/// 🧭 Classic glob matching with `*` as a wildcard, compared
-/// case-insensitively like Caddy. Matching is byte-based (ASCII case
-/// folding) to stay allocation-free on the request hot path.
-fn glob_match(pattern: &str, text: &str) -> bool {
-    let pattern = pattern.as_bytes();
-    let text = text.as_bytes();
-    let mut p = 0usize;
-    let mut t = 0usize;
-    let mut star_p: Option<usize> = None;
-    let mut star_t = 0usize;
-    let ascii_eq = |a: u8, b: u8| a.eq_ignore_ascii_case(&b);
-
-    while t < text.len() {
-        if p < pattern.len() && ascii_eq(pattern[p], text[t]) {
-            p += 1;
-            t += 1;
-        } else if p < pattern.len() && pattern[p] == b'*' {
-            star_p = Some(p);
-            star_t = t;
-            p += 1;
-        } else if let Some(sp) = star_p {
-            p = sp + 1;
-            star_t += 1;
-            t = star_t;
-        } else {
-            return false;
-        }
-    }
-    while p < pattern.len() && pattern[p] == b'*' {
-        p += 1;
-    }
-    p == pattern.len()
+    PathPattern::of(pattern).matches(path)
 }
 
 #[cfg(test)]
@@ -1603,6 +1575,22 @@ mod tests {
             middle
                 .match_request(
                     "/accounts/42/other",
+                    "GET",
+                    &headers,
+                    "e.com",
+                    peer("10.0.0.1"),
+                    "https",
+                    None
+                )
+                .is_none()
+        );
+
+        // 🧩 A glob's `*` stays inside one segment, as in a route path
+        // (issue #193), so a deeper path does not match.
+        assert!(
+            middle
+                .match_request(
+                    "/accounts/42/7/info",
                     "GET",
                     &headers,
                     "e.com",

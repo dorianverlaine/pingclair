@@ -334,9 +334,15 @@ place in directive order like any other, so a longer pattern of the same
 directive still goes first. Unlike Caddy, `?`, `[…]` and `\` in a path
 pattern are literal characters, not wildcards.
 
+The same rules apply to a `path` matcher that does not pick a route — one
+gating a directive inside a `handle` or `route` block, or under `not`.
+There a `*` in the middle used to cross `/`, so `path /accounts/*/info`
+also matched `/accounts/42/7/info`; now it does not.
+
 **Upgrading:** a site that listed such a pattern had it silently match
 nothing; it now answers the requests it names. Check that those routes
-should. (#193)
+should. A nested `path` matcher that relied on a middle `*` spanning
+several segments needs one `*` per segment, or a `path_regexp`. (#193)
 
 ### 🧭 Directive order, not the most specific path, decides which route answers
 
