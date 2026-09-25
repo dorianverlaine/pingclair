@@ -246,8 +246,28 @@ impl Router {
 
     /// 🌲 The precomputed candidate slice for a path: its node's list, or the
     /// catch-alls when it lands on no node.
+    ///
+    /// 🔤 The tree's nodes are lowercase, so the path is folded the same way
+    /// before the walk; that is what makes `/Admin` reach an `/admin` route
+    /// (issue #198). A lowercase path, nearly every request, is not copied.
     fn candidates(&self, path: &str) -> &[usize] {
-        match self.path_router.at(path) {
+        if super::path_pattern::has_ascii_uppercase(path) {
+            return self.folded_candidates(path);
+        }
+        self.node_candidates(path)
+    }
+
+    /// 🔤 The mixed-case half of [`Self::candidates`], kept out of line so
+    /// its stack buffer does not enlarge the frame of every lowercase lookup.
+    #[cold]
+    #[inline(never)]
+    fn folded_candidates(&self, path: &str) -> &[usize] {
+        super::path_pattern::with_ascii_lowercase(path, |key| self.node_candidates(key))
+    }
+
+    /// 🌲 One tree walk with a path already in the tree's case.
+    fn node_candidates(&self, key: &str) -> &[usize] {
+        match self.path_router.at(key) {
             Ok(matched) => matched.value,
             Err(_) => &self.default_routes,
         }

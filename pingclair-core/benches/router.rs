@@ -84,6 +84,14 @@ fn exact_path() -> Option<usize> {
     select("/health")
 }
 
+/// 🔤 The same route asked for in another case (issue #198): the path is
+/// folded into a stack buffer before the tree walk, where a lowercase path
+/// is passed through untouched.
+#[divan::bench]
+fn exact_path_mixed_case() -> Option<usize> {
+    select("/Health")
+}
+
 #[divan::bench]
 fn nested_glob() -> Option<usize> {
     select("/api/v2/users/42")

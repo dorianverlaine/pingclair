@@ -123,17 +123,24 @@ pub(super) struct Candidates {
 }
 
 /// 🏗️ Builds every node's candidate list from the routes, in list order.
+///
+/// 🔤 Every route path is lowercased first (ASCII only), so the tree's
+/// nodes are lowercase and `/Admin` and `/admin` are one node. The router
+/// looks a request up with its path folded the same way; see
+/// `Router::candidates`. This is what makes an exact or prefix route path
+/// ignore letter case, like a wildcard one already does (issue #198).
 pub(super) fn build(routes: &[RouteConfig]) -> Candidates {
-    let kinds: Vec<RoutePath<'_>> = routes
+    let paths: Vec<String> = routes
         .iter()
-        .map(|route| RoutePath::of(&route.path))
+        .map(|route| route.path.to_ascii_lowercase())
         .collect();
+    let kinds: Vec<RoutePath<'_>> = paths.iter().map(|path| RoutePath::of(path)).collect();
 
     // 🧮 Keyed by matchit pattern, so a glob's bare prefix and an exact route
     // on the same path become one node instead of two inserts where the
     // second loses. `BTreeMap` keeps the insert order deterministic.
     let mut nodes: BTreeMap<String, Node<'_>> = BTreeMap::new();
-    for (route, kind) in routes.iter().zip(&kinds) {
+    for (path, kind) in paths.iter().zip(&kinds) {
         match *kind {
             // 🧩 Neither gets a node of its own; `covers` places them.
             RoutePath::Any | RoutePath::Wildcard(_) => {}
@@ -141,11 +148,11 @@ pub(super) fn build(routes: &[RouteConfig]) -> Candidates {
                 nodes.insert(path.to_string(), Node::Exact(path));
             }
             RoutePath::Prefix(prefix) => {
-                nodes.insert(glob_to_matchit(&route.path), Node::Prefix(prefix));
-                for bare in bare_prefixes(&route.path) {
+                nodes.insert(glob_to_matchit(path), Node::Prefix(prefix));
+                for bare in bare_prefixes(path) {
                     // 🪢 Every bare prefix is a prefix of the route's own
                     // path, so the node can borrow it from there.
-                    let node = Node::Exact(&route.path[..bare.len()]);
+                    let node = Node::Exact(&path[..bare.len()]);
                     nodes.entry(bare).or_insert(node);
                 }
             }

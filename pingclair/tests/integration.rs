@@ -62,6 +62,10 @@ mod cache_vary;
 #[path = "integration/route_order.rs"]
 mod route_order;
 
+// 🔤 Route paths ignore letter case, exact and prefix as well as wildcard.
+#[path = "integration/route_path_case.rs"]
+mod route_path_case;
+
 // 🔌 WebSocket handshakes spelled across several field lines.
 #[path = "integration/websocket_upgrade.rs"]
 mod websocket_upgrade;

@@ -72,6 +72,10 @@ below, which ends with what to write instead.
 - **Metrics are off unless `metrics` is set.** Add the global `metrics`
   option to keep collecting; without it the scrape endpoints answer empty.
   → [Metrics are collected only when `metrics` is set](#-metrics-are-collected-only-when-metrics-is-set)
+- **Route paths ignore letter case.** `respond /Admin/*` now also answers
+  `/admin/x`, as in Caddy; a site that used case to tell two routes apart
+  needs a `path_regexp`.
+  → [Every route path ignores letter case](#-every-route-path-ignores-letter-case)
 
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
@@ -328,6 +332,24 @@ during reload. Adding routes no longer multiplies these budgets. Cache admission
 uses atomic accounting without adding request-path locks; a route serves misses
 uncached when other routes occupy the budget. File eligibility and HTTP behavior
 are unchanged. These fixed limits are not a total process-memory ceiling. (#33)
+
+### 🔤 Every route path ignores letter case
+
+**Breaking.** An exact or prefix route path now matches without regard to
+ASCII letter case, as Caddy's `path` matcher does: `respond /Health "ok"`
+answers `/health` and `/HEALTH`, and `/Admin/*` answers `/admin/users`.
+Until now those two shapes compared case exactly, while a wildcard pattern
+such as `*.php` already ignored it (#193), so two patterns in one
+Pingclairfile disagreed about what `/Admin` meant. Route paths are
+lowercased once when the configuration loads; a request path is only
+folded when it has a capital letter, on the stack, so an all-lowercase
+request pays for one scan and nothing more. Letters outside ASCII still
+compare exactly.
+
+**Upgrading:** a mixed-case request can now reach a route it used to miss.
+A site that relied on case to send `/Admin` and `/admin` to different
+routes, or to keep `/Private/*` from answering `/private/x`, needs a
+case-sensitive `path_regexp` matcher instead. (#198)
 
 ### 🧩 A `*` anywhere in a route's path matches
 

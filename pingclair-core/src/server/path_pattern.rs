@@ -19,7 +19,9 @@
 //! glob, in which a `*` stands for any run of characters **inside one path
 //! segment**: `/a/*x` matches `/a/bx` but not `/a/b/cx`, and `/a/*/b*`
 //! matches `/a/1/bee` but not `/a/1/b/c`. Comparison ignores ASCII case,
-//! because the reference lowercases both the pattern and the path.
+//! because the reference lowercases both the pattern and the path. The same
+//! holds for an exact or prefix route path, which the radix pre-filter
+//! stores lowercased and looks up through [`with_ascii_lowercase`].
 //!
 //! 📜 Where this comes from: `MatchPath.MatchWithError` in the reference's
 //! `modules/caddyhttp/matchers.go` (v2.x), written from memory of that
@@ -115,6 +117,69 @@ impl<S: AsRef<str>> PathPattern<S> {
             }
         }
     }
+}
+
+/// 🔎 Whether `text` has an ASCII uppercase letter, the question every
+/// request asks before its radix lookup (issue #198).
+///
+/// 🏎️ Eight bytes at a time: a byte-at-a-time scan with an early exit cost
+/// about 6 ns on a 19-byte path in the router benchmark, which is a third of
+/// a whole route selection. For a byte `b` below 0x80, `b + 0x3F` sets the
+/// top bit exactly when `b >= b'A'`, and `b + 0x25` exactly when
+/// `b > b'Z'`; neither sum can carry into the next byte. Bytes at or above
+/// 0x80 (UTF-8 continuation and lead bytes) are masked out by `!word`.
+pub(super) fn has_ascii_uppercase(text: &str) -> bool {
+    const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
+    const HIGH: u64 = ONES * 0x80;
+    let bytes = text.as_bytes();
+    let (words, rest) = bytes.as_chunks::<8>();
+    for &word in words {
+        let word = u64::from_ne_bytes(word);
+        let at_least_a = word.wrapping_add(ONES * 0x3F);
+        let above_z = word.wrapping_add(ONES * 0x25);
+        if at_least_a & !above_z & !word & HIGH != 0 {
+            return true;
+        }
+    }
+    rest.iter().any(u8::is_ascii_uppercase)
+}
+
+/// 📏 The longest path [`with_ascii_lowercase`] folds on the stack. Real
+/// request paths are tens of bytes; one longer than this that also has an
+/// uppercase letter pays for one heap copy instead.
+const FOLD_ON_STACK: usize = 256;
+
+/// 🔤 Calls `f` with `path` lowercased (ASCII only), without a heap
+/// allocation unless the path is unusually long.
+///
+/// The radix pre-filter compares bytes exactly and its nodes were
+/// lowercased at load, so a request path with an uppercase letter must be
+/// folded the same way before the lookup (issue #198). The caller checks
+/// [`has_ascii_uppercase`] first, so a lowercase path, nearly every
+/// request, never gets here and is not copied at all.
+///
+/// - 📦 A path up to [`FOLD_ON_STACK`] bytes is folded into a buffer on the
+///   stack.
+/// - 🐢 A longer one is folded into a `String`: one allocation for a request
+///   that is already unusual, which keeps the answer correct rather than
+///   capping how long a routable path may be.
+///
+/// Folding only ASCII keeps every other byte in place, so the result is
+/// still valid UTF-8 and has the same length as `path`.
+pub(super) fn with_ascii_lowercase<R>(path: &str, f: impl FnOnce(&str) -> R) -> R {
+    if path.len() <= FOLD_ON_STACK {
+        let mut buffer = [0u8; FOLD_ON_STACK];
+        let folded = &mut buffer[..path.len()];
+        folded.copy_from_slice(path.as_bytes());
+        folded.make_ascii_lowercase();
+        // 🛡️ Cannot fail, since ASCII folding keeps UTF-8 valid; checking
+        // anyway costs a few nanoseconds on an uncommon path and needs no
+        // `unsafe`.
+        if let Ok(folded) = std::str::from_utf8(folded) {
+            return f(folded);
+        }
+    }
+    f(&path.to_ascii_lowercase())
 }
 
 /// 🔤 `text` starts with `prefix`, ignoring ASCII case.
@@ -256,6 +321,53 @@ mod tests {
                 assert!(!compiled.matches(path), "{pattern} should not match {path}");
             }
         }
+    }
+
+    #[test]
+    fn folding_lowercases_ascii_on_every_path_length() {
+        // 🔤 Short and long mixed-case paths take different buffers; both
+        // must fold only ASCII letters and leave other bytes alone.
+        let long = format!("/Ä/{}", "Ab".repeat(200));
+        let folded: Vec<String> = ["/already/lower", "/Mixed/Case/ÄB", long.as_str()]
+            .into_iter()
+            .map(|path| super::with_ascii_lowercase(path, str::to_string))
+            .collect();
+        assert_eq!(
+            folded,
+            [
+                "/already/lower".to_string(),
+                "/mixed/case/Äb".to_string(),
+                format!("/Ä/{}", "ab".repeat(200)),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_uppercase_scan_sees_a_capital_in_any_byte_position() {
+        // 🔎 A capital in each position of a word and in the remainder, the
+        // two letters at the edges of the range, the bytes just outside it,
+        // and non-ASCII bytes, which must never count.
+        let mut seen = Vec::new();
+        for position in 0..19 {
+            let mut path = vec![b'a'; 19];
+            path[position] = b'Q';
+            seen.push(super::has_ascii_uppercase(
+                std::str::from_utf8(&path).unwrap(),
+            ));
+        }
+        assert_eq!(seen, [true; 19]);
+        let edges: Vec<bool> = [
+            "/abcdefgA",
+            "/abcdefgZ",
+            "/abcdefg@",
+            "/abcdefg[",
+            "/ÄÖÜéàèìò",
+            "",
+        ]
+        .into_iter()
+        .map(super::has_ascii_uppercase)
+        .collect();
+        assert_eq!(edges, [true, true, false, false, false, false]);
     }
 
     #[test]
