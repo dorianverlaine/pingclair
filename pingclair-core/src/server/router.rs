@@ -5,6 +5,7 @@
 //!
 //! Provides O(log n) path matching with support for wildcards and parameters.
 
+use super::matcher_tree::MatcherNode;
 use super::path_pattern::PathPattern;
 use crate::config::{
     HandlerConfig, HandlerElement, IpRanges, Matcher, MatcherCondition, RouteConfig,
@@ -64,6 +65,9 @@ pub struct CompiledMatcher {
     pub matcher: Matcher,
     /// Pre-compiled regex patterns (keyed by pattern string)
     pub compiled_regexes: HashMap<String, Arc<regex::Regex>>,
+    /// 🌳 The matcher as it is evaluated, with `path` patterns classified
+    /// at load rather than per request (issue #199).
+    tree: MatcherNode,
 }
 
 impl CompiledMatcher {
@@ -74,6 +78,7 @@ impl CompiledMatcher {
         Self {
             matcher: matcher.clone(),
             compiled_regexes,
+            tree: MatcherNode::compile(matcher),
         }
     }
 
@@ -140,7 +145,7 @@ pub fn evaluate_verdict(
     compiled: &CompiledMatcher,
     request: &mut MatcherRequest<'_>,
 ) -> MatcherVerdict {
-    evaluate_matcher_inner(&compiled.matcher, compiled, request)
+    evaluate_node(&compiled.tree, compiled, request)
 }
 
 /// 🧭 Precompiled per-route matcher state, populated by C2.
@@ -423,18 +428,50 @@ impl Default for Router {
     }
 }
 
-/// Inner matcher evaluation with access to pre-compiled regexes
-fn evaluate_matcher_inner(
+/// 🌳 Walks the compiled tree: `path` patterns are compared as classified
+/// at load, combinators short-circuit, and every other matcher is a leaf.
+fn evaluate_node(
+    node: &MatcherNode,
+    compiled: &CompiledMatcher,
+    request: &mut MatcherRequest<'_>,
+) -> MatcherVerdict {
+    match node {
+        MatcherNode::Path(patterns) => {
+            bool_verdict(patterns.iter().any(|pattern| pattern.matches(request.path)))
+        }
+        MatcherNode::Leaf(matcher) => evaluate_leaf(matcher, compiled, request),
+        MatcherNode::And(left, right) => match evaluate_node(left, compiled, request) {
+            MatcherVerdict::NoMatch => MatcherVerdict::NoMatch,
+            error @ MatcherVerdict::Error(_) => error,
+            MatcherVerdict::Match => evaluate_node(right, compiled, request),
+        },
+        MatcherNode::Or(left, right) => match evaluate_node(left, compiled, request) {
+            MatcherVerdict::Match => MatcherVerdict::Match,
+            MatcherVerdict::NoMatch => evaluate_node(right, compiled, request),
+            error @ MatcherVerdict::Error(_) => error,
+        },
+        MatcherNode::Not(inner) => match evaluate_node(inner, compiled, request) {
+            MatcherVerdict::Match => MatcherVerdict::NoMatch,
+            MatcherVerdict::NoMatch => MatcherVerdict::Match,
+            error @ MatcherVerdict::Error(_) => error,
+        },
+    }
+}
+
+/// 🌿 Evaluates one leaf matcher, with access to the pre-compiled regexes.
+fn evaluate_leaf(
     matcher: &Matcher,
     compiled: &CompiledMatcher,
     request: &mut MatcherRequest<'_>,
 ) -> MatcherVerdict {
     match matcher {
-        Matcher::Path { patterns } => bool_verdict(
-            patterns
-                .iter()
-                .any(|pattern| path_matches(request.path, pattern)),
-        ),
+        // 🛡️ `MatcherNode::compile` never makes a leaf of these; answering
+        // no-match keeps an impossible state fail-closed instead of a panic
+        // on the request path.
+        Matcher::Path { .. } | Matcher::And(..) | Matcher::Or(..) | Matcher::Not(_) => {
+            debug_assert!(false, "a combinator or path matcher reached a leaf");
+            MatcherVerdict::NoMatch
+        }
         Matcher::Header { name, condition } => {
             let header_value = request.headers.get(name).and_then(|v| v.to_str().ok());
             bool_verdict(evaluate_condition(header_value, condition, compiled))
@@ -542,21 +579,6 @@ fn evaluate_matcher_inner(
             try_policy.as_deref(),
             split_path,
         ),
-        Matcher::And(left, right) => match evaluate_matcher_inner(left, compiled, request) {
-            MatcherVerdict::NoMatch => MatcherVerdict::NoMatch,
-            error @ MatcherVerdict::Error(_) => error,
-            MatcherVerdict::Match => evaluate_matcher_inner(right, compiled, request),
-        },
-        Matcher::Or(left, right) => match evaluate_matcher_inner(left, compiled, request) {
-            MatcherVerdict::Match => MatcherVerdict::Match,
-            MatcherVerdict::NoMatch => evaluate_matcher_inner(right, compiled, request),
-            error @ MatcherVerdict::Error(_) => error,
-        },
-        Matcher::Not(inner) => match evaluate_matcher_inner(inner, compiled, request) {
-            MatcherVerdict::Match => MatcherVerdict::NoMatch,
-            MatcherVerdict::NoMatch => MatcherVerdict::Match,
-            error @ MatcherVerdict::Error(_) => error,
-        },
     }
 }
 
@@ -1206,17 +1228,6 @@ fn evaluate_condition(
 /// matches nothing.
 fn ip_matches(ranges: &IpRanges, address: Option<std::net::IpAddr>) -> bool {
     address.is_some_and(|address| ranges.contains(address))
-}
-
-/// 🧩 A `path` matcher pattern against the request path, with the same
-/// wildcard rules a route path follows (see `path_pattern`).
-///
-/// 🏎️ The pattern is classified on every call rather than at load: that is
-/// a count of its `*` characters, a few bytes, and it allocates nothing.
-/// Compiling matcher patterns ahead of time would mean threading them
-/// through `CompiledMatcher`, which is a larger change than this one.
-fn path_matches(path: &str, pattern: &str) -> bool {
-    PathPattern::of(pattern).matches(path)
 }
 
 #[cfg(test)]
