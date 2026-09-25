@@ -19,6 +19,7 @@ fn main() {
     // whichever benchmark runs first does not pay for construction.
     LazyLock::force(&ROUTER);
     LazyLock::force(&IP_GUARDED);
+    LazyLock::force(&WILDCARD);
     divan::main();
 }
 
@@ -96,6 +97,42 @@ fn shallow_glob() -> Option<usize> {
 #[divan::bench]
 fn catch_all() -> Option<usize> {
     select("/blog/2026/09/hello")
+}
+
+/// 🧩 A PHP-style site: a suffix route the radix tree cannot hold, beside a
+/// prefix and a catch-all (issue #193). The suffix route is a candidate for
+/// every path, so both the hit and the miss pay for its compiled check.
+static WILDCARD: LazyLock<Router> = LazyLock::new(|| {
+    Router::new(vec![
+        route("/api/*", path_matcher("/api/*")),
+        route("*.php", path_matcher("*.php")),
+        route("/*", None),
+    ])
+});
+
+fn select_wildcard(path: &str) -> Option<usize> {
+    let headers = http::HeaderMap::new();
+    WILDCARD
+        .match_normalized_request(
+            black_box(path),
+            "GET",
+            &headers,
+            "example.com",
+            RequestAddresses::direct(std::net::Ipv4Addr::LOCALHOST.into()),
+            "HTTP/1.1",
+            None,
+        )
+        .map(|route| route.index)
+}
+
+#[divan::bench]
+fn suffix_wildcard_hit() -> Option<usize> {
+    select_wildcard("/blog/2026/index.php")
+}
+
+#[divan::bench]
+fn suffix_wildcard_miss() -> Option<usize> {
+    select_wildcard("/blog/2026/09/hello")
 }
 
 /// 🌐 A `remote_ip` matcher over the given ranges.

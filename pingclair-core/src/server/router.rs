@@ -5,6 +5,7 @@
 //!
 //! Provides O(log n) path matching with support for wildcards and parameters.
 
+use super::path_pattern::PathPattern;
 use crate::config::{
     HandlerConfig, HandlerElement, IpRanges, Matcher, MatcherCondition, RouteConfig,
 };
@@ -168,6 +169,10 @@ pub struct CompiledRoute {
     pub compiled_matcher: Option<CompiledMatcher>,
     /// Pre-compiled per-element matchers for this route's handler tree.
     pub matcher_precompile: MatcherPrecompile,
+    /// 🧩 The route path, compiled, when it has a `*` the radix tree cannot
+    /// express (`*.php`, `/a/*x`). Such a route sits in candidate lists it
+    /// may not match, so its path is tested before its matcher.
+    wildcard: Option<PathPattern<Box<str>>>,
 }
 
 /// 🧭 Picks the route that answers a request: the **first** route in list
@@ -200,6 +205,7 @@ impl Router {
                 index,
                 compiled_matcher: config.matcher.as_ref().map(CompiledMatcher::compile),
                 matcher_precompile: precompile_handler(&config.handler),
+                wildcard: super::route_candidates::wildcard(&config.path),
             })
             .collect();
 
@@ -307,6 +313,11 @@ impl Router {
 
     /// 🔎 Evaluates the constraints attached to one precompiled route.
     fn route_matches(route: &CompiledRoute, request: &mut MatcherRequest<'_>) -> bool {
+        if let Some(pattern) = &route.wildcard
+            && !pattern.matches(request.path)
+        {
+            return false;
+        }
         if let Some(methods) = &route.config.methods
             && !methods
                 .iter()

@@ -5,6 +5,7 @@
 
 mod file_glob;
 mod handlers;
+mod path_pattern;
 mod redirect;
 mod route_candidates;
 mod router;

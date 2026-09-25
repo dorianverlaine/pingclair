@@ -43,10 +43,12 @@
 //!   all count as having none (the reference's issue #5037 case).
 //! - Two different trimmed patterns of equal length are ordered
 //!   alphabetically there; here they stay in file order, per the decision.
-//!   The two can only disagree for patterns with a `*` in the middle — two
-//!   different prefixes of the same length never match the same request —
-//!   and a route path does not match a mid-pattern `*` today, so no request
-//!   can tell them apart yet.
+//!   The two can only disagree for patterns with a `*` that is not at the
+//!   end — two different prefixes of the same length never match the same
+//!   request. Since route paths honour such a `*` (issue #193) the
+//!   difference is observable: with `@a path /a/*x` and `@b path /*/bx`,
+//!   `/a/bx` matches both, and the one written first answers here, where the
+//!   reference always picks `/*/bx` (`*` sorts before `a`).
 
 use super::order::DirectiveOrder;
 use super::sites::{handler_directive_name, handler_has_terminal};
@@ -385,10 +387,8 @@ mod tests {
         // puts `/*/bx` first whichever is written first (`*` sorts before
         // `a`). Here file order decides; issue #18 records the decision.
         //
-        // ⚠️ Only a `*` in the middle lets two such patterns match the same
-        // request (`/a/bx` matches both), and a route path does not match a
-        // mid-pattern `*` at all today, so the two orders cannot yet produce
-        // different answers. This asserts the list, not an answer.
+        // 🧩 `/a/bx` matches both patterns, since a mid-path `*` matches
+        // (issue #193), so the difference shows in which one answers.
         let written = |first: &str, second: &str| {
             format!(
                 "example.com {{\n    @a path /a/*x\n    @b path /*/bx\n    respond {first}\n    respond {second}\n}}"
@@ -398,5 +398,7 @@ mod tests {
         let b = "@b \"b\"";
         assert_eq!(bodies(&written(a, b)), ["a", "b"]);
         assert_eq!(bodies(&written(b, a)), ["b", "a"]);
+        assert_eq!(answer(&written(a, b), "/a/bx"), "a");
+        assert_eq!(answer(&written(b, a), "/a/bx"), "b");
     }
 }

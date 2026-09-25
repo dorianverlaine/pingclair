@@ -316,6 +316,28 @@ uses atomic accounting without adding request-path locks; a route serves misses
 uncached when other routes occupy the budget. File eligibility and HTTP behavior
 are unchanged. These fixed limits are not a total process-memory ceiling. (#33)
 
+### 🧩 A `*` anywhere in a route's path matches
+
+A path matcher with a `*` that is not its last character never matched
+before: `@a path /a/*x` let `/a/bx` fall through to whatever came next, and
+`@php path *.php` matched nothing. Such patterns now match the way Caddy's
+`path` matcher reads them:
+
+- one leading `*` is a suffix at any depth (`*.php` matches `/x/y/index.php`);
+- two, one at each end, is a substring (`*/admin/*`);
+- any other placement is a glob in which each `*` stays inside one path
+  segment: `/a/*x` matches `/a/bx` but not `/a/b/cx`, and `/files/*/raw/*`
+  matches `/files/7/raw/readme` but not `/files/7/8/raw/readme`.
+
+Such a pattern ignores letter case, as Caddy's matcher does. These routes take their
+place in directive order like any other, so a longer pattern of the same
+directive still goes first. Unlike Caddy, `?`, `[…]` and `\` in a path
+pattern are literal characters, not wildcards.
+
+**Upgrading:** a site that listed such a pattern had it silently match
+nothing; it now answers the requests it names. Check that those routes
+should. (#193)
+
 ### 🧭 Directive order, not the most specific path, decides which route answers
 
 **Breaking.** A site's routes are now tried as one list, ordered the way
@@ -344,9 +366,10 @@ middleware directive (`header @api …`) ranks where the site's answering
 directive does, since that is what answers for it; `php_fastcgi` ranks as
 itself, after `respond`; and `templates` beside `file_server` ranks as
 `file_server`. Two different paths of equal length keep file order, where
-Caddy sorts them alphabetically — not observable yet, because only a `*`
-in the middle of a path lets two such paths match one request, and route
-paths do not support that.
+Caddy sorts them alphabetically. Only a `*` that is not at the end lets two
+such paths match one request: with `@a path /a/*x` and `@b path /*/bx`,
+`/a/bx` is answered by whichever is written first here, and by `/*/bx`
+in Caddy.
 
 **Upgrading:** a configuration where a narrower directive sits below a
 broader one of an earlier rank now answers differently. To keep the old

@@ -178,3 +178,61 @@ async fn test_reversing_file_order_changes_no_answer() {
         (200, None, Some("on".to_string()), "catch-all".to_string())
     );
 }
+
+/// 🧩 Route paths with a `*` that is not at the end (issue #193): a
+/// mid-path `*` matches within one segment, a leading `*` is a suffix at any
+/// depth, and both answer beside plain prefixes where the order puts them —
+/// longest trimmed pattern first, so `/files/*/raw/*` leads and `/a/*`
+/// trails. Before the fix none of the three patterns ever matched.
+#[tokio::test]
+async fn test_wildcards_anywhere_in_a_route_path_match() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            @mid path /a/*x
+            respond @mid "mid" 200
+            @php path *.php
+            respond @php "php" 200
+            @segments path /files/*/raw/*
+            respond @segments "segments" 200
+            respond /a/* "a prefix" 200
+            respond /files/* "files prefix" 200
+            respond "catch-all" 200
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let mut answers = Vec::new();
+    for path in [
+        "/a/bx",
+        "/a/b/cx",
+        "/index.php",
+        "/a/deep/page.php",
+        "/files/7/raw/readme",
+        "/files/7/8/raw/readme",
+        "/elsewhere",
+    ] {
+        let reply = client.get(server.url(0, path)).send().await.unwrap();
+        answers.push((path, reply.text().await.unwrap()));
+    }
+    assert_eq!(
+        answers,
+        [
+            ("/a/bx", "mid".to_string()),
+            ("/a/b/cx", "a prefix".to_string()),
+            ("/index.php", "php".to_string()),
+            ("/a/deep/page.php", "php".to_string()),
+            ("/files/7/raw/readme", "segments".to_string()),
+            ("/files/7/8/raw/readme", "files prefix".to_string()),
+            ("/elsewhere", "catch-all".to_string()),
+        ]
+    );
+}
