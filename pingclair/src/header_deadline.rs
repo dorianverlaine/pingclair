@@ -21,19 +21,8 @@
 use bytes::BytesMut;
 use pingora_core::protocols::Stream;
 use pingora_core::server::ShutdownWatch;
-use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::time::Instant;
-
-/// ⏱️ How long a request header may take when `limits { header_timeout }` is
-/// not set.
-///
-/// One minute, as Caddy's `defaultReadHeaderTimeout` (`modules/caddyhttp/app.go`,
-/// v2.x, recalled from memory on 2026-10-02 rather than re-read) and nginx's
-/// `client_header_timeout`. A header is usually under a kilobyte, so a minute
-/// is generous even for a very slow link, while still letting go of a client
-/// that never finishes.
-pub(crate) const DEFAULT_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 📏 The first allocation, the size Pingora's own reader starts with
 /// (`INIT_HEADER_BUF_SIZE`, pingora-core 0.9.0), so a header read here costs

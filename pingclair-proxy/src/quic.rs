@@ -1159,6 +1159,10 @@ struct H3App {
     open: Option<crate::drain::OpenConnection>,
     /// 🔌 The drain's "close now" has woken this connection once already.
     close_woken: bool,
+    /// ⏱️ Request streams whose HEADERS frame has not finished arriving, each
+    /// on the clock of `limits { header_timeout }`; see
+    /// [`crate::h3_header_deadline`].
+    pending_headers: crate::h3_header_deadline::PendingHeaders,
 }
 
 impl Drop for H3App {
@@ -1268,12 +1272,20 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         // next worker iteration (an inbound packet) instead; `process_writes`
         // frees capacity and retries the parked event there. A close is the
         // one thing that must not wait for the client to send something.
+        //
+        // ⏱️ Nor is a header deadline: a quiet connection would otherwise
+        // never reset the stream that ran out of time.
+        let header_deadline = self.pending_headers.next_deadline();
+        let header_expiry = async move {
+            match header_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         if self.deferred.is_some() {
-            if watch_close {
-                crate::drain::closing().await;
-                self.close_woken = true;
-            } else {
-                std::future::pending::<()>().await;
+            tokio::select! {
+                _ = crate::drain::closing(), if watch_close => self.close_woken = true,
+                _ = header_expiry => {}
             }
             return Ok(());
         }
@@ -1298,6 +1310,9 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
             // Only until it has, or every later wait would return at once.
             _ = crate::drain::stopping(), if self.goaway_from.is_none() => {}
             _ = crate::drain::closing(), if watch_close => self.close_woken = true,
+            // ⏱️ Waking is all this does too: `process_writes` resets the
+            // streams whose header deadline has passed.
+            _ = header_expiry => {}
         }
         // 🧲 Applies anything that queued behind the event that woke us.
         self.apply_available_events();
@@ -1317,6 +1332,13 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         // polling, so the Finished event that ends a request body is not
         // observed until its bytes have been handed over.
         self.retry_pending_body_drains(qconn);
+
+        // ⏱️ Puts every request stream the client just opened on the header
+        // clock, before quiche consumes the bytes and an unfinished HEADERS
+        // frame disappears into its buffer without an event.
+        for stream_id in qconn.readable() {
+            self.pending_headers.opened(stream_id);
+        }
 
         self.pump_h3_events(qconn);
         Ok(())
@@ -1341,6 +1363,7 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         // stops sending, so without this the drain (and its WINDOW_UPDATE)
         // would wait for the next packet or PTO and hang the request.
         self.retry_pending_body_drains(qconn);
+        self.reset_streams_past_header_deadline(qconn);
 
         // 🧮 Applies deferred events whose streams may have room again.
         self.apply_available_events();
@@ -1635,7 +1658,11 @@ impl QuicServer {
 
             // 🔢 Only this loop increments, so a load-then-add cannot race
             // itself; drops of `ConnectionSlot` are the only decrements.
-            if let Some(limit) = self.proxy.listener_limits().max_connections
+            //
+            // ⏱️ Read once per connection, so a reload's limits apply to the
+            // connections that open after it.
+            let limits = self.proxy.listener_limits();
+            if let Some(limit) = limits.max_connections
                 && live_connections.load(Ordering::Acquire) >= limit
             {
                 tracing::warn!("🚫 Rejecting an HTTP/3 connection at the configured limit");
@@ -1662,6 +1689,9 @@ impl QuicServer {
                 lingering: Vec::new(),
                 open: None,
                 close_woken: false,
+                pending_headers: crate::h3_header_deadline::PendingHeaders::new(
+                    crate::header_timeout::resolve(&limits),
+                ),
             });
         }
 
@@ -1775,6 +1805,35 @@ impl H3App {
         }
     }
 
+    /// ⏱️ Resets every request stream whose header missed its deadline.
+    ///
+    /// RFC 9114 §4.1 names H3_REQUEST_INCOMPLETE for a stream that ends
+    /// without a whole request, which is what this stream is now. Both halves
+    /// are shut so the client hears it whichever way it is looking: STOP_SENDING
+    /// on the half it is trickling into, RESET_STREAM on the half it reads.
+    /// Only that stream ends; the connection's other requests carry on.
+    fn reset_streams_past_header_deadline(
+        &mut self,
+        qconn: &mut tokio_quiche::quic::QuicheConnection,
+    ) {
+        if self.pending_headers.next_deadline().is_none() {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        let code = quiche::h3::WireErrorCode::RequestIncomplete as u64;
+        while let Some(stream_id) = self.pending_headers.pop_expired(now) {
+            tracing::debug!(
+                "⏱️ H3 {}: stream {} reset, its header missed the deadline",
+                qconn.trace_id(),
+                stream_id
+            );
+            // 📌 A stream the client already closed is gone from quiche, and
+            // shutting it down again is a harmless error.
+            let _ = qconn.stream_shutdown(stream_id, quiche::Shutdown::Read, code);
+            let _ = qconn.stream_shutdown(stream_id, quiche::Shutdown::Write, code);
+        }
+    }
+
     fn pump_h3_events(&mut self, qconn: &mut tokio_quiche::quic::QuicheConnection) {
         loop {
             let poll_result = {
@@ -1784,6 +1843,7 @@ impl H3App {
 
             match poll_result {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                    self.pending_headers.settled(stream_id);
                     self.handle_h3_headers(qconn, stream_id, list);
                 }
                 Ok((stream_id, quiche::h3::Event::Data)) => {
@@ -1797,6 +1857,7 @@ impl H3App {
                     self.drain_request_body(qconn, stream_id);
                 }
                 Ok((stream_id, quiche::h3::Event::Reset(_))) => {
+                    self.pending_headers.settled(stream_id);
                     if let Some(ss) = self.streams.get_mut(&stream_id) {
                         cancel_stream_handler(ss);
                         ss.dead = true;

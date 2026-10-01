@@ -102,8 +102,9 @@ below, which ends with what to write instead.
   → [Every address of a site has a certificate](#-every-address-of-a-site-has-a-certificate)
 - **A request header has one minute by default**, start to finish, where it
   had no limit unless `limits { header_timeout }` was set. An idle HTTP/1
-  keepalive connection is therefore closed after a minute without a request.
-  Set `limits { header_timeout … }` to choose another bound.
+  keepalive connection is therefore closed after a minute without a request,
+  and an HTTP/3 request stream whose header is still unfinished after a minute
+  is reset. Set `limits { header_timeout … }` to choose another bound.
   → [Security](#-security)
 - **A request body may pause one minute by default** between two reads
   before the request is answered `408`. An upload client that stalls longer
@@ -3138,6 +3139,20 @@ immediately after the `101`, both ends seeing EOF with no error.
   it no longer sees the gateway's denial; to rewrite a denial, put
   `intercept`, `forward_auth` and the handler they guard in one `route`
   block, which keeps written order.
+
+- ⏱️ **An HTTP/3 request header sent slowly enough was never cut off either.**
+  The slow-header fix above covered HTTP/1 and HTTP/2. Over HTTP/3 a client
+  could open a request stream and send its header block a byte at a time:
+  the server sees nothing until the header is complete, and QUIC's idle timer
+  starts again with every packet, so the stream and its connection stayed open
+  for as long as the client kept trickling — up to a hundred such streams on
+  one connection. Each request stream now has the same `header_timeout`
+  (60 s by default) from the moment the client opens it, and one that misses
+  it is reset with `H3_REQUEST_INCOMPLETE`. Only that stream ends; other
+  requests on the same connection are not affected.
+
+  ⚠️ **Behaviour change:** an HTTP/3 request whose header takes longer than
+  `header_timeout` to arrive is reset; it used to be waited on indefinitely.
 
 - 🔒 **`rustls` moves to 0.23.45 for RUSTSEC-2026-0285.** Rustls accepted TLS
   1.3 handshake messages sent at the wrong encryption level when they followed a

@@ -80,6 +80,10 @@ mod header_limits;
 #[path = "h3_end_to_end/reload.rs"]
 mod reload;
 
+// ⏱️ A request header that never finishes arriving, and its deadline.
+#[path = "h3_end_to_end/header_deadline.rs"]
+mod header_deadline;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {

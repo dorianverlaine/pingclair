@@ -68,7 +68,7 @@ pub struct ResourceGuardedProxy {
     /// `limits { header_timeout }`, or [`DEFAULT_HEADER_TIMEOUT`] when unset.
     /// Resolved once here, because no request can change it.
     ///
-    /// [`DEFAULT_HEADER_TIMEOUT`]: crate::header_deadline::DEFAULT_HEADER_TIMEOUT
+    /// [`DEFAULT_HEADER_TIMEOUT`]: pingclair_proxy::header_timeout::DEFAULT_HEADER_TIMEOUT
     header_timeout: Duration,
 }
 
@@ -93,10 +93,7 @@ impl ResourceGuardedProxy {
         let connections = limits
             .max_connections
             .map(|limit| Arc::new(Semaphore::new(limit)));
-        let header_timeout = limits.header_timeout_ms.map_or(
-            crate::header_deadline::DEFAULT_HEADER_TIMEOUT,
-            Duration::from_millis,
-        );
+        let header_timeout = pingclair_proxy::header_timeout::resolve(&limits);
         Self {
             proxy: Arc::new(proxy),
             connections,
