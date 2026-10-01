@@ -168,3 +168,40 @@ async fn static_identity_responses_always_vary_by_encoding() {
     assert_eq!(response.headers().get("vary").unwrap(), "Accept-Encoding");
     server.stop();
 }
+
+#[tokio::test]
+async fn proxy_encode_varies_identity_and_encoded_responses() {
+    let (address, task) = origin().await;
+    let mut server = proxy_site(address, "encode gzip");
+    assert!(server.wait_until_ready().await);
+    let client = no_proxy_client();
+    for (accepted, path, encoding) in [
+        ("", "/text", None),
+        ("gzip", "/text", Some("gzip")),
+        ("gzip", "/binary", None),
+    ] {
+        let response = client
+            .get(server.url(0, path))
+            .header("Accept-Encoding", accepted)
+            .send()
+            .await
+            .unwrap();
+        let vary: Vec<_> = response
+            .headers()
+            .get_all("vary")
+            .iter()
+            .flat_map(|value| value.to_str().unwrap().split(','))
+            .map(str::trim)
+            .collect();
+        assert_eq!(vary, ["Origin", "Accept-Encoding"]);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-encoding")
+                .map(|value| value.to_str().unwrap()),
+            encoding
+        );
+    }
+    server.stop();
+    task.abort();
+}

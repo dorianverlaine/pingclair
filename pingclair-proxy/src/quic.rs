@@ -6228,6 +6228,10 @@ async fn reverse_proxy_upstream(
         ));
     }
     apply_h3_response_policy(&mut hdrs, &effective_policy, request_id, Some(state));
+    if crate::response_encoding::should_vary(&state.config, effective_status) {
+        crate::response_encoding::vary_h3_on_accept_encoding(&mut hdrs);
+    }
+
     let mut download_pacer = limits.download_bytes_per_sec.map(StreamPacer::new);
 
     send_headers(resp_tx, stream_id, hdrs, false).await;
@@ -6722,6 +6726,12 @@ fn apply_h3_response_policy(
     }
 
     apply_h3_trailer_headers(headers, suppress_server, request_id, state);
+    // 🧊 Local and upstream failures need the same encoding cache key as successful responses.
+    if state.is_some_and(|state| {
+        crate::response_encoding::should_vary(&state.config, response_status(headers))
+    }) {
+        crate::response_encoding::vary_h3_on_accept_encoding(headers);
+    }
 }
 
 /// 🧩 One block's operations on an H3 response, in upstream's order.

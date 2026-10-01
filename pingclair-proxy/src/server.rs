@@ -8443,6 +8443,12 @@ impl ProxyHttp for PingclairProxy {
             );
         }
 
+        if ctx.state.as_ref().is_some_and(|state| {
+            crate::response_encoding::should_vary(&state.config, upstream_response.status.as_u16())
+        }) {
+            crate::response_encoding::vary_on_accept_encoding(upstream_response)?;
+        }
+
         // 🗜️ Both transports share eligibility; the downstream module keeps cached bytes identity.
         // 💡 An informational response (a `103 Early Hints`, say) passes
         // through this filter too, but it has no body and only predicts the

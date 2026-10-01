@@ -24,6 +24,7 @@
 use bytes::Bytes;
 use pingora_core::modules::http::{HttpModule, HttpModuleBuilder, HttpModuleCtx, Module};
 use pingora_http::ResponseHeader;
+use tokio_quiche::quiche;
 
 use crate::encoding::{ResponseEncoder, stream_chunk};
 
@@ -152,6 +153,25 @@ pub(crate) fn is_full_representation(method: &http::Method, header: &ResponseHea
 pub(crate) fn forbids_transform(header: &ResponseHeader) -> bool {
     field_tokens(&header.headers, "cache-control")
         .any(|token| token.eq_ignore_ascii_case("no-transform"))
+}
+
+/// 🧊 Encoding is part of the cache key even when this client receives identity.
+pub(crate) fn should_vary(config: &pingclair_core::config::ServerConfig, status: u16) -> bool {
+    !config.encodings.is_empty() && status >= 200
+}
+
+/// 🧊 Preserves every H3 Vary member while reserving the encoding cache key.
+pub(crate) fn vary_h3_on_accept_encoding(headers: &mut Vec<quiche::h3::Header>) {
+    use quiche::h3::NameValue;
+    let present = headers
+        .iter()
+        .filter(|header| header.name().eq_ignore_ascii_case(b"vary"))
+        .filter_map(|header| std::str::from_utf8(header.value()).ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim() == "*" || token.trim().eq_ignore_ascii_case("accept-encoding"));
+    if !present {
+        headers.push(quiche::h3::Header::new(b"vary", b"Accept-Encoding"));
+    }
 }
 
 /// 🗜️ Applies the same response eligibility policy to both transports.

@@ -56,6 +56,9 @@ below, which ends with what to write instead.
   → [Static compression follows the coding list](#static-compression-follows-the-coding-list)
 - **Static file responses always send Vary: Accept-Encoding, even without encode.**
   → [Static responses always vary by encoding](#static-responses-always-vary-by-encoding)
+- **Proxied responses on encode sites send Vary: Accept-Encoding even when served as identity.**
+  → [Proxy encode responses always vary by encoding](#proxy-encode-responses-always-vary-by-encoding)
+
 
 
 
@@ -247,6 +250,10 @@ selection is recorded in configuration; codec application is tracked in #223.
 ### Static responses always vary by encoding
 
 🗜️ Static file responses always send Vary: Accept-Encoding, even without encode. Upgrade: expect shared caches to reserve an encoding-specific key before compressed variants appear (#219).
+
+### Proxy encode responses always vary by encoding
+
+🗜️ Proxied responses on encode sites send Vary: Accept-Encoding even when served as identity. Upgrade: allow caches to distinguish identity clients from clients that accept the configured codings (#226).
 
 ### Admin-only startup accepts its first HTTP generation
 
