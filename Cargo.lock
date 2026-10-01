@@ -2555,6 +2555,7 @@ dependencies = [
 name = "pingclair-api"
 version = "0.0.0"
 dependencies = [
+ "boring",
  "bytes",
  "http-body-util",
  "hyper",

@@ -33,6 +33,10 @@ Most configurations keep working unchanged. These are the changes most
 likely to alter what an existing configuration does; each links to its entry
 below, which ends with what to write instead.
 
+- **Admin config writes honor `If-Match`.** Refresh the config and its Etag
+  after a 412 before retrying.
+  → [Admin config validators](#️-admin-config-validators)
+
 - **Automatic HTTPS changes its plaintext listener and redirects.**
   `disable_redirects` leaves the automatic HTTP port unbound.
   → [Automatic HTTPS follows the configured listener policy](#-automatic-https-follows-the-configured-listener-policy)
@@ -94,6 +98,15 @@ below, which ends with what to write instead.
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
 [Known defect — WebSocket upgrades under load](#-known-defect--websocket-upgrades-under-load).
+
+### 🏷️ Admin config validators
+
+`GET /config/...` returns a path-qualified Etag. Config writes with a stale
+`If-Match` return 412 and leave the running document unchanged (#221).
+`/load` and `/adapt` retain their existing behavior.
+
+**Upgrade:** Refresh the config and its Etag after a 412; writes without
+`If-Match` remain unconditional.
 
 ### 🔄 Automatic HTTPS follows the configured listener policy
 

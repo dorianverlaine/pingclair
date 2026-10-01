@@ -23,6 +23,7 @@ use tokio::sync::Notify;
 use pingclair_core::config::{AdminConfig, PingclairConfig};
 
 use crate::auth::{ApiKeyAuth, AuthDecision, OriginPolicy, authorize, origin_allowed};
+use crate::config_etag::config_response;
 use crate::config_tree::{self, Mode, TreeError};
 
 /// 🧭 Shared state for one admin server connection.
@@ -178,6 +179,7 @@ struct ApplyContext<'a> {
     autosave: Option<&'a Path>,
     publisher: Option<&'a dyn pingclair_proxy::server::ConfigPublisher>,
     authorized_revision: u64,
+    if_match: Option<String>,
 }
 
 /// 🔧 Serves the admin API on a listener the caller has already bound.
@@ -359,6 +361,13 @@ async fn handle_request_inner(
         autosave,
         publisher,
         authorized_revision: access_policy.revision,
+        if_match: if req.uri().path() == "/config" || req.uri().path().starts_with("/config/") {
+            req.headers()
+                .get(hyper::header::IF_MATCH)
+                .map(|value| value.to_str().unwrap_or_default().to_owned())
+        } else {
+            None
+        },
     };
     let authorization = req
         .headers()
@@ -451,8 +460,7 @@ async fn handle_request_inner(
             // 🧭 Exports the active document so the output can be POSTed back
             // to /load or traversed with /config/<path>.
             let guard = document.read();
-            let json = serde_json::to_string_pretty(&*guard).unwrap_or_default();
-            Ok(Response::new(Full::new(Bytes::from(json))))
+            Ok(config_response(path, &guard))
         }
         (&Method::GET, path) if path.starts_with("/config/") => {
             let segments = normalize_config_segments(config_tree::segments_from_path(
@@ -460,10 +468,7 @@ async fn handle_request_inner(
             ));
             let guard = document.read();
             match config_tree::get(&guard, &segments) {
-                Ok(node) => {
-                    let json = serde_json::to_string_pretty(node).unwrap_or_default();
-                    Ok(Response::new(Full::new(Bytes::from(json))))
-                }
+                Ok(node) => Ok(config_response(path, node)),
                 Err(error) => Ok(response(
                     StatusCode::NOT_FOUND,
                     &format!(
@@ -642,7 +647,7 @@ async fn handle_request_inner(
             // restart-required until TCP, QUIC, and TLS can be rebuilt as one
             // transaction.
             let value = serde_json::to_value(&config).unwrap_or_default();
-            match commit_document(&value, publisher, access_policy.revision) {
+            match commit_document(&value, publisher, access_policy.revision, None) {
                 Ok(()) => {
                     *document.write() = value;
                     if let Some(path) = autosave {
@@ -814,12 +819,50 @@ async fn read_json_body(
     })
 }
 
+/// 🏷️ A path-qualified validator may protect a parent of the node being edited.
+fn check_if_match(
+    ctx: &ApplyContext<'_>,
+    document: &Value,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    let Some(expected) = &ctx.if_match else {
+        return Ok(());
+    };
+    let matches = expected
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .and_then(|value| value.rsplit_once(' '))
+        .filter(|(path, _)| *path == "/config" || path.starts_with("/config/"))
+        .is_some_and(|(path, _)| {
+            let segments = normalize_config_segments(config_tree::segments_from_path(
+                path.strip_prefix("/config").unwrap_or_default(),
+            ));
+            config_tree::get(document, &segments)
+                .is_ok_and(|node| crate::config_etag::etag(path, node) == *expected)
+        });
+    if matches {
+        Ok(())
+    } else {
+        Err(Box::new(response(
+            StatusCode::PRECONDITION_FAILED,
+            r#"{"error":"configuration Etag does not match"}"#,
+        )))
+    }
+}
+
 /// 📤 Applies a full replacement document and commits it as the active tree.
 async fn apply_full_document(
     ctx: &ApplyContext<'_>,
     value: Value,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    match commit_document(&value, ctx.publisher, ctx.authorized_revision) {
+    if let Err(rejection) = check_if_match(ctx, &ctx.document.read()) {
+        return Ok(*rejection);
+    }
+    match commit_document(
+        &value,
+        ctx.publisher,
+        ctx.authorized_revision,
+        ctx.if_match.as_deref(),
+    ) {
         Ok(()) => {
             *ctx.document.write() = value;
             if let Some(path) = ctx.autosave {
@@ -1000,7 +1043,13 @@ async fn apply_segments(
     mut segments: Vec<String>,
     body: Option<Value>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let mut next = ctx.document.read().clone();
+    let mut next = {
+        let document = ctx.document.read();
+        if let Err(rejection) = check_if_match(ctx, &document) {
+            return Ok(*rejection);
+        }
+        document.clone()
+    };
     let expand = segments.last().is_some_and(|segment| segment == "...");
     if expand {
         segments.pop();
@@ -1040,7 +1089,12 @@ async fn apply_segments(
             StatusCode::BAD_REQUEST,
             &format!(r#"{{"error":"{}"}}"#, TreeError::Invalid(reason).message()),
         )),
-        Ok(()) => match commit_document(&next, ctx.publisher, ctx.authorized_revision) {
+        Ok(()) => match commit_document(
+            &next,
+            ctx.publisher,
+            ctx.authorized_revision,
+            ctx.if_match.as_deref(),
+        ) {
             Ok(()) => {
                 *ctx.document.write() = next;
                 if let Some(path) = ctx.autosave {
@@ -1083,6 +1137,7 @@ fn commit_document(
     next: &Value,
     publisher: Option<&dyn pingclair_proxy::server::ConfigPublisher>,
     expected_admin_revision: u64,
+    if_match: Option<&str>,
 ) -> Result<(), (StatusCode, String)> {
     let config: PingclairConfig = serde_json::from_value(next.clone())
         .map_err(|error| (StatusCode::BAD_REQUEST, format!("Invalid config: {error}")))?;
@@ -1098,7 +1153,21 @@ fn commit_document(
     publisher
         .publish_config(&config, Some(expected_admin_revision))
         .map(|_| ())
-        .map_err(config_apply_response)
+        .map_err(|error| {
+            // 🛡️ The publisher checks the revision under its publication lock,
+            // so a competing writer cannot slip past a successful Etag check.
+            let precondition_failed = if_match.is_some()
+                && error.kind == pingclair_proxy::server::ConfigApplyErrorKind::StaleAuthorization;
+            let (status, message) = config_apply_response(error);
+            (
+                if precondition_failed {
+                    StatusCode::PRECONDITION_FAILED
+                } else {
+                    status
+                },
+                message,
+            )
+        })
 }
 
 /// 🚫 Maps runtime publication failures to stable Admin API responses.

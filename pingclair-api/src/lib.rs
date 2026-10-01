@@ -6,6 +6,7 @@
 //! RESTful API for dynamic configuration management.
 
 mod auth;
+mod config_etag;
 mod config_tree;
 pub mod server;
 

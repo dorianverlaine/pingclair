@@ -10,6 +10,9 @@ mod scheme_ports;
 #[path = "integration/automatic_https_policy.rs"]
 mod automatic_https_policy;
 
+#[path = "integration/admin_etag.rs"]
+mod admin_etag;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
