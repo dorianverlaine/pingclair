@@ -19,29 +19,34 @@ use super::cache::FileKey;
 impl FileServer {
     /// 🎯 Preconditions and body selection must choose the same representation.
     pub(super) fn matches_file_encode(&self, status: u16, meta: &super::cache::FileMeta) -> bool {
-        self.config.encode.matches(status, |name, patterns| {
-            let value = if name.eq_ignore_ascii_case("content-type") {
-                meta.content_type.to_str().ok()
-            } else if name.eq_ignore_ascii_case("content-length") {
-                meta.content_length.to_str().ok()
-            } else if name.eq_ignore_ascii_case("accept-ranges") {
-                Some("bytes")
-            } else if name.eq_ignore_ascii_case("etag") {
-                meta.etags.for_coding(None).to_str().ok()
-            } else if name.eq_ignore_ascii_case("last-modified") {
-                meta.last_modified
-                    .as_ref()
-                    .and_then(|value| value.to_str().ok())
-            } else {
-                None
-            };
-            value.is_some_and(|value| {
-                patterns.is_empty()
-                    || patterns.iter().any(|pattern| {
-                        pingclair_core::encoding::header_pattern_matches(value, pattern)
-                    })
+        (self.config.encode.matcher.is_some()
+            || pingclair_core::encoding::is_compressible_content_type(
+                meta.content_type.to_str().unwrap_or(""),
+                &self.config.gzip_types,
+            ))
+            && self.config.encode.matches(status, |name, patterns| {
+                let value = if name.eq_ignore_ascii_case("content-type") {
+                    meta.content_type.to_str().ok()
+                } else if name.eq_ignore_ascii_case("content-length") {
+                    meta.content_length.to_str().ok()
+                } else if name.eq_ignore_ascii_case("accept-ranges") {
+                    Some("bytes")
+                } else if name.eq_ignore_ascii_case("etag") {
+                    meta.etags.for_coding(None).to_str().ok()
+                } else if name.eq_ignore_ascii_case("last-modified") {
+                    meta.last_modified
+                        .as_ref()
+                        .and_then(|value| value.to_str().ok())
+                } else {
+                    None
+                };
+                value.is_some_and(|value| {
+                    patterns.is_empty()
+                        || patterns.iter().any(|pattern| {
+                            pingclair_core::encoding::header_pattern_matches(value, pattern)
+                        })
+                })
             })
-        })
     }
 
     // MARK: - Reading and compressing

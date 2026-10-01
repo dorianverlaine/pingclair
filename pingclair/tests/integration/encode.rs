@@ -229,3 +229,45 @@ async fn proxy_reencoding_weakens_only_strong_etags() {
     server.stop();
     task.abort();
 }
+
+#[tokio::test]
+async fn static_and_proxy_share_the_content_type_policy() {
+    let tree = compressible_tree();
+    std::fs::copy(tree.path().join("big.txt"), tree.path().join("data.bin")).unwrap();
+    let (address, task) = origin().await;
+    let client = no_proxy_client();
+    for (types, text_encoding, binary_encoding) in [
+        ("", Some("gzip"), None),
+        ("gzip_types application/octet-stream", None, Some("gzip")),
+    ] {
+        let settings = format!("encode gzip\n{types}");
+        let mut static_server = file_server_site(tree.path().to_str().unwrap(), &settings);
+        let mut proxy_server = proxy_site(address, &settings);
+        assert!(static_server.wait_until_ready().await);
+        assert!(proxy_server.wait_until_ready().await);
+        for (server, path, expected) in [
+            (&static_server, "/big.txt", text_encoding),
+            (&static_server, "/data.bin", binary_encoding),
+            (&proxy_server, "/text", text_encoding),
+            (&proxy_server, "/binary", binary_encoding),
+        ] {
+            let response = client
+                .get(server.url(0, path))
+                .header("Accept-Encoding", "gzip")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-encoding")
+                    .map(|value| value.to_str().unwrap()),
+                expected,
+                "{types}, {path}"
+            );
+        }
+        static_server.stop();
+        proxy_server.stop();
+    }
+    task.abort();
+}

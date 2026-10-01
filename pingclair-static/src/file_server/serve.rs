@@ -248,6 +248,11 @@ impl FileServer {
                     let (content, encoding) = if self
                         .would_compress(listing.len() as u64, accept_encoding)
                         && range.is_none()
+                        && (self.config.encode.matcher.is_some()
+                            || pingclair_core::encoding::is_compressible_content_type(
+                                "text/html",
+                                &self.config.gzip_types,
+                            ))
                         && self.config.encode.matches(200, |name, patterns| {
                             name.eq_ignore_ascii_case("content-type")
                                 && (patterns.is_empty()

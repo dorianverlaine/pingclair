@@ -1027,44 +1027,9 @@ pub fn is_streaming_content_type(content_type: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 🗜️ Matches a response MIME type against configured gzip patterns.
+/// 🗜️ Both response paths use the same MIME policy.
 pub fn is_compressible_content_type(content_type: &str, configured_types: &[String]) -> bool {
-    let mime = content_type.split(';').next().map(str::trim).unwrap_or("");
-    if mime.is_empty() {
-        return false;
-    }
-
-    if configured_types.is_empty() {
-        return pingclair_core::config::DEFAULT_GZIP_TYPES
-            .iter()
-            .any(|pattern| gzip_type_matches(mime, pattern));
-    }
-    configured_types
-        .iter()
-        .any(|pattern| gzip_type_matches(mime, pattern))
-}
-
-/// 🎯 Matches exact, subtype-wildcard, and structured-suffix MIME patterns.
-fn gzip_type_matches(mime: &str, pattern: &str) -> bool {
-    let pattern = pattern.trim();
-    if pattern == "*/*" {
-        return true;
-    }
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        return mime
-            .get(..prefix.len())
-            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
-            && mime.as_bytes().get(prefix.len()) == Some(&b'/');
-    }
-    if let Some((prefix, suffix)) = pattern.split_once('*') {
-        return mime
-            .get(..prefix.len())
-            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
-            && mime
-                .get(mime.len().saturating_sub(suffix.len())..)
-                .is_some_and(|value| value.eq_ignore_ascii_case(suffix));
-    }
-    mime.eq_ignore_ascii_case(pattern)
+    pingclair_core::encoding::is_compressible_content_type(content_type, configured_types)
 }
 
 /// Mutable state for hot reloading
@@ -2344,6 +2309,7 @@ impl ProxyState {
                     compress: wanted.compress,
                     encode: self.config.encode.clone(),
                     encodings: self.config.encodings.clone(),
+                    gzip_types: self.config.gzip_types.clone(),
                     // 📄 A response subroute supports only a bare `file_server`,
                     // so everything else keeps its default — sidecar lookup
                     // included, which stays off.

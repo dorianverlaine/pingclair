@@ -78,6 +78,8 @@ pub struct FileServerConfig {
     pub encode: pingclair_core::encoding::EncodeOptions,
     /// 🗜️ Only these codings may be produced, in the site preference order.
     pub encodings: Vec<pingclair_core::config::Encoding>,
+    /// 🎯 The site MIME policy is shared with the proxy path.
+    pub gzip_types: Vec<String>,
     /// 🗜️ Encodings whose sidecar files may be served (`app.js.br`), in
     /// preference order. Empty means never look — a stale sidecar is a wrong
     /// answer, so hunting for one is opt-in, matching upstream.
@@ -199,6 +201,7 @@ impl FileServerConfig {
     pub fn with_site_encode(mut self, site: &pingclair_core::config::ServerConfig) -> Self {
         self.encode = site.encode.clone();
         self.encodings = site.encodings.clone();
+        self.gzip_types = site.gzip_types.clone();
         self
     }
 
@@ -244,6 +247,7 @@ impl FileServerConfig {
             compress,
             encode: Default::default(),
             encodings: pingclair_core::config::default_encodings(),
+            gzip_types: pingclair_core::config::default_gzip_types(),
             // 🗜️ Resolved to suffixes here, and a name this build cannot read
             // is dropped now rather than tested on every request. The adapter
             // already refuses unknown names, so this only filters what the
@@ -275,6 +279,7 @@ impl Default for FileServerConfig {
             compress: true,
             encode: Default::default(),
             encodings: pingclair_core::config::default_encodings(),
+            gzip_types: pingclair_core::config::default_gzip_types(),
             // 🗜️ Off by default, like upstream. This server used to look for
             // sidecars unconditionally, so a stale `app.js.gz` was served in
             // place of a fresh `app.js` — the same configuration answering

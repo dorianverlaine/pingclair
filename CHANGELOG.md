@@ -60,6 +60,9 @@ below, which ends with what to write instead.
   → [Proxy encode responses always vary by encoding](#proxy-encode-responses-always-vary-by-encoding)
 - **Re-encoding a proxied response turns its strong ETag into a weak validator.**
   → [Proxy compression weakens strong etags](#proxy-compression-weakens-strong-etags)
+- **Static compression follows the same content-type allow-list as proxy compression.**
+  → [Static and proxy compression share mime rules](#static-and-proxy-compression-share-mime-rules)
+
 
 
 
@@ -261,6 +264,10 @@ selection is recorded in configuration; codec application is tracked in #223.
 ### Proxy compression weakens strong etags
 
 🗜️ Re-encoding a proxied response turns its strong ETag into a weak validator. Upgrade: use weak ETags for cache revalidation; range resumption must use a validator for the actual encoded bytes (#227).
+
+### Static and proxy compression share mime rules
+
+🗜️ Static compression follows the same content-type allow-list as proxy compression. Upgrade: set gzip_types explicitly to enable additional MIME types; an explicit encode match block replaces the default matcher (#217).
 
 ### Admin-only startup accepts its first HTTP generation
 
