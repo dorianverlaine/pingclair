@@ -192,30 +192,12 @@ impl FileServer {
 
     // MARK: - Negotiation
 
-    /// 🗜️ Codings this server will produce, in preference order.
-    ///
-    /// Brotli stays in the list even though the DSL refuses `encode br`,
-    /// because a static file has been able to answer a brotli request for as
-    /// long as this code existed and dropping it is a behaviour change that
-    /// belongs in its own commit, not smuggled into a correctness fix. The
-    /// inconsistency with the proxy path is recorded rather than papered over.
-    const OFFERED: &'static [&'static str] = &["br", "zstd", "gzip"];
-
-    /// 🗜️ Picks the coding for a response, honouring the client's quality
-    /// values.
-    ///
-    /// `None` means "serve uncompressed" — the client accepted none of
-    /// [`Self::OFFERED`], or sent no `Accept-Encoding` at all. It is an
-    /// ordinary answer, not a failure.
-    ///
-    /// This used to be `header.contains("gzip")`. Day 26 measured what that
-    /// costs: a client sending `Accept-Encoding: gzip;q=0` — an explicit
-    /// refusal — was answered with a gzip body, because the refusal still
-    /// contains the word. `contains` also matched substrings, so a token merely
-    /// embedding a coding name selected it. Both are gone now that whole tokens
-    /// and their `q` are read.
-    pub(super) fn negotiate_encoding(accept_header: Option<&str>) -> Option<&'static str> {
-        pingclair_core::encoding::negotiate(accept_header?, Self::OFFERED)
+    /// 🗜️ Both paths negotiate exactly the site's codings without allocating.
+    pub(super) fn negotiate_encoding(&self, accept_header: Option<&str>) -> Option<&'static str> {
+        pingclair_core::encoding::negotiate_by(accept_header?, &self.config.encodings, |coding| {
+            coding.token()
+        })
+        .map(|coding| coding.token())
     }
 
     /// Compress `input` with a specific, already-negotiated encoding.
@@ -254,7 +236,7 @@ impl FileServer {
         input: &[u8],
         accept_header: Option<&str>,
     ) -> Result<(Vec<u8>, Option<String>)> {
-        match Self::negotiate_encoding(accept_header) {
+        match self.negotiate_encoding(accept_header) {
             Some(enc) => Ok((
                 Self::compress_with(input, enc).await?,
                 Some(enc.to_string()),

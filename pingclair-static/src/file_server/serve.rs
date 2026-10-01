@@ -393,7 +393,7 @@ impl FileServer {
             && self.would_compress(file_size, accept_encoding)
             && self.matches_file_encode(status, &meta)
         {
-            Self::negotiate_encoding(accept_encoding)
+            self.negotiate_encoding(accept_encoding)
         } else {
             None
         };

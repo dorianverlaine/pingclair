@@ -2343,6 +2343,7 @@ impl ProxyState {
                     browse_limit: wanted.browse_limit,
                     compress: wanted.compress,
                     encode: self.config.encode.clone(),
+                    encodings: self.config.encodings.clone(),
                     // 📄 A response subroute supports only a bare `file_server`,
                     // so everything else keeps its default — sidecar lookup
                     // included, which stays off.

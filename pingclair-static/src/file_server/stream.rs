@@ -201,7 +201,7 @@ impl FileServer {
     pub(super) fn would_compress(&self, file_size: u64, accept_encoding: Option<&str>) -> bool {
         self.config.compress
             && (self.config.encode.minimum_length..=Self::MAX_COMPRESSIBLE).contains(&file_size)
-            && Self::negotiate_encoding(accept_encoding).is_some()
+            && self.negotiate_encoding(accept_encoding).is_some()
     }
 
     /// Cheap pre-check for the streaming path, without any I/O.
@@ -215,7 +215,7 @@ impl FileServer {
         // 📏 No size here, so assume the file is small enough to compress: this
         // predicate exists to answer "is streaming *impossible*", and a caller
         // with a size uses `should_stream_response` instead.
-        !(self.config.compress && Self::negotiate_encoding(accept_encoding).is_some())
+        !(self.config.compress && self.negotiate_encoding(accept_encoding).is_some())
     }
 
     /// 🧭 Whether a response of `body_len` bytes should be streamed rather than

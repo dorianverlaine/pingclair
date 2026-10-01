@@ -120,3 +120,37 @@ async fn encode_block_controls_proxy_responses() {
     }
     task.abort();
 }
+
+#[tokio::test]
+async fn static_encode_offers_only_the_configured_codings() {
+    let tree = compressible_tree();
+    let client = no_proxy_client();
+    for (encode, accepted, expected) in [
+        ("encode gzip", "br", None),
+        ("encode gzip", "zstd", None),
+        ("encode gzip", "gzip", Some("gzip")),
+        ("encode zstd gzip", "br", None),
+        ("encode zstd gzip", "gzip, zstd", Some("zstd")),
+        ("encode gzip zstd", "gzip, zstd", Some("gzip")),
+        ("encode gzip", "*", Some("gzip")),
+        ("encode zstd gzip", "*", Some("zstd")),
+    ] {
+        let mut server = file_server_site(tree.path().to_str().unwrap(), encode);
+        assert!(server.wait_until_ready().await);
+        let response = client
+            .get(server.url(0, "/big.txt"))
+            .header("Accept-Encoding", accepted)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get("content-encoding")
+                .map(|value| value.to_str().unwrap()),
+            expected,
+            "{encode}, {accepted}"
+        );
+        server.stop();
+    }
+}

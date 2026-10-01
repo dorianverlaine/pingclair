@@ -181,7 +181,7 @@ impl FileServer {
         if self.would_compress(file_size, accept_encoding)
             && self.matches_file_encode(self.config.status.unwrap_or(200), meta)
         {
-            return Self::negotiate_encoding(accept_encoding);
+            return self.negotiate_encoding(accept_encoding);
         }
         None
     }

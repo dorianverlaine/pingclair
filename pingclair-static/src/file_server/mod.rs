@@ -76,6 +76,8 @@ pub struct FileServerConfig {
     pub compress: bool,
     /// 🗜️ The site encode settings are retained once for every file response.
     pub encode: pingclair_core::encoding::EncodeOptions,
+    /// 🗜️ Only these codings may be produced, in the site preference order.
+    pub encodings: Vec<pingclair_core::config::Encoding>,
     /// 🗜️ Encodings whose sidecar files may be served (`app.js.br`), in
     /// preference order. Empty means never look — a stale sidecar is a wrong
     /// answer, so hunting for one is opt-in, matching upstream.
@@ -196,6 +198,7 @@ impl FileServerConfig {
     /// 🗜️ Resolves site compression settings before the server is published.
     pub fn with_site_encode(mut self, site: &pingclair_core::config::ServerConfig) -> Self {
         self.encode = site.encode.clone();
+        self.encodings = site.encodings.clone();
         self
     }
 
@@ -252,6 +255,7 @@ impl FileServerConfig {
             browse_limit,
             compress,
             encode: Default::default(),
+            encodings: pingclair_core::config::default_encodings(),
             // 🗜️ Resolved to suffixes here, and a name this build cannot read
             // is dropped now rather than tested on every request. The adapter
             // already refuses unknown names, so this only filters what the
@@ -282,6 +286,7 @@ impl Default for FileServerConfig {
             // compression serves identity bytes even with this default.
             compress: true,
             encode: Default::default(),
+            encodings: pingclair_core::config::default_encodings(),
             // 🗜️ Off by default, like upstream. This server used to look for
             // sidecars unconditionally, so a stale `app.js.gz` was served in
             // place of a fresh `app.js` — the same configuration answering

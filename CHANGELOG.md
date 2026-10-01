@@ -52,6 +52,9 @@ below, which ends with what to write instead.
   → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
 - **`encode` blocks now take effect and reject unknown settings.** Review size floors and response matchers.
   → [Encode blocks take effect](#encode-blocks-take-effect)
+- **Static compression offers exactly the encode list in order.**
+  → [Static compression follows the coding list](#static-compression-follows-the-coding-list)
+
 
 
 - **Empty startup can load its first HTTP listeners.** TLS listeners and later topology changes still require restart.
@@ -233,6 +236,10 @@ its settings instead of silently compiling every block as gzip. Unknown
 sub-directives fail at load time. Upgrade: remove misspelled settings and review
 response matchers and size floors that were previously ignored. Gzip level
 selection is recorded in configuration; codec application is tracked in #223.
+
+### Static compression follows the coding list
+
+🗜️ Static compression offers exactly the encode list in order. Upgrade: name each desired coding in encode; brotli remains available only as a precompressed sidecar (#216).
 
 ### Admin-only startup accepts its first HTTP generation
 
