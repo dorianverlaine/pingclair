@@ -36,6 +36,8 @@ tar = "0.4"
 async-trait.workspace = true
 
 tokio.workspace = true
+# ⏱️ The buffer a request header is read into before Pingora parses it.
+bytes.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
@@ -70,7 +72,6 @@ uuid = { version = "1.0", features = ["v4"] }
 flate2 = "1.0"
 h2.workspace = true
 rcgen.workspace = true
-bytes.workspace = true
 http.workspace = true
 
 [lints]

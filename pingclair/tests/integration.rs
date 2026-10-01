@@ -130,6 +130,10 @@ mod error_responses;
 #[path = "integration/graceful_shutdown.rs"]
 mod graceful_shutdown;
 
+// ⏱️ A dribbled request header is dropped at one whole-header deadline.
+#[path = "integration/header_deadline.rs"]
+mod header_deadline;
+
 // 🍪 Several `Cookie` field lines read as one cookie-string.
 #[path = "integration/cookie_fold.rs"]
 mod cookie_fold;

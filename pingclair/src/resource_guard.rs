@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use pingclair_core::config::ResourceLimitsConfig;
 use pingclair_proxy::server::PingclairProxy;
-use pingora_core::apps::{HttpServerApp, HttpServerOptions, ServerApp};
+use pingora_core::apps::{HttpPersistentSettings, HttpServerApp, HttpServerOptions, ServerApp};
 use pingora_core::protocols::http::ServerSession;
 use pingora_core::protocols::http::v2::server;
 use pingora_core::protocols::{ALPN, Digest, Stream};
@@ -14,9 +14,10 @@ use pingora_core::server::ShutdownWatch;
 use pingora_proxy::HttpProxy;
 use std::future::poll_fn;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
+use tokio::time::Instant;
 
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -41,9 +42,9 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// 📌 The cost is up to 24 peeks per *connection* — not per request — and only
 /// for a connection whose bytes match the preface so far.
 ///
-/// 🚫 What is still unbounded is a peer that sends a matching prefix and then
-/// stops, which is genuinely ambiguous; `header_timeout_ms` is what bounds that
-/// when it is configured.
+/// ⏱️ A peer that sends a matching prefix and then stops is genuinely
+/// ambiguous, so the wait is bounded by the connection's header deadline
+/// instead, which always applies.
 async fn is_h2c_preface(stream: &mut Stream) -> std::io::Result<bool> {
     let mut buffer = [0u8; H2_PREFACE.len()];
     for length in 1..=H2_PREFACE.len() {
@@ -62,8 +63,13 @@ async fn is_h2c_preface(stream: &mut Stream) -> std::io::Result<bool> {
 /// 🧱 Owns one Pingora proxy while bounding accepted transport connections and H1 headers.
 pub struct ResourceGuardedProxy {
     proxy: Arc<HttpProxy<PingclairProxy>>,
-    limits: ResourceLimitsConfig,
     connections: Option<Arc<Semaphore>>,
+    /// ⏱️ How long one request header may take to arrive, start to finish:
+    /// `limits { header_timeout }`, or [`DEFAULT_HEADER_TIMEOUT`] when unset.
+    /// Resolved once here, because no request can change it.
+    ///
+    /// [`DEFAULT_HEADER_TIMEOUT`]: crate::header_deadline::DEFAULT_HEADER_TIMEOUT
+    header_timeout: Duration,
 }
 
 impl ResourceGuardedProxy {
@@ -87,10 +93,14 @@ impl ResourceGuardedProxy {
         let connections = limits
             .max_connections
             .map(|limit| Arc::new(Semaphore::new(limit)));
+        let header_timeout = limits.header_timeout_ms.map_or(
+            crate::header_deadline::DEFAULT_HEADER_TIMEOUT,
+            Duration::from_millis,
+        );
         Self {
             proxy: Arc::new(proxy),
-            limits,
             connections,
+            header_timeout,
         }
     }
 
@@ -112,7 +122,9 @@ impl ResourceGuardedProxy {
         mut stream: Stream,
         shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
-        let mut header_started = Instant::now();
+        // ⏱️ The header deadline runs from accept for the first request and
+        // from the end of the previous one for each keepalive request after.
+        let mut header_deadline = Instant::now() + self.header_timeout;
         let options = self.proxy.server_options.as_ref();
         let mut h2c = options.is_some_and(|options| options.h2c);
         let custom = options.is_some_and(|options| options.force_custom);
@@ -122,13 +134,10 @@ impl ResourceGuardedProxy {
             // 📌 A timeout here abandons a partially read preface, which would
             // lose those bytes for any later parser -- safe only because the
             // `?` below drops the connection instead of reusing the stream.
-            h2c = match self.limits.header_timeout_ms {
-                Some(timeout_ms) => tokio::time::timeout(Duration::from_millis(timeout_ms), peek)
-                    .await
-                    .ok()?
-                    .ok()?,
-                None => peek.await.ok()?,
-            };
+            h2c = tokio::time::timeout_at(header_deadline, peek)
+                .await
+                .ok()?
+                .ok()?;
         }
 
         if h2c || matches!(stream.selected_alpn_proto(), Some(ALPN::H2)) {
@@ -138,8 +147,13 @@ impl ResourceGuardedProxy {
                 proxy_digest: stream.get_proxy_digest(),
                 socket_digest: stream.get_socket_digest(),
             });
-            let mut connection = server::handshake(stream, self.proxy.h2_options.clone())
+            // ⏱️ The handshake reads the client's connection preface and
+            // SETTINGS, the HTTP/2 counterpart of a request header, so a client
+            // that trickles them gets the same deadline.
+            let handshake = server::handshake(stream, self.proxy.h2_options.clone());
+            let mut connection = tokio::time::timeout_at(header_deadline, handshake)
                 .await
+                .ok()?
                 .ok()?;
             let mut shutdown = shutdown.clone();
             loop {
@@ -176,17 +190,30 @@ impl ResourceGuardedProxy {
                 .await;
         }
 
-        let mut session = ServerSession::new_http1(stream);
+        let mut stream = stream;
+        let mut persistent: Option<HttpPersistentSettings> = None;
+        let mut shutdown_signal = shutdown.clone();
         loop {
-            let header_timeout = self
-                .limits
-                .header_timeout_ms
-                .map(Duration::from_millis)
-                .and_then(|timeout| timeout.checked_sub(header_started.elapsed()));
-            if self.limits.header_timeout_ms.is_some() && header_timeout.is_none() {
-                return None;
+            // ⏱️ The whole header arrives before Pingora sees the connection;
+            // see `header_deadline` for why Pingora's own timer cannot do this.
+            let head = crate::header_deadline::read_request_head(
+                &mut stream,
+                header_deadline,
+                &mut shutdown_signal,
+            )
+            .await?;
+            let mut session = ServerSession::new_http1(stream);
+            if let Some(persistent) = persistent.take() {
+                persistent.apply_to_session(&mut session);
             }
-            session.set_read_timeout(header_timeout);
+            // 📌 Pingora carries a prefix of its own only when pipelining is
+            // enabled, which this server never does, so this is the only one.
+            session.set_pipelined_prefix(head);
+            // ⏱️ Normally nothing is left to read for the header; this bounds
+            // Pingora if its parser disagrees about where the header ended.
+            session.set_read_timeout(Some(
+                header_deadline.saturating_duration_since(Instant::now()),
+            ));
             // ⏱️ Pingora's keepalive timer overrides its header-read timer.
             // ⏱️ Keepalive therefore begins only after routing accepts the header.
             session.set_keepalive(None);
@@ -195,12 +222,8 @@ impl ResourceGuardedProxy {
             );
 
             let reused = self.proxy.process_new_http(session, shutdown).await?;
-            let (stream, persistent) = reused.consume();
-            session = ServerSession::new_http1(stream);
-            header_started = Instant::now();
-            if let Some(persistent) = persistent {
-                persistent.apply_to_session(&mut session);
-            }
+            (stream, persistent) = reused.consume();
+            header_deadline = Instant::now() + self.header_timeout;
         }
     }
 }

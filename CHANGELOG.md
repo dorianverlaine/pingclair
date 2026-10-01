@@ -76,6 +76,11 @@ below, which ends with what to write instead.
   `/admin/x`, as in Caddy; a site that used case to tell two routes apart
   needs a `path_regexp`.
   → [Every route path ignores letter case](#-every-route-path-ignores-letter-case)
+- **A request header has one minute by default**, start to finish, where it
+  had no limit unless `limits { header_timeout }` was set. An idle HTTP/1
+  keepalive connection is therefore closed after a minute without a request.
+  Set `limits { header_timeout … }` to choose another bound.
+  → [Security](#-security)
 
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
@@ -2823,6 +2828,24 @@ immediately after the `101`, both ends seeing EOF with no error.
   run. A cache hit now gets exactly the edits the miss got. HTTP/3 has no
   response cache, so it was never affected. A `+` field also stops being added
   once more for every retried upstream attempt.
+
+- ⏱️ **A request header sent slowly enough was never cut off.** A slowloris
+  client opens a connection and sends its request header a byte at a time,
+  never finishing; ten of them held their connections for over 120 s in a
+  production-like soak run. With no `limits { header_timeout }` there was no
+  timer at all, and a configured one did not help either: it timed each read on
+  its own, so every byte that arrived started it again, and a byte a second
+  stayed under a two-second limit forever. The timeout now covers the whole
+  header, from the moment the connection is accepted (or the previous keepalive
+  request ends) to its last byte, and it defaults to 60 s — Caddy's default
+  for `read_header`, and nginx's for `client_header_timeout`. The same deadline
+  bounds the HTTP/2 connection preface and the h2c check. A client that misses
+  it is disconnected without a response.
+
+  ⚠️ **Behaviour change:** because the deadline also runs while a keepalive
+  connection waits for its next request, an idle HTTP/1 connection is now
+  closed after 60 s; it used to stay open indefinitely. Set
+  `limits { header_timeout … }` for a different bound.
 
 - 🔒 **`rustls` moves to 0.23.45 for RUSTSEC-2026-0285.** Rustls accepted TLS
   1.3 handshake messages sent at the wrong encryption level when they followed a
