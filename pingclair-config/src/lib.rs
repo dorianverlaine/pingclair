@@ -248,6 +248,7 @@ fn merge_globals(
         local_certs,
         blocked_ips,
         trusted_proxies,
+        client_ip_headers,
         listener_options,
         upstream_keepalive_pool_size,
         http3,
@@ -337,6 +338,21 @@ fn merge_globals(
     // that matters; the reverse is merely surprising.
     if !http3 {
         into.http3 = false;
+    }
+
+    // 🛡️ An ordered list, so it cannot accumulate the way the network lists
+    // below do: two files naming different headers would produce an order
+    // neither wrote. The second file to state one is refused instead.
+    if !client_ip_headers.is_empty() {
+        if !into.client_ip_headers.is_empty() && into.client_ip_headers != client_ip_headers {
+            return Err(FullCompileError::Compile(pingclair_config_compile_error(
+                format!(
+                    "`client_ip_headers` is set differently in more than one file (seen again in {})",
+                    path.display()
+                ),
+            )));
+        }
+        into.client_ip_headers = client_ip_headers;
     }
 
     // 🧭 One listener's options per address, accumulated like the channels in
@@ -1534,6 +1550,60 @@ mod tests {
             ["127.0.0.1", "10.0.0.0/8", "2001:db8::/32"]
         );
         assert_eq!(config.servers[0].proxy_protocol_listen, ["[::]:80"]);
+    }
+
+    /// 🛡️ `client_ip_headers` keeps its order globally and per listener, and a
+    /// name that is not a header is refused rather than dropped.
+    #[test]
+    fn client_ip_headers_compile_in_order_and_refuse_bad_names() {
+        let config = compile(
+            r#"{
+                servers {
+                    trusted_proxies static 10.0.0.0/8
+                    client_ip_headers CF-Connecting-IP X-Forwarded-For
+                }
+                servers :8443 {
+                    client_ip_headers X-Real-IP
+                }
+            }
+
+            example.com:8443 {
+                respond "OK"
+            }"#,
+        )
+        .expect("client_ip_headers compiles");
+        assert_eq!(
+            (
+                config.global.client_ip_headers,
+                config.global.listener_options[":8443"]
+                    .client_ip_headers
+                    .clone()
+            ),
+            (
+                vec![
+                    "CF-Connecting-IP".to_string(),
+                    "X-Forwarded-For".to_string()
+                ],
+                Some(vec!["X-Real-IP".to_string()])
+            )
+        );
+
+        let refused = compile(
+            r#"{
+                servers {
+                    client_ip_headers "Bad Header"
+                }
+            }
+
+            example.com {
+                respond "OK"
+            }"#,
+        )
+        .expect_err("a name with a space is not a header");
+        assert!(
+            refused.to_string().contains("Bad Header"),
+            "the refusal names the bad header: {refused}"
+        );
     }
 
     #[test]

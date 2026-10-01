@@ -353,6 +353,7 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
     }
 
     config.global.trusted_proxies = global.trusted_proxies.clone();
+    config.global.client_ip_headers = global.client_ip_headers.clone();
     config.global.storage_path = global.storage_path.clone();
 
     // 🚰 Left as `None` when unset, which is not "unconfigured" but the actual
@@ -400,6 +401,7 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
             options.proxy_protocol.is_some()
                 || options.http3.is_some()
                 || options.trusted_proxies.is_some()
+                || options.client_ip_headers.is_some()
         })
         .map(|(address, options)| {
             (
@@ -408,6 +410,7 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
                     proxy_protocol: options.proxy_protocol,
                     http3: options.http3,
                     trusted_proxies: options.trusted_proxies.clone(),
+                    client_ip_headers: options.client_ip_headers.clone(),
                 },
             )
         })
@@ -1011,6 +1014,36 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
                     message: format!("{option} contains invalid IP or CIDR `{rule}`"),
                 });
             }
+        }
+    }
+    // 🛡️ Checked here as well as in the DSL adapter, so a JSON document cannot
+    // hand the runtime a header name it would have to drop. A dropped name
+    // means the client address quietly comes from a source nobody chose.
+    // 📌 An empty global list means "the built-in set"; an empty listener list
+    // has no such meaning and would leave that listener with no source at all.
+    if config.global.listener_options.values().any(|options| {
+        options
+            .client_ip_headers
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+    }) {
+        return Err(CompileError::InvalidServer {
+            message: "client_ip_headers for a listener names no header".into(),
+        });
+    }
+    let header_names = config.global.client_ip_headers.iter().chain(
+        config
+            .global
+            .listener_options
+            .values()
+            .filter_map(|options| options.client_ip_headers.as_ref())
+            .flatten(),
+    );
+    for name in header_names {
+        if http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+            return Err(CompileError::InvalidServer {
+                message: format!("client_ip_headers contains invalid header name `{name}`"),
+            });
         }
     }
     // 🚧 An Admin listen address that cannot be parsed is a typo, and a typo has

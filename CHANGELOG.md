@@ -102,6 +102,10 @@ below, which ends with what to write instead.
   before the request is answered `408`. An upload client that stalls longer
   needs `limits { body_timeout … }`.
   → [Security](#-security)
+- **`CF-Connecting-IP` no longer names the client by itself.** A deployment
+  behind Cloudflare that relied on it must add
+  `servers { client_ip_headers CF-Connecting-IP }`.
+  → [`CF-Connecting-IP` counts only when `client_ip_headers` lists it](#️-cf-connecting-ip-counts-only-when-client_ip_headers-lists-it)
 
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
@@ -241,6 +245,37 @@ while it was still in flight saw nothing running and ended at once, losing
 any packet of it that had to be sent again.
 
 📌 Upgrading: nothing to change. (#211)
+
+### ☁️ `CF-Connecting-IP` counts only when `client_ip_headers` lists it
+
+**Breaking for deployments behind Cloudflare that relied on the header.**
+Behind `trusted_proxies`, `CF-Connecting-IP` used to name the client ahead of
+every other header. But a trusted peer is not necessarily Cloudflare: an
+ingress or load balancer that passes client headers through untouched let
+any client choose its own `{client_ip}`, and with it what `client_ip`
+matchers, rate limits and access logs believed. The header now counts only
+when it is listed.
+
+Caddy's `client_ip_headers` server option is implemented to list it, in the
+global `servers` block or an addressed `servers <address>` block for one
+listener. Listed headers are the only sources, consulted in order; the
+first that names a client decides. Without the option, the client comes from
+`X-Forwarded-For` and `Forwarded`, with `X-Real-IP` when neither was sent, as
+before. Caddy's default is `X-Forwarded-For` alone.
+
+📌 Upgrading: a site behind Cloudflare writes
+
+```caddyfile
+{
+    servers {
+        trusted_proxies static 173.245.48.0/20
+        client_ip_headers CF-Connecting-IP
+    }
+}
+```
+
+with Cloudflare's published ranges (or the tunnel's address) as the trusted
+proxies.
 
 ### 📊 Metrics are collected only when `metrics` is set
 

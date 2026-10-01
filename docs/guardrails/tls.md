@@ -60,6 +60,10 @@
 
 - Untrusted sources **must not** be able to forge `X-Forwarded-*`, `X-Real-IP`, or
   `CF-Connecting-IP`.
+- ☁️ A trusted proxy is not necessarily Cloudflare. `CF-Connecting-IP` used to
+  win whenever the peer was trusted, so an ingress that passed the header
+  through let any client name itself. It counts only when
+  `client_ip_headers` lists it.
 - Misconfiguration always **fails closed**, never gets ignored silently.
 - Sensitive fields (`Authorization`, `Cookie`, API keys) are **masked by default**
   in logs, metrics, Admin dumps, and panic messages.

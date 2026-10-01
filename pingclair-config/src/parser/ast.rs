@@ -78,6 +78,8 @@ pub struct GlobalBlock {
     pub persist_config_off: bool,
     /// 🛡️ Proxy IP or CIDR ranges allowed to supply client identity headers.
     pub trusted_proxies: Vec<String>,
+    /// 🛡️ Headers a trusted proxy may name the client in (`client_ip_headers`).
+    pub client_ip_headers: Vec<String>,
     /// 🔄 Upstream re-resolution interval in seconds; `Some(0)` disables it.
     /// `None` means the directive was absent and the default applies.
     pub dns_refresh_secs: Option<u64>,
@@ -140,6 +142,8 @@ pub struct ListenerOptions {
     pub http3: Option<bool>,
     /// 🛡️ Proxies whose forwarded client address this listener believes.
     pub trusted_proxies: Option<Vec<String>>,
+    /// 🛡️ Headers this listener reads the client address from.
+    pub client_ip_headers: Option<Vec<String>>,
 }
 
 /// Admin API configuration (from the global `admin` directive)

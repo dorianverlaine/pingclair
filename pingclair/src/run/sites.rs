@@ -99,9 +99,15 @@ pub(super) fn group_by_address(
             // forwarded address is a decision about who is in front of *this*
             // socket, and two deployments behind different load balancers is
             // the case the address exists to separate.
-            let trusted = pingclair_core::config::listener_options_for(listener_options, &addr)
+            let addressed = pingclair_core::config::listener_options_for(listener_options, &addr);
+            let trusted = addressed
                 .and_then(|options| options.trusted_proxies.as_deref())
                 .unwrap_or(trusted_proxies);
+            // 🛡️ Which headers name the client is decided the same way: the
+            // addressed block replaces the global list for its listener.
+            let client_ip_headers = addressed
+                .and_then(|options| options.client_ip_headers.as_deref())
+                .unwrap_or(&config.global.client_ip_headers);
             let proxy = port_proxies.entry(addr.clone()).or_insert_with(|| {
                 pingclair_proxy::server::PingclairProxy::with_listener_policy(
                     tls_manager.clone(),
@@ -109,6 +115,7 @@ pub(super) fn group_by_address(
                     proxy_protocol_addresses.contains(&addr),
                     listener_policy,
                 )
+                .reading_client_ip_from(client_ip_headers)
             });
 
             // Track what sites are bound to what addresses
@@ -137,6 +144,7 @@ pub(super) fn group_by_address(
                     proxy_protocol_addresses.contains(&addr),
                     listener_policy,
                 )
+                .reading_client_ip_from(&config.global.client_ip_headers)
             });
             binding_info.entry(addr).or_default().push(format!(
                 "{} (automatic HTTP)",

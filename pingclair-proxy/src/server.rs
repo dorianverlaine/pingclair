@@ -517,9 +517,12 @@ fn strip_hop_by_hop_headers(
 struct NegotiatedUpstreamAlpn(Vec<u8>);
 
 /// 🛡️ Pre-parsed proxy networks allowed to assert downstream client identity.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TrustedProxyPolicy {
     networks: Vec<IpNet>,
+    /// 🛡️ The headers a trusted peer may name the client in; `None` is the
+    /// built-in set. Parsed into `HeaderName`s once, at load.
+    client_ip_headers: Option<Box<[http::HeaderName]>>,
 }
 
 impl TrustedProxyPolicy {
@@ -539,7 +542,39 @@ impl TrustedProxyPolicy {
                     .ok()
             })
             .collect();
-        Self { networks }
+        Self {
+            networks,
+            client_ip_headers: None,
+        }
+    }
+
+    /// 🛡️ Restricts the client address to the headers `names` lists, in order.
+    ///
+    /// An empty list keeps the built-in set. Names were validated when the
+    /// configuration compiled; one that still fails to parse is logged and
+    /// skipped, which narrows the sources rather than widening them.
+    fn reading_client_ip_from(mut self, names: &[String]) -> Self {
+        if names.is_empty() {
+            self.client_ip_headers = None;
+            return self;
+        }
+        self.client_ip_headers = Some(
+            names
+                .iter()
+                .filter_map(|name| {
+                    http::HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|error| {
+                            tracing::error!(
+                                name,
+                                %error,
+                                "❌ Invalid client_ip_headers entry; the header is ignored"
+                            );
+                        })
+                        .ok()
+                })
+                .collect(),
+        );
+        self
     }
 
     fn contains(&self, address: IpAddr) -> bool {
@@ -562,23 +597,19 @@ impl TrustedProxyPolicy {
             return fallback;
         }
 
-        // ☁️ `CF-Connecting-IP` wins when the immediate peer is trusted.
+        // 🛡️ Configured headers are the only sources, consulted in order: the
+        // first one that names a client decides, and a header that is absent,
+        // malformed or stops at a hidden hop passes to the next.
         //
-        // Cloudflare defines it as the single original visitor address, so it
-        // needs no chain walking and cannot be ambiguous the way a multi-hop
-        // `X-Forwarded-For` can. This is the header that matters for the
-        // `Cloudflare Tunnel → pingclair` deployment.
-        //
-        // It is read *only* inside the `self.contains(peer)` branch above, so
-        // an untrusted client sending `CF-Connecting-IP: 1.2.3.4` is ignored
-        // and its socket peer is used instead — spoofing it requires already
-        // being a trusted proxy.
-        if let Some(cf_ip) = headers
-            .get("cf-connecting-ip")
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_forwarded_ip)
-        {
-            return cf_ip;
+        // ☁️ `CF-Connecting-IP` is believed only from here. It used to win
+        // whenever the peer was trusted, but a trusted peer is not necessarily
+        // Cloudflare: an ingress or load balancer that forwards client headers
+        // untouched let any client name itself with it.
+        if let Some(names) = &self.client_ip_headers {
+            return names
+                .iter()
+                .find_map(|name| self.client_from_header(name, headers))
+                .unwrap_or(fallback);
         }
 
         // 🧭 Each header is read on its own first. A header that fails to
@@ -587,7 +618,7 @@ impl TrustedProxyPolicy {
         // Only two headers that each name a client, and name different ones,
         // are treated as tampering, because that is the one case where
         // believing either would be a guess.
-        let xff = parse_forwarded_chain(headers);
+        let xff = parse_forwarded_chain(headers, "x-forwarded-for");
         let forwarded = parse_rfc_forwarded_chain(headers);
         let both_absent = matches!((&xff, &forwarded), (Ok(None), Ok(None)));
         let xff_client = match &xff {
@@ -624,6 +655,20 @@ impl TrustedProxyPolicy {
         }
     }
 
+    /// 🧭 The client one configured header names, if it names one.
+    fn client_from_header(
+        &self,
+        name: &http::HeaderName,
+        headers: &http::HeaderMap,
+    ) -> Option<IpAddr> {
+        if name == http::header::FORWARDED {
+            let chain = parse_rfc_forwarded_chain(headers).ok()??;
+            return self.client_from(chain.into_iter());
+        }
+        let chain = parse_forwarded_chain(headers, name).ok()??;
+        self.client_from(chain.into_iter().map(Some))
+    }
+
     /// 🧭 Walks a forwarding chain from the nearest hop outward and returns
     /// the first address this server does not trust, which is the client.
     ///
@@ -657,7 +702,7 @@ impl TrustedProxyPolicy {
             return fallback.to_string();
         }
 
-        let Ok(Some(mut chain)) = parse_forwarded_chain(headers) else {
+        let Ok(Some(mut chain)) = parse_forwarded_chain(headers, "x-forwarded-for") else {
             let client = self.verified_client_ip_with_fallback(transport_peer, fallback, headers);
             return if client == transport_peer {
                 transport_peer.to_string()
@@ -676,14 +721,20 @@ impl TrustedProxyPolicy {
     }
 }
 
-/// 🔎 Parses every `X-Forwarded-For` field into one bounded, normalized chain.
+/// 🔎 Parses every field named `name` — `X-Forwarded-For`, or any header
+/// `client_ip_headers` lists — as a comma-separated address list, into one
+/// bounded, normalized chain. A single-address header such as
+/// `CF-Connecting-IP` is the one-element case.
 ///
 /// 🧹 Empty list elements are skipped, as RFC 9110 §5.6.1.2 requires of a
 /// recipient: a sender that merges two lists commonly leaves `a, , b` or a
 /// trailing comma behind. [`EmptyElementBudget`] keeps a field made only of
 /// commas from being accepted at any length.
-fn parse_forwarded_chain(headers: &http::HeaderMap) -> Result<Option<Vec<IpAddr>>, ()> {
-    let values = headers.get_all("x-forwarded-for");
+fn parse_forwarded_chain<K: http::header::AsHeaderName>(
+    headers: &http::HeaderMap,
+    name: K,
+) -> Result<Option<Vec<IpAddr>>, ()> {
+    let values = headers.get_all(name);
     if values.iter().next().is_none() {
         return Ok(None);
     }
@@ -2390,6 +2441,15 @@ impl PingclairProxy {
             trusted_proxies: Arc::new(TrustedProxyPolicy::from_rules(trusted_proxies)),
             ..Self::default()
         }
+    }
+
+    /// 🛡️ Reads the client address only from `names`, in order, when the peer
+    /// is trusted (`client_ip_headers`). An empty list keeps the built-in set.
+    pub fn reading_client_ip_from(mut self, names: &[String]) -> Self {
+        self.trusted_proxies = Arc::new(
+            TrustedProxyPolicy::clone(&self.trusted_proxies).reading_client_ip_from(names),
+        );
+        self
     }
 
     /// 🛡️ Resolves the verified client address shared by all request policies.
@@ -9701,62 +9761,59 @@ mod forwarded_headers_tests {
         );
     }
 
+    /// 🛡️ A trusted peer is not necessarily Cloudflare, so by default the
+    /// header names nobody: the peer is the client unless a chain says otherwise.
     #[test]
-    fn trusted_peer_cf_connecting_ip_is_honored() {
+    fn trusted_peer_cf_connecting_ip_is_ignored_unless_configured() {
         let proxy = PingclairProxy::with_trusted_proxies(&["10.0.0.0/8".to_string()]);
         let peer: IpAddr = "10.0.0.5".parse().unwrap();
         let mut headers = http::HeaderMap::new();
         headers.insert("cf-connecting-ip", "203.0.113.7".parse().unwrap());
+        assert_eq!(proxy.verified_client_ip(peer, &headers), peer);
 
+        headers.insert("x-forwarded-for", "198.51.100.9".parse().unwrap());
         assert_eq!(
             proxy.verified_client_ip(peer, &headers),
-            "203.0.113.7".parse::<IpAddr>().unwrap()
+            "198.51.100.9".parse::<IpAddr>().unwrap()
         );
     }
 
-    /// Cloudflare sends both headers. CF-Connecting-IP is the unambiguous
-    /// single original-visitor value, so it wins over chain walking.
+    /// ☁️ Listed headers are the only sources, consulted in the listed order.
     #[test]
-    fn cf_connecting_ip_takes_precedence_over_forwarded_chain() {
-        let proxy = PingclairProxy::with_trusted_proxies(&["10.0.0.0/8".to_string()]);
+    fn configured_client_ip_headers_decide_in_order() {
+        let proxy = PingclairProxy::with_trusted_proxies(&["10.0.0.0/8".to_string()])
+            .reading_client_ip_from(&["CF-Connecting-IP".into(), "X-Forwarded-For".into()]);
         let peer: IpAddr = "10.0.0.5".parse().unwrap();
-        let mut headers = http::HeaderMap::new();
-        headers.insert("cf-connecting-ip", "203.0.113.7".parse().unwrap());
-        headers.insert("x-forwarded-for", "198.51.100.9, 10.1.2.3".parse().unwrap());
-        headers.insert("x-real-ip", "198.51.100.10".parse().unwrap());
+        let resolve = |pairs: &[(&'static str, &'static str)]| {
+            let mut headers = http::HeaderMap::new();
+            for (name, value) in pairs {
+                headers.insert(*name, value.parse().unwrap());
+            }
+            proxy.verified_client_ip(peer, &headers).to_string()
+        };
 
         assert_eq!(
-            proxy.verified_client_ip(peer, &headers),
-            "203.0.113.7".parse::<IpAddr>().unwrap()
-        );
-    }
-
-    /// A malformed CF-Connecting-IP must not silently fall through to a
-    /// value an attacker also controls — it falls back to the normal chain.
-    #[test]
-    fn malformed_cf_connecting_ip_falls_back_to_the_chain() {
-        let proxy = PingclairProxy::with_trusted_proxies(&["10.0.0.0/8".to_string()]);
-        let peer: IpAddr = "10.0.0.5".parse().unwrap();
-        let mut headers = http::HeaderMap::new();
-        headers.insert("cf-connecting-ip", "not-an-ip".parse().unwrap());
-        headers.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
-
-        assert_eq!(
-            proxy.verified_client_ip(peer, &headers),
-            "203.0.113.7".parse::<IpAddr>().unwrap()
-        );
-    }
-
-    #[test]
-    fn cf_connecting_ip_supports_ipv6() {
-        let proxy = PingclairProxy::with_trusted_proxies(&["10.0.0.0/8".to_string()]);
-        let peer: IpAddr = "10.0.0.5".parse().unwrap();
-        let mut headers = http::HeaderMap::new();
-        headers.insert("cf-connecting-ip", "2001:db8::1".parse().unwrap());
-
-        assert_eq!(
-            proxy.verified_client_ip(peer, &headers),
-            "2001:db8::1".parse::<IpAddr>().unwrap()
+            [
+                // ☁️ The first listed header wins over the second.
+                resolve(&[
+                    ("cf-connecting-ip", "203.0.113.7"),
+                    ("x-forwarded-for", "198.51.100.9, 10.1.2.3"),
+                ]),
+                // 🔁 A malformed first header passes to the next one.
+                resolve(&[
+                    ("cf-connecting-ip", "not-an-ip"),
+                    ("x-forwarded-for", "198.51.100.9"),
+                ]),
+                // 🚫 An unlisted header is not a source, even as a fallback.
+                resolve(&[("x-real-ip", "198.51.100.10")]),
+                resolve(&[("cf-connecting-ip", "2001:db8::1")]),
+            ],
+            [
+                "203.0.113.7".to_string(),
+                "198.51.100.9".to_string(),
+                "10.0.0.5".to_string(),
+                "2001:db8::1".to_string(),
+            ]
         );
     }
 

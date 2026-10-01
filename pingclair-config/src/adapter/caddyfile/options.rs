@@ -337,6 +337,9 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 "trusted_proxies" => {
                     parse_trusted_proxies(&sub.args, &mut global.trusted_proxies)?;
                 }
+                "client_ip_headers" => {
+                    global.client_ip_headers = parse_client_ip_headers(&sub.args)?;
+                }
                 // 📡 `dns <provider> [args…]` names the provider used both for
                 // DNS-01 challenges and, upstream, for general resolution. We
                 // only have the first meaning, which is why `acme_dns` below
@@ -663,6 +666,9 @@ pub(super) fn expand_servers_block(
                     parse_trusted_proxies(&child.args, &mut rules)?;
                     options.trusted_proxies = Some(rules);
                 }
+                "client_ip_headers" => {
+                    options.client_ip_headers = Some(parse_client_ip_headers(&child.args)?);
+                }
                 // 🚫 Everything else has no meaning for one listener — `admin`,
                 // `email`, `pki`, `storage` are process-wide — or is a setting
                 // this build does not implement at all. Applying it to every
@@ -674,8 +680,8 @@ pub(super) fn expand_servers_block(
                     return Err(AdapterError::UnsupportedFeature(
                         format!("global: servers {address} {{ {other} }}"),
                         format!(
-                            "only `listener_wrappers`, `protocols`, `trusted_proxies` and \
-                             `metrics` can be set for one listener; `{other}` is process-wide, \
+                            "only `listener_wrappers`, `protocols`, `trusted_proxies`, \
+                             `client_ip_headers` and `metrics` can be set for one listener; `{other}` is process-wide, \
                              so write it without an address (`servers {{ {other} … }}`) to apply \
                              it to every listener"
                         ),
@@ -757,6 +763,32 @@ fn parse_trusted_proxies(args: &[String], into: &mut Vec<String>) -> Result<(), 
         into.push(rule.clone());
     }
     Ok(())
+}
+
+/// 🛡️ Parses one `client_ip_headers` line: header names, in the order they
+/// are consulted.
+///
+/// 🚫 A name that is not a valid header field name is refused here, where the
+/// line can be pointed at, rather than at startup, where it could only be
+/// dropped — and a dropped name means the client address silently comes from
+/// somewhere the operator did not choose.
+fn parse_client_ip_headers(args: &[String]) -> Result<Vec<String>, AdapterError> {
+    if args.is_empty() {
+        return Err(AdapterError::ArgumentCount(
+            "client_ip_headers".into(),
+            1,
+            0,
+        ));
+    }
+    for name in args {
+        if http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+            return Err(AdapterError::InvalidArgument(
+                "client_ip_headers".into(),
+                format!("`{name}` is not a valid header name"),
+            ));
+        }
+    }
+    Ok(args.to_vec())
 }
 
 /// 🌐 Parses one `protocols` line into `into`.

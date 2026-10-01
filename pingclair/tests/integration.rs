@@ -181,6 +181,10 @@ mod blocked_ips;
 #[path = "integration/ip_matchers.rs"]
 mod ip_matchers;
 
+// 🛡️ Which headers may name the client behind a trusted proxy.
+#[path = "integration/client_ip_headers.rs"]
+mod client_ip_headers;
+
 // 📁 Filenames that are not valid UTF-8; 🐧 Linux only, APFS refuses them.
 #[cfg(target_os = "linux")]
 #[path = "integration/non_utf8_paths.rs"]

@@ -135,6 +135,7 @@ pub(super) static GLOBAL_OPTIONS: &[Spec] = &[
     implemented("acme_dns"),
     implemented("admin"),
     implemented("auto_https"),
+    implemented("client_ip_headers"),
     implemented("debug"),
     implemented("default_bind"),
     implemented("default_sni"),

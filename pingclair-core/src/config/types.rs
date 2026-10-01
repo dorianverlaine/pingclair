@@ -96,6 +96,10 @@ pub struct ListenerOptions {
     /// 🛡️ Proxies whose forwarded client address this listener believes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_proxies: Option<Vec<String>>,
+    /// 🛡️ The headers this listener reads the client address from, replacing
+    /// the global [`GlobalConfig::client_ip_headers`] for this one socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ip_headers: Option<Vec<String>>,
 }
 
 /// Global configuration options
@@ -205,6 +209,17 @@ pub struct GlobalConfig {
     /// 🛡️ Proxy IP or CIDR ranges allowed to supply client identity headers.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+
+    /// 🛡️ The request headers a trusted proxy may name the client in, in the
+    /// order they are consulted (Caddy's `client_ip_headers`).
+    ///
+    /// 📌 Empty means the built-in set: `X-Forwarded-For` and `Forwarded`,
+    /// with `X-Real-IP` when neither was sent. `CF-Connecting-IP` is not in
+    /// that set and counts only when listed here, because a trusted peer that
+    /// is not Cloudflare usually passes the header through from its client
+    /// untouched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_ip_headers: Vec<String>,
 
     /// 🧭 Options an addressed `servers <address> { … }` block set, keyed by
     /// the address the operator wrote.
@@ -469,6 +484,7 @@ impl Default for GlobalConfig {
             local_certs: false,
             blocked_ips: Vec::new(),
             trusted_proxies: Vec::new(),
+            client_ip_headers: Vec::new(),
             listener_options: BTreeMap::new(),
             upstream_keepalive_pool_size: None,
             http3: true,
