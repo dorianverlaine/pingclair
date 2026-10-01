@@ -121,6 +121,12 @@ impl RouteOrderKey {
         }
     }
 
+    /// 🔢 The directive rank this key sorts by first. For a route that
+    /// answers, it is the rank of the directive that answers.
+    pub(super) fn rank(&self) -> usize {
+        self.rank
+    }
+
     /// 🔢 The rank the default pipeline answers at.
     ///
     /// That pipeline bundles every unmatched directive, and it answers
@@ -170,7 +176,10 @@ fn trim_wildcard(pattern: &str) -> &str {
 /// A named matcher is one matcher set whose conditions are `and`ed, so its
 /// path patterns are collected across the `and` tree. `or` and `not` are not
 /// descended: the reference does not read either as a plain path condition.
-fn sort_path<'a>(matcher: &'a Matcher, matchers: &'a HashMap<String, Matcher>) -> Option<&'a str> {
+pub(super) fn sort_path<'a>(
+    matcher: &'a Matcher,
+    matchers: &'a HashMap<String, Matcher>,
+) -> Option<&'a str> {
     let mut patterns = Vec::new();
     collect_paths(matcher, matchers, &mut patterns, 0);
     match patterns.as_slice() {

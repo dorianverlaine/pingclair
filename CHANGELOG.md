@@ -2959,6 +2959,37 @@ immediately after the `101`, both ends seeing EOF with no error.
   the site's limits say, as before. Found while triaging the slow-header soak
   finding above.
 
+- 🛡️ **A guard written with a matcher protects every route that answers its
+  requests.** With routes chosen in directive order (#18), `basic_auth
+  /secret { … }` beside `respond /secret "…"` let an unauthenticated client
+  read the body: the guard does not answer by itself, the `respond` route
+  matched first, and only the matched route ran. The same held for every
+  middleware line written with a matcher — `forward_auth`, `request_header`,
+  `header`, `request_body`, `rewrite`, `uri`, `try_files`, `rate_limit`,
+  `cors`, `access_control`, `intercept`, and a `route` or `handle` block with
+  nothing in it that answers — in front of a `respond`, `reverse_proxy`,
+  `file_server`, `handle` or other answering sibling, and between two such
+  lines matching one request (`header /admin/public …` sorted ahead of
+  `basic_auth /admin/*` and ran alone). Each line is now copied, at load, in
+  front of every answering route the directive order puts it ahead of, still
+  checked against its matcher per request; `redir`, which the order puts
+  ahead of `basic_auth`, still redirects unguarded, as upstream. This
+  regression came with the directive-order routing work and **never shipped
+  in a release**: `0.2.0-rc.3` chose routes by path and answers 401.
+
+- 🛡️ **`forward_auth` without a matcher runs before the site's `respond`.**
+  It ranked as `reverse_proxy`, which it compiles to, so in a site with
+  `forward_auth` and `respond` the `respond` answered first and the gateway
+  was never asked. It now ranks as `forward_auth`, right after `basic_auth`.
+  The same ordering put it after `respond` inside a `handle` block. **This
+  one shipped** in `0.2.0-rc.1` through `0.2.0-rc.3`: `0.2.0-rc.3` serves a
+  site of `forward_auth <gateway>` and `respond "…"` without contacting the
+  gateway. A `reverse_proxy` written above it shared its rank and could
+  answer first too. **Upgrading:** `intercept` ranks after `forward_auth`, so
+  it no longer sees the gateway's denial; to rewrite a denial, put
+  `intercept`, `forward_auth` and the handler they guard in one `route`
+  block, which keeps written order.
+
 - 🔒 **`rustls` moves to 0.23.45 for RUSTSEC-2026-0285.** Rustls accepted TLS
   1.3 handshake messages sent at the wrong encryption level when they followed a
   key-changing message in the same record — a plaintext `EncryptedExtensions`

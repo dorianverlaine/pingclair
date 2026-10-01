@@ -47,6 +47,7 @@ pub mod registry;
 mod retry_expr;
 mod reverse_proxy;
 mod route_order;
+mod scoped_middleware;
 mod sites;
 mod tls;
 

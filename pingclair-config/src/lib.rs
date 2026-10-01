@@ -2314,7 +2314,10 @@ mod tests {
                     HandlerConfig::Pipeline { handlers }
                     | HandlerConfig::FirstMatch { handlers }
                     | HandlerConfig::HandlePath { handlers, .. } => {
-                        for element in handlers {
+                        // 🎯 A step with a matcher is another line's, carried
+                        // along so it still runs when its own matcher matches
+                        // too; only the unconditional steps are this route's.
+                        for element in handlers.iter().filter(|element| element.matcher.is_none()) {
                             visit(
                                 &element.handler,
                                 cache_control,

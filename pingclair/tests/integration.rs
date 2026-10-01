@@ -5901,14 +5901,20 @@ async fn test_pingclairfile_forward_auth_copies_headers_and_answers_denials() {
             @readiness path __PINGCLAIR_TEST_READINESS_PATH__
             respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
 
-            intercept {{
-                @denied status 403
-                replace_status @denied 401
-            }}
+            # 🧭 `forward_auth` ranks ahead of `intercept`, so only a `route`
+            # block, which keeps written order, lets `intercept` see the
+            # gateway's denial.
             @app path /app
-            forward_auth @app http://{auth} {{
-                uri /auth
-                copy_headers X-User-Id X-Role>X-Identity
+            route @app {{
+                intercept {{
+                    @denied status 403
+                    replace_status @denied 401
+                }}
+                forward_auth http://{auth} {{
+                    uri /auth
+                    copy_headers X-User-Id X-Role>X-Identity
+                }}
+                reverse_proxy http://{backend}
             }}
             reverse_proxy http://{backend}
         }}
@@ -15306,3 +15312,10 @@ mod metrics_default;
 // ♻️ Requests keep flowing while signal reloads publish new generations.
 #[path = "integration/reload_under_traffic.rs"]
 mod reload_under_traffic;
+
+// MARK: - Matcher-scoped middleware
+
+// 🛡️ A matcher-scoped guard runs ahead of every route that answers the
+// requests it matches, not only the site's fallback pipeline.
+#[path = "integration/scoped_middleware.rs"]
+mod scoped_middleware;

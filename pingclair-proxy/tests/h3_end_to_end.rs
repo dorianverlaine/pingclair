@@ -785,15 +785,20 @@ async fn h3_forward_auth_mutates_the_backend_request_and_streams_denials() {
     // 🧾 The real adapter must produce the same handler tree the H3 server executes.
     let source = format!(
         r#":443 {{
-            intercept {{
-                @denied status 403
-                replace_status @denied 401
+            # 🧭 `forward_auth` ranks ahead of `intercept`, so only a `route`
+            # block, which keeps written order, lets `intercept` see the
+            # gateway's denial.
+            route {{
+                intercept {{
+                    @denied status 403
+                    replace_status @denied 401
+                }}
+                forward_auth http://{auth_address} {{
+                    uri /auth
+                    copy_headers X-User>X-Identity
+                }}
+                reverse_proxy http://{backend_address}
             }}
-            forward_auth http://{auth_address} {{
-                uri /auth
-                copy_headers X-User>X-Identity
-            }}
-            reverse_proxy http://{backend_address}
         }}"#
     );
     let config = pingclair_config::compile(&source).unwrap();

@@ -17,6 +17,7 @@ use super::matchers::{
 use super::options::is_wildcard_host;
 use super::order::DirectiveOrder;
 use super::route_order::RouteOrderKey;
+use super::scoped_middleware;
 use super::tls::adapt_tls_directive;
 use crate::parser::ast::*;
 use crate::parser::caddy_ast::Directive;
@@ -694,20 +695,6 @@ pub(super) fn adapt_server(
         // the default pipeline here reproduces that guarantee.
         default_handlers.sort_by_key(|handler| caddy_handler_rank(order, handler));
 
-        let final_handler = if default_handlers.len() == 1 {
-            default_handlers[0].clone()
-        } else {
-            Handler::Pipeline(
-                default_handlers
-                    .iter()
-                    .map(|handler| HandlerElement {
-                        matcher: None,
-                        handler: handler.clone(),
-                    })
-                    .collect(),
-            )
-        };
-
         // 🧭 The site's routes become one list in directive order (issue #18):
         // the reference tries them first to last and the first that matches
         // answers. Each arm is keyed while the arms are still in file order
@@ -719,7 +706,7 @@ pub(super) fn adapt_server(
             .as_mut()
             .map(|routes| std::mem::take(&mut routes.inner.arms))
             .unwrap_or_default();
-        let mut keyed: Vec<(RouteArm, RouteOrderKey)> = arms
+        let keyed: Vec<(RouteArm, RouteOrderKey)> = arms
             .into_iter()
             .enumerate()
             .map(|(file_index, arm)| {
@@ -733,40 +720,15 @@ pub(super) fn adapt_server(
                 (arm.inner, key)
             })
             .collect();
-        // 🧩 A terminal route skips the site's default pipeline. Prepend
-        // unmatched site middleware so it still applies to that route;
-        // route-local middleware runs afterward and can override it.
-        let site_middleware: Vec<&Handler> = default_handlers
-            .iter()
-            .filter(|handler| is_site_middleware(handler))
-            .collect();
-        for (arm, _) in &mut keyed {
-            if !handler_has_terminal(&arm.handler) {
-                arm.handler = compose_with_default_handlers(arm.handler.clone(), &default_handlers);
-            } else if !site_middleware.is_empty() {
-                let own = std::mem::replace(&mut arm.handler, Handler::Pipeline(Vec::new()));
-                arm.handler = Handler::Pipeline(
-                    site_middleware
-                        .iter()
-                        .map(|handler| (*handler).clone())
-                        .chain(std::iter::once(own))
-                        .map(|handler| HandlerElement {
-                            matcher: None,
-                            handler,
-                        })
-                        .collect(),
-                );
-            }
-        }
-        if !default_handlers.is_empty() {
-            keyed.push((
-                RouteArm {
-                    matcher: None,
-                    handler: final_handler,
-                },
-                RouteOrderKey::for_catch_all(pipeline_rank),
-            ));
-        }
+        // 🛡️ Middleware goes in front of every route that answers a request
+        // it matches; the first-match router would otherwise skip it.
+        let mut keyed = scoped_middleware::compose_site_routes(
+            order,
+            &server.matchers,
+            keyed,
+            &default_handlers,
+            pipeline_rank,
+        );
         // 🏗️ One sort per site per load; the router keeps this order.
         keyed.sort_by_key(|(_, key)| *key);
         for (arm, _) in keyed {
@@ -887,7 +849,11 @@ pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
         Handler::Respond(_) => "respond",
         Handler::Proxy(_) => "reverse_proxy",
         Handler::Intercept(_) => "intercept",
-        Handler::ForwardAuth(_) => "reverse_proxy",
+        // 🛡️ A guard, ranked as itself: right after `basic_auth`, ahead of
+        // every directive that answers. It used to rank as `reverse_proxy`,
+        // which it compiles to, and so sorted after `respond`: a site with
+        // `forward_auth` and `respond` answered without asking the gateway.
+        Handler::ForwardAuth(_) => "forward_auth",
         Handler::FileServer(_) => "file_server",
         // 🧭 Three of ours with no counterpart in the shared order. They are
         // middleware that guards what follows, so they belong with the other
@@ -950,61 +916,6 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
         | Handler::ForwardAuth(_)
         | Handler::Plugin { .. } => false,
     }
-}
-
-/// 🧩 Site directives that transform or guard a request or response before a
-/// route answers. Response-producing handlers stay in the fallback pipeline.
-fn is_site_middleware(handler: &Handler) -> bool {
-    match handler {
-        Handler::Headers(_)
-        | Handler::RequestHeaders(_)
-        | Handler::RequestBody(_)
-        | Handler::BasicAuth(_)
-        | Handler::RateLimit(_)
-        | Handler::Rewrite(_)
-        | Handler::TryFiles(_)
-        | Handler::Cors(_)
-        | Handler::AccessControl(_)
-        | Handler::LogSkip
-        | Handler::Vars(_)
-        | Handler::Intercept(_)
-        | Handler::ForwardAuth(_) => true,
-        Handler::Proxy(_)
-        | Handler::Respond(_)
-        | Handler::Error(_)
-        | Handler::Redirect(_)
-        | Handler::FileServer(_)
-        | Handler::AcmeServer(_)
-        | Handler::Templates
-        | Handler::Abort
-        | Handler::Metrics { .. }
-        | Handler::Pipeline(_)
-        | Handler::Handle(_)
-        | Handler::HandleGroup(_)
-        | Handler::HandlePath { .. }
-        | Handler::Plugin { .. } => false,
-    }
-}
-
-/// 🧩 Inserts matched middleware before the default terminal handler.
-pub(super) fn compose_with_default_handlers(matched: Handler, defaults: &[Handler]) -> Handler {
-    let terminal_index = defaults
-        .iter()
-        .position(handler_has_terminal)
-        .unwrap_or(defaults.len());
-    let mut handlers = Vec::with_capacity(defaults.len() + 1);
-    handlers.extend_from_slice(&defaults[..terminal_index]);
-    handlers.push(matched);
-    handlers.extend_from_slice(&defaults[terminal_index..]);
-    Handler::Pipeline(
-        handlers
-            .into_iter()
-            .map(|handler| HandlerElement {
-                matcher: None,
-                handler,
-            })
-            .collect(),
-    )
 }
 
 pub(super) fn add_route(server: &mut ServerBlock, matcher: Option<Matcher>, handler: Handler) {
@@ -1183,13 +1094,20 @@ mod directive_order_tests {
         )
         .expect("compile");
         let routes = &config.servers[0].routes;
+        // 🛡️ The `header @api` line also runs inside it, as a guarded step,
+        // since it ranks ahead of `handle`.
+        let HandlerConfig::Pipeline { handlers } = &routes[0].handler else {
+            panic!("expected a pipeline, got {:?}", routes[0].handler);
+        };
         assert!(
             matches!(
-                &routes[0].handler,
-                HandlerConfig::Pipeline { handlers } if handlers.iter().any(|element| matches!(&element.handler, HandlerConfig::Respond { .. }))
+                handlers.as_slice(),
+                [header, handle]
+                    if header.matcher.is_some()
+                        && matches!(header.handler, HandlerConfig::Headers { .. })
+                        && matches!(&handle.handler, HandlerConfig::Pipeline { handlers } if matches!(handlers.as_slice(), [only] if matches!(only.handler, HandlerConfig::Respond { .. })))
             ),
-            "the answering route must come first, got {:?}",
-            routes[0].handler
+            "the answering route must come first, got {handlers:?}"
         );
     }
 
