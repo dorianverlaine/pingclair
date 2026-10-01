@@ -120,9 +120,9 @@ pub(super) struct ParsedAddress {
     pub(super) explicit: bool,
 }
 
-/// Parse a Caddy server address like `http://ai.408timeout.com:20615`
+/// 🌐 Parses a Caddy server address like `http://ai.408timeout.com:20615`
 /// or `:8080` or `example.com`.
-pub(super) fn parse_server_address(addr: &str) -> Option<ParsedAddress> {
+pub(super) fn parse_server_address(addr: &str, global: &GlobalBlock) -> Option<ParsedAddress> {
     // 🚫 Caddy network addresses may carry a network prefix (`tcp/`,
     // `unix/`, ...) or a port range (`:8080-8085`). Neither has a runtime
     // equivalent here, and treating them as hostnames silently produces a
@@ -171,10 +171,10 @@ pub(super) fn parse_server_address(addr: &str) -> Option<ParsedAddress> {
         let p = rest[colon_pos + 1..].parse::<u16>().ok()?;
         (h.to_string(), Some(p), true)
     } else {
-        // host only (default port based on scheme)
+        // 🌐 Scheme-only addresses inherit the configured listener port.
         let p = match scheme {
-            Scheme::Https => Some(443),
-            Scheme::Http => Some(80),
+            Scheme::Https => Some(global.https_port.unwrap_or(443)),
+            Scheme::Http => Some(global.http_port.unwrap_or(80)),
         };
         (rest.to_string(), p, false)
     };
@@ -233,6 +233,39 @@ pub(super) fn is_ip_literal(host: &str) -> bool {
 #[cfg(test)]
 mod address_semantics_tests {
     use crate::compile;
+
+    #[test]
+    fn scheme_only_addresses_use_global_ports_and_keep_explicit_ports() {
+        for (scheme, port) in [("http", 8080), ("https", 8443)] {
+            for (suffix, expected) in [("", port), (":9090", 9090)] {
+                let source = format!(
+                    "{{\n http_port 8080\n https_port 8443\n}}\n{scheme}://example.test{suffix} {{\n respond \"x\"\n}}"
+                );
+                let server = first_server(&source);
+                assert_eq!(server.listen, [format!("[::]:{expected}")], "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn global_ports_group_equivalent_site_addresses() {
+        let config = compile(
+            "{\n http_port 8080\n https_port 8443\n}\nhttp://a.test, http://b.test:8080 {\n respond \"x\"\n}"
+        ).unwrap();
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].names, ["a.test", "b.test"]);
+        assert_eq!(config.servers[0].listen, ["[::]:8080", "[::]:8080"]);
+    }
+
+    #[test]
+    fn catch_all_schemes_use_global_ports() {
+        for (scheme, port) in [("http", 8080), ("https", 8443)] {
+            let server = first_server(&format!(
+                "{{\n http_port 8080\n https_port 8443\n}}\n{scheme}:// {{\n respond \"x\"\n}}"
+            ));
+            assert_eq!(server.listen, [format!("[::]:{port}")]);
+        }
+    }
 
     fn first_server(source: &str) -> pingclair_core::config::ServerConfig {
         compile(source)

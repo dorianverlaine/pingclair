@@ -165,7 +165,7 @@ enum SiteAddressGroup {
 /// emits one server per listener group. Keeping the block whole loses the
 /// hostname-to-scheme relationship and lets one HTTP address suppress TLS for
 /// every HTTPS address beside it.
-fn split_site_address_groups(directive: Directive) -> Vec<Directive> {
+fn split_site_address_groups(directive: Directive, global: &GlobalBlock) -> Vec<Directive> {
     let mut groups: Vec<(SiteAddressGroup, Vec<String>)> = Vec::new();
     let addresses =
         std::iter::once(directive.name.as_str()).chain(directive.args.iter().map(String::as_str));
@@ -176,16 +176,16 @@ fn split_site_address_groups(directive: Directive) -> Vec<Directive> {
             "http://" => SiteAddressGroup::Listener {
                 scheme: Scheme::Http,
                 host: "[::]".to_string(),
-                port: Some(80),
+                port: Some(global.http_port.unwrap_or(80)),
                 force_plaintext: true,
             },
             "https://" => SiteAddressGroup::Listener {
                 scheme: Scheme::Https,
                 host: "[::]".to_string(),
-                port: Some(443),
+                port: Some(global.https_port.unwrap_or(443)),
                 force_plaintext: false,
             },
-            _ => addresses::parse_server_address(&address).map_or(
+            _ => addresses::parse_server_address(&address, global).map_or(
                 SiteAddressGroup::Implicit,
                 |parsed| {
                     if parsed.explicit {
@@ -262,6 +262,11 @@ pub fn adapt_from(
     let mut order = order::DirectiveOrder::default();
     for d in &expanded {
         if d.name.is_empty() || d.name == "global" || d.name == "options" {
+            // 🌐 Ports must be resolved before sites are grouped or adapted.
+            if ast.global.is_some() {
+                return Err(AdapterError::DuplicateGlobal);
+            }
+            ast.global = Some(Node::new(adapt_global(d.clone())?, Location::synthetic()));
             for sub in d.block.iter().flat_map(|block| &block.directives) {
                 if sub.name == "order" {
                     order.apply(&sub.args)?;
@@ -270,18 +275,20 @@ pub fn adapt_from(
         }
     }
 
+    let global = ast
+        .global
+        .as_ref()
+        .map(|node| node.inner.clone())
+        .unwrap_or_default();
     for d in expanded {
         if d.name.is_empty() || d.name == "global" || d.name == "options" {
-            if ast.global.is_some() {
-                return Err(AdapterError::DuplicateGlobal);
-            }
-            ast.global = Some(Node::new(adapt_global(d)?, Location::synthetic()));
+            continue;
         } else if d.name == "macro" {
             // 🐛 TODO: Support macros in Caddyfile?
             // Caddy uses snippets (import), which we now handle above.
         } else {
-            for split in split_site_address_groups(d) {
-                let server = adapt_server(split, &order)?;
+            for split in split_site_address_groups(d, &global) {
+                let server = adapt_server(split, &order, &global)?;
                 ast.servers.push(Node::new(server, Location::synthetic()));
             }
         }

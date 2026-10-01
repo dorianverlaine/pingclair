@@ -4,6 +4,9 @@
 #[path = "integration/nested_handles.rs"]
 mod nested_handles;
 
+#[path = "integration/scheme_ports.rs"]
+mod scheme_ports;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;

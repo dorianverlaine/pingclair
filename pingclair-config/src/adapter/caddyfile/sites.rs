@@ -49,6 +49,7 @@ pub(super) fn is_valid_mime_pattern(pattern: &str) -> bool {
 pub(super) fn adapt_server(
     d: Directive,
     order: &DirectiveOrder,
+    global: &GlobalBlock,
 ) -> Result<ServerBlock, AdapterError> {
     // 🏷️ Caddy separates multiple site addresses with commas; the lexer keeps
     // the comma attached to the token, so strip it before parsing.
@@ -65,9 +66,8 @@ pub(super) fn adapt_server(
         // 🚫 Refuse an address that cannot mean anything before deriving a
         // listener from it.
         reject_impossible_address(name)?;
-        // 🌐 A catch-all scheme address (`http://`, `https://`) has no host;
-        // it still names a listener (80 or 443) even though no Host header
-        // will ever match it.
+        // 🌐 Catch-all schemes inherit the same global ports as named sites.
+        // Their missing hostname must not prevent the listener from binding.
         if matches!(name.as_str(), "http://" | "https://") {
             let is_https = name == "https://";
             server.listens.push(ListenAddr {
@@ -77,13 +77,17 @@ pub(super) fn adapt_server(
                     Scheme::Http
                 },
                 host: "[::]".to_string(),
-                port: Some(if is_https { 443 } else { 80 }),
+                port: Some(if is_https {
+                    global.https_port.unwrap_or(443)
+                } else {
+                    global.http_port.unwrap_or(80)
+                }),
                 force_plaintext: !is_https,
                 proxy_protocol: false,
             });
             continue;
         }
-        if let Some(parsed) = parse_server_address(name) {
+        if let Some(parsed) = parse_server_address(name, global) {
             // 📍 A bare hostname site address selects the virtual host; the
             // listener is derived later from whether TLS is configured.
             // Only explicit ports, schemes and IP literals create listeners
@@ -116,7 +120,7 @@ pub(super) fn adapt_server(
 
     // Fallback: if server name is still a full URL, strip it
     if server.name.contains("://")
-        && let Some(parsed) = parse_server_address(&server.name)
+        && let Some(parsed) = parse_server_address(&server.name, global)
     {
         server.name = parsed.hostname;
     }

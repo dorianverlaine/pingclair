@@ -33,6 +33,8 @@ Most configurations keep working unchanged. These are the changes most
 likely to alter what an existing configuration does; each links to its entry
 below, which ends with what to write instead.
 
+- **Scheme-only site addresses inherit global ports.** Explicit ports stay as written.
+  → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
 - **Routes are chosen in directive order**, not by the most specific path.
   A `redir`, `route` or `handle` catch-all can now answer requests that a more
   specific `respond` used to take.
@@ -89,6 +91,15 @@ below, which ends with what to write instead.
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
 [Known defect — WebSocket upgrades under load](#-known-defect--websocket-upgrades-under-load).
+
+### 🌐 Scheme-only addresses use global ports
+
+`http://example.test` and `https://example.test` now listen on `http_port`
+and `https_port`, respectively, as in Caddy. Previously they always bound
+80 and 443. Addresses that name a port keep that port (#220).
+
+**Upgrade:** Remove workarounds that repeat global ports in site addresses,
+or name an explicit port to keep a site on its previous listener.
 
 ### 🚫 Non-goals for 0.2.0
 
