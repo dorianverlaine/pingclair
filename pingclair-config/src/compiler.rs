@@ -526,6 +526,7 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
             server.gzip_types.clone()
         },
         encodings: site_encodings,
+        encode: server.encode.clone(),
         error_pages: server.error_pages.iter().cloned().collect(),
         error_routes: Vec::new(),
         vars_routes: Vec::new(),
@@ -996,6 +997,26 @@ fn validate_cache_ceiling_agrees(config: &PingclairConfig) -> CompileResult<()> 
 }
 
 pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
+    for server in &config.servers {
+        if !(1..=9).contains(&server.encode.gzip_level) {
+            return Err(CompileError::InvalidServer {
+                message: "encode gzip level must be between 1 and 9".into(),
+            });
+        }
+    }
+    for server in &config.servers {
+        if let Some(matcher) = &server.encode.matcher {
+            for name in matcher.headers.keys() {
+                if http::HeaderName::from_bytes(name.strip_prefix('!').unwrap_or(name).as_bytes())
+                    .is_err()
+                {
+                    return Err(CompileError::InvalidServer {
+                        message: format!("encode match has an invalid header name `{name}`"),
+                    });
+                }
+            }
+        }
+    }
     // 🚫 `{remote_ip}` is refused wherever it appears (see that module).
     crate::retired_placeholders::refuse_retired_placeholders(config)?;
     // 🛡️ Both lists are refused here rather than at listener setup, so

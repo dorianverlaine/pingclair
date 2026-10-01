@@ -725,6 +725,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 security: Default::default(),
                 gzip_types: pingclair_core::config::default_gzip_types(),
                 encodings: pingclair_core::config::default_encodings(),
+                encode: Default::default(),
                 error_pages: Default::default(),
             };
 
@@ -876,6 +877,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 limits: Default::default(),
                 security: Default::default(),
                 gzip_types: pingclair_core::config::default_gzip_types(),
+                encode: Default::default(),
                 encodings: if no_compress {
                     Vec::new()
                 } else {

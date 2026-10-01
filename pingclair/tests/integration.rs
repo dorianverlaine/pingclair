@@ -18,6 +18,8 @@ mod admin_reload;
 
 #[path = "integration/admin_compat.rs"]
 mod admin_compat;
+#[path = "integration/encode.rs"]
+mod encode;
 
 #[path = "integration/cli_tls_validate.rs"]
 mod cli_tls_validate;

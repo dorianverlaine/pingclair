@@ -341,3 +341,61 @@ mod tests {
         assert_eq!(order, [&"br", &"zstd"]);
     }
 }
+
+/// 🗜️ Load-time settings for an encode handler, shared by static and proxy responses.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct EncodeOptions {
+    /// 📏 Small responses stay identity to avoid compression overhead.
+    pub minimum_length: u64,
+    /// 🗜️ Gzip quality is retained at load time for codec construction.
+    pub gzip_level: u32,
+    /// 🎯 An explicit matcher replaces the default content-type matcher.
+    pub matcher: Option<crate::config::ResponseMatcher>,
+}
+
+impl Default for EncodeOptions {
+    fn default() -> Self {
+        Self {
+            minimum_length: 512,
+            gzip_level: 5,
+            matcher: None,
+        }
+    }
+}
+
+impl EncodeOptions {
+    /// 🧾 Default settings stay absent so existing canonical JSON remains stable.
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// 🎯 Checks response-dependent data without collecting header values.
+    pub fn matches(&self, status: u16, header: impl Fn(&str, &[String]) -> bool) -> bool {
+        self.matcher.as_ref().is_none_or(|matcher| {
+            (matcher.status_codes.is_empty()
+                || matcher.status_codes.contains(&status)
+                || matcher.status_codes.contains(&(status / 100)))
+                && matcher.headers.iter().all(|(name, patterns)| {
+                    if let Some(name) = name.strip_prefix('!') {
+                        !header(name, &[])
+                    } else {
+                        header(name, patterns)
+                    }
+                })
+        })
+    }
+}
+
+/// 🎯 Matches Caddy response-header patterns without allocating.
+pub fn header_pattern_matches(value: &str, pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    match (pattern.strip_prefix('*'), pattern.strip_suffix('*')) {
+        (Some(rest), Some(_)) => value.contains(rest.trim_end_matches('*')),
+        (Some(suffix), None) => value.ends_with(suffix),
+        (None, Some(prefix)) => value.starts_with(prefix),
+        (None, None) => value == pattern,
+    }
+}

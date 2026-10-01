@@ -6053,6 +6053,34 @@ async fn reverse_proxy_upstream(
         return Err((502, "Upstream Response Trailers Not Supported"));
     }
 
+    // 🗜️ H3 streams through the same codec and eligibility policy as H1/H2.
+    let mut encoder = if intercept_file.is_none()
+        && intercept_replacement.is_none()
+        && !immediate_stream
+    {
+        session
+            .response_header()
+            .filter(|response| {
+                crate::response_encoding::eligible(&state.config, &client_header.method, response)
+            })
+            .and_then(|_| {
+                let accepted = client_header
+                    .headers
+                    .get("accept-encoding")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("");
+                crate::encoding::negotiate(accepted, &state.config.encodings).and_then(|encoding| {
+                    crate::encoding::ResponseEncoder::new(encoding)
+                        .map_err(|error| {
+                            tracing::warn!("⚠️ Could not initialize H3 encoder: {error}")
+                        })
+                        .ok()
+                })
+            })
+    } else {
+        None
+    };
+
     let mut hdrs = Vec::new();
     if let Some(resp) = session.response_header() {
         if let Some(stream) = &intercept_file {
@@ -6109,6 +6137,18 @@ async fn reverse_proxy_upstream(
             ));
             for (name, value) in resp.headers.iter() {
                 let lower = name.as_str();
+                if encoder.is_some()
+                    && matches!(
+                        lower,
+                        "content-length"
+                            | "content-digest"
+                            | "repr-digest"
+                            | "digest"
+                            | "content-md5"
+                    )
+                {
+                    continue;
+                }
                 if matches!(
                     lower,
                     "connection"
@@ -6124,6 +6164,24 @@ async fn reverse_proxy_upstream(
                     continue;
                 }
                 hdrs.push(quiche::h3::Header::new(lower.as_bytes(), value.as_bytes()));
+            }
+            if let Some(encoder) = &encoder {
+                hdrs.push(quiche::h3::Header::new(
+                    b"content-encoding",
+                    encoder.token().as_bytes(),
+                ));
+                if !resp
+                    .headers
+                    .get_all("vary")
+                    .iter()
+                    .filter_map(|value| value.to_str().ok())
+                    .flat_map(|value| value.split(','))
+                    .any(|value| {
+                        value.trim().eq_ignore_ascii_case("accept-encoding") || value.trim() == "*"
+                    })
+                {
+                    hdrs.push(quiche::h3::Header::new(b"vary", b"Accept-Encoding"));
+                }
             }
             for (name, value) in &intercept_set {
                 let resolved = crate::server::resolve_caddy_placeholders(
@@ -6243,6 +6301,15 @@ async fn reverse_proxy_upstream(
                     None => Some(bytes),
                 };
                 let Some(bytes) = outgoing else { continue };
+                let mut encoded = Some(bytes);
+                if let Err(error) = crate::encoding::stream_chunk(&mut encoder, &mut encoded, false)
+                {
+                    tracing::warn!("🚫 H3 compression failed: {error}");
+                    clean = false;
+                    break;
+                }
+                let bytes = encoded.unwrap_or_default();
+
                 if let Some(delay) = download_pacer
                     .as_mut()
                     .and_then(|pacer| pacer.delay_for(bytes.len()))
@@ -6283,6 +6350,12 @@ async fn reverse_proxy_upstream(
     // client a body that is short but framed as complete — a worse failure
     // than the truncation the error path already reports.
     if let Some(bytes) = response_buffer.as_mut().and_then(|buffer| buffer.finish()) {
+        let mut encoded = Some(bytes);
+        if let Err(error) = crate::encoding::stream_chunk(&mut encoder, &mut encoded, false) {
+            tracing::warn!("🚫 H3 buffered compression failed: {error}");
+            clean = false;
+        }
+        let bytes = encoded.unwrap_or_default();
         let delay = download_pacer
             .as_mut()
             .and_then(|pacer| pacer.delay_for(bytes.len()));
@@ -6300,6 +6373,16 @@ async fn reverse_proxy_upstream(
                 send_body(resp_tx, stream_id, bytes, false).await;
             }
             None => send_body(resp_tx, stream_id, bytes, false).await,
+        }
+    }
+
+    if clean && encoder.is_some() {
+        let mut tail = None;
+        if let Err(error) = crate::encoding::stream_chunk(&mut encoder, &mut tail, true) {
+            tracing::warn!("🚫 H3 compression trailer failed: {error}");
+            clean = false;
+        } else if let Some(tail) = tail {
+            send_body(resp_tx, stream_id, tail, false).await;
         }
     }
 

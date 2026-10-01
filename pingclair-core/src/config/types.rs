@@ -691,6 +691,13 @@ pub struct ServerConfig {
     #[serde(default = "default_encodings")]
     pub encodings: Vec<Encoding>,
 
+    /// 🗜️ Response eligibility and codec settings compiled from `encode`.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::encoding::EncodeOptions::is_default"
+    )]
+    pub encode: crate::encoding::EncodeOptions,
+
     /// Custom error pages: HTTP status code → file path served for that
     /// error (404/500/502/504, ...). Falls back to the built-in plain-text
     /// response when unset or unreadable.
@@ -771,6 +778,7 @@ impl Default for ServerConfig {
             security: SecurityConfig::default(),
             gzip_types: default_gzip_types(),
             encodings: default_encodings(),
+            encode: Default::default(),
             error_pages: BTreeMap::new(),
             error_routes: Vec::new(),
             vars_routes: Vec::new(),
@@ -3711,6 +3719,7 @@ mod tests {
             security: Default::default(),
             gzip_types: default_gzip_types(),
             encodings: default_encodings(),
+            encode: Default::default(),
             error_pages: Default::default(),
             error_routes: Vec::new(),
             vars_routes: Vec::new(),

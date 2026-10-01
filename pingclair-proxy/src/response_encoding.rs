@@ -154,6 +154,46 @@ pub(crate) fn forbids_transform(header: &ResponseHeader) -> bool {
         .any(|token| token.eq_ignore_ascii_case("no-transform"))
 }
 
+/// 🗜️ Applies the same response eligibility policy to both transports.
+pub(crate) fn eligible(
+    config: &pingclair_core::config::ServerConfig,
+    method: &http::Method,
+    response: &ResponseHeader,
+) -> bool {
+    let content_type = response
+        .headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let size = response
+        .headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    is_full_representation(method, response)
+        && !forbids_transform(response)
+        && !response.headers.contains_key("content-encoding")
+        && !crate::server::is_streaming_content_type(content_type)
+        && size.is_none_or(|size| size >= config.encode.minimum_length)
+        && (config.encode.matcher.is_some()
+            || crate::server::is_compressible_content_type(content_type, &config.gzip_types))
+        && config
+            .encode
+            .matches(response.status.as_u16(), |name, patterns| {
+                response
+                    .headers
+                    .get_all(name)
+                    .iter()
+                    .filter_map(|value| value.to_str().ok())
+                    .any(|value| {
+                        patterns.is_empty()
+                            || patterns.iter().any(|pattern| {
+                                pingclair_core::encoding::header_pattern_matches(value, pattern)
+                            })
+                    })
+            })
+}
+
 /// 🧹 Removes the fields that vouch for the origin's exact bytes.
 ///
 /// Once the body is re-encoded, a digest the origin computed over its

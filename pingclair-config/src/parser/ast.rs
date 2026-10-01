@@ -251,6 +251,9 @@ pub struct ServerBlock {
     /// a different thing from `Some(vec![])`, meaning `encode off`.
     pub compress: Option<Vec<CompressionAlgo>>,
 
+    /// 🗜️ Settings shared by both response paths.
+    pub encode: pingclair_core::encoding::EncodeOptions,
+
     /// 🗜️ MIME patterns eligible for reverse-proxy gzip compression.
     pub gzip_types: Vec<String>,
 
@@ -1305,6 +1308,7 @@ impl ServerBlock {
             bind: None,
             root: None,
             compress: None,
+            encode: Default::default(),
             gzip_types: Vec::new(),
             log: None,
             log_channels: Vec::new(),

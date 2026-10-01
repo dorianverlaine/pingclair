@@ -50,6 +50,9 @@ below, which ends with what to write instead.
   → [Automatic HTTPS follows the configured listener policy](#-automatic-https-follows-the-configured-listener-policy)
 - **Scheme-only site addresses inherit global ports.** Explicit ports stay as written.
   → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
+- **`encode` blocks now take effect and reject unknown settings.** Review size floors and response matchers.
+  → [Encode blocks take effect](#encode-blocks-take-effect)
+
 
 - **Empty startup can load its first HTTP listeners.** TLS listeners and later topology changes still require restart.
   → [Admin-only startup accepts its first HTTP generation](#admin-only-startup-accepts-its-first-http-generation)
@@ -223,6 +226,13 @@ and `https_port`, respectively, as in Caddy. Previously they always bound
 
 **Upgrade:** Remove workarounds that repeat global ports in site addresses,
 or name an explicit port to keep a site on its previous listener.
+### Encode blocks take effect
+
+🗜️ `encode { gzip [level]; zstd; minimum_length; match { … } }` now preserves
+its settings instead of silently compiling every block as gzip. Unknown
+sub-directives fail at load time. Upgrade: remove misspelled settings and review
+response matchers and size floors that were previously ignored. Gzip level
+selection is recorded in configuration; codec application is tracked in #223.
 
 ### Admin-only startup accepts its first HTTP generation
 

@@ -245,7 +245,19 @@ impl FileServer {
                 if self.config.browse {
                     let listing = self.generate_listing(&file_path, path).await?;
                     // Compress listing if enabled
-                    let (content, encoding) = if self.config.compress && range.is_none() {
+                    let (content, encoding) = if self
+                        .would_compress(listing.len() as u64, accept_encoding)
+                        && range.is_none()
+                        && self.config.encode.matches(200, |name, patterns| {
+                            name.eq_ignore_ascii_case("content-type")
+                                && (patterns.is_empty()
+                                    || patterns.iter().any(|pattern| {
+                                        pingclair_core::encoding::header_pattern_matches(
+                                            "text/html; charset=utf-8",
+                                            pattern,
+                                        )
+                                    }))
+                        }) {
                         self.compress_content(listing.as_bytes(), accept_encoding)
                             .await?
                     } else {
@@ -377,12 +389,14 @@ impl FileServer {
         // 🗜️ One predicate decides this and the streaming question, so a body can
         // never be judged compressible by one and not the other. It carries the
         // size floor and the size ceiling both.
-        let cache_encoding =
-            if content_range.is_none() && self.would_compress(file_size, accept_encoding) {
-                Self::negotiate_encoding(accept_encoding)
-            } else {
-                None
-            };
+        let cache_encoding = if content_range.is_none()
+            && self.would_compress(file_size, accept_encoding)
+            && self.matches_file_encode(status, &meta)
+        {
+            Self::negotiate_encoding(accept_encoding)
+        } else {
+            None
+        };
         let mtime_ns = metadata
             .modified()
             .ok()
@@ -495,7 +509,7 @@ impl FileServer {
         // outright, which made `Range: bytes=0-` on a large file the single most
         // expensive request this server could be asked for — the one shape
         // guaranteed to allocate the whole file.
-        if self.should_stream_response(length, file_size, accept_encoding) {
+        if cache_encoding.is_none() && length > Self::STREAMING_THRESHOLD {
             let window = super::stream::StreamWindow {
                 start,
                 length: Some(length),

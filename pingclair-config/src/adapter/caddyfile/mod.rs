@@ -38,6 +38,7 @@
 mod addresses;
 mod args;
 mod directives;
+mod encode;
 mod handle_groups;
 mod logs;
 mod matchers;

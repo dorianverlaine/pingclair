@@ -455,8 +455,11 @@ pub(super) fn adapt_server(
                             algos.push(algo);
                         }
                     }
-                    // Bare `encode` with no arguments means gzip, as before.
-                    if args.is_empty() {
+                    if let Some(block) = &sub_d.block {
+                        super::encode::adapt_block(block, &mut algos, &mut server.encode)?;
+                    }
+                    // 🗜️ Preserve the bare shorthand when no coding was named.
+                    if args.is_empty() && algos.is_empty() {
                         algos.push(CompressionAlgo::Gzip);
                     }
                     if !algos.is_empty() {
