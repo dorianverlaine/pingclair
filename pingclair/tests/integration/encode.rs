@@ -154,3 +154,17 @@ async fn static_encode_offers_only_the_configured_codings() {
         server.stop();
     }
 }
+
+#[tokio::test]
+async fn static_identity_responses_always_vary_by_encoding() {
+    let tree = compressible_tree();
+    let mut server = file_server_site(tree.path().to_str().unwrap(), "");
+    assert!(server.wait_until_ready().await);
+    let response = no_proxy_client()
+        .get(server.url(0, "/big.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.headers().get("vary").unwrap(), "Accept-Encoding");
+    server.stop();
+}

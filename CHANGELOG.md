@@ -54,6 +54,9 @@ below, which ends with what to write instead.
   → [Encode blocks take effect](#encode-blocks-take-effect)
 - **Static compression offers exactly the encode list in order.**
   → [Static compression follows the coding list](#static-compression-follows-the-coding-list)
+- **Static file responses always send Vary: Accept-Encoding, even without encode.**
+  → [Static responses always vary by encoding](#static-responses-always-vary-by-encoding)
+
 
 
 
@@ -240,6 +243,10 @@ selection is recorded in configuration; codec application is tracked in #223.
 ### Static compression follows the coding list
 
 🗜️ Static compression offers exactly the encode list in order. Upgrade: name each desired coding in encode; brotli remains available only as a precompressed sidecar (#216).
+
+### Static responses always vary by encoding
+
+🗜️ Static file responses always send Vary: Accept-Encoding, even without encode. Upgrade: expect shared caches to reserve an encoding-specific key before compressed variants appear (#219).
 
 ### Admin-only startup accepts its first HTTP generation
 

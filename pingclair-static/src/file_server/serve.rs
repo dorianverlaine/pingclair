@@ -1528,10 +1528,9 @@ mod vary_tests {
         );
     }
 
-    /// 👍 A site that can never vary must not claim it does — a needless `Vary`
-    /// splits every cache key and costs hit rate for nothing.
+    /// 🧊 Caddy reserves the encoding cache key even on an identity-only site.
     #[tokio::test]
-    async fn a_plain_site_does_not_claim_to_vary() {
+    async fn a_plain_site_always_varies_by_encoding() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("app.js"), "plain").unwrap();
 
@@ -1551,8 +1550,8 @@ mod vary_tests {
             .unwrap()
             .expect("the file must be served");
         match served {
-            ServedResponse::Buffered(file) => assert!(!file.vary_accept_encoding),
-            ServedResponse::Stream(stream) => assert!(!stream.vary_accept_encoding),
+            ServedResponse::Buffered(file) => assert!(file.vary_accept_encoding),
+            ServedResponse::Stream(stream) => assert!(stream.vary_accept_encoding),
             _ => panic!("expected a served body"),
         }
     }
