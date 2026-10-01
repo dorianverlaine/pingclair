@@ -2813,6 +2813,17 @@ immediately after the `101`, both ends seeing EOF with no error.
 
 ### 🔐 Security
 
+- 🛡️ **A cached response skipped `header_down`.** The cache stores the
+  origin's headers as they arrived, and `reverse_proxy { header_down … }` was
+  applied only to a response coming from the origin. So the first visitor got
+  the edited response, and every visitor after that got the cached one with the
+  edits missing: a field the operator removed — an internal header, or a
+  `Set-Cookie` meant for one person — went out to everyone the cache answered,
+  and a field the operator added was absent. Found in a production-like soak
+  run. A cache hit now gets exactly the edits the miss got. HTTP/3 has no
+  response cache, so it was never affected. A `+` field also stops being added
+  once more for every retried upstream attempt.
+
 - 🔒 **`rustls` moves to 0.23.45 for RUSTSEC-2026-0285.** Rustls accepted TLS
   1.3 handshake messages sent at the wrong encryption level when they followed a
   key-changing message in the same record — a plaintext `EncryptedExtensions`

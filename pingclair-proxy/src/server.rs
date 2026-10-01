@@ -7277,6 +7277,28 @@ impl ProxyHttp for PingclairProxy {
                     return Ok(true);
                 }
             }
+
+            // 🛡️ `header_down` joins the response policy here, once, before the
+            // cache is consulted. It used to be merged in `upstream_peer`, which
+            // a cache hit never reaches: the stored copy holds the origin's raw
+            // headers, so a field `header_down -X-Internal` strips went out to
+            // every later visitor, and a field it adds was missing. Merging per
+            // attempt also appended a `+` field once for every retry.
+            //
+            // 🧭 After `handle_config`, so a `header` directive around the proxy
+            // has already claimed its fields and keeps winning a shared `set`.
+            if let Some(proxy_config) = self.get_proxy_config(&state, index) {
+                ctx.response_headers.merge_proxy_response_ops(
+                    &proxy_config.headers_down,
+                    &proxy_config.headers_down_add,
+                    &proxy_config.headers_down_remove,
+                    &proxy_config.headers_down_default,
+                );
+                if !proxy_config.headers_down_replace.is_empty() {
+                    ctx.response_headers
+                        .merge_proxy_replacements(&proxy_config.headers_down_replace);
+                }
+            }
         }
 
         // A vhost matched but no route did: there is no handler and no
@@ -7570,16 +7592,6 @@ impl ProxyHttp for PingclairProxy {
             if let Some(proxy_config) = &proxy_config {
                 ctx.headers_upstream = proxy_config.headers_up.clone();
                 ctx.headers_upstream_remove = proxy_config.headers_up_remove.clone();
-                ctx.response_headers.merge_proxy_response_ops(
-                    &proxy_config.headers_down,
-                    &proxy_config.headers_down_add,
-                    &proxy_config.headers_down_remove,
-                    &proxy_config.headers_down_default,
-                );
-                if !proxy_config.headers_down_replace.is_empty() {
-                    ctx.response_headers
-                        .merge_proxy_replacements(&proxy_config.headers_down_replace);
-                }
                 ctx.streaming_response = wants_immediate_flush(proxy_config.flush_interval);
             }
             let request_budget = ctx
@@ -7661,16 +7673,6 @@ impl ProxyHttp for PingclairProxy {
             if let Some(proxy_config) = &proxy_config {
                 ctx.headers_upstream = proxy_config.headers_up.clone();
                 ctx.headers_upstream_remove = proxy_config.headers_up_remove.clone();
-                ctx.response_headers.merge_proxy_response_ops(
-                    &proxy_config.headers_down,
-                    &proxy_config.headers_down_add,
-                    &proxy_config.headers_down_remove,
-                    &proxy_config.headers_down_default,
-                );
-                if !proxy_config.headers_down_replace.is_empty() {
-                    ctx.response_headers
-                        .merge_proxy_replacements(&proxy_config.headers_down_replace);
-                }
                 ctx.streaming_response = wants_immediate_flush(proxy_config.flush_interval);
             }
             let request_budget = ctx

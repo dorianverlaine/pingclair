@@ -314,3 +314,68 @@ async fn test_conflicting_expires_is_treated_as_stale() {
         "a response with two Expires lines must be rechecked on every reuse"
     );
 }
+
+/// 🛡️ A cache hit carries the same `header_down` edits as the miss that filled it.
+///
+/// The store keeps the origin's raw headers, so whatever `header_down` does has
+/// to happen again on the way out of the cache. It used to happen only on the
+/// way out of the origin: the hit leaked the field the operator removed — a
+/// `Set-Cookie` or an internal header, now served to every later visitor — and
+/// dropped the field the operator added.
+#[tokio::test]
+async fn test_a_cache_hit_applies_header_down_like_the_miss() {
+    let body = "cached body";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Secret: origin-only\r\n\
+         X-Kept: from-origin\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (origin, hits) = spawn_scripted_origin(response.into_bytes()).await;
+    let mut server = TestServer::new_pingclairfile(&proxy_pingclairfile(
+        origin,
+        "header_down -X-Secret\n header_down +X-Added added-by-proxy\n cache {\n ttl 60s\n }",
+    ));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🎯 The fields `header_down` decides, plus one it leaves alone, as one
+    // value per response: a hit that differs from the miss in any of them is
+    // the defect.
+    let expected = (
+        200,
+        Vec::<String>::new(),
+        vec!["added-by-proxy".to_string()],
+        vec!["from-origin".to_string()],
+    );
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let response = client
+            .get(server.url(0, "/page"))
+            .header("Accept-Encoding", "identity")
+            .send()
+            .await
+            .unwrap();
+        let all = |name: &str| -> Vec<String> {
+            response
+                .headers()
+                .get_all(name)
+                .iter()
+                .map(|value| value.to_str().unwrap().to_string())
+                .collect()
+        };
+        let fields = (
+            response.status().as_u16(),
+            all("x-secret"),
+            all("x-added"),
+            all("x-kept"),
+        );
+        assert_eq!(response.text().await.unwrap(), body);
+        seen.push(fields);
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the second reply must be a hit"
+    );
+    assert_eq!(seen, vec![expected.clone(), expected], "miss, then hit");
+}
