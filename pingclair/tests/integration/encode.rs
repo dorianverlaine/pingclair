@@ -132,8 +132,8 @@ async fn static_encode_offers_only_the_configured_codings() {
         ("encode zstd gzip", "br", None),
         ("encode zstd gzip", "gzip, zstd", Some("zstd")),
         ("encode gzip zstd", "gzip, zstd", Some("gzip")),
-        ("encode gzip", "*", Some("gzip")),
-        ("encode zstd gzip", "*", Some("zstd")),
+        ("encode gzip", "*", None),
+        ("encode zstd gzip", "*", None),
     ] {
         let mut server = file_server_site(tree.path().to_str().unwrap(), encode);
         assert!(server.wait_until_ready().await);
@@ -309,5 +309,169 @@ async fn gzip_levels_reach_both_wire_encoders() {
         static_server.stop();
         proxy_server.stop();
     }
+    task.abort();
+}
+
+#[tokio::test]
+async fn wildcard_acceptance_does_not_enable_a_coding() {
+    let tree = compressible_tree();
+    let (address, task) = origin().await;
+    let client = no_proxy_client();
+    let mut static_server = file_server_site(tree.path().to_str().unwrap(), "encode zstd gzip");
+    let mut proxy_server = proxy_site(address, "encode zstd gzip");
+    assert!(static_server.wait_until_ready().await);
+    assert!(proxy_server.wait_until_ready().await);
+    for (accepted, expected) in [
+        ("*", None),
+        ("*, gzip", Some("gzip")),
+        ("gzip, *", Some("gzip")),
+        ("*;q=0.5, gzip;q=0.5", Some("gzip")),
+    ] {
+        for (server, path) in [(&static_server, "/big.txt"), (&proxy_server, "/text")] {
+            let response = client
+                .get(server.url(0, path))
+                .header("Accept-Encoding", accepted)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-encoding")
+                    .map(|value| value.to_str().unwrap()),
+                expected,
+                "{accepted}, {path}"
+            );
+        }
+    }
+    static_server.stop();
+    proxy_server.stop();
+    task.abort();
+}
+
+/// 🛰️ The optional QUIC drill checks wire negotiation with an ngtcp2 curl.
+#[tokio::test]
+#[ignore = "requires an HTTP/3 curl; set PINGCLAIR_H3_CURL and run explicitly"]
+async fn h3_encode_negotiation_matches_both_tcp_paths() {
+    let tree = compressible_tree();
+    let (address, task) = origin().await;
+    let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unavailable_address = unavailable.local_addr().unwrap();
+    drop(unavailable);
+    let config = format!(
+        r#"
+{{
+    admin off
+    http_port __PINGCLAIR_TEST_HTTP_PORT__
+    https_port __PINGCLAIR_TEST_HTTPS_PORT__
+    servers {{
+        protocols h1 h2 h3
+    }}
+}}
+https://encode.test:__PINGCLAIR_TEST_HTTPS_PORT__ {{
+    tls internal
+    root * {root}
+    header ETag "\"origin\""
+    encode {{
+        zstd
+        gzip 9
+    }}
+    @unavailable path /unavailable
+    reverse_proxy @unavailable {unavailable_address}
+    @proxy path /proxy/*
+    reverse_proxy @proxy {address}
+    file_server
+    @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+    respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+}}
+"#,
+        root = tree.path().display()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_tls_ready("encode.test").await);
+    let curl = std::env::var("PINGCLAIR_H3_CURL")
+        .expect("set PINGCLAIR_H3_CURL to an ngtcp2/nghttp3 curl");
+    let artifacts = tempfile::tempdir().unwrap();
+    for (accepted, expected) in [
+        ("*", None),
+        ("*, gzip", Some("gzip")),
+        ("gzip, *", Some("gzip")),
+        ("*;q=0.5, gzip;q=0.5", Some("gzip")),
+    ] {
+        for path in ["/big.txt", "/proxy/text", "/unavailable"] {
+            let headers = artifacts.path().join("headers");
+            let body = artifacts.path().join("body");
+            let mut command = Command::new(&curl);
+            command
+                .args([
+                    "--http3-only",
+                    "--noproxy",
+                    "*",
+                    "--silent",
+                    "--show-error",
+                    "--max-time",
+                    "15",
+                ])
+                .arg("--cacert")
+                .arg(
+                    server
+                        ._temp_dir
+                        .path()
+                        .join("tls/pki/authorities/local/root.crt"),
+                )
+                .arg("--resolve")
+                .arg(format!(
+                    "encode.test:{}:127.0.0.1",
+                    server.address(0).port()
+                ))
+                .arg("--header")
+                .arg(format!("Accept-Encoding: {accepted}"))
+                .arg("--dump-header")
+                .arg(&headers)
+                .arg("--output")
+                .arg(&body)
+                .arg(server.tls_url(0, "encode.test", path));
+            let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let headers = std::fs::read_to_string(headers)
+                .unwrap()
+                .to_ascii_lowercase();
+            let status = if path == "/unavailable" {
+                "http/3 502"
+            } else {
+                "http/3 200"
+            };
+            assert!(headers.starts_with(status), "{headers}");
+            assert!(headers.contains("vary: accept-encoding"), "{headers}");
+            if path == "/unavailable" {
+                continue;
+            }
+            let encoding = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-encoding: "));
+            assert_eq!(encoding, expected, "{accepted}, {path}");
+            let wire = std::fs::read(body).unwrap();
+            if expected == Some("gzip") {
+                assert_eq!(wire[8], 2, "gzip 9 must reach the H3 wire");
+                let mut decoded = String::new();
+                flate2::read::GzDecoder::new(wire.as_slice())
+                    .read_to_string(&mut decoded)
+                    .unwrap();
+                assert_eq!(decoded, "compressible text ".repeat(512));
+                if path == "/proxy/text" {
+                    assert!(headers.contains("etag: w/\"origin\""), "{headers}");
+                }
+            } else {
+                assert_eq!(wire, "compressible text ".repeat(512).as_bytes());
+            }
+        }
+    }
+    server.stop();
     task.abort();
 }

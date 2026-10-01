@@ -247,12 +247,12 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_accepts_anything_not_named() {
-        assert_eq!(negotiate("*", BOTH), Some(Encoding::Zstd));
-        // An explicit refusal beats the wildcard even when listed after it.
-        assert_eq!(negotiate("*, zstd;q=0", BOTH), Some(Encoding::Gzip));
-        assert_eq!(negotiate("zstd;q=0, *", BOTH), Some(Encoding::Gzip));
-        // ...and a wildcard refusal is not overridden by server preference.
+    fn wildcard_never_enables_an_unnamed_coding() {
+        assert_eq!(negotiate("*", BOTH), None);
+        // 🚫 A wildcard cannot revive a refused coding or enable an unnamed one.
+        assert_eq!(negotiate("*, zstd;q=0", BOTH), None);
+        assert_eq!(negotiate("zstd;q=0, *", BOTH), None);
+        // 🚫 Server preference cannot override a wildcard refusal.
         assert_eq!(negotiate("*;q=0", BOTH), None);
         assert_eq!(negotiate("*;q=0, gzip", BOTH), Some(Encoding::Gzip));
     }

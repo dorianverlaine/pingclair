@@ -48,11 +48,10 @@ fn entries(header: &str) -> impl Iterator<Item = AcceptedCoding<'_>> {
     })
 }
 
-/// 🔎 The quality the header gives `coding` by name or, failing that, by `*`.
+/// 🔎 Only a named coding grants permission to encode, matching Caddy.
 ///
-/// `None` means the header does not mention it at all. One pass: the first
-/// explicit mention ends the scan, and the first wildcard is remembered in case
-/// no explicit mention follows.
+/// A wildcard refusal still excludes unnamed last resorts when identity was
+/// refused too; a positive wildcard never enables an encoder.
 fn mentioned_quality(accept_encoding: &str, coding: &str) -> Option<f32> {
     let mut wildcard = None;
     for entry in entries(accept_encoding) {
@@ -63,15 +62,14 @@ fn mentioned_quality(accept_encoding: &str, coding: &str) -> Option<f32> {
             wildcard = Some(entry.q);
         }
     }
-    wildcard
+    wildcard.filter(|quality| *quality == 0.0)
 }
 
 /// 🤝 The quality the client assigned to `coding`, or `None` if it refused it.
 ///
-/// `None` means "do not send this coding". That happens two ways: the client
-/// named it with `q=0`, or it sent `*;q=0` and never named it. An explicit
-/// mention always beats the wildcard, whichever came first in the header —
-/// `*;q=0, gzip` accepts gzip.
+/// `None` means the client did not accept this coding by name, or refused it.
+/// An explicit name still wins over a wildcard refusal: `*;q=0, gzip` accepts
+/// gzip. A positive wildcard alone leaves the response identity.
 ///
 /// Comparison is case-insensitive because `Accept-Encoding: GZIP` is a valid
 /// header that means gzip.
@@ -248,19 +246,19 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_is_a_fallback_that_an_explicit_mention_beats() {
-        assert_eq!(negotiate("*", BOTH), Some("zstd"));
+    fn wildcard_never_enables_an_unnamed_coding() {
+        assert_eq!(negotiate("*", BOTH), None);
         assert_eq!(negotiate("*;q=0", BOTH), None);
-        // The explicit mention wins even though the wildcard came first.
+        // 📌 An explicitly accepted coding still wins over a wildcard refusal.
         assert_eq!(negotiate("*;q=0, gzip", BOTH), Some("gzip"));
-        assert_eq!(negotiate("gzip;q=0, *", BOTH), Some("zstd"));
+        assert_eq!(negotiate("gzip;q=0, *", BOTH), None);
     }
 
     #[test]
     fn client_quality_outranks_server_preference() {
         assert_eq!(negotiate("zstd;q=0.1, gzip;q=1.0", BOTH), Some("gzip"));
         assert_eq!(negotiate("zstd;q=1.0, gzip;q=0.5", BOTH), Some("zstd"));
-        // Equal quality falls back to the server's order.
+        // 🥇 Equal quality falls back to the server's order.
         assert_eq!(negotiate("gzip, zstd", BOTH), Some("zstd"));
         assert_eq!(negotiate("gzip, zstd", &["gzip", "zstd"]), Some("gzip"));
     }
@@ -311,9 +309,9 @@ mod tests {
     #[test]
     fn identity_rated_above_a_coding_wins() {
         assert_eq!(negotiate("gzip;q=0.5, identity", BOTH), None);
-        assert_eq!(negotiate("gzip;q=0.5, *", &["gzip"]), None);
+        assert_eq!(negotiate("gzip;q=0.5, *", &["gzip"]), Some("gzip"));
         assert_eq!(negotiate("gzip, identity", BOTH), Some("gzip"));
-        assert_eq!(negotiate("*", BOTH), Some("zstd"));
+        assert_eq!(negotiate("*", BOTH), None);
     }
 
     /// 🪪 #91: `identity;q=0` was ignored. Refusing the plain body turns the
@@ -338,7 +336,7 @@ mod tests {
         let order: Vec<_> = ranked("gzip, br;q=0.5, zstd;q=0.9", &offered, |c| c).collect();
         assert_eq!(order, [&"gzip", &"zstd", &"br"]);
         let order: Vec<_> = ranked("gzip;q=0.4, identity;q=0.5, *", &offered, |c| c).collect();
-        assert_eq!(order, [&"br", &"zstd"]);
+        assert!(order.is_empty());
     }
 }
 

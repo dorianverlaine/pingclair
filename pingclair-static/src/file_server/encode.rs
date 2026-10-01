@@ -142,8 +142,8 @@ impl FileServer {
     /// breaks ties: `precompressed zstd gzip` means zstd when the client does
     /// not care, but `zstd;q=0.1, gzip` gets the `.gz`. This used to be
     /// `accept.contains(encoding)`, which served the `.gz` to a client that
-    /// sent `gzip;q=0` and served nothing to one that sent `*`. It now walks
-    /// the same ranking live compression uses, so the two cannot drift again.
+    /// sent `gzip;q=0`. Named coding acceptance now follows the same ranking
+    /// as live compression; a positive wildcard alone keeps identity, as Caddy does.
     ///
     /// 🔁 A missing sidecar falls through to the next-ranked coding rather
     /// than giving up. Empty configuration never reaches here — the caller

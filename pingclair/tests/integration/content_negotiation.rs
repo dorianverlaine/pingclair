@@ -60,7 +60,7 @@ async fn fetch(server: &TestServer, accept_encoding: &str) -> (Option<String>, S
 }
 
 /// 🚫 #89: `gzip;q=0` is a refusal, and a substring test read it as consent.
-/// `*` accepts every coding, and a substring test found none in it.
+/// 🗜️ Caddy ignores wildcard acceptance rather than choosing an unnamed coding.
 #[tokio::test]
 async fn sidecar_selection_follows_quality_values() {
     let root = tempfile::tempdir().unwrap();
@@ -69,10 +69,7 @@ async fn sidecar_selection_follows_quality_values() {
     assert!(server.wait_until_ready().await, "server failed to start");
 
     assert_eq!(fetch(&server, "gzip;q=0").await, (None, "original".into()));
-    assert_eq!(
-        fetch(&server, "*").await,
-        (Some("gzip".into()), "sidecar.gz".into())
-    );
+    assert_eq!(fetch(&server, "*").await, (None, "original".into()));
 }
 
 /// 🪪 #91: identity is ranked like any coding. Refusing it selects the

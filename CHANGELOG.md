@@ -64,6 +64,9 @@ below, which ends with what to write instead.
   → [Static and proxy compression share mime rules](#static-and-proxy-compression-share-mime-rules)
 - **Both response paths apply encode gzip levels and use the Caddy default of 5.**
   → [Compression uses the configured gzip level](#compression-uses-the-configured-gzip-level)
+- **Accept-Encoding wildcard acceptance no longer enables an unnamed coding.**
+  → [Wildcard acceptance does not enable compression](#wildcard-acceptance-does-not-enable-compression)
+
 
 
 
@@ -274,6 +277,10 @@ response matchers and size floors that were previously ignored. Gzip levels are 
 ### Compression uses the configured gzip level
 
 🗜️ Both response paths apply encode gzip levels and use the Caddy default of 5. Upgrade: set gzip 1 inside encode for faster compression, or gzip 9 for a smaller body; zstd uses one shared native default of 3 (#223).
+
+### Wildcard acceptance does not enable compression
+
+🗜️ Accept-Encoding wildcard acceptance no longer enables an unnamed coding. Upgrade: send gzip or zstd explicitly; wildcard-only requests receive identity responses (#224).
 
 ### Admin-only startup accepts its first HTTP generation
 
