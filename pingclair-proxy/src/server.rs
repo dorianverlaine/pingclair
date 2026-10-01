@@ -6651,6 +6651,12 @@ impl ProxyHttp for PingclairProxy {
         // as nginx's `proxy_cache_valid`. An origin that states its own
         // lifetime knows more about its content than the proxy config does,
         // so it wins; the route only answers for responses that say nothing.
+        //
+        // 🔐 Both rebuilds below take their headers from `meta`, never from
+        // `response`. Pingora has already removed the fields `private="..."`
+        // and `no-cache="..."` name from `meta`; the raw upstream header still
+        // has them, and storing that copy replays the first visitor's
+        // `X-User-Token` to everyone who follows.
         let RespCacheable::Cacheable(meta) = decision else {
             return Ok(decision);
         };
@@ -6669,7 +6675,7 @@ impl ProxyHttp for PingclairProxy {
                     created,
                     meta.stale_while_revalidate_sec(),
                     meta.stale_if_error_sec(),
-                    response.clone(),
+                    meta.response_header_copy(),
                 )));
             }
             OriginFreshness::Silent => {}
@@ -6690,7 +6696,7 @@ impl ProxyHttp for PingclairProxy {
             created,
             meta.stale_while_revalidate_sec(),
             meta.stale_if_error_sec(),
-            response.clone(),
+            meta.response_header_copy(),
         )))
     }
 

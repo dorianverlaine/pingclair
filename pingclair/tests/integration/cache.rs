@@ -379,3 +379,49 @@ async fn test_a_cache_hit_applies_header_down_like_the_miss() {
     );
     assert_eq!(seen, vec![expected.clone(), expected], "miss, then hit");
 }
+
+/// 🔐 A field the origin marked `private="..."` is never replayed from cache.
+///
+/// `Cache-Control: private="X-User-Token"` means "share this response, but not
+/// that one field": the token belongs to whoever asked first. The response
+/// states no lifetime, so the route's `ttl` answers — which is the path that
+/// used to rebuild the stored entry from the untouched upstream headers and
+/// hand the first visitor's token to everyone after them.
+#[tokio::test]
+async fn test_private_field_is_not_served_from_an_entry_stored_under_the_route_ttl() {
+    let body = "shared page";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+         Cache-Control: private=\"X-User-Token\"\r\nX-User-Token: first-visitor-secret\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (origin, hits) = spawn_scripted_origin(response.into_bytes()).await;
+    let mut server = TestServer::new_pingclairfile(&cache_pingclairfile(origin, "60s"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let miss = client.get(server.url(0, "/account")).send().await.unwrap();
+    assert_eq!(miss.status(), 200);
+    let _ = miss.bytes().await.unwrap();
+
+    let hit = client.get(server.url(0, "/account")).send().await.unwrap();
+    let observed = (
+        hit.status().as_u16(),
+        hit.headers().get("x-user-token").cloned(),
+    );
+    assert_eq!(hit.text().await.unwrap(), body);
+
+    // 🩺 Without the hit count, a missing token would only prove that nothing
+    // was stored at all.
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the second reply must be a hit"
+    );
+    assert_eq!(
+        observed,
+        (200, None),
+        "a private field must not be served from cache"
+    );
+}
