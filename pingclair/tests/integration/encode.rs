@@ -271,3 +271,43 @@ async fn static_and_proxy_share_the_content_type_policy() {
     }
     task.abort();
 }
+
+#[tokio::test]
+async fn gzip_levels_reach_both_wire_encoders() {
+    let tree = compressible_tree();
+    let (address, task) = origin().await;
+    let client = no_proxy_client();
+    for (encode, extra_flags) in [
+        ("encode {\ngzip 1\n}", 4),
+        ("encode {\ngzip 9\n}", 2),
+        ("encode {\ngzip 5\n}", 0),
+        ("encode gzip", 0),
+    ] {
+        let mut static_server = file_server_site(tree.path().to_str().unwrap(), encode);
+        let mut proxy_server = proxy_site(address, encode);
+        assert!(static_server.wait_until_ready().await);
+        assert!(proxy_server.wait_until_ready().await);
+        for (server, path) in [(&static_server, "/big.txt"), (&proxy_server, "/text")] {
+            let response = client
+                .get(server.url(0, path))
+                .header("Accept-Encoding", "gzip")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.headers().get("content-encoding").unwrap(), "gzip");
+            let wire = response.bytes().await.unwrap();
+            assert_eq!(
+                wire[8], extra_flags,
+                "gzip XFL identifies fast/best/default quality: {encode}, {path}"
+            );
+            let mut decoded = String::new();
+            flate2::read::GzDecoder::new(wire.as_ref())
+                .read_to_string(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, "compressible text ".repeat(512));
+        }
+        static_server.stop();
+        proxy_server.stop();
+    }
+    task.abort();
+}

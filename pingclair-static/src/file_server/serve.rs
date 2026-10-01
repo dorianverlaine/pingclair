@@ -1365,7 +1365,8 @@ mod serve_cache_tests {
 
         // ...until the leader publishes its result to the cache and
         // releases the lock.
-        let compressed = FileServer::compress_with(&vec![b'a'; 4096], "gzip")
+        let compressed = FileServer::serve_dir(".")
+            .compress_with(&vec![b'a'; 4096], "gzip")
             .await
             .unwrap();
         fs.compress_cache

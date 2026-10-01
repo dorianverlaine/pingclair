@@ -6185,7 +6185,10 @@ async fn reverse_proxy_upstream(
                 crate::response_encoding::eligible_h3(&state.config, &client_header.method, &hdrs)
             })
             .and_then(|encoding| {
-                crate::encoding::ResponseEncoder::new(encoding)
+                crate::encoding::ResponseEncoder::at_gzip_level(
+                    encoding,
+                    state.config.encode.gzip_level,
+                )
                 .map_err(|error| tracing::warn!("⚠️ Could not initialize H3 encoder: {error}"))
                 .ok()
             })

@@ -342,6 +342,11 @@ mod tests {
     }
 }
 
+/// 🗜️ Caddy's default gzip quality, shared by both response paths.
+pub const DEFAULT_GZIP_LEVEL: u32 = 5;
+/// 🗜️ The native zstd default quality is identical on both response paths.
+pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
+
 /// 🗜️ Load-time settings for an encode handler, shared by static and proxy responses.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -358,7 +363,7 @@ impl Default for EncodeOptions {
     fn default() -> Self {
         Self {
             minimum_length: 512,
-            gzip_level: 5,
+            gzip_level: DEFAULT_GZIP_LEVEL,
             matcher: None,
         }
     }

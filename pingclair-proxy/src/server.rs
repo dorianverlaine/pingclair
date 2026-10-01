@@ -8435,7 +8435,7 @@ impl ProxyHttp for PingclairProxy {
             && !ctx.streaming_response
             && ctx.intercepted_response.is_none()
         {
-            match ResponseEncoder::new(encoding) {
+            match ResponseEncoder::at_gzip_level(encoding, state.config.encode.gzip_level) {
                 Ok(encoder) => {
                     // 🛡️ Headers are only rewritten once the encoder is
                     // in place. Announcing a coding that nothing then

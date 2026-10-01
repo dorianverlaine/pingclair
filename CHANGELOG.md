@@ -62,6 +62,9 @@ below, which ends with what to write instead.
   → [Proxy compression weakens strong etags](#proxy-compression-weakens-strong-etags)
 - **Static compression follows the same content-type allow-list as proxy compression.**
   → [Static and proxy compression share mime rules](#static-and-proxy-compression-share-mime-rules)
+- **Both response paths apply encode gzip levels and use the Caddy default of 5.**
+  → [Compression uses the configured gzip level](#compression-uses-the-configured-gzip-level)
+
 
 
 
@@ -246,8 +249,7 @@ or name an explicit port to keep a site on its previous listener.
 🗜️ `encode { gzip [level]; zstd; minimum_length; match { … } }` now preserves
 its settings instead of silently compiling every block as gzip. Unknown
 sub-directives fail at load time. Upgrade: remove misspelled settings and review
-response matchers and size floors that were previously ignored. Gzip level
-selection is recorded in configuration; codec application is tracked in #223.
+response matchers and size floors that were previously ignored. Gzip levels are applied by both response paths.
 
 ### Static compression follows the coding list
 
@@ -268,6 +270,10 @@ selection is recorded in configuration; codec application is tracked in #223.
 ### Static and proxy compression share mime rules
 
 🗜️ Static compression follows the same content-type allow-list as proxy compression. Upgrade: set gzip_types explicitly to enable additional MIME types; an explicit encode match block replaces the default matcher (#217).
+
+### Compression uses the configured gzip level
+
+🗜️ Both response paths apply encode gzip levels and use the Caddy default of 5. Upgrade: set gzip 1 inside encode for faster compression, or gzip 9 for a smaller body; zstd uses one shared native default of 3 (#223).
 
 ### Admin-only startup accepts its first HTTP generation
 

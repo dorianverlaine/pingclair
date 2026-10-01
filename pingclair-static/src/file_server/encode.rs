@@ -106,7 +106,7 @@ impl FileServer {
 
         match encoding {
             Some(enc) => {
-                let compressed = Bytes::from(Self::compress_with(&content, enc).await?);
+                let compressed = Bytes::from(self.compress_with(&content, enc).await?);
                 if let Some(mtime_ns) = mtime_ns {
                     let key = FileKey {
                         path: file_path.to_path_buf(),
@@ -205,8 +205,8 @@ impl FileServer {
         .map(|coding| coding.token())
     }
 
-    /// Compress `input` with a specific, already-negotiated encoding.
-    pub(super) async fn compress_with(input: &[u8], encoding: &str) -> Result<Vec<u8>> {
+    /// 🗜️ Both paths construct codecs with the site quality, rather than library defaults.
+    pub(super) async fn compress_with(&self, input: &[u8], encoding: &str) -> Result<Vec<u8>> {
         use async_compression::tokio::write::{BrotliEncoder, GzipEncoder, ZstdEncoder};
         use tokio::io::AsyncWriteExt;
 
@@ -218,13 +218,19 @@ impl FileServer {
                 e.into_inner()
             }
             "zstd" => {
-                let mut e = ZstdEncoder::new(Vec::new());
+                let mut e = ZstdEncoder::with_quality(
+                    Vec::new(),
+                    async_compression::Level::Precise(pingclair_core::encoding::DEFAULT_ZSTD_LEVEL),
+                );
                 e.write_all(input).await?;
                 e.shutdown().await?;
                 e.into_inner()
             }
             "gzip" => {
-                let mut e = GzipEncoder::new(Vec::new());
+                let mut e = GzipEncoder::with_quality(
+                    Vec::new(),
+                    async_compression::Level::Precise(self.config.encode.gzip_level as i32),
+                );
                 e.write_all(input).await?;
                 e.shutdown().await?;
                 e.into_inner()
@@ -242,10 +248,7 @@ impl FileServer {
         accept_header: Option<&str>,
     ) -> Result<(Vec<u8>, Option<String>)> {
         match self.negotiate_encoding(accept_header) {
-            Some(enc) => Ok((
-                Self::compress_with(input, enc).await?,
-                Some(enc.to_string()),
-            )),
+            Some(enc) => Ok((self.compress_with(input, enc).await?, Some(enc.to_string()))),
             None => Ok((input.to_vec(), None)),
         }
     }

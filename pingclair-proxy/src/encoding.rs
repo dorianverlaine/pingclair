@@ -22,14 +22,6 @@ use flate2::write::GzEncoder;
 use pingclair_core::config::Encoding;
 use std::io::Write;
 
-/// Compression level used for proxied responses.
-///
-/// Fastest setting on purpose. A reverse proxy compresses on the request path
-/// with the client waiting, so CPU spent chasing a marginally better ratio is
-/// latency the client pays on every single response — unlike static files,
-/// which can be compressed once and cached.
-const ZSTD_LEVEL: i32 = 1;
-
 // MARK: - Negotiation
 
 /// 🤝 Picks the coding to use for a response, or `None` for identity.
@@ -83,17 +75,26 @@ impl ResponseEncoder {
     /// front; a failure here means the response goes out uncompressed, which
     /// is always a safe outcome.
     pub fn new(encoding: Encoding) -> std::io::Result<Self> {
-        Self::with_sink(encoding, Vec::new())
+        Self::at_gzip_level(encoding, pingclair_core::encoding::DEFAULT_GZIP_LEVEL)
+    }
+    /// 🗜️ The chosen quality is fixed by configuration before response bytes arrive.
+    pub(crate) fn at_gzip_level(encoding: Encoding, gzip_level: u32) -> std::io::Result<Self> {
+        Self::with_sink_at_level(encoding, Vec::new(), gzip_level)
     }
 }
 
 impl<W: CompressedSink> ResponseEncoder<W> {
     /// 🪣 Creates the encoder for a negotiated coding, writing into `sink`.
     pub fn with_sink(encoding: Encoding, sink: W) -> std::io::Result<Self> {
+        Self::with_sink_at_level(encoding, sink, pingclair_core::encoding::DEFAULT_GZIP_LEVEL)
+    }
+
+    fn with_sink_at_level(encoding: Encoding, sink: W, gzip_level: u32) -> std::io::Result<Self> {
         Ok(match encoding {
-            Encoding::Gzip => Self::Gzip(GzEncoder::new(sink, Compression::fast())),
+            Encoding::Gzip => Self::Gzip(GzEncoder::new(sink, Compression::new(gzip_level))),
             Encoding::Zstd => Self::Zstd(Box::new(zstd::stream::write::Encoder::new(
-                sink, ZSTD_LEVEL,
+                sink,
+                pingclair_core::encoding::DEFAULT_ZSTD_LEVEL,
             )?)),
         })
     }
