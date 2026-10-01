@@ -13,6 +13,9 @@ mod automatic_https_policy;
 #[path = "integration/admin_etag.rs"]
 mod admin_etag;
 
+#[path = "integration/admin_reload.rs"]
+mod admin_reload;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;

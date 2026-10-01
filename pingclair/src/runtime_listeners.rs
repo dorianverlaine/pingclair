@@ -203,7 +203,6 @@ pub(crate) struct RuntimeListeners {
     pub(crate) tls_manager: Arc<TlsManager>,
     pub(crate) h3_cert_table: Option<Arc<pingclair_proxy::quic::CertTable>>,
     pub(crate) admin_policy: Arc<AdminPolicy>,
-    pub(crate) document: Arc<RwLock<Value>>,
     pub(crate) listener_policies: HashMap<String, Arc<PublishedListenerPolicy>>,
     pub(crate) automatic_http_available: bool,
     pub(crate) api_changed: Arc<AtomicBool>,
@@ -217,7 +216,6 @@ pub(crate) struct RuntimePublisherInputs {
     pub(crate) tls_manager: Arc<TlsManager>,
     pub(crate) h3_cert_table: Option<Arc<pingclair_proxy::quic::CertTable>>,
     pub(crate) admin_policy: Arc<AdminPolicy>,
-    pub(crate) document: Arc<RwLock<Value>>,
     pub(crate) listener_policies: HashMap<String, Arc<PublishedListenerPolicy>>,
     pub(crate) automatic_http_available: bool,
     pub(crate) api_changed: Arc<AtomicBool>,
@@ -235,7 +233,6 @@ impl RuntimeListeners {
             tls_manager: inputs.tls_manager,
             h3_cert_table: inputs.h3_cert_table,
             admin_policy: inputs.admin_policy,
-            document: inputs.document,
             listener_policies: inputs.listener_policies,
             automatic_http_available: inputs.automatic_http_available,
             api_changed: inputs.api_changed,
@@ -251,6 +248,7 @@ impl RuntimeListeners {
         &self,
         config: &PingclairConfig,
         expected_admin_revision: Option<u64>,
+        document: Value,
     ) -> Result<PreparedAdminPolicy, ConfigApplyError> {
         if let Some(expected) = expected_admin_revision
             && self.admin_policy.revision() != expected
@@ -259,7 +257,7 @@ impl RuntimeListeners {
                 "the Admin access policy changed; authenticate again before retrying",
             ));
         }
-        self.admin_policy.prepare(config.admin.as_ref())
+        self.admin_policy.prepare(config.admin.as_ref(), document)
     }
 
     fn ensure_hot_compatible(
@@ -363,33 +361,12 @@ impl RuntimeListeners {
     }
 }
 
-/// 🚧 Reopens the Admin API even if a debug build unwinds during publication.
-///
-/// 📌 Only the Admin API still has a gate. Listeners need none: each one's
-/// routes and client-auth policy are published as a single generation, so no
-/// request can see half of a reload.
-struct PublicationGate<'a> {
-    admin_policy: &'a AdminPolicy,
-}
-
-impl<'a> PublicationGate<'a> {
-    fn close(admin_policy: &'a AdminPolicy) -> Self {
-        admin_policy.begin_publish();
-        Self { admin_policy }
-    }
-}
-
-impl Drop for PublicationGate<'_> {
-    fn drop(&mut self) {
-        self.admin_policy.finish_publish();
-    }
-}
-
 impl ConfigPublisher for RuntimeListeners {
     fn publish_config(
         &self,
         config: &PingclairConfig,
         expected_admin_revision: Option<u64>,
+        document: Option<&Value>,
     ) -> Result<usize, ConfigApplyError> {
         let _publication = self.publication.lock();
         if expected_admin_revision.is_none() && self.api_changed.load(Ordering::SeqCst) {
@@ -400,7 +377,13 @@ impl ConfigPublisher for RuntimeListeners {
         pingclair_config::compiler::validate_config(config)
             .map_err(|error| ConfigApplyError::invalid(error.to_string()))?;
 
-        let prepared_admin = self.prepare_admin(config, expected_admin_revision)?;
+        let prepared_document = match document {
+            Some(document) => document.clone(),
+            None => serde_json::to_value(config)
+                .map_err(|error| ConfigApplyError::invalid(error.to_string()))?,
+        };
+        let prepared_admin =
+            self.prepare_admin(config, expected_admin_revision, prepared_document)?;
         let next = prepare_listener_policies(config, self.automatic_http_available)?;
         let current = self.current.read();
         self.ensure_hot_compatible(&current, config, &next)?;
@@ -428,8 +411,6 @@ impl ConfigPublisher for RuntimeListeners {
             })
             .transpose()
             .map_err(|error| ConfigApplyError::invalid(error.to_string()))?;
-        let prepared_document = serde_json::to_value(config)
-            .map_err(|error| ConfigApplyError::invalid(error.to_string()))?;
 
         let targets = {
             let proxies = self.port_proxies.read();
@@ -453,10 +434,7 @@ impl ConfigPublisher for RuntimeListeners {
         };
         drop(current);
 
-        // 🚧 No fallible work remains below this gate. Admin requests are
-        // refused until Admin access names the new generation; listeners keep
-        // serving, because each swaps routes and client-auth policy at once.
-        let gate = PublicationGate::close(&self.admin_policy);
+        // 📦 Every reader keeps its published generation while the next is installed.
         if let (Some(table), Some(prepared)) = (&self.h3_cert_table, prepared_h3_certs) {
             table.publish_manual_update(prepared);
         }
@@ -471,7 +449,6 @@ impl ConfigPublisher for RuntimeListeners {
             self.listener_policies[&address].publish(client_auth, routes);
             tracing::info!(listener = %address, "♻️ Published listener configuration");
         }
-        self.admin_policy.publish(prepared_admin);
         pingclair_proxy::access_log::register_channels(&config.logging.channels);
         // 🔁 A reload that adds or removes `metrics` takes effect here, not at
         // the next restart.
@@ -488,19 +465,14 @@ impl ConfigPublisher for RuntimeListeners {
             config: config.clone(),
             listeners: next,
         };
-        *self.document.write() = prepared_document;
-        drop(gate);
+        self.admin_policy.publish(prepared_admin);
 
         // 🔀 A reload can move the process log or take it off a file, and
         // Caddy re-provisions its loggers on reload for the same reason: a
         // configuration that could not undo a `log { output file … }` would
         // leave the file growing for a listener set that no longer mentions it.
         //
-        // 📌 Deliberately *after* the gate reopens. Opening a file and
-        // rebuilding a filter are not part of "routes, TLS and Admin access all
-        // name the same generation", and holding the gate through them widens
-        // the window in which a request is answered with "reload in progress"
-        // — which is a real answer a client can see.
+        // 🪵 Opening log files is separate from publishing the Admin generation.
         crate::logging::apply_process_log(&config.logging);
 
         // 🚫 Claim the Admin-owned generation before releasing the same

@@ -128,10 +128,13 @@ pub trait ConfigPublisher: Send + Sync {
     /// policy or none. `expected_admin_revision` binds a mutation to the policy
     /// that authenticated it, preventing an old key's queued request from
     /// landing after key rotation.
+    /// 📄 Admin writes retain their raw document, including traversal metadata;
+    /// signal reloads pass no document and publish the canonical serialization.
     fn publish_config(
         &self,
         config: &pingclair_core::config::PingclairConfig,
         expected_admin_revision: Option<u64>,
+        document: Option<&serde_json::Value>,
     ) -> Result<usize, ConfigApplyError>;
 }
 

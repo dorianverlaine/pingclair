@@ -7,15 +7,14 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use parking_lot::RwLock;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -28,19 +27,19 @@ use crate::config_tree::{self, Mode, TreeError};
 
 /// 🧭 Shared state for one admin server connection.
 struct AdminState {
-    document: Arc<RwLock<Value>>,
     shutdown: Arc<Notify>,
     autosave: Option<PathBuf>,
     publisher: Option<Arc<dyn pingclair_proxy::server::ConfigPublisher>>,
     policy: Arc<AdminPolicy>,
 }
 
-/// 🔐 One immutable Admin access-policy generation.
+/// 🔐 One immutable Admin generation binds access policy to its document.
 struct AdminPolicySnapshot {
     enabled: bool,
     auth: Option<Arc<ApiKeyAuth>>,
     origins: Arc<OriginPolicy>,
     revision: u64,
+    document: Value,
 }
 
 /// 🔐 A prepared Admin policy that has not been published yet.
@@ -48,7 +47,7 @@ pub struct PreparedAdminPolicy {
     snapshot: Arc<AdminPolicySnapshot>,
 }
 
-/// 🔐 Publishes API keys, origins, and disablement as one request-time snapshot.
+/// 🔐 Publishes access policy and its config document as one request-time snapshot.
 ///
 /// Connections do not capture this policy. Every request loads it immediately
 /// before authorization, so a key rotation also applies to the next request on
@@ -56,8 +55,7 @@ pub struct PreparedAdminPolicy {
 pub struct AdminPolicy {
     bound_listen: String,
     listener_available: bool,
-    current: RwLock<Arc<AdminPolicySnapshot>>,
-    publishing: AtomicBool,
+    current: ArcSwap<AdminPolicySnapshot>,
 }
 
 impl AdminPolicy {
@@ -66,6 +64,7 @@ impl AdminPolicy {
         bound_listen: String,
         config: Option<&AdminConfig>,
         listener_available: bool,
+        document: Value,
     ) -> Self {
         let enabled = config.is_some_and(|admin| admin.enabled) && listener_available;
         let auth = config
@@ -81,13 +80,13 @@ impl AdminPolicy {
         Self {
             bound_listen,
             listener_available,
-            current: RwLock::new(Arc::new(AdminPolicySnapshot {
+            current: ArcSwap::from_pointee(AdminPolicySnapshot {
                 enabled,
                 auth,
                 origins,
                 revision: 0,
-            })),
-            publishing: AtomicBool::new(false),
+                document,
+            }),
         }
     }
 
@@ -95,6 +94,7 @@ impl AdminPolicy {
     pub fn prepare(
         &self,
         config: Option<&AdminConfig>,
+        document: Value,
     ) -> Result<PreparedAdminPolicy, pingclair_proxy::server::ConfigApplyError> {
         let enabled = config.is_some_and(|admin| admin.enabled);
         if enabled && !self.listener_available {
@@ -113,7 +113,7 @@ impl AdminPolicy {
             ));
         }
 
-        let current_revision = self.current.read().revision;
+        let current_revision = self.current.load().revision;
         let auth = config
             .and_then(|admin| admin.api_key.as_ref())
             .map(|key| Arc::new(ApiKeyAuth::new(key.expose())));
@@ -130,43 +130,28 @@ impl AdminPolicy {
                 auth,
                 origins,
                 revision: current_revision.wrapping_add(1),
+                document,
             }),
         })
     }
 
     /// 📣 Publishes a policy only after the data-plane transaction is ready.
     pub fn publish(&self, prepared: PreparedAdminPolicy) {
-        *self.current.write() = prepared.snapshot;
+        self.current.store(prepared.snapshot);
     }
 
     /// 🔢 Returns the access-policy generation used to authorize new requests.
     pub fn revision(&self) -> u64 {
-        self.current.read().revision
-    }
-
-    /// 🚦 Refuses new Admin requests while the complete transaction publishes.
-    pub fn begin_publish(&self) {
-        self.publishing.store(true, Ordering::Release);
-    }
-
-    /// 🚦 Reopens Admin only after data-plane and document state agree.
-    pub fn finish_publish(&self) {
-        self.publishing.store(false, Ordering::Release);
-    }
-
-    /// 🚧 Reports whether Admin access is between complete generations.
-    pub fn is_publishing(&self) -> bool {
-        self.publishing.load(Ordering::Acquire)
+        self.current.load().revision
     }
 
     fn snapshot(&self) -> Arc<AdminPolicySnapshot> {
-        Arc::clone(&self.current.read())
+        self.current.load_full()
     }
 }
 
 /// 🧭 Everything the admin server needs beyond its socket address.
 pub struct AdminServerOptions {
-    pub document: Arc<RwLock<Value>>,
     pub shutdown: Arc<Notify>,
     pub autosave: Option<PathBuf>,
     pub publisher: Option<Arc<dyn pingclair_proxy::server::ConfigPublisher>>,
@@ -175,10 +160,11 @@ pub struct AdminServerOptions {
 
 /// 🧭 Read-only context threaded through the config mutation helpers.
 struct ApplyContext<'a> {
-    document: &'a Arc<RwLock<Value>>,
+    document: &'a Value,
     autosave: Option<&'a Path>,
     publisher: Option<&'a dyn pingclair_proxy::server::ConfigPublisher>,
     authorized_revision: u64,
+    policy: &'a AdminPolicy,
     if_match: Option<String>,
 }
 
@@ -220,7 +206,6 @@ pub async fn run_admin_server(
 
         let io = TokioIo::new(stream);
         let state = Arc::new(AdminState {
-            document: options.document.clone(),
             shutdown: options.shutdown.clone(),
             autosave: options.autosave.clone(),
             publisher: options.publisher.clone(),
@@ -331,25 +316,12 @@ async fn handle_request_inner(
     state: &AdminState,
     peer_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let document = &state.document;
     let shutdown = &state.shutdown;
     let autosave = state.autosave.as_deref();
     let publisher = state.publisher.as_deref();
-    if state.policy.is_publishing() {
-        return Ok(response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"error":"configuration publication in progress"}"#,
-        ));
-    }
+    // 📦 Authorization and traversal use one generation even if a reload publishes.
     let access_policy = state.policy.snapshot();
-    // 🚧 Recheck after loading the snapshot so a publication that began
-    // between the first gate read and this load cannot admit an Admin request.
-    if state.policy.is_publishing() {
-        return Ok(response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"error":"configuration publication in progress"}"#,
-        ));
-    }
+    let document = &access_policy.document;
     if !access_policy.enabled {
         return Ok(response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -361,6 +333,7 @@ async fn handle_request_inner(
         autosave,
         publisher,
         authorized_revision: access_policy.revision,
+        policy: &state.policy,
         if_match: if req.uri().path() == "/config" || req.uri().path().starts_with("/config/") {
             req.headers()
                 .get(hyper::header::IF_MATCH)
@@ -459,21 +432,21 @@ async fn handle_request_inner(
         (&Method::GET, path) if path == "/config" || path == "/config/" => {
             // 🧭 Exports the active document so the output can be POSTed back
             // to /load or traversed with /config/<path>.
-            let guard = document.read();
-            Ok(config_response(path, &guard))
+            let guard = document;
+            Ok(config_response(path, guard))
         }
         (&Method::GET, path) if path.starts_with("/config/") => {
             let segments = normalize_config_segments(config_tree::segments_from_path(
                 &path["/config/".len()..],
             ));
-            let guard = document.read();
-            match config_tree::get(&guard, &segments) {
+            let guard = document;
+            match config_tree::get(guard, &segments) {
                 Ok(node) => Ok(config_response(path, node)),
                 Err(error) => Ok(response(
                     StatusCode::NOT_FOUND,
                     &format!(
                         r#"{{"error":"{}"}}"#,
-                        missing_path_message(&guard, &segments, &error)
+                        missing_path_message(guard, &segments, &error)
                     ),
                 )),
             }
@@ -490,8 +463,8 @@ async fn handle_request_inner(
         // 🚫 The endpoint used to be missing, so the same health check got a
         // `404` — indistinguishable from a deployment with no upstreams at all.
         (&Method::GET, "/reverse_proxy/upstreams") => {
-            let guard = document.read();
-            let upstreams: Vec<serde_json::Value> = collected_upstreams(&guard)
+            let guard = document;
+            let upstreams: Vec<serde_json::Value> = collected_upstreams(guard)
                 .into_iter()
                 .map(|address| serde_json::json!({ "address": address }))
                 .collect();
@@ -649,9 +622,8 @@ async fn handle_request_inner(
             let value = serde_json::to_value(&config).unwrap_or_default();
             match commit_document(&value, publisher, access_policy.revision, None) {
                 Ok(()) => {
-                    *document.write() = value;
                     if let Some(path) = autosave {
-                        autosave_document(document, path);
+                        autosave_document(&state.policy.snapshot().document, path);
                     }
                     Ok(response(StatusCode::OK, "Config loaded"))
                 }
@@ -854,7 +826,7 @@ async fn apply_full_document(
     ctx: &ApplyContext<'_>,
     value: Value,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    if let Err(rejection) = check_if_match(ctx, &ctx.document.read()) {
+    if let Err(rejection) = check_if_match(ctx, ctx.document) {
         return Ok(*rejection);
     }
     match commit_document(
@@ -864,9 +836,8 @@ async fn apply_full_document(
         ctx.if_match.as_deref(),
     ) {
         Ok(()) => {
-            *ctx.document.write() = value;
             if let Some(path) = ctx.autosave {
-                autosave_document(ctx.document, path);
+                autosave_document(&ctx.policy.snapshot().document, path);
             }
             Ok(response(StatusCode::OK, "Config loaded"))
         }
@@ -1008,8 +979,8 @@ async fn apply_id_request(
     let tail = parts.next().unwrap_or("");
 
     let base = {
-        let guard = ctx.document.read();
-        match config_tree::find_id_path(&guard, name) {
+        let guard = ctx.document;
+        match config_tree::find_id_path(guard, name) {
             Some(segments) => segments,
             None => {
                 return Ok(response(
@@ -1022,8 +993,8 @@ async fn apply_id_request(
     let mut segments = base;
     segments.extend(config_tree::segments_from_path(tail));
     if method == Method::GET {
-        let guard = ctx.document.read();
-        return match config_tree::get(&guard, &segments) {
+        let guard = ctx.document;
+        return match config_tree::get(guard, &segments) {
             Ok(node) => {
                 let json = serde_json::to_string_pretty(node).unwrap_or_default();
                 Ok(Response::new(Full::new(Bytes::from(json))))
@@ -1044,8 +1015,8 @@ async fn apply_segments(
     body: Option<Value>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let mut next = {
-        let document = ctx.document.read();
-        if let Err(rejection) = check_if_match(ctx, &document) {
+        let document = ctx.document;
+        if let Err(rejection) = check_if_match(ctx, document) {
             return Ok(*rejection);
         }
         document.clone()
@@ -1096,9 +1067,8 @@ async fn apply_segments(
             ctx.if_match.as_deref(),
         ) {
             Ok(()) => {
-                *ctx.document.write() = next;
                 if let Some(path) = ctx.autosave {
-                    autosave_document(ctx.document, path);
+                    autosave_document(&ctx.policy.snapshot().document, path);
                 }
                 Ok(response(StatusCode::OK, "OK"))
             }
@@ -1109,8 +1079,8 @@ async fn apply_segments(
 
 /// 💾 Persists the active document so `run --resume` can restore it after a
 /// restart, matching Caddy's autosave behavior for API-driven configs.
-fn autosave_document(document: &Arc<RwLock<Value>>, path: &Path) {
-    let Ok(json) = serde_json::to_string_pretty(&*document.read()) else {
+fn autosave_document(document: &Value, path: &Path) {
+    let Ok(json) = serde_json::to_string_pretty(document) else {
         return;
     };
     // 🔐 Through the owner-only atomic writer, because this document is a
@@ -1151,7 +1121,7 @@ fn commit_document(
         ))
     })?;
     publisher
-        .publish_config(&config, Some(expected_admin_revision))
+        .publish_config(&config, Some(expected_admin_revision), Some(next))
         .map(|_| ())
         .map_err(|error| {
             // 🛡️ The publisher checks the revision under its publication lock,
@@ -1527,3 +1497,7 @@ mod caddy_document_tests {
         assert!(message.contains("debug, servers"), "{message}");
     }
 }
+
+#[cfg(test)]
+#[path = "admin_generation_tests.rs"]
+mod generation_tests;

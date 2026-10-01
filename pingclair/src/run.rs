@@ -307,16 +307,15 @@ pub(crate) fn run_server(
         .map(|admin| admin.listen.clone())
         .unwrap_or_else(|| "localhost:2019".to_string());
     let admin_listener_available = config.admin.as_ref().is_some_and(|admin| admin.enabled);
-    // 🧭 Signal reload and Admin mutations publish the same active document;
-    // `/config` can therefore never describe a generation older than runtime.
-    let active_document = Arc::new(RwLock::new(
-        serde_json::to_value(config.clone())
-            .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
-    ));
+    // 📦 Admin publishes this document with its access policy so a read keeps
+    // one complete generation even when a reload changes the running config.
+    let active_document = serde_json::to_value(config.clone())
+        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
     let admin_policy = Arc::new(pingclair_api::AdminPolicy::new(
         admin_listen,
         config.admin.as_ref(),
         admin_listener_available,
+        active_document,
     ));
     let config_publisher: Arc<dyn pingclair_proxy::server::ConfigPublisher> =
         Arc::new(RuntimeListeners::new(
@@ -325,7 +324,6 @@ pub(crate) fn run_server(
                 tls_manager: tls_manager.clone(),
                 h3_cert_table,
                 admin_policy: admin_policy.clone(),
-                document: active_document.clone(),
                 listener_policies: listener_security_by_address,
                 automatic_http_available,
                 api_changed: api_changed.clone(),
@@ -338,7 +336,6 @@ pub(crate) fn run_server(
     admin::start(
         &config,
         admin::AdminShared {
-            document: active_document.clone(),
             shutdown: admin_shutdown.clone(),
             publisher: config_publisher.clone(),
             policy: admin_policy.clone(),

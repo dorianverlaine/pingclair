@@ -10,12 +10,10 @@
 //! the generation that is actually serving.
 
 use crate::paths::tls_store_dir_with;
-use parking_lot::RwLock;
 use std::sync::Arc;
 
 /// 🔧 Everything the Admin API shares with the rest of the process.
 pub(super) struct AdminShared {
-    pub(super) document: Arc<RwLock<serde_json::Value>>,
     pub(super) shutdown: Arc<tokio::sync::Notify>,
     pub(super) publisher: Arc<dyn pingclair_proxy::server::ConfigPublisher>,
     pub(super) policy: Arc<pingclair_api::AdminPolicy>,
@@ -33,9 +31,6 @@ pub(super) fn start(
         let shutdown_for_admin = shared.shutdown;
         let autosave =
             tls_store_dir_with(config.global.storage_path.as_deref()).join("autosave.json");
-        // 🧭 The admin traversal endpoints read and write one shared config
-        // document; it starts as the exact configuration that was loaded.
-        let document = shared.document;
         let publisher_for_admin = shared.publisher;
         let policy_for_admin = shared.policy;
 
@@ -54,7 +49,6 @@ pub(super) fn start(
             let rt = tokio::runtime::Runtime::new().expect("Failed to create admin runtime");
             rt.block_on(async {
                 let options = pingclair_api::AdminServerOptions {
-                    document,
                     shutdown: shutdown_for_admin,
                     autosave: Some(autosave),
                     publisher: Some(publisher_for_admin),

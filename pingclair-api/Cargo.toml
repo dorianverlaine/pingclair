@@ -27,7 +27,7 @@ bytes = "1.0"
 # 🏷️ Reuses the existing BoringSSL graph for collision-resistant config hashes.
 boring.workspace = true
 pingclair-proxy = { path = "../pingclair-proxy" }
-parking_lot = "0.12"
+arc-swap.workspace = true
 
 [lints]
 workspace = true

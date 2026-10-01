@@ -85,7 +85,7 @@ pub(super) async fn listen_for_reload(
                 tracing::info!("✅ Step 1/3: Configuration validation successful");
                 tracing::info!("📋 Step 2/3: Preparing configuration update...");
                 tracing::info!("📋 Step 3/3: Publishing prepared configuration...");
-                match publisher_for_reload.publish_config(&new_config, None) {
+                match publisher_for_reload.publish_config(&new_config, None, None) {
                     Ok(success_count) => {
                         let reload_duration = reload_start.elapsed();
                         tracing::info!(

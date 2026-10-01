@@ -36,6 +36,10 @@ below, which ends with what to write instead.
 - **Admin config writes honor `If-Match`.** Refresh the config and its Etag
   after a 412 before retrying.
   → [Admin config validators](#️-admin-config-validators)
+- **Admin reads keep serving through reload.** Read the returned generation;
+  retry a write after a conflict if another reload changed its authorization.
+  → [Admin reads during reload](#️-admin-reads-during-reload)
+
 
 - **Automatic HTTPS changes its plaintext listener and redirects.**
   `disable_redirects` leaves the automatic HTTP port unbound.
@@ -107,6 +111,17 @@ known defect that ships is under
 
 **Upgrade:** Refresh the config and its Etag after a 412; writes without
 `If-Match` remain unconditional.
+
+### ♻️ Admin reads during reload
+
+Admin requests no longer receive 503 just because a reload is publishing
+(#197). Access policy and the config document are published as one immutable
+generation. Each request retains the generation that authorized it, and writes
+still check its revision under the publisher's lock.
+
+**Upgrade:** Polling scripts need no publication-delay retry. A write racing
+another publication may still require reauthentication and retry after 409
+(or a refreshed Etag after 412 for a conditional config write).
 
 ### 🔄 Automatic HTTPS follows the configured listener policy
 
@@ -221,8 +236,8 @@ a reload, compiling every site, now runs before anything is swapped.
 
 📌 Upgrading: nothing to change. On a listener with `client_auth`, a reload
 still asks connections admitted under the previous policy to reconnect, as
-before. The Admin API itself still answers `503` for the moment a reload is
-publishing.
+before. The Admin API also keeps serving through publication; see
+[Admin reads during reload](#️-admin-reads-during-reload).
 
 ### 🏷️ A build of `main` says it is a dev build
 
