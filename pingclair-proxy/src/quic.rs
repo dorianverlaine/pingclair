@@ -6053,34 +6053,6 @@ async fn reverse_proxy_upstream(
         return Err((502, "Upstream Response Trailers Not Supported"));
     }
 
-    // 🗜️ H3 streams through the same codec and eligibility policy as H1/H2.
-    let mut encoder = if intercept_file.is_none()
-        && intercept_replacement.is_none()
-        && !immediate_stream
-    {
-        session
-            .response_header()
-            .filter(|response| {
-                crate::response_encoding::eligible(&state.config, &client_header.method, response)
-            })
-            .and_then(|_| {
-                let accepted = client_header
-                    .headers
-                    .get("accept-encoding")
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("");
-                crate::encoding::negotiate(accepted, &state.config.encodings).and_then(|encoding| {
-                    crate::encoding::ResponseEncoder::new(encoding)
-                        .map_err(|error| {
-                            tracing::warn!("⚠️ Could not initialize H3 encoder: {error}")
-                        })
-                        .ok()
-                })
-            })
-    } else {
-        None
-    };
-
     let mut hdrs = Vec::new();
     if let Some(resp) = session.response_header() {
         if let Some(stream) = &intercept_file {
@@ -6137,18 +6109,6 @@ async fn reverse_proxy_upstream(
             ));
             for (name, value) in resp.headers.iter() {
                 let lower = name.as_str();
-                if encoder.is_some()
-                    && matches!(
-                        lower,
-                        "content-length"
-                            | "content-digest"
-                            | "repr-digest"
-                            | "digest"
-                            | "content-md5"
-                    )
-                {
-                    continue;
-                }
                 if matches!(
                     lower,
                     "connection"
@@ -6164,24 +6124,6 @@ async fn reverse_proxy_upstream(
                     continue;
                 }
                 hdrs.push(quiche::h3::Header::new(lower.as_bytes(), value.as_bytes()));
-            }
-            if let Some(encoder) = &encoder {
-                hdrs.push(quiche::h3::Header::new(
-                    b"content-encoding",
-                    encoder.token().as_bytes(),
-                ));
-                if !resp
-                    .headers
-                    .get_all("vary")
-                    .iter()
-                    .filter_map(|value| value.to_str().ok())
-                    .flat_map(|value| value.split(','))
-                    .any(|value| {
-                        value.trim().eq_ignore_ascii_case("accept-encoding") || value.trim() == "*"
-                    })
-                {
-                    hdrs.push(quiche::h3::Header::new(b"vary", b"Accept-Encoding"));
-                }
             }
             for (name, value) in &intercept_set {
                 let resolved = crate::server::resolve_caddy_placeholders(
@@ -6228,8 +6170,30 @@ async fn reverse_proxy_upstream(
         ));
     }
     apply_h3_response_policy(&mut hdrs, &effective_policy, request_id, Some(state));
-    if crate::response_encoding::should_vary(&state.config, effective_status) {
-        crate::response_encoding::vary_h3_on_accept_encoding(&mut hdrs);
+    // 🗜️ Final headers decide encoding, so outer policy cannot restore a strong validator.
+    let mut encoder = if intercept_file.is_none()
+        && intercept_replacement.is_none()
+        && !immediate_stream
+    {
+        let accepted = client_header
+            .headers
+            .get("accept-encoding")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        crate::encoding::negotiate(accepted, &state.config.encodings)
+            .filter(|_| {
+                crate::response_encoding::eligible_h3(&state.config, &client_header.method, &hdrs)
+            })
+            .and_then(|encoding| {
+                crate::encoding::ResponseEncoder::new(encoding)
+                .map_err(|error| tracing::warn!("⚠️ Could not initialize H3 encoder: {error}"))
+                .ok()
+            })
+    } else {
+        None
+    };
+    if let Some(encoder) = &encoder {
+        crate::response_encoding::reencode_h3_headers(&mut hdrs, encoder.token());
     }
 
     let mut download_pacer = limits.download_bytes_per_sec.map(StreamPacer::new);

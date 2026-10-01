@@ -25,6 +25,7 @@ use bytes::Bytes;
 use pingora_core::modules::http::{HttpModule, HttpModuleBuilder, HttpModuleCtx, Module};
 use pingora_http::ResponseHeader;
 use tokio_quiche::quiche;
+use tokio_quiche::quiche::h3::NameValue;
 
 use crate::encoding::{ResponseEncoder, stream_chunk};
 
@@ -135,13 +136,20 @@ fn vary_covers_accept_encoding(headers: &http::HeaderMap) -> bool {
 /// `204` and `304` have no body to compress, and an informational response
 /// only predicts the final one.
 pub(crate) fn is_full_representation(method: &http::Method, header: &ResponseHeader) -> bool {
-    let status = header.status;
+    full_representation(
+        method,
+        header.status,
+        header.headers.contains_key(http::header::CONTENT_RANGE),
+    )
+}
+
+fn full_representation(method: &http::Method, status: http::StatusCode, partial: bool) -> bool {
     !(status.is_informational()
         || status == http::StatusCode::NO_CONTENT
         || status == http::StatusCode::PARTIAL_CONTENT
         || status == http::StatusCode::NOT_MODIFIED
         || *method == http::Method::HEAD
-        || header.headers.contains_key(http::header::CONTENT_RANGE))
+        || partial)
 }
 
 /// 🛡️ Whether the response's `Cache-Control` carries `no-transform`.
@@ -162,7 +170,6 @@ pub(crate) fn should_vary(config: &pingclair_core::config::ServerConfig, status:
 
 /// 🧊 Preserves every H3 Vary member while reserving the encoding cache key.
 pub(crate) fn vary_h3_on_accept_encoding(headers: &mut Vec<quiche::h3::Header>) {
-    use quiche::h3::NameValue;
     let present = headers
         .iter()
         .filter(|header| header.name().eq_ignore_ascii_case(b"vary"))
@@ -174,44 +181,178 @@ pub(crate) fn vary_h3_on_accept_encoding(headers: &mut Vec<quiche::h3::Header>) 
     }
 }
 
-/// 🗜️ Applies the same response eligibility policy to both transports.
+/// 🗜️ Response facts borrow final headers, so policy does not require a second header map.
+struct EncodingFacts<'a> {
+    status: u16,
+    content_type: &'a str,
+    length: Option<u64>,
+    full: bool,
+    encoded: bool,
+    no_transform: bool,
+}
+
+fn eligible_facts(
+    config: &pingclair_core::config::ServerConfig,
+    facts: EncodingFacts<'_>,
+    matches_header: impl Fn(&str, &[String]) -> bool,
+) -> bool {
+    facts.full
+        && !facts.no_transform
+        && !facts.encoded
+        && !crate::server::is_streaming_content_type(facts.content_type)
+        && facts
+            .length
+            .is_none_or(|length| length >= config.encode.minimum_length)
+        && (config.encode.matcher.is_some()
+            || crate::server::is_compressible_content_type(facts.content_type, &config.gzip_types))
+        && config.encode.matches(facts.status, matches_header)
+}
+
+/// 🗜️ Both transports evaluate the same policy after response headers are finalized.
 pub(crate) fn eligible(
     config: &pingclair_core::config::ServerConfig,
     method: &http::Method,
     response: &ResponseHeader,
 ) -> bool {
-    let content_type = response
-        .headers
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    let size = response
-        .headers
-        .get("content-length")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
-    is_full_representation(method, response)
-        && !forbids_transform(response)
-        && !response.headers.contains_key("content-encoding")
-        && !crate::server::is_streaming_content_type(content_type)
-        && size.is_none_or(|size| size >= config.encode.minimum_length)
-        && (config.encode.matcher.is_some()
-            || crate::server::is_compressible_content_type(content_type, &config.gzip_types))
-        && config
-            .encode
-            .matches(response.status.as_u16(), |name, patterns| {
-                response
-                    .headers
-                    .get_all(name)
+    eligible_facts(
+        config,
+        EncodingFacts {
+            status: response.status.as_u16(),
+            content_type: response
+                .headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or(""),
+            length: response
+                .headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok()),
+            full: is_full_representation(method, response),
+            encoded: response.headers.contains_key("content-encoding"),
+            no_transform: forbids_transform(response),
+        },
+        |name, patterns| {
+            response
+                .headers
+                .get_all(name)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|value| {
+                    patterns.is_empty()
+                        || patterns.iter().any(|pattern| {
+                            pingclair_core::encoding::header_pattern_matches(value, pattern)
+                        })
+                })
+        },
+    )
+}
+
+fn h3_header<'a>(headers: &'a [quiche::h3::Header], name: &[u8]) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|header| header.name().eq_ignore_ascii_case(name))
+        .and_then(|header| std::str::from_utf8(header.value()).ok())
+}
+
+/// 🗜️ H3 borrows its wire headers rather than cloning them into an HTTP/1 header map.
+pub(crate) fn eligible_h3(
+    config: &pingclair_core::config::ServerConfig,
+    method: &http::Method,
+    headers: &[quiche::h3::Header],
+) -> bool {
+    eligible_facts(
+        config,
+        EncodingFacts {
+            status: h3_header(headers, b":status")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(502),
+            content_type: h3_header(headers, b"content-type").unwrap_or(""),
+            length: h3_header(headers, b"content-length").and_then(|value| value.parse().ok()),
+            full: full_representation(
+                method,
+                http::StatusCode::from_u16(
+                    h3_header(headers, b":status")
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(502),
+                )
+                .unwrap_or(http::StatusCode::BAD_GATEWAY),
+                headers
                     .iter()
-                    .filter_map(|value| value.to_str().ok())
-                    .any(|value| {
-                        patterns.is_empty()
-                            || patterns.iter().any(|pattern| {
-                                pingclair_core::encoding::header_pattern_matches(value, pattern)
-                            })
-                    })
-            })
+                    .any(|header| header.name().eq_ignore_ascii_case(b"content-range")),
+            ),
+            encoded: headers
+                .iter()
+                .any(|header| header.name().eq_ignore_ascii_case(b"content-encoding")),
+            no_transform: headers
+                .iter()
+                .filter(|header| header.name().eq_ignore_ascii_case(b"cache-control"))
+                .filter_map(|header| std::str::from_utf8(header.value()).ok())
+                .flat_map(|value| value.split(','))
+                .any(|token| token.trim().eq_ignore_ascii_case("no-transform")),
+        },
+        |name, patterns| {
+            headers
+                .iter()
+                .filter(|header| header.name().eq_ignore_ascii_case(name.as_bytes()))
+                .filter_map(|header| std::str::from_utf8(header.value()).ok())
+                .any(|value| {
+                    patterns.is_empty()
+                        || patterns.iter().any(|pattern| {
+                            pingclair_core::encoding::header_pattern_matches(value, pattern)
+                        })
+                })
+        },
+    )
+}
+
+/// 🏷️ Final policy headers must describe the encoded bytes, including policy-supplied ETags.
+pub(crate) fn reencode_h3_headers(headers: &mut Vec<quiche::h3::Header>, coding: &'static str) {
+    headers.retain(|header| {
+        ![
+            "content-length",
+            "content-digest",
+            "repr-digest",
+            "digest",
+            "content-md5",
+        ]
+        .iter()
+        .any(|name| header.name().eq_ignore_ascii_case(name.as_bytes()))
+    });
+    for header in headers.iter_mut() {
+        if header.name().eq_ignore_ascii_case(b"etag")
+            && let Some(weak) = weak_etag(header.value())
+        {
+            *header = quiche::h3::Header::new(b"etag", weak.as_bytes());
+        }
+    }
+    headers.push(quiche::h3::Header::new(
+        b"content-encoding",
+        coding.as_bytes(),
+    ));
+}
+
+/// 🏷️ Re-encoded bytes cannot retain the origin's strong byte validator.
+fn weak_etag(value: &[u8]) -> Option<http::HeaderValue> {
+    if value.starts_with(b"W/") {
+        return None;
+    }
+    let mut weak = Vec::with_capacity(value.len() + 2);
+    weak.extend_from_slice(b"W/");
+    weak.extend_from_slice(value);
+    http::HeaderValue::from_maybe_shared(Bytes::from(weak)).ok()
+}
+
+/// 🏷️ Weak validators still support cache revalidation without promising exact bytes.
+pub(crate) fn weaken_etag(response: &mut ResponseHeader) -> pingora_core::Result<()> {
+    if let Some(value) = response
+        .headers
+        .get(http::header::ETAG)
+        .and_then(|value| weak_etag(value.as_bytes()))
+    {
+        response.insert_header("ETag", value)?;
+    }
+    Ok(())
 }
 
 /// 🧹 Removes the fields that vouch for the origin's exact bytes.

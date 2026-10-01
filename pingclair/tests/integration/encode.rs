@@ -205,3 +205,27 @@ async fn proxy_encode_varies_identity_and_encoded_responses() {
     server.stop();
     task.abort();
 }
+
+#[tokio::test]
+async fn proxy_reencoding_weakens_only_strong_etags() {
+    let (address, task) = origin().await;
+    let mut server = proxy_site(address, "encode gzip");
+    assert!(server.wait_until_ready().await);
+    let client = no_proxy_client();
+    for (accepted, path, expected) in [
+        ("", "/text", "\"origin\""),
+        ("gzip", "/text", "W/\"origin\""),
+        ("gzip", "/weak", "W/\"origin\""),
+        ("gzip", "/binary", "\"origin\""),
+    ] {
+        let response = client
+            .get(server.url(0, path))
+            .header("Accept-Encoding", accepted)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.headers().get("etag").unwrap(), expected);
+    }
+    server.stop();
+    task.abort();
+}

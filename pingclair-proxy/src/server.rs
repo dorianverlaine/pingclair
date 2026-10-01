@@ -8485,6 +8485,7 @@ impl ProxyHttp for PingclairProxy {
                     upstream_response.insert_header("Content-Encoding", token)?;
                     let _ = upstream_response.remove_header("Content-Length");
                     crate::response_encoding::drop_integrity_fields(upstream_response);
+                    crate::response_encoding::weaken_etag(upstream_response)?;
                     // 🌊 With Content-Length gone, HTTP/1.1 needs explicit
                     // chunked framing. Pingora only adds it before this
                     // filter runs, and has already promised keep-alive,

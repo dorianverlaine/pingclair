@@ -58,6 +58,9 @@ below, which ends with what to write instead.
   → [Static responses always vary by encoding](#static-responses-always-vary-by-encoding)
 - **Proxied responses on encode sites send Vary: Accept-Encoding even when served as identity.**
   → [Proxy encode responses always vary by encoding](#proxy-encode-responses-always-vary-by-encoding)
+- **Re-encoding a proxied response turns its strong ETag into a weak validator.**
+  → [Proxy compression weakens strong etags](#proxy-compression-weakens-strong-etags)
+
 
 
 
@@ -254,6 +257,10 @@ selection is recorded in configuration; codec application is tracked in #223.
 ### Proxy encode responses always vary by encoding
 
 🗜️ Proxied responses on encode sites send Vary: Accept-Encoding even when served as identity. Upgrade: allow caches to distinguish identity clients from clients that accept the configured codings (#226).
+
+### Proxy compression weakens strong etags
+
+🗜️ Re-encoding a proxied response turns its strong ETag into a weak validator. Upgrade: use weak ETags for cache revalidation; range resumption must use a validator for the actual encoded bytes (#227).
 
 ### Admin-only startup accepts its first HTTP generation
 
