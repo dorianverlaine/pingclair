@@ -8607,7 +8607,7 @@ impl ProxyHttp for PingclairProxy {
         // 💥 Count upstream and internal failures as *attempts*, which is a
         // different number from requests the client saw fail: a request retried
         // twice and then served contributes two here and none to
-        // `pingclair_request_errors_total`. That gap is exactly the degradation
+        // `caddy_http_request_errors_total`. That gap is exactly the degradation
         // a proxy hides, so it is worth its own metric.
         if metrics::enabled() && !matches!(e.esource(), ErrorSource::Downstream) {
             let route = ctx

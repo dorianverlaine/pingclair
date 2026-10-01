@@ -22,6 +22,7 @@ use tokio::sync::Notify;
 use pingclair_core::config::{AdminConfig, PingclairConfig};
 
 use crate::auth::{ApiKeyAuth, AuthDecision, OriginPolicy, authorize, origin_allowed};
+use crate::config_diagnostics::missing_path_message;
 use crate::config_etag::config_response;
 use crate::config_tree::{self, Mode, TreeError};
 
@@ -442,12 +443,13 @@ async fn handle_request_inner(
             let guard = document;
             match config_tree::get(guard, &segments) {
                 Ok(node) => Ok(config_response(path, node)),
+                Err(TreeError::NotFound) => Ok(config_response(path, &Value::Null)),
                 Err(error) => Ok(response(
                     StatusCode::NOT_FOUND,
-                    &format!(
-                        r#"{{"error":"{}"}}"#,
-                        missing_path_message(guard, &segments, &error)
-                    ),
+                    &serde_json::json!({
+                        "error": missing_path_message(guard, &segments, &error)
+                    })
+                    .to_string(),
                 )),
             }
         }
@@ -808,8 +810,13 @@ fn check_if_match(
             let segments = normalize_config_segments(config_tree::segments_from_path(
                 path.strip_prefix("/config").unwrap_or_default(),
             ));
-            config_tree::get(document, &segments)
-                .is_ok_and(|node| crate::config_etag::etag(path, node) == *expected)
+            match config_tree::get(document, &segments) {
+                Ok(node) => crate::config_etag::etag(path, node) == *expected,
+                Err(TreeError::NotFound) => {
+                    crate::config_etag::etag(path, &Value::Null) == *expected
+                }
+                Err(TreeError::Conflict | TreeError::Invalid(_)) => false,
+            }
         });
     if matches {
         Ok(())
@@ -868,44 +875,6 @@ async fn apply_config_traversal(
     let raw = path.strip_prefix("/config").unwrap_or(path);
     let segments = normalize_config_segments(config_tree::segments_from_path(raw));
     apply_segments(ctx, method, segments, body).await
-}
-
-/// 📣 Says *why* a `/config/<path>` lookup found nothing, in the terms the
-/// caller is thinking in.
-///
-/// 🚫 `config path does not exist` is true and useless. The path that brings
-/// people here is `apps`, the top level of Caddy's own document, and answering
-/// a caller who believes they are talking to Caddy with "that path does not
-/// exist" reads as a bug on their side. Naming the keys this document does have
-/// tells them the shape differs, which is the fact they are missing.
-///
-/// It stays a 404: the path genuinely is not in this document, and a 200 would
-/// claim a subtree that could not be returned.
-fn missing_path_message(
-    document: &Value,
-    segments: &[String],
-    error: &config_tree::TreeError,
-) -> String {
-    let config_tree::TreeError::NotFound = error else {
-        return error.message();
-    };
-    let top_level = document
-        .as_object()
-        .map(|map| {
-            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
-            keys.sort_unstable();
-            keys.join(", ")
-        })
-        .unwrap_or_default();
-    let detail = match segments.first().map(String::as_str) {
-        Some("apps") => "`apps` is the top level of Caddy's JSON, and this admin API serves \
-             pingclair's own configuration shape. POST a Caddyfile instead \
-             (Content-Type: text/caddyfile), or read the running document from \
-             /config/."
-            .to_string(),
-        _ => format!("this document's top level is: {top_level}"),
-    };
-    format!("{} — {detail}", error.message())
 }
 
 /// 🔎 Is this body a Caddy configuration document rather than a pingclair one?
@@ -1050,7 +1019,10 @@ async fn apply_segments(
     match mutation {
         Err(TreeError::NotFound) => Ok(response(
             StatusCode::NOT_FOUND,
-            &format!(r#"{{"error":"{}"}}"#, TreeError::NotFound.message()),
+            &serde_json::json!({
+                "error": missing_path_message(ctx.document, &segments, &TreeError::NotFound)
+            })
+            .to_string(),
         )),
         Err(TreeError::Conflict) => Ok(response(
             StatusCode::CONFLICT,
@@ -1456,45 +1428,6 @@ mod caddy_document_tests {
             "servers": [{ "routes": [{ "handler": { "type": "respond", "body": "hi" } }] }]
         });
         assert!(collected_upstreams(&document).is_empty());
-    }
-
-    /// 📣 `apps` is the path that brings people here, and the answer must say
-    /// why it is not in this document rather than that the path does not exist.
-    #[test]
-    fn a_missing_apps_path_is_explained_not_just_denied() {
-        let document = serde_json::json!({
-            "debug": false,
-            "servers": [],
-            "admin": null,
-            "global": {},
-            "logging": {}
-        });
-        let message = missing_path_message(
-            &document,
-            &["apps".to_string()],
-            &config_tree::TreeError::NotFound,
-        );
-        assert!(
-            message.contains("Caddy"),
-            "must name whose shape this is: {message}"
-        );
-        assert!(
-            message.contains("text/caddyfile"),
-            "must point at the spelling this endpoint does take: {message}"
-        );
-    }
-
-    /// 🧭 Any other unknown key gets the document's real top level, which is the
-    /// fact the caller is missing.
-    #[test]
-    fn any_other_missing_path_names_the_documents_top_level() {
-        let document = serde_json::json!({ "debug": false, "servers": [] });
-        let message = missing_path_message(
-            &document,
-            &["nope".to_string()],
-            &config_tree::TreeError::NotFound,
-        );
-        assert!(message.contains("debug, servers"), "{message}");
     }
 }
 

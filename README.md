@@ -40,7 +40,9 @@ production deployment.
 - **Fail-closed configuration** — Validate policy before publication and keep
   the last-known-good configuration when a reload cannot be applied safely.
 - **Operational visibility** — Export Prometheus metrics and structured access
-  logs without requiring an external module.
+  logs without requiring an external module. Standard HTTP and Admin metric
+  families use Caddy's `caddy_*` names; additional runtime metrics retain
+  `pingclair_*` names. See the [metric name mapping](CHANGELOG.md#-admin-config-reads-and-metric-names-follow-caddy).
 
 ## 📦 Install
 

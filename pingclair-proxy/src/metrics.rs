@@ -170,7 +170,7 @@ pub fn host_label(host: &str) -> std::borrow::Cow<'_, str> {
 /// Total requests processed
 pub static REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
-        Opts::new("pingclair_requests_total", "Total number of HTTP requests"),
+        Opts::new("caddy_http_requests_total", "Total number of HTTP requests"),
         &["method", "status", "host"],
     )
     .expect("metric can be created")
@@ -180,7 +180,7 @@ pub static REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 pub static REQUEST_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
         prometheus::HistogramOpts::new(
-            "pingclair_request_duration_seconds",
+            "caddy_http_request_duration_seconds",
             "Request duration in seconds",
         ),
         &["method", "status", "host"],
@@ -192,7 +192,7 @@ pub static REQUEST_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
 pub static REQUEST_SIZE_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
         prometheus::HistogramOpts::new(
-            "pingclair_request_size_bytes",
+            "caddy_http_request_size_bytes",
             "Estimated request body size in bytes",
         )
         .buckets(vec![
@@ -214,7 +214,7 @@ pub static REQUEST_SIZE_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
 pub static RESPONSE_SIZE_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
         prometheus::HistogramOpts::new(
-            "pingclair_response_size_bytes",
+            "caddy_http_response_size_bytes",
             "Response body size in bytes",
         )
         .buckets(vec![
@@ -236,7 +236,7 @@ pub static RESPONSE_SIZE_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
 pub static RESPONSE_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
         prometheus::HistogramOpts::new(
-            "pingclair_response_duration_seconds",
+            "caddy_http_response_duration_seconds",
             "Time to first response byte in seconds",
         ),
         &["method", "status", "host"],
@@ -248,7 +248,7 @@ pub static RESPONSE_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| 
 pub static REQUEST_ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
-            "pingclair_request_errors_total",
+            "caddy_http_request_errors_total",
             "Requests that ended with an error",
         ),
         &["method", "host"],
@@ -372,7 +372,7 @@ pub static UPSTREAM_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| 
 
 /// 💥 Upstream attempts that failed, by why.
 ///
-/// Split from `pingclair_request_errors_total` because they answer different
+/// 📊 Split from `caddy_http_request_errors_total` because they answer different
 /// questions: that one counts requests the client saw fail, this one counts
 /// attempts — a request retried twice and then served successfully contributes
 /// two failures here and none there, which is precisely the invisible
@@ -558,7 +558,7 @@ pub static CIRCUIT_STATE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 pub static ADMIN_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
-            "pingclair_admin_http_requests_total",
+            "caddy_admin_http_requests_total",
             "Requests made to the admin API endpoints",
         ),
         &["method", "endpoint", "status"],
@@ -570,7 +570,7 @@ pub static ADMIN_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 pub static UPSTREAM_HEALTHY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     IntGaugeVec::new(
         Opts::new(
-            "pingclair_reverse_proxy_upstreams_healthy",
+            "caddy_reverse_proxy_upstreams_healthy",
             "Healthiness of reverse-proxy upstreams",
         ),
         &["upstream"],

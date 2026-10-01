@@ -39,6 +39,10 @@ below, which ends with what to write instead.
 - **Admin reads keep serving through reload.** Read the returned generation;
   retry a write after a conflict if another reload changed its authorization.
   → [Admin reads during reload](#️-admin-reads-during-reload)
+- **Missing Admin config reads return `200 null`; standard metric names change.**
+  Check the returned value and update dashboards using the metric mapping.
+  → [Admin config reads and metric names](#-admin-config-reads-and-metric-names-follow-caddy)
+
 
 
 - **Automatic HTTPS changes its plaintext listener and redirects.**
@@ -122,6 +126,40 @@ still check its revision under the publisher's lock.
 **Upgrade:** Polling scripts need no publication-delay retry. A write racing
 another publication may still require reauthentication and retry after 409
 (or a refreshed Etag after 412 for a conditional config write).
+
+### 📊 Admin config reads and metric names follow Caddy
+
+`GET /config/<missing path>` now returns `200` with JSON `null` and an Etag,
+including missing object keys and array indices (#164). Conditional creation
+can use that validator. Missing write paths still return errors; diagnostics
+name the nearest parent and its keys or array length rather than the document's
+root keys.
+
+Standard metric families now use Caddy's series names. This mapping follows
+Caddy from memory; its metrics source was not read. Values remain Pingclair's,
+and existing labels and cardinality limits are unchanged.
+
+| Previous name | New name |
+| --- | --- |
+| `pingclair_requests_total` | `caddy_http_requests_total` |
+| `pingclair_request_duration_seconds` | `caddy_http_request_duration_seconds` |
+| `pingclair_request_size_bytes` | `caddy_http_request_size_bytes` |
+| `pingclair_response_size_bytes` | `caddy_http_response_size_bytes` |
+| `pingclair_response_duration_seconds` | `caddy_http_response_duration_seconds` |
+| `pingclair_request_errors_total` | `caddy_http_request_errors_total` |
+| `pingclair_admin_http_requests_total` | `caddy_admin_http_requests_total` |
+| `pingclair_reverse_proxy_upstreams_healthy` | `caddy_reverse_proxy_upstreams_healthy` |
+
+Metrics without a definite Caddy equivalent retain their `pingclair_` names:
+connections, overload, cache, access-log drops, upstream timing/errors/retries,
+TLS and H3 counters, readiness, config version, queue occupancy, circuit state,
+and process resources. No collectors are dropped or duplicated.
+
+**Upgrade:** Scripts must check for `null` instead of relying on a 404 from a
+missing config read. Replace the old metric names in dashboards, recording
+rules, and alerts with the names above; histogram `_bucket`, `_sum`, and
+`_count` series follow the renamed family. The old names are no longer exported.
+The names do not imply that Pingclair exports Caddy's complete label schema.
 
 ### 🔄 Automatic HTTPS follows the configured listener policy
 

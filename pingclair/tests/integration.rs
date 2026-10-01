@@ -16,6 +16,9 @@ mod admin_etag;
 #[path = "integration/admin_reload.rs"]
 mod admin_reload;
 
+#[path = "integration/admin_compat.rs"]
+mod admin_compat;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -5429,12 +5432,12 @@ async fn test_pingclairfile_metrics_directive_serves_the_scrape() {
     );
     let body = scrape.text().await.unwrap();
     assert!(
-        body.contains("# HELP pingclair_requests_total"),
+        body.contains("# HELP caddy_http_requests_total"),
         "the exposition format carries HELP lines; got {}",
         &body[..body.len().min(400)]
     );
     assert!(
-        body.contains("pingclair_requests_total{"),
+        body.contains("caddy_http_requests_total{"),
         "the request this test made must appear; got {}",
         &body[..body.len().min(400)]
     );
@@ -6790,7 +6793,7 @@ async fn test_admin_config_traversal_end_to_end() {
         serde_json::json!(true)
     );
 
-    // 🗑️ DELETE removes it; unknown paths are 404.
+    // 🗑️ DELETE removes it; reads of missing paths return null.
     let resp = client
         .delete(server.admin_url("/config/servers/0/extra"))
         .send()
@@ -6802,13 +6805,21 @@ async fn test_admin_config_traversal_end_to_end() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap(),
+        serde_json::Value::Null
+    );
     let resp = client
         .get(server.admin_url("/config/servers/0/nope"))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap(),
+        serde_json::Value::Null
+    );
 
     // 🛡️ A malformed mutation rolls back; the running server stays patched.
     let resp = client
@@ -14783,7 +14794,7 @@ async fn test_admin_metric_labels_are_a_fixed_set() {
 
     let series: Vec<&str> = body
         .lines()
-        .filter(|line| line.starts_with("pingclair_admin_http_requests_total{"))
+        .filter(|line| line.starts_with("caddy_admin_http_requests_total{"))
         .collect();
 
     assert!(
