@@ -425,3 +425,108 @@ async fn test_private_field_is_not_served_from_an_entry_stored_under_the_route_t
         "a private field must not be served from cache"
     );
 }
+
+/// 🔑 Two caching routes for the same URL never answer from each other's entries.
+///
+/// The shape an operator writes for an internal view of a page: a guarded
+/// route that proxies to a confidential upstream, and a public route for
+/// everyone else, both cached. The guard here is a header so the test client
+/// can satisfy it; in production it is usually `client_ip`. Keyed on host and
+/// URL alone, whichever route filled the entry first answered for both, so a
+/// public visitor received the confidential page.
+#[tokio::test]
+async fn test_routes_sharing_a_url_keep_separate_cache_entries() {
+    let page = |body: &str| {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    };
+    let (internal, internal_hits) = spawn_scripted_origin(page("confidential")).await;
+    let (public, public_hits) = spawn_scripted_origin(page("public")).await;
+    let mut server = TestServer::new_pingclairfile(&format!(
+        r#"
+        {{
+            admin __PINGCLAIR_TEST_ADMIN_LISTEN__
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            @internal header X-Internal yes
+            reverse_proxy @internal http://{internal} {{
+                cache {{
+                    ttl 60s
+                }}
+            }}
+
+            reverse_proxy http://{public} {{
+                cache {{
+                    ttl 60s
+                }}
+            }}
+        }}
+        "#
+    ));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let mut bodies = Vec::new();
+    for internal_view in [true, false, true, false] {
+        let mut request = client.get(server.url(0, "/report"));
+        if internal_view {
+            request = request.header("X-Internal", "yes");
+        }
+        bodies.push(request.send().await.unwrap().text().await.unwrap());
+    }
+
+    assert_eq!(
+        (
+            bodies,
+            internal_hits.load(Ordering::SeqCst),
+            public_hits.load(Ordering::SeqCst)
+        ),
+        (
+            vec![
+                "confidential".to_string(),
+                "public".to_string(),
+                "confidential".to_string(),
+                "public".to_string()
+            ],
+            1,
+            1
+        ),
+        "each route serves its own upstream's page, and each is still cached"
+    );
+
+    // 🧹 Purge is addressed by host and URL, so it has to reach the entry of
+    // every route that stored that URL, not just one of them.
+    let purge = client
+        .post(server.admin_url("/cache/purge"))
+        .json(&serde_json::json!({
+            "host": server.server_addresses[0][0].to_string(),
+            "path": "/report",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(purge.text().await.unwrap(), r#"{"purged":true}"#);
+    for internal_view in [true, false] {
+        let mut request = client.get(server.url(0, "/report"));
+        if internal_view {
+            request = request.header("X-Internal", "yes");
+        }
+        let _ = request.send().await.unwrap().text().await.unwrap();
+    }
+    assert_eq!(
+        (
+            internal_hits.load(Ordering::SeqCst),
+            public_hits.load(Ordering::SeqCst)
+        ),
+        (2, 2),
+        "both routes' entries were purged"
+    );
+}

@@ -184,6 +184,9 @@ pub struct RequestContext {
     /// Carried on the context because `response_cache_filter` runs long after
     /// the route was matched and has no other way back to its configuration.
     pub cache_ttl_secs: Option<u64>,
+    /// 🔑 The matched route's cache scope, copied out of `ProxyState` when
+    /// caching is enabled so `cache_key_callback` can key the entry by route.
+    pub(crate) cache_scope: Option<crate::cache_key::CacheScope>,
 
     /// 📏 Whether this request's cache has a per-response ceiling that still
     /// needs body chunks fed to it. Cleared once the limit is exceeded, so the
@@ -301,6 +304,7 @@ impl Default for RequestContext {
             generation: None,
             route_index: None,
             cache_ttl_secs: None,
+            cache_scope: None,
             cache_size_tracked: false,
             upstream: None,
             headers_upstream: BTreeMap::new(),
@@ -1073,6 +1077,9 @@ pub struct ProxyState {
     /// body filters run per chunk — the one place a per-request `min()` would
     /// be paid a hundred thousand times a second.
     pub(crate) route_buffering: Vec<RouteBuffering>,
+    /// 🔑 Per route, the scope that keeps its cache entries apart from every
+    /// other route's; `None` for a route that does not cache.
+    pub(crate) cache_scopes: Vec<Option<crate::cache_key::CacheScope>>,
     /// 🧭 Whether configured runtime text can observe original-URI variables.
     /// Most sites cannot, so their requests never build those owned map entries.
     needs_original_uri_vars: bool,
@@ -1945,6 +1952,9 @@ impl ProxyState {
         target_entries.extend(named_targets);
         let log_targets = crate::access_log::LogTargets::new(target_entries);
         let strict_transport = crate::http_policy::StrictTransport::from_security(&config.security);
+        let cache_scopes = crate::cache_key::route_scopes(&config, |route| {
+            find_reverse_proxy_config(&route.handler).is_some_and(|proxy| proxy.cache.is_some())
+        });
 
         Self {
             config: Arc::new(config),
@@ -1968,6 +1978,7 @@ impl ProxyState {
             route_body_ceilings,
             route_body_timeouts,
             route_buffering,
+            cache_scopes,
             needs_original_uri_vars,
             log_targets,
             strict_transport,
@@ -5903,20 +5914,27 @@ pub fn cache_status() -> CacheStatus {
 /// warm entries to fix one of them turns a small correction into a traffic
 /// spike at the origin.
 ///
-/// 🔑 The key is built with the same host/path/query triple as
-/// [`ProxyService::cache_key_callback`], including the lowercased host. If those
-/// two ever disagree, purge silently stops working — which is why the caller
-/// gets a boolean rather than a cheerful unconditional success.
+/// 🔑 The key is built by the same [`crate::cache_key::primary`] as
+/// [`ProxyService::cache_key_callback`], once per route scope, because the
+/// same URL may be stored separately by every route that caches it. If the two
+/// ever disagree, purge silently stops working — which is why the caller gets
+/// a boolean rather than a cheerful unconditional success.
 pub async fn purge_cached_response(host: &str, path_and_query: &str) -> bool {
+    let mut purged = false;
+    for scope in crate::cache_key::known_scopes() {
+        purged |= purge_cached_entry(crate::cache_key::primary(&scope, host, path_and_query)).await;
+    }
+    purged
+}
+
+/// 🧹 Drops the one stored response with this primary key, keeping the
+/// eviction accounting in step.
+async fn purge_cached_entry(primary: Vec<u8>) -> bool {
     use pingora_cache::eviction::CacheEntryKeyRef;
     use pingora_cache::key::CacheKey;
     use pingora_cache::storage::{PurgeOutcome, PurgeTarget, PurgeType, Storage};
 
-    let key = CacheKey::new(
-        cache_key_primary(&host.to_ascii_lowercase(), path_and_query),
-        "",
-    )
-    .to_compact();
+    let key = CacheKey::new(primary, "").to_compact();
     let outcome = Storage::purge(
         response_cache_storage(),
         PurgeTarget::Active(&key),
@@ -5937,18 +5955,6 @@ pub async fn purge_cached_response(host: &str, path_and_query: &str) -> bool {
         metrics::CACHE_SIZE_BYTES.set(eviction.total_size() as i64);
     }
     true
-}
-
-/// 🔑 Frames the host and request target into the single primary component
-/// required by Pingora 0.9's cache-key API while preserving their old order.
-/// Length prefixes prevent an ambiguous pair from sharing a cache entry.
-fn cache_key_primary(host: &str, path_and_query: &str) -> Vec<u8> {
-    let mut primary = Vec::with_capacity(16 + host.len() + path_and_query.len());
-    primary.extend_from_slice(&(host.len() as u64).to_be_bytes());
-    primary.extend_from_slice(host.as_bytes());
-    primary.extend_from_slice(&(path_and_query.len() as u64).to_be_bytes());
-    primary.extend_from_slice(path_and_query.as_bytes());
-    primary
 }
 
 /// 🚫 Recognizes only cache-bypass directives, across every field line, without
@@ -6543,6 +6549,18 @@ impl ProxyHttp for PingclairProxy {
             return Ok(());
         }
 
+        // 🔑 No scope means the entry could not be told apart from another
+        // route's, so this route is not cached at all rather than shared.
+        let Some(cache_scope) = ctx
+            .state
+            .as_ref()
+            .zip(ctx.route_index)
+            .and_then(|(state, route_index)| state.cache_scopes.get(route_index).copied())
+            .flatten()
+        else {
+            return Ok(());
+        };
+
         // 🌊 A streaming route hands chunks downstream as they arrive; storing
         // that response means buffering it whole, which is the memory bug this
         // project has already shipped twice.
@@ -6551,6 +6569,7 @@ impl ProxyHttp for PingclairProxy {
         }
 
         ctx.cache_ttl_secs = Some(cache_ttl_secs);
+        ctx.cache_scope = Some(cache_scope);
 
         session.cache.enable(
             response_cache_storage(),
@@ -6579,29 +6598,41 @@ impl ProxyHttp for PingclairProxy {
 
     /// 🔑 Identifies a cached response by the parts that change what is served.
     ///
-    /// Host, path and query — the same triple nginx's default `proxy_cache_key`
-    /// uses. The method is not in the key because only safe methods reach here,
-    /// and the scheme is not either: a route serves the same upstream bytes
-    /// whichever way the client arrived.
+    /// The route's scope, then host, path and query — nginx's default
+    /// `proxy_cache_key` is `$scheme$proxy_host$request_uri`, which names the
+    /// upstream; the scope does the same job, and also separates two routes
+    /// that share an upstream but not a guard. The method is not in the key
+    /// because only safe methods reach here, and the scheme is not either: a
+    /// route serves the same upstream bytes whichever way the client arrived.
     fn cache_key_callback(
         &self,
         session: &Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> pingora_core::Result<CacheKey> {
+        // 🛡️ `request_cache_filter` enables the cache only after setting the
+        // scope, so this is unreachable; refusing beats sharing if it ever is.
+        let Some(scope) = ctx.cache_scope.as_ref() else {
+            return pingora_core::Error::e_explain(
+                pingora_core::ErrorType::InternalError,
+                "cache enabled without a route scope",
+            );
+        };
         let request = session.req_header();
         let host = request
             .headers
             .get("host")
             .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
+            .unwrap_or_default();
         let path_and_query = request
             .uri
             .path_and_query()
             .map(|value| value.as_str())
             .unwrap_or("/");
 
-        Ok(CacheKey::new(cache_key_primary(&host, path_and_query), ""))
+        Ok(CacheKey::new(
+            crate::cache_key::primary(scope, host, path_and_query),
+            "",
+        ))
     }
 
     /// 🗄️ Decides whether an upstream response may be stored.
@@ -11400,7 +11431,7 @@ mod response_cache_tests {
     use std::time::{Duration as StdDuration, SystemTime};
 
     fn key(path: &str) -> pingora_cache::key::CompactCacheKey {
-        CacheKey::new(cache_key_primary("example.com", path), "").to_compact()
+        CacheKey::new(crate::cache_key::primary(&[0; 16], "example.com", path), "").to_compact()
     }
 
     fn entry(path: &str) -> CacheEntryKey {
@@ -11506,29 +11537,6 @@ mod response_cache_tests {
             100,
             "the purged entry's bytes are available again"
         );
-    }
-
-    /// 🔑 Purge addresses an entry exactly the way the request path does.
-    ///
-    /// `cache_key_callback` lowercases the host; if `purge_cached_response`
-    /// ever stops doing the same, purge silently stops working — the endpoint
-    /// would report success and the stale page would keep being served.
-    #[test]
-    fn purge_builds_the_same_key_the_request_path_builds() {
-        let from_request =
-            CacheKey::new(cache_key_primary("example.com", "/a?b=1"), "").to_compact();
-        let from_purge = CacheKey::new(
-            cache_key_primary(&"EXAMPLE.com".to_ascii_lowercase(), "/a?b=1"),
-            "",
-        )
-        .to_compact();
-        assert_eq!(from_request, from_purge);
-    }
-
-    /// 🔐 Length prefixes keep host and target boundaries unambiguous.
-    #[test]
-    fn cache_key_primary_does_not_conflate_adjacent_fields() {
-        assert_ne!(cache_key_primary("ab", "c"), cache_key_primary("a", "bc"));
     }
 }
 
