@@ -3824,9 +3824,19 @@ async fn handle_request_inner(
     // 📥 Planning is done, so whichever `request_body` handler actually ran
     // has had its say. Everything that reads the body from here on uses these.
     let body_limit = body_plan.limit.unwrap_or(site_body_limit);
+    //
+    // ⏱️ With nothing configured, a body that stops arriving still gets let go
+    // of, as on HTTP/1 and HTTP/2; see `body_timeout`. An immediate-flush
+    // proxy route is a long connection there and keeps no default here either,
+    // because its client may be quiet on purpose.
+    let long_connection = proxy
+        .get_proxy_config(&state, route_index)
+        .is_some_and(|config| crate::server::wants_immediate_flush(config.flush_interval));
     let body_timeout_ms = body_plan
         .read_timeout_ms
-        .or(state.config.limits.body_timeout_ms);
+        .or(state.config.limits.body_timeout_ms)
+        .or((!long_connection)
+            .then_some(crate::body_timeout::DEFAULT_BODY_TIMEOUT.as_millis() as u64));
 
     // 🧾 A `request_body { set … }` handler replaces the body, so the rest of
     // this function reads from a channel that yields the configured string

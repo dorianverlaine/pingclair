@@ -134,6 +134,10 @@ mod graceful_shutdown;
 #[path = "integration/header_deadline.rs"]
 mod header_deadline;
 
+// ⏱️ A request body that stops arriving is answered at the default pause.
+#[path = "integration/body_stall.rs"]
+mod body_stall;
+
 // 🍪 Several `Cookie` field lines read as one cookie-string.
 #[path = "integration/cookie_fold.rs"]
 mod cookie_fold;

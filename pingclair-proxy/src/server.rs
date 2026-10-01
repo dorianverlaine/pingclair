@@ -3160,15 +3160,12 @@ impl PingclairProxy {
         ctx.request_body_read_timeout_ms = route_timeouts.read_ms;
         ctx.request_body_write_timeout_ms = route_timeouts.write_ms;
 
-        let read_timeout = route_timeouts
-            .read_ms
-            .map(Duration::from_millis)
-            .or_else(|| {
-                shortest_duration(
-                    limits.body_timeout_ms.map(Duration::from_millis),
-                    limits.idle_timeout_ms.map(Duration::from_millis),
-                )
-            });
+        // ⏱️ With nothing configured, a body that stops arriving still gets
+        // let go of; see `body_timeout` for the value and the failure it ends.
+        let read_timeout = Some(
+            Self::configured_read_timeout(route_timeouts.read_ms, limits)
+                .unwrap_or(crate::body_timeout::DEFAULT_BODY_TIMEOUT),
+        );
         session.as_mut().set_read_timeout(read_timeout);
         session.as_mut().set_write_timeout(
             route_timeouts
@@ -3182,6 +3179,21 @@ impl PingclairProxy {
                 .idle_timeout_ms
                 .map_or(60, |idle_ms| idle_ms.div_ceil(1_000)),
         ));
+    }
+
+    /// ⏱️ The pause between two downstream reads that the configuration asks
+    /// for: the route's `request_body { read_timeout }`, else the shorter of
+    /// the site's `body_timeout` and `idle_timeout`. `None` when none is set.
+    fn configured_read_timeout(
+        route_read_ms: Option<u64>,
+        limits: &pingclair_core::config::ResourceLimitsConfig,
+    ) -> Option<Duration> {
+        route_read_ms.map(Duration::from_millis).or_else(|| {
+            shortest_duration(
+                limits.body_timeout_ms.map(Duration::from_millis),
+                limits.idle_timeout_ms.map(Duration::from_millis),
+            )
+        })
     }
 
     /// 🌊 Replaces ordinary deadlines for an intentional streaming response or tunnel.
@@ -3207,6 +3219,17 @@ impl PingclairProxy {
             session
                 .as_mut()
                 .set_keepalive((idle_ms > 0).then(|| idle_ms.div_ceil(1_000)));
+        } else {
+            // 🌊 The default body pause is for an upload that stalls, not for a
+            // tunnel or stream that is quiet on purpose: a WebSocket whose
+            // client says nothing for a minute is healthy. Only what the
+            // operator configured carries over to a long connection.
+            let timeout = Self::configured_read_timeout(
+                ctx.request_body_read_timeout_ms,
+                &state.config.limits,
+            );
+            session.as_mut().set_read_timeout(timeout);
+            session.as_mut().set_total_drain_timeout(timeout);
         }
     }
 
@@ -3935,7 +3958,34 @@ impl PingclairProxy {
         session: &mut Session,
         ctx: &mut RequestContext,
     ) -> pingora_core::Result<()> {
-        while let Some(bytes) = session.read_request_body().await? {
+        // ⏱️ Pingora times HTTP/1 body reads itself, from the read timeout
+        // `initialize_request_limits` set, but `set_read_timeout` is a no-op
+        // on an HTTP/2 stream (pingora-core 0.9.0, `ServerSession`). Without
+        // this, a stream announcing a body and sending no DATA would hold its
+        // `respond` route forever; the error maps to 408 like HTTP/1's.
+        let h2_pause = session.as_downstream().is_http2().then(|| {
+            ctx.state
+                .as_ref()
+                .and_then(|state| {
+                    Self::configured_read_timeout(
+                        ctx.request_body_read_timeout_ms,
+                        &state.config.limits,
+                    )
+                })
+                .unwrap_or(crate::body_timeout::DEFAULT_BODY_TIMEOUT)
+        });
+        loop {
+            let read = session.read_request_body();
+            let next = match h2_pause {
+                Some(pause) => tokio::time::timeout(pause, read).await.or_else(|_| {
+                    pingora_core::Error::e_explain(
+                        pingora_core::ErrorType::ReadTimedout,
+                        "HTTP/2 request body paused past its timeout",
+                    )
+                })?,
+                None => read.await,
+            }?;
+            let Some(bytes) = next else { break };
             Self::enforce_request_body_chunk(session, ctx, bytes.len()).await?;
         }
         Ok(())

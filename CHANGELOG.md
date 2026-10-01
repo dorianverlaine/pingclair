@@ -81,6 +81,10 @@ below, which ends with what to write instead.
   keepalive connection is therefore closed after a minute without a request.
   Set `limits { header_timeout … }` to choose another bound.
   → [Security](#-security)
+- **A request body may pause one minute by default** between two reads
+  before the request is answered `408`. An upload client that stalls longer
+  needs `limits { body_timeout … }`.
+  → [Security](#-security)
 
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
@@ -2846,6 +2850,21 @@ immediately after the `101`, both ends seeing EOF with no error.
   connection waits for its next request, an idle HTTP/1 connection is now
   closed after 60 s; it used to stay open indefinitely. Set
   `limits { header_timeout … }` for a different bound.
+
+- ⏱️ **A request body that never arrived was waited on forever.** A client
+  could send `Content-Length: 999999999999` and then nothing. A `respond` route
+  reads the announced body before it answers, and with no `body_timeout`,
+  `idle_timeout` or `request_body { read_timeout }` that read had no deadline:
+  no response came, and the connection was held for as long as the client
+  liked. The old 1 MiB default body ceiling used to refuse this request on its
+  header alone; since it went, nothing else stood in the way. A body may now
+  pause at most 60 s between two reads when nothing configures it — nginx's
+  `client_body_timeout` default — and a client that stops is answered `408`.
+  A large upload over a slow link still finishes as long as it keeps moving.
+  WebSockets and immediate-flush proxy routes are exempt, because their
+  clients may be quiet on purpose; they keep whatever `long_connections` or
+  the site's limits say, as before. Found while triaging the slow-header soak
+  finding above.
 
 - 🔒 **`rustls` moves to 0.23.45 for RUSTSEC-2026-0285.** Rustls accepted TLS
   1.3 handshake messages sent at the wrong encryption level when they followed a
