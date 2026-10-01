@@ -2689,12 +2689,7 @@ impl PingclairProxy {
     /// configured HTTP port. A process with no automatic HTTPS, a proxied
     /// listener, a TLS listener — none of them has a redirect to offer, and
     /// inventing one would send a working client somewhere it cannot be served.
-    fn automatic_https_redirect(
-        &self,
-        host: &str,
-        session: &Session,
-        orig_uri: &http::Uri,
-    ) -> Option<String> {
+    fn automatic_https_redirect(&self, session: &Session, orig_uri: &http::Uri) -> Option<String> {
         let configured = self.automatic_https.load();
         // 🧯 Deref through the `ArcSwap` guard and the `Arc` in one step: the
         // guard borrows the published snapshot and must be dropped before this
@@ -2716,18 +2711,23 @@ impl PingclairProxy {
             return None;
         }
 
-        let authority = redirect_authority(host)?;
+        // 🔤 Routing normalizes names, but a redirect preserves the Host spelling.
+        let authority = crate::http_policy::request_authority(session.req_header());
+        let host = crate::http_policy::authority_host(authority);
+        let host = host.strip_suffix('.').unwrap_or(host);
 
         // 🧭 The whole original target, query string included, so the redirect
         // lands on the page that was asked for rather than the site root.
         let uri = orig_uri
             .path_and_query()
             .map_or("/", http::uri::PathAndQuery::as_str);
-        Some(if configured.https_port == 443 {
-            format!("https://{authority}{uri}")
+        // 🌐 The configured HTTPS port is an internal default, not a URL suffix.
+        if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            Some(format!("https://[{host}]{uri}"))
         } else {
-            format!("https://{authority}:{}{uri}", configured.https_port)
-        })
+            let authority = redirect_authority(host)?;
+            Some(format!("https://{authority}{uri}"))
+        }
     }
 
     // MARK: - Internal Helpers
@@ -6930,9 +6930,7 @@ impl ProxyHttp for PingclairProxy {
                     // entire purpose was to forward them, while `https://` typed
                     // by hand worked. Caddy answers the same request with the
                     // redirect.
-                    if let Some(redirect) =
-                        self.automatic_https_redirect(host, session, &ctx.orig_uri)
-                    {
+                    if let Some(redirect) = self.automatic_https_redirect(session, &ctx.orig_uri) {
                         let mut header =
                             Self::build_downstream_header(session, 308, Some(1)).unwrap();
                         header.insert_header("Location", redirect.as_str()).unwrap();
@@ -6948,17 +6946,20 @@ impl ProxyHttp for PingclairProxy {
                         return Ok(true);
                     }
 
-                    // Unknown virtual host: nothing could ever proxy this
-                    // request, so answer 404 now. Returning Ok(false) here
-                    // would land in upstream_peer with no state and surface
-                    // as a 500 (ConnectNoRoute).
-                    //
-                    // 📏 The body is empty, matching what upstream sends for
-                    // the same status (measured 2026-08-07). The status is
-                    // the answer; a body repeating it in prose is one more
-                    // thing for a differential run to flag as a difference
-                    // that turns out not to matter.
-                    let mut header = Self::build_downstream_header(session, 404, Some(1)).unwrap();
+                    // 📭 An unmatched plaintext site has no response body and
+                    // succeeds, as Caddy does. TLS and invalid companion hosts
+                    // keep their existing refusal instead of inventing a route.
+                    let status = if self.automatic_https.load().is_none()
+                        && !session
+                            .digest()
+                            .is_some_and(|digest| digest.ssl_digest.is_some())
+                    {
+                        200
+                    } else {
+                        404
+                    };
+                    let mut header =
+                        Self::build_downstream_header(session, status, Some(1)).unwrap();
                     header.insert_header("Content-Length", "0").unwrap();
                     self.write_local_response(
                         session,

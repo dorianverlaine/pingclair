@@ -33,6 +33,9 @@ Most configurations keep working unchanged. These are the changes most
 likely to alter what an existing configuration does; each links to its entry
 below, which ends with what to write instead.
 
+- **Automatic HTTPS changes its plaintext listener and redirects.**
+  `disable_redirects` leaves the automatic HTTP port unbound.
+  → [Automatic HTTPS follows the configured listener policy](#-automatic-https-follows-the-configured-listener-policy)
 - **Scheme-only site addresses inherit global ports.** Explicit ports stay as written.
   → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
 - **Routes are chosen in directive order**, not by the most specific path.
@@ -91,6 +94,19 @@ below, which ends with what to write instead.
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
 [Known defect — WebSocket upgrades under load](#-known-defect--websocket-upgrades-under-load).
+
+### 🔄 Automatic HTTPS follows the configured listener policy
+
+`auto_https disable_redirects` no longer binds an automatic plaintext listener.
+A non-companion plaintext listener answers an unmatched Host with 200 and an
+empty body. Automatic 308 redirects preserve the request Host's case and omit
+both port 443 and the configured default `https_port`; a site on another HTTPS
+port keeps that port in the URL, as in Caddy (#163).
+
+**Upgrade:** Declare an HTTP site explicitly if plaintext service is needed
+with `disable_redirects`. Use DNS and host matchers rather than treating an
+empty 404 as a plaintext virtual-host health check. When forwarding external
+port 443 to a custom internal port, set `https_port` to that internal port.
 
 ### 🌐 Scheme-only addresses use global ports
 

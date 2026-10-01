@@ -51,10 +51,8 @@ pub(crate) fn reserve_private_listener_address()
 /// - the site already listens on the HTTP port, meaning the operator has said what
 ///   they want served there and we must not overrule it.
 ///
-/// Under `auto_https disable_redirects` the listener is still provisioned but
-/// carries no routes: the ACME challenge path is answered before routing, so
-/// validation keeps working while ordinary requests get no redirect. That is
-/// precisely what the mode asks for, and until now it did nothing at all.
+/// 📴 `auto_https disable_redirects` creates no plaintext companion. Operators
+/// who need a plaintext listener must declare it explicitly.
 pub(crate) fn automatic_http_companion(
     server_config: &pingclair_core::config::ServerConfig,
     mode: pingclair_core::config::AutoHttpsMode,
@@ -65,7 +63,9 @@ pub(crate) fn automatic_http_companion(
 ) -> Option<pingclair_core::config::ServerConfig> {
     use pingclair_core::config::AutoHttpsMode;
 
-    if mode == AutoHttpsMode::Off || server_config.tls.is_none() {
+    if matches!(mode, AutoHttpsMode::Off | AutoHttpsMode::DisableRedirects)
+        || server_config.tls.is_none()
+    {
         return None;
     }
 
@@ -91,30 +91,37 @@ pub(crate) fn automatic_http_companion(
         return None;
     }
 
-    let routes = if mode == AutoHttpsMode::DisableRedirects {
-        Vec::new()
-    } else {
-        // 🧭 The redirect target must land on the HTTPS port, not whatever
-        // port the client used for plaintext HTTP. The default 443 needs no
-        // suffix; a custom `https_port` does.
-        let redirect_target = if https_port == 443 {
+    // 🧭 Redirects omit the internal default HTTPS port, as Caddy does. A site
+    // on a different port must retain that port so the redirect reaches it.
+    let site_port = listen_addrs
+        .iter()
+        .filter_map(|address| address.rsplit_once(':')?.1.parse::<u16>().ok())
+        .find(|port| *port == https_port)
+        .or_else(|| {
+            listen_addrs
+                .first()?
+                .rsplit_once(':')?
+                .1
+                .parse::<u16>()
+                .ok()
+        })
+        .unwrap_or(https_port);
+    let redirect_target =
+        if matches!(site_port, 80 | 443) || site_port == http_port || site_port == https_port {
             "https://{host}{uri}".to_string()
         } else {
-            format!("https://{{host}}:{https_port}{{uri}}")
+            format!("https://{{host}}:{site_port}{{uri}}")
         };
-        vec![pingclair_core::config::RouteConfig {
-            path: "/*".to_string(),
-            // 🧭 308 rather than 302: the redirect is permanent, and unlike 301
-            // it forbids a client from rewriting POST into GET, so a form
-            // submitted over HTTP survives the hop to HTTPS.
-            handler: pingclair_core::config::HandlerConfig::Redirect {
-                to: redirect_target,
-                code: 308,
-            },
-            methods: None,
-            matcher: None,
-        }]
-    };
+    let routes = vec![pingclair_core::config::RouteConfig {
+        path: "/*".to_string(),
+        // 🧭 A 308 keeps POST unchanged across a permanent hop to HTTPS.
+        handler: pingclair_core::config::HandlerConfig::Redirect {
+            to: redirect_target,
+            code: 308,
+        },
+        methods: None,
+        matcher: None,
+    }];
 
     Some(pingclair_core::config::ServerConfig {
         name: Some(name),
@@ -494,12 +501,9 @@ mod tests {
         );
     }
 
-    /// 🔁 `disable_redirects` keeps the listener but drops the redirect.
-    ///
-    /// Before this existed the mode parsed, compiled, and then went unread —
-    /// a setting that validated and silently did nothing.
+    /// 📴 Disabling redirects must leave the automatic plaintext port unbound.
     #[test]
-    fn disable_redirects_keeps_acme_reachable_without_redirecting() {
+    fn disable_redirects_does_not_create_a_companion() {
         use pingclair_core::config::AutoHttpsMode;
 
         let site = pingclair_core::config::ServerConfig {
@@ -516,13 +520,7 @@ mod tests {
             &HashSet::new(),
             80,
             443,
-        )
-        .expect("ACME still needs to be reachable on port 80");
-
-        assert_eq!(companion.listen, vec!["[::]:80".to_string()]);
-        assert!(
-            companion.routes.is_empty(),
-            "the challenge path is answered before routing, so no route means no redirect"
         );
+        assert!(companion.is_none());
     }
 }
