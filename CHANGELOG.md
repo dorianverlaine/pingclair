@@ -51,6 +51,8 @@ below, which ends with what to write instead.
 - **Scheme-only site addresses inherit global ports.** Explicit ports stay as written.
   → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
 
+- **Running without a configuration now starts the admin API.** Supply an explicit path when a missing file must fail startup.
+  → [Run starts empty when no default configuration exists](#run-starts-empty-when-no-default-configuration-exists)
 - **CLI scripts can use Caddy-style configuration flags.** Explicit adapters override filename extensions.
   → [Run and validate accept configuration flags](#run-and-validate-accept-configuration-flags)
 - **Validation now rejects unusable TLS material.** Fix malformed or mismatched manual pairs before deployment.
@@ -213,6 +215,16 @@ and `https_port`, respectively, as in Caddy. Previously they always bound
 
 **Upgrade:** Remove workarounds that repeat global ports in site addresses,
 or name an explicit port to keep a site on its previous listener.
+
+### Run starts empty when no default configuration exists
+
+With no path and neither `Pingclairfile` nor `Caddyfile` in the working directory,
+`pingclair run` starts with no HTTP sites and the admin API at `127.0.0.1:2019`,
+following Caddy (#175). `--resume` checks the autosave first, even without default
+files. There is no file watcher or signal file reload for an empty configuration.
+Explicit missing paths and absent `validate` input continue to fail.
+Upgrade note: orchestration may start Pingclair before creating a configuration;
+supply an explicit file path if its absence should stop the process.
 
 ### Run and validate accept configuration flags
 

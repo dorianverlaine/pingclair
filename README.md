@@ -134,6 +134,12 @@ Run Pingclair in the foreground:
 pingclair run Pingclairfile
 ```
 
+Without a path, `run` looks for `Pingclairfile`, then `Caddyfile`, in the working
+directory. If neither exists, it starts with no HTTP sites and only the admin API
+at `127.0.0.1:2019`, matching `caddy run`. `--resume` loads an available admin
+autosave before using the file or empty configuration. Explicit missing paths
+still fail, and `validate` still requires a configuration file or stdin.
+
 Both `run` and `validate` accept a positional path or `--config` / `-c`.
 Use `--adapter caddyfile` or `--adapter json` to override the filename extension;
 JSON must use Pingclair's schema. Other adapter names are rejected.

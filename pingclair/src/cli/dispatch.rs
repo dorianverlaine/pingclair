@@ -18,8 +18,7 @@ use crate::addr::{host_only, listen_for_site, upstream_hostport};
 use crate::cli::admin::{admin_request, trust_internal_ca};
 use crate::cli::service::manage_system_service;
 use crate::paths::{
-    CONFIG_CANDIDATES, DefaultConfig, resolve_config_path, resolve_default_config, tls_store_dir,
-    tls_store_dir_with,
+    DefaultConfig, resolve_config_path, resolve_default_config, tls_store_dir, tls_store_dir_with,
 };
 use crate::run::run_server;
 
@@ -389,33 +388,11 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             watch,
         } => {
             let config = config.or(path);
-            let mut config_path = resolve_config_path(config.as_deref());
-            // 🚫 No argument and no conventional file is the one case where the
-            // generic "Failed to load config: No such file or directory" sends
-            // the operator looking in the wrong place — it names no path, and
-            // the file its absence describes was never the mistake.
-            //
-            // 🧭 Caddy starts an empty server here and waits for the Admin API.
-            // This build refuses instead, which is the clearer answer for
-            // someone who typed `run` in the wrong directory and the wrong one
-            // for orchestration that posts its configuration later. The refusal
-            // says which of the two this is, and what to do about it.
-            if matches!(
-                resolve_default_config(config.as_deref()),
-                DefaultConfig::Missing
-            ) {
-                let directory = std::env::current_dir()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|_| "the working directory".to_string());
-                let candidates = CONFIG_CANDIDATES.join("`, then `");
-                tracing::error!(
-                    "❌ No configuration found in {directory}: looked for `{candidates}`. Pass a \
-                     path (`pingclair run <path>`), or create one of those files. Caddy starts an \
-                     empty server here and waits for the Admin API; this build does not start \
-                     with no configuration at all."
-                );
-                std::process::exit(1);
-            }
+            // 🧭 An omitted path can start empty; an explicit path must still load.
+            let mut config_path = match resolve_default_config(config.as_deref()) {
+                DefaultConfig::Given(path) | DefaultConfig::Found(path) => path,
+                DefaultConfig::Missing => String::new(),
+            };
             if resume {
                 let autosave = tls_store_dir().join("autosave.json");
                 if autosave.is_file() {
@@ -433,10 +410,17 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                     );
                 }
             }
-            tracing::info!("🚀 Starting Pingclair with config: {}", config_path);
-
-            let config = super::config::load(&config_path, adapter)
-                .map_err(|error| anyhow::anyhow!("❌ Failed to load config: {error}"))?;
+            let config = if config_path.is_empty() {
+                tracing::info!(
+                    "🚀 Starting Pingclair with an empty configuration (admin API only)"
+                );
+                // 📡 Caddy enables the default admin endpoint even with no HTTP sites.
+                pingclair_config::compile("{\n admin 127.0.0.1:2019\n}\n")?
+            } else {
+                tracing::info!("🚀 Starting Pingclair with config: {}", config_path);
+                super::config::load(&config_path, adapter)
+                    .map_err(|error| anyhow::anyhow!("❌ Failed to load config: {error}"))?
+            };
 
             // 🔀 A global `log { output … }` block points the process log at a
             // file, so it has to be applied here — where the configuration
@@ -444,7 +428,10 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             // before the file has been read. See `crate::logging`.
             crate::logging::apply_process_log(&config.logging);
 
-            if watch {
+            if watch && (config_path.is_empty() || config_path == "-") {
+                tracing::warn!("👀 No configuration file to watch; continuing without a watcher");
+            }
+            if watch && !config_path.is_empty() && config_path != "-" {
                 // 👀 `--watch` reloads the config file after every change,
                 // like Caddy's local-development flag. Polling the mtime is
                 // deliberately simple: correctness matters, latency does not.

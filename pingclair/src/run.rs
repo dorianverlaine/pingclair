@@ -139,8 +139,9 @@ pub(crate) fn run_server_with_adapter(
         tracing::info!("🔐 Auto HTTPS: disabled");
     }
 
-    if config.servers.is_empty() {
-        tracing::warn!("⚠️ No servers configured!");
+    // 📡 An admin-only process must stay alive even without data-plane listeners.
+    if config.servers.is_empty() && !config.admin.as_ref().is_some_and(|admin| admin.enabled) {
+        tracing::warn!("⚠️ No HTTP servers or admin API configured!");
         return Ok(());
     }
 

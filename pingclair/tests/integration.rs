@@ -25,6 +25,9 @@ mod cli_tls_validate;
 #[path = "integration/cli_args.rs"]
 mod cli_args;
 
+#[path = "integration/cli_empty.rs"]
+mod cli_empty;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
