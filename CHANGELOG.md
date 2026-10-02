@@ -198,6 +198,27 @@ What this release deliberately does not do, so the rest can converge:
 - Plugins; `pingclair-plugin` stays an unwired skeleton, and a
   plugin handler is refused.
 
+### 🔁 `reload` has no gap; `restart` has a brief one
+
+`systemctl reload pingclair` (`SIGUSR1`) is the zero-downtime way to apply a
+configuration. `systemctl restart pingclair` is not, and cannot be: the old
+process stops accepting the moment it receives SIGTERM, lets running
+requests finish for at most `grace_period`, and exits, and systemd starts
+the new process only after that. New TCP connections are refused in
+between. Measured on Linux with release builds under load, that gap was 40
+to 210 ms when only short requests were running, and as long as the longest
+running request when one was — which is how a production-like soak with
+`grace_period 20s` and open event streams saw about 390 refused connections
+over 20 seconds. An HTTP/3 client that connects during the gap is not
+refused: its handshake goes unanswered, its retransmissions reach the new
+process, and it is served once the gap ends, unless the gap outlasts its
+handshake timeout (ten seconds for curl). The installed unit adds nothing to
+the gap: it has no `ExecStop=` (the repository lint now refuses one) and
+keeps systemd's own stop timeout as a backstop.
+
+📌 Upgrading: apply configuration changes with `reload`, and keep
+`grace_period` short where restarts must be brief. (#210)
+
 ### 🔌 An HTTP/3 request cut by a stop ends at `grace_period`, not at an idle timeout
 
 When `grace_period` ran out with an HTTP/3 request still running — a

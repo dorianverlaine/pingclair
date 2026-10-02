@@ -76,6 +76,18 @@ sudo pingclair validate /etc/Pingclair/Pingclairfile
 sudo pc service reload
 ```
 
+🔁 Reload, not restart, is the zero-downtime way to apply a configuration:
+the running process swaps it in while every connection keeps being served.
+A restart (`systemctl restart pingclair`) has a brief gap instead. The old
+process stops accepting the moment it receives SIGTERM, lets running
+requests finish for at most `grace_period` (default 30 s), and exits; only
+then can systemd start the new one, and new connections are refused in
+between. With only short requests running, that gap measured 40 to 210 ms on
+Linux; a long download or event stream holds it open until it finishes or
+`grace_period` runs out. HTTP/3 clients that connect during the gap wait for
+the new process instead of being refused. Restart for what a reload cannot
+do, such as moving a listener to another address or upgrading the binary.
+
 See the [installation guide](https://pingclair.com/start/install/) for Docker,
 service management, verification, removal, and troubleshooting.
 

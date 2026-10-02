@@ -38,12 +38,28 @@ REQUIRED_UNIT_LINES = (
     "Restart=on-failure",
     "RestartPreventExitStatus=1",
 )
-# 🚫 A directive the installed unit must not carry. `ExecStartPre` looks like the
-# safe place to check a configuration, and it is the trap: systemd applies
-# `RestartPreventExitStatus=` to the main process, not to a failing pre-command,
-# so a configuration the compiler refuses was retried every five seconds instead
-# of leaving the unit failed for an operator.
-FORBIDDEN_UNIT_LINE_PREFIXES = ("ExecStartPre=",)
+# 🚫 Directives the installed unit must not carry, each with the failure it
+# caused or would cause.
+FORBIDDEN_UNIT_LINE_PREFIXES = {
+    # 🚫 `ExecStartPre` looks like the safe place to check a configuration, and
+    # it is the trap: systemd applies `RestartPreventExitStatus=` to the main
+    # process, not to a failing pre-command, so a configuration the compiler
+    # refuses was retried every five seconds instead of leaving the unit failed
+    # for an operator.
+    "ExecStartPre=": (
+        "systemd does not apply `RestartPreventExitStatus=` to a failing "
+        "pre-command, so the unit restarts a refused configuration forever"
+    ),
+    # ⏱️ A `restart` refuses connections from the moment the old process stops
+    # listening until the new one listens, and systemd starts the new one only
+    # after the old one exits. Anything run before the SIGTERM, such as a stop
+    # command that sleeps or waits on a drain of its own, lengthens that gap;
+    # the server's own SIGTERM handling is the whole stop (#210).
+    "ExecStop=": (
+        "a stop command runs before SIGTERM and every second it takes is a "
+        "second `systemctl restart` refuses connections"
+    ),
+}
 
 _SECTION_RE = re.compile(r"^\[(?P<name>[^\]]+)\]\s*$", re.MULTILINE)
 _FORBIDDEN_RE = re.compile(
@@ -117,11 +133,9 @@ def unit_errors(text: str) -> list[str]:
         if line not in text
     ]
     errors.extend(
-        f"the service unit must not carry `{line}…`: systemd does not apply "
-        "`RestartPreventExitStatus=` to a failing pre-command, so the unit "
-        "restarts a refused configuration forever"
+        f"the service unit must not carry `{line}…`: {reason}"
         for line in active_unit_lines(text)
-        for prefix in FORBIDDEN_UNIT_LINE_PREFIXES
+        for prefix, reason in FORBIDDEN_UNIT_LINE_PREFIXES.items()
         if line.startswith(prefix)
     )
     return errors

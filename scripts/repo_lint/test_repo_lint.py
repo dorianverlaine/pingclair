@@ -150,6 +150,14 @@ class ServiceUnitTest(unittest.TestCase):
         errors = unit_errors(trapped)
         self.assertTrue(any("ExecStartPre" in error for error in errors), errors)
 
+    def test_a_stop_command_is_refused(self):
+        delayed = self.CANONICAL.replace(
+            "[Service]\n",
+            "[Service]\nExecStop=/bin/sleep 5\n",
+        )
+        errors = unit_errors(delayed)
+        self.assertTrue(any("ExecStop" in error for error in errors), errors)
+
     def test_a_comment_naming_the_pre_command_is_allowed(self):
         # 🚫 The unit's own comment explains why the directive is absent, so the
         # check has to read directives rather than every substring.
