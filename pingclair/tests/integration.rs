@@ -15343,3 +15343,7 @@ mod reload_under_traffic;
 // requests it matches, not only the site's fallback pipeline.
 #[path = "integration/scoped_middleware.rs"]
 mod scoped_middleware;
+
+// 🛡️ A path guard and the file server agree on a percent-escaped path.
+#[path = "integration/encoded_path_guard.rs"]
+mod encoded_path_guard;

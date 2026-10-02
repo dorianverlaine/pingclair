@@ -327,19 +327,28 @@ impl Router {
             vars,
         };
 
+        // 🛡️ Route paths are compared with escapes decoded, like every
+        // other `path` pattern; see `percent::decode_for_matching`.
+        let matching = crate::percent::decode_for_matching(path);
+
         // 🌲 One tree walk, then the first candidate that agrees. The slice
         // already holds catch-alls in their list position, so nothing is
         // merged, sorted, or allocated here.
-        self.candidates(path)
+        self.candidates(&matching)
             .iter()
             .map(|&index| &self.compiled_routes[index])
-            .find(|route| Self::route_matches(route, &mut request))
+            .find(|route| Self::route_matches(route, &matching, &mut request))
     }
 
     /// 🔎 Evaluates the constraints attached to one precompiled route.
-    fn route_matches(route: &CompiledRoute, request: &mut MatcherRequest<'_>) -> bool {
+    /// `matching` is the request path as path patterns see it.
+    fn route_matches(
+        route: &CompiledRoute,
+        matching: &str,
+        request: &mut MatcherRequest<'_>,
+    ) -> bool {
         if let Some(pattern) = &route.wildcard
-            && !pattern.matches(request.path)
+            && !pattern.matches(matching)
         {
             return false;
         }
@@ -457,7 +466,10 @@ fn evaluate_node(
 ) -> MatcherVerdict {
     match node {
         MatcherNode::Path(patterns) => {
-            bool_verdict(patterns.iter().any(|pattern| pattern.matches(request.path)))
+            // 🛡️ Escapes decoded, so a guard and the file it guards name the
+            // same resource; see `percent::decode_for_matching`.
+            let matching = crate::percent::decode_for_matching(request.path);
+            bool_verdict(patterns.iter().any(|pattern| pattern.matches(&matching)))
         }
         MatcherNode::Leaf(matcher) => evaluate_leaf(matcher, compiled, request),
         MatcherNode::And(left, right) => match evaluate_node(left, compiled, request) {
@@ -564,11 +576,13 @@ fn evaluate_leaf(
             let Some(vars) = request.vars.as_deref_mut() else {
                 return MatcherVerdict::NoMatch;
             };
+            // 🛡️ The same decoded spelling `path` patterns see.
+            let matching = crate::percent::decode_for_matching(request.path);
             bool_verdict(record_regexp_captures(
                 vars,
                 name.as_deref(),
                 regex,
-                request.path,
+                &matching,
             ))
         }
         Matcher::HeaderRegexp {

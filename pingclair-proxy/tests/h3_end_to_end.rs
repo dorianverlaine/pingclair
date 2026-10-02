@@ -84,6 +84,10 @@ mod reload;
 #[path = "h3_end_to_end/header_deadline.rs"]
 mod header_deadline;
 
+// 🛡️ A path guard and the file server agree on a percent-escaped path.
+#[path = "h3_end_to_end/encoded_path_guard.rs"]
+mod encoded_path_guard;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {

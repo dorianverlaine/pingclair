@@ -66,6 +66,57 @@ pub fn decode_path_component(component: &str, out: &mut Vec<u8>) -> bool {
     true
 }
 
+/// 🛡️ The spelling of a request path that `path` and `path_regexp` patterns
+/// are compared against: every well-formed escape decoded once, the query
+/// left as it is.
+///
+/// The ingress decodes only unreserved escapes, so that the request it
+/// forwards stays a valid URI with its meaning intact. A matcher comparing
+/// that spelling disagreed with whatever decodes the rest: `basic_auth
+/// /secret!` did not match `/secret%21`, while the file server, which decodes
+/// every escape to find a filename, served the file `secret!` to it without
+/// credentials. An origin that decodes would do the same. Matching the decoded
+/// path, as the reference `path` matcher does with Go's already-unescaped
+/// `URL.Path` (recalled from memory, not re-read), makes the guard and the
+/// thing it guards name one resource.
+///
+/// 📌 One pass, as the file server's decode is one pass: `%2521` becomes
+/// `%21`, which is also the filename the file server looks for. A byte
+/// sequence that is not UTF-8 after decoding is matched with replacement
+/// characters, since no pattern can spell it.
+///
+/// 🍃 Borrowed when the path holds no `%`, so an ordinary request allocates
+/// nothing; this is for matching only and never rewrites the request.
+pub fn decode_for_matching(target: &str) -> std::borrow::Cow<'_, str> {
+    let (path, query) = match target.split_once('?') {
+        Some((path, _)) => (path, &target[path.len()..]),
+        None => (target, ""),
+    };
+    if !path.contains('%') {
+        return std::borrow::Cow::Borrowed(target);
+    }
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(target.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match decoded_byte(bytes, index) {
+            Some(byte) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    decoded.extend_from_slice(query.as_bytes());
+    std::borrow::Cow::Owned(match String::from_utf8(decoded) {
+        Ok(text) => text,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    })
+}
+
 /// 📂 Resolves a request path to a file below `root`, decoding escapes and
 /// refusing anything that would leave.
 ///

@@ -97,6 +97,11 @@ below, which ends with what to write instead.
   dropped with a warning while the server started. `hide [secret` has to
   become a pattern whose `[` set closes.
   → [Security](#-security)
+- **Path matchers see escapes decoded.** `/secret%21` now matches
+  `path /secret!`; a pattern written with an escape such as `/a%20b` has to
+  be written decoded to keep matching.
+  → [Security](#-security)
+
 
 - **`handle_path`, `uri strip_prefix` and `uri strip_suffix` ignore letter
   case** too, so `handle_path /API/*` strips `/api` from `/api/x`.
@@ -3195,6 +3200,19 @@ immediately after the `101`, both ends seeing EOF with no error.
 
   ⚠️ **Behaviour change:** a configuration with such a pattern no longer
   starts. Close the set, or write `[[]` for a literal `[`.
+
+- 🛡️ **A path guard could be skipped by escaping a reserved character.**
+  With `basic_auth /secret!` in front of `file_server`, a request for
+  `/secret%21` was served the file `secret!` without credentials, over every
+  protocol. The server decodes only unreserved escapes (`%41`, `%7E`) in the
+  path it routes and forwards, so the guard compared `/secret%21` and did not
+  match, while the file server decoded `%21` to find the file. Route paths,
+  `path` and `path_regexp` matchers now compare the path with every escape
+  decoded once, as Caddy's `path` matcher does; the request that is forwarded
+  upstream is unchanged.
+
+  ⚠️ **Behaviour change:** a `path` pattern written with an escape, such as
+  `/a%20b`, now has to be written decoded (`/a b`, quoted) to match.
 
 - 🔒 **`rustls` moves to 0.23.45 for RUSTSEC-2026-0285.** Rustls accepted TLS
   1.3 handshake messages sent at the wrong encryption level when they followed a
