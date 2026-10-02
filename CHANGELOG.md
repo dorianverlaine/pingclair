@@ -107,8 +107,9 @@ below, which ends with what to write instead.
   is reset. Set `limits { header_timeout … }` to choose another bound.
   → [Security](#-security)
 - **A request body may pause one minute by default** between two reads
-  before the request is answered `408`. An upload client that stalls longer
-  needs `limits { body_timeout … }`.
+  before the request is answered `408`, or, for an HTTP/2 upload through
+  `reverse_proxy`, has its stream reset. An upload client that stalls longer,
+  such as a quiet gRPC client stream, needs `limits { body_timeout … }`.
   → [Security](#-security)
 - **`CF-Connecting-IP` no longer names the client by itself.** A deployment
   behind Cloudflare that relied on it must add
@@ -3153,6 +3154,24 @@ immediately after the `101`, both ends seeing EOF with no error.
 
   ⚠️ **Behaviour change:** an HTTP/3 request whose header takes longer than
   `header_timeout` to arrive is reset; it used to be waited on indefinitely.
+
+- ⏱️ **An HTTP/2 upload to an upstream or FastCGI that stopped halfway was
+  waited on forever, even with `body_timeout` set.** The body-pause bound
+  above reached HTTP/2 only for locally answered routes: the server's read
+  timeout does nothing on an HTTP/2 stream, so a `reverse_proxy` or
+  `php_fastcgi` request whose client sent part of its body and then went
+  quiet held the stream, the upstream connection and, for FastCGI, a php-fpm
+  worker for as long as it liked. The same pause — `request_body
+  { read_timeout }`, else the shorter of `body_timeout` and `idle_timeout`,
+  else 60 s — now applies there. A FastCGI request is answered `408`, as on
+  HTTP/1; a proxied one has its stream reset with `CANCEL`, because the proxy
+  loop that reads that body cannot be made to answer instead. Immediate-flush
+  routes keep only a configured value, as on HTTP/1.
+
+  ⚠️ **Behaviour change:** a client-streaming HTTP/2 request through
+  `reverse_proxy` (a gRPC upload stream, for example) that sends nothing for
+  a minute is now reset. Set `limits { body_timeout … }`, or
+  `flush_interval -1` on the route, to allow longer silences.
 
 - 🔒 **`rustls` moves to 0.23.45 for RUSTSEC-2026-0285.** Rustls accepted TLS
   1.3 handshake messages sent at the wrong encryption level when they followed a

@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use pingclair_core::config::ResourceLimitsConfig;
+use pingclair_proxy::body_timeout::H2BodyWatch;
 use pingclair_proxy::server::PingclairProxy;
 use pingora_core::apps::{HttpPersistentSettings, HttpServerApp, HttpServerOptions, ServerApp};
 use pingora_core::protocols::http::ServerSession;
@@ -171,10 +172,13 @@ impl ResourceGuardedProxy {
                 };
                 let proxy = self.proxy.clone();
                 let shutdown = shutdown.clone();
+                // ⏱️ Pingora cannot time an HTTP/2 request body it proxies, so
+                // each stream runs under a watch that can; see `H2BodyWatch`.
                 tokio::spawn(async move {
-                    proxy
-                        .process_new_http(ServerSession::new_http2(stream), &shutdown)
-                        .await;
+                    H2BodyWatch::serve(
+                        proxy.process_new_http(ServerSession::new_http2(stream), &shutdown),
+                    )
+                    .await;
                 });
             }
         }

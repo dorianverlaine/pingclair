@@ -161,6 +161,10 @@ mod header_deadline;
 #[path = "integration/body_stall.rs"]
 mod body_stall;
 
+// ⏱️ An HTTP/2 upload to an upstream or FastCGI that stops halfway.
+#[path = "integration/h2_body_stall.rs"]
+mod h2_body_stall;
+
 // 🍪 Several `Cookie` field lines read as one cookie-string.
 #[path = "integration/cookie_fold.rs"]
 mod cookie_fold;

@@ -3301,6 +3301,7 @@ impl PingclairProxy {
         }
         if let Some(idle_ms) = long.idle_timeout_ms {
             let timeout = (idle_ms > 0).then(|| Duration::from_millis(idle_ms));
+            crate::body_timeout::H2BodyWatch::rearm(timeout);
             session.as_mut().set_read_timeout(timeout);
             session.as_mut().set_write_timeout(timeout);
             session.as_mut().set_total_drain_timeout(timeout);
@@ -3316,6 +3317,7 @@ impl PingclairProxy {
                 ctx.request_body_read_timeout_ms,
                 &state.config.limits,
             );
+            crate::body_timeout::H2BodyWatch::rearm(timeout);
             session.as_mut().set_read_timeout(timeout);
             session.as_mut().set_total_drain_timeout(timeout);
         }
@@ -3819,7 +3821,12 @@ impl PingclairProxy {
         // has sent the whole body or outgrown the buffer.
         let mut request_buffer = ctx.request_buffer.take();
         if !bodyless {
-            while let Some(bytes) = session.read_request_body().await? {
+            // ⏱️ An HTTP/2 upload that stops halfway would otherwise hold this
+            // stream and a php-fpm worker forever; see `h2_body_pause`.
+            let h2_pause = Self::h2_body_pause(session, ctx);
+            while let Some(bytes) =
+                crate::body_timeout::read_within(h2_pause, session.read_request_body()).await?
+            {
                 // 🛡️ FastCGI is the one upstream path that never enters
                 // Pingora's proxy lifecycle, so the body limit, the request
                 // and retry deadlines, and the upload pacer have to be applied
@@ -4046,37 +4053,45 @@ impl PingclairProxy {
         session: &mut Session,
         ctx: &mut RequestContext,
     ) -> pingora_core::Result<()> {
-        // ⏱️ Pingora times HTTP/1 body reads itself, from the read timeout
-        // `initialize_request_limits` set, but `set_read_timeout` is a no-op
-        // on an HTTP/2 stream (pingora-core 0.9.0, `ServerSession`). Without
-        // this, a stream announcing a body and sending no DATA would hold its
-        // `respond` route forever; the error maps to 408 like HTTP/1's.
-        let h2_pause = session.as_downstream().is_http2().then(|| {
-            ctx.state
-                .as_ref()
-                .and_then(|state| {
-                    Self::configured_read_timeout(
-                        ctx.request_body_read_timeout_ms,
-                        &state.config.limits,
-                    )
-                })
-                .unwrap_or(crate::body_timeout::DEFAULT_BODY_TIMEOUT)
-        });
-        loop {
-            let read = session.read_request_body();
-            let next = match h2_pause {
-                Some(pause) => tokio::time::timeout(pause, read).await.or_else(|_| {
-                    pingora_core::Error::e_explain(
-                        pingora_core::ErrorType::ReadTimedout,
-                        "HTTP/2 request body paused past its timeout",
-                    )
-                })?,
-                None => read.await,
-            }?;
-            let Some(bytes) = next else { break };
+        // ⏱️ Without this, an HTTP/2 stream announcing a body and sending no
+        // DATA would hold its `respond` route forever; the error maps to 408
+        // like HTTP/1's. See `h2_body_pause`.
+        let h2_pause = Self::h2_body_pause(session, ctx);
+        while let Some(bytes) =
+            crate::body_timeout::read_within(h2_pause, session.read_request_body()).await?
+        {
             Self::enforce_request_body_chunk(session, ctx, bytes.len()).await?;
         }
         Ok(())
+    }
+
+    /// ⏱️ The longest pause allowed between two pieces of request body: what
+    /// the configuration asks for, else [`DEFAULT_BODY_TIMEOUT`] — except on a
+    /// long connection, whose client may be quiet on purpose and keeps only a
+    /// configured value.
+    ///
+    /// [`DEFAULT_BODY_TIMEOUT`]: crate::body_timeout::DEFAULT_BODY_TIMEOUT
+    fn body_pause(ctx: &RequestContext) -> Option<Duration> {
+        let configured = ctx.state.as_ref().and_then(|state| {
+            Self::configured_read_timeout(ctx.request_body_read_timeout_ms, &state.config.limits)
+        });
+        if ctx.long_connection {
+            configured
+        } else {
+            Some(configured.unwrap_or(crate::body_timeout::DEFAULT_BODY_TIMEOUT))
+        }
+    }
+
+    /// ⏱️ The pause to time a body read this server makes itself with, which
+    /// only HTTP/2 needs: Pingora times HTTP/1 reads from the read timeout
+    /// `initialize_request_limits` set, but `set_read_timeout` is a no-op on an
+    /// HTTP/2 stream (pingora-core 0.9.0, `ServerSession`).
+    fn h2_body_pause(session: &Session, ctx: &RequestContext) -> Option<Duration> {
+        if session.as_downstream().is_http2() {
+            Self::body_pause(ctx)
+        } else {
+            None
+        }
     }
 
     /// 📤 Writes one local response chunk through the configured streaming budget.
@@ -7536,6 +7551,16 @@ impl ProxyHttp for PingclairProxy {
         if let Some(bytes) = body.as_ref() {
             Self::enforce_request_body_chunk(session, ctx, bytes.len()).await?;
         }
+        // ⏱️ Every chunk Pingora reads pushes the HTTP/2 body deadline back,
+        // and the last one stops it, so waiting on the upstream's answer
+        // afterwards is never mistaken for a stalled upload.
+        if session.as_downstream().is_http2() {
+            if end_of_stream {
+                crate::body_timeout::H2BodyWatch::arm(None);
+            } else {
+                crate::body_timeout::H2BodyWatch::moved();
+            }
+        }
 
         // 🧾 A `request_body { set … }` handler replaces the body outright, so
         // the client's bytes are discarded one chunk at a time and the
@@ -7987,6 +8012,16 @@ impl ProxyHttp for PingclairProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // ⏱️ The upstream connection exists, so Pingora is about to start
+        // reading the body to send it: from here an HTTP/2 upload that stops
+        // is timed, because Pingora's own loop cannot time it; see
+        // `H2BodyWatch`. Armed per attempt, so a retry starts a fresh pause,
+        // and not before, so a slow upstream connect is not charged to the
+        // client.
+        if session.as_downstream().is_http2() && !session.is_body_done() {
+            crate::body_timeout::H2BodyWatch::arm(Self::body_pause(ctx));
+        }
+
         // 🧹 Hop-by-hop fields stop here, before anything of ours is added.
         //
         // Doing this first matters twice over: a client naming our own fields in

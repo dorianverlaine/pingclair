@@ -15,7 +15,7 @@ pub mod access_log;
 mod acme_challenge;
 pub mod alt_svc;
 mod body_buffer;
-mod body_timeout;
+pub mod body_timeout;
 mod cache_key;
 mod cache_policy;
 mod cache_vary;
