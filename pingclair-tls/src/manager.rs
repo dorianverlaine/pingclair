@@ -259,24 +259,13 @@ impl TlsManager {
         let mut problems = Vec::new();
 
         for (domain, cert_path, key_path) in entries {
-            let cert_pem = match std::fs::read_to_string(cert_path) {
-                Ok(pem) => pem,
-                Err(error) => {
-                    problems.push(format!("{domain}: cannot read {cert_path}: {error}"));
+            let (cert_pem, key_pem) = match load_manual_certificate(cert_path, key_path) {
+                Ok(pair) => pair,
+                Err(reason) => {
+                    problems.push(format!("{domain}: {reason}"));
                     continue;
                 }
             };
-            let key_pem = match std::fs::read_to_string(key_path) {
-                Ok(pem) => pem,
-                Err(error) => {
-                    problems.push(format!("{domain}: cannot read {key_path}: {error}"));
-                    continue;
-                }
-            };
-            if let Err(reason) = validate_pem_pair(&cert_pem, &key_pem) {
-                problems.push(format!("{domain}: {reason} ({cert_path}, {key_path})"));
-                continue;
-            }
             prepared.insert(normalize_internal_domain(domain), (cert_pem, key_pem));
         }
 
@@ -1225,6 +1214,20 @@ mod tests {
             Some(("MANUAL_CERT".to_string(), "MANUAL_KEY".to_string()))
         );
     }
+}
+
+/// 🔐 Loads the same manual PEM material for startup and offline validation.
+pub fn load_manual_certificate(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<(String, String), String> {
+    let cert_pem = std::fs::read_to_string(cert_path)
+        .map_err(|error| format!("cannot read {cert_path}: {error}"))?;
+    let key_pem = std::fs::read_to_string(key_path)
+        .map_err(|error| format!("cannot read {key_path}: {error}"))?;
+    validate_pem_pair(&cert_pem, &key_pem)
+        .map_err(|reason| format!("{reason} ({cert_path}, {key_path})"))?;
+    Ok((cert_pem, key_pem))
 }
 
 /// 🔐 Free-function wrapper so the validator can be unit-tested directly.

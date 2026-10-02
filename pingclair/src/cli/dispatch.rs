@@ -980,20 +980,18 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 )
             };
 
-            // 🛡️ Provisioning checks: files the server will need at startup
-            // must exist now, not fail mid-flight later.
+            // 🔐 Read and match manual pairs through the startup loader without
+            // opening listeners or provisioning automatic certificates.
             for server in &compiled.servers {
-                let Some(tls) = &server.tls else {
+                let (Some(tls), Some(name)) = (&server.tls, server.name.as_deref()) else {
                     continue;
                 };
-                let (Some(cert), Some(key)) = (&tls.cert, &tls.key) else {
-                    continue;
-                };
-                for (kind, path) in [("certificate", cert), ("key", key)] {
-                    if !std::path::Path::new(path).is_file() {
-                        eprintln!("❌ TLS {kind} file does not exist: {path}");
-                        std::process::exit(1);
-                    }
+                if let (Some(cert), Some(key)) = (&tls.cert, &tls.key)
+                    && !name.is_empty()
+                    && name != "_"
+                {
+                    pingclair_tls::manager::load_manual_certificate(cert, key)
+                        .map_err(|reason| anyhow::anyhow!("🔐 {name}: {reason}"))?;
                 }
             }
             println!("✅ Configuration '{label}' is valid!");

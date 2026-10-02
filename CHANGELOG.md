@@ -50,6 +50,9 @@ below, which ends with what to write instead.
   → [Automatic HTTPS follows the configured listener policy](#-automatic-https-follows-the-configured-listener-policy)
 - **Scheme-only site addresses inherit global ports.** Explicit ports stay as written.
   → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
+
+- **Validation now rejects unusable TLS material.** Fix malformed or mismatched manual pairs before deployment.
+  → [Validate loads manual TLS material](#validate-loads-manual-tls-material)
 - **Routes are chosen in directive order**, not by the most specific path.
   A `redir`, `route` or `handle` catch-all can now answer requests that a more
   specific `respond` used to take.
@@ -208,6 +211,12 @@ and `https_port`, respectively, as in Caddy. Previously they always bound
 
 **Upgrade:** Remove workarounds that repeat global ports in site addresses,
 or name an explicit port to keep a site on its previous listener.
+
+### Validate loads manual TLS material
+
+`pingclair validate` reads, parses and matches manual certificates and private
+keys through the same loader as startup, without starting listeners (#218).
+Upgrade note: replace malformed PEM files or mismatched keys before validation.
 
 ### 🚫 Non-goals for 0.2.0
 

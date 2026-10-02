@@ -121,7 +121,8 @@ http://localhost:8080 {
 }
 ```
 
-Validate it before starting the server:
+Validate it before starting the server. Validation reads and matches explicit
+TLS certificate/key pairs without opening listeners:
 
 ```bash
 pingclair validate Pingclairfile
