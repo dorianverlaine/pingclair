@@ -9,18 +9,28 @@
 //! internal view guarded by `client_ip` and a public one, say — and a key that
 //! cannot tell them apart serves whichever filled the entry first to both.
 //!
-//! So every key starts with the route's *scope*: a 16-byte digest of where the
-//! route lives (the site's names, listeners and bind address), its position in
-//! the site, and its full configuration. It is computed once per configuration
-//! load, so the request path only copies 16 bytes. A reload that leaves a route
-//! unchanged produces the same scope and keeps its warm entries; one that
-//! changes the route, or moves it, starts it cold, and the old entries age out
-//! of the LRU because nothing can address them any more.
+//! So every key starts with the route's *scope*: a 16-byte digest of the whole
+//! site configuration the route belongs to — names, listeners, site-level
+//! `vars` and every route — and the route's position in it. Anything in the
+//! site can change what the route sends upstream (`header_up
+//! {http.vars.tenant}`), so all of it counts. It is computed once per
+//! configuration load, so the request path only copies 16 bytes. A reload
+//! that leaves a site unchanged keeps its warm entries; one that changes
+//! anything in the site starts it cold, and the old entries age out of the LRU
+//! because nothing can address them any more.
+//!
+//! A route whose dial is a placeholder adds one more step per request: the
+//! upstream the dial resolves to becomes part of the entry's variant
+//! ([`upstream_digest`], [`with_variance`]), because one route can then reach
+//! several upstreams. A variant rather than the primary key, so a purge by URL
+//! still reaches every upstream's copy.
 
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
 use pingclair_core::config::{RouteConfig, ServerConfig};
+
+use crate::upstream::UpstreamSpec;
 use pingora_cache::key::{HashBinary, hash_key};
 use serde::Serialize;
 
@@ -29,16 +39,13 @@ pub(crate) type CacheScope = HashBinary;
 
 /// 🧾 Everything that makes one route's cached answer differ from another's.
 ///
-/// Serialized only to be hashed. `RouteConfig` holds its maps as `BTreeMap`s,
-/// so the same configuration always produces the same bytes and therefore the
-/// same scope across reloads.
+/// Serialized only to be hashed. The configuration holds its maps as
+/// `BTreeMap`s, so the same configuration always produces the same bytes and
+/// therefore the same scope across reloads.
 #[derive(Serialize)]
 struct ScopeIdentity<'a> {
-    names: &'a [String],
-    listen: &'a [String],
-    bind: Option<&'a str>,
+    site: &'a ServerConfig,
     route_index: usize,
-    route: &'a RouteConfig,
 }
 
 /// 🔑 Computes the scope of each route in `config` that caches, parallel to
@@ -59,11 +66,8 @@ pub(crate) fn route_scopes(
                 return None;
             }
             let identity = ScopeIdentity {
-                names: &config.names,
-                listen: &config.listen,
-                bind: config.bind.as_deref(),
+                site: config,
                 route_index,
-                route,
             };
             // 🛡️ A route whose identity cannot be serialized gets no scope,
             // and a route without a scope is never cached. Falling back to a
@@ -111,6 +115,27 @@ pub(crate) fn known_scopes() -> Vec<CacheScope> {
 fn registry() -> &'static Mutex<HashSet<CacheScope>> {
     static SCOPES: OnceLock<Mutex<HashSet<CacheScope>>> = OnceLock::new();
     SCOPES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// 🧭 A digest of the upstream a placeholder dial resolved to.
+///
+/// Runs per request, but only on a caching route whose dial has placeholders;
+/// the formatted dial is the one allocation it makes.
+pub(crate) fn upstream_digest(upstream: &UpstreamSpec) -> HashBinary {
+    hash_key(format!("{:?}://{}", upstream.scheme, upstream.authority()))
+}
+
+/// 🔀 Combines an upstream digest with the `Vary` variance, if any, into one
+/// variant key. The marker byte keeps "no `Vary`" apart from a `Vary` whose
+/// digest happens to be all zeroes.
+pub(crate) fn with_variance(upstream: &HashBinary, vary: Option<HashBinary>) -> HashBinary {
+    let mut bytes = [0u8; 33];
+    bytes[..16].copy_from_slice(upstream);
+    if let Some(vary) = vary {
+        bytes[16] = 1;
+        bytes[17..].copy_from_slice(&vary);
+    }
+    hash_key(bytes)
 }
 
 /// 🔑 Frames scope, host and request target into the single primary component

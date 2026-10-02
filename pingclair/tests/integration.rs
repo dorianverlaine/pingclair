@@ -60,6 +60,10 @@ mod cache;
 #[path = "integration/cache_private_fields.rs"]
 mod cache_private_fields;
 
+// 🔑 A cached response belongs to the upstream that produced it.
+#[path = "integration/cache_dynamic_upstream.rs"]
+mod cache_dynamic_upstream;
+
 // 🗜️ `Accept-Encoding` negotiation tests live beside this file for the same
 // reason; they reuse its `TestServer` harness.
 #[path = "integration/content_negotiation.rs"]

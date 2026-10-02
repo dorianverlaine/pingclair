@@ -187,6 +187,10 @@ pub struct RequestContext {
     /// 🔑 The matched route's cache scope, copied out of `ProxyState` when
     /// caching is enabled so `cache_key_callback` can key the entry by route.
     pub(crate) cache_scope: Option<crate::cache_key::CacheScope>,
+    /// 🧭 The upstream a placeholder dial resolved to, as a digest, for a
+    /// caching route whose dial has placeholders. `cache_vary_filter` makes it
+    /// part of the variant, so each upstream's copy is stored apart.
+    pub(crate) cache_upstream: Option<pingora_cache::key::HashBinary>,
 
     /// 📏 Whether this request's cache has a per-response ceiling that still
     /// needs body chunks fed to it. Cleared once the limit is exceeded, so the
@@ -305,6 +309,7 @@ impl Default for RequestContext {
             route_index: None,
             cache_ttl_secs: None,
             cache_scope: None,
+            cache_upstream: None,
             cache_size_tracked: false,
             upstream: None,
             headers_upstream: BTreeMap::new(),
@@ -6611,15 +6616,38 @@ impl ProxyHttp for PingclairProxy {
 
         // 🔑 No scope means the entry could not be told apart from another
         // route's, so this route is not cached at all rather than shared.
-        let Some(cache_scope) = ctx
-            .state
-            .as_ref()
-            .zip(ctx.route_index)
-            .and_then(|(state, route_index)| state.cache_scopes.get(route_index).copied())
-            .flatten()
-        else {
+        let Some((state, route_index)) = ctx.state.as_ref().zip(ctx.route_index) else {
             return Ok(());
         };
+        let Some(route_scope) = state.cache_scopes.get(route_index).copied().flatten() else {
+            return Ok(());
+        };
+        // 🧭 A dial with placeholders reaches a different upstream per request,
+        // so the upstream it resolves to joins the key, the way nginx's
+        // `$proxy_host` does. It joins as a variant of the URL's entry rather
+        // than as part of the primary key, so a purge by URL still reaches
+        // every upstream's copy. Expanded here with the same inputs
+        // `upstream_peer` uses; a dial that does not resolve is not cached,
+        // and `upstream_peer` answers it with a 502 anyway.
+        let cache_upstream = match state
+            .dynamic_dials
+            .get(route_index)
+            .and_then(Option::as_ref)
+        {
+            None => None,
+            Some(dial_plan) => {
+                let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+                let Some(upstream) = dial_plan.resolve(
+                    session.req_header(),
+                    verified_client_ip.as_deref(),
+                    &ctx.request_vars,
+                ) else {
+                    return Ok(());
+                };
+                Some(crate::cache_key::upstream_digest(&upstream))
+            }
+        };
+        let cache_scope = route_scope;
 
         // 🌊 A streaming route hands chunks downstream as they arrive; storing
         // that response means buffering it whole, which is the memory bug this
@@ -6630,6 +6658,7 @@ impl ProxyHttp for PingclairProxy {
 
         ctx.cache_ttl_secs = Some(cache_ttl_secs);
         ctx.cache_scope = Some(cache_scope);
+        ctx.cache_upstream = cache_upstream;
 
         session.cache.enable(
             response_cache_storage(),
@@ -6796,7 +6825,8 @@ impl ProxyHttp for PingclairProxy {
         )))
     }
 
-    /// 🎯 Builds the variance key from the request fields `Vary` names.
+    /// 🎯 Builds the variance key from the request fields `Vary` names, and
+    /// from the upstream a placeholder dial resolved to.
     ///
     /// Without this a response that differs by request header is stored under a
     /// key that cannot tell the variants apart, and the first one stored is
@@ -6805,10 +6835,14 @@ impl ProxyHttp for PingclairProxy {
     fn cache_vary_filter(
         &self,
         meta: &CacheMeta,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
         request: &RequestHeader,
     ) -> Option<HashBinary> {
-        crate::cache_vary::variance(meta.headers(), &request.headers)
+        let vary = crate::cache_vary::variance(meta.headers(), &request.headers);
+        match ctx.cache_upstream {
+            None => vary,
+            Some(upstream) => Some(crate::cache_key::with_variance(&upstream, vary)),
+        }
     }
 
     /// Request filter (Handle static files and early return)
