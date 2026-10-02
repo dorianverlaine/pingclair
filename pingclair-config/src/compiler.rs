@@ -1263,6 +1263,18 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
             });
         }
 
+        // 🚫 The runtime indexes manual sources by site name and cannot serve an unnamed pair.
+        if tls.cert.is_some()
+            && server
+                .name
+                .as_deref()
+                .is_none_or(|name| name.is_empty() || name == "_")
+        {
+            return Err(CompileError::InvalidServer {
+                message: "manual TLS requires a named site; unnamed and `_` sites cannot select a certificate".to_string(),
+            });
+        }
+
         if let Some(client_auth) = &tls.client_auth {
             validate_client_auth(client_auth)?;
         }

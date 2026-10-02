@@ -51,6 +51,8 @@ below, which ends with what to write instead.
 - **Scheme-only site addresses inherit global ports.** Explicit ports stay as written.
   → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
 
+- **Manual TLS requires a named site.** Unnamed and `_` sites are rejected instead of silently ignoring their certificate sources.
+  → [Unnamed manual TLS fails closed](#unnamed-manual-tls-fails-closed)
 - **Empty and stdin startup survive reload signals.** SIGHUP is ignored; SIGUSR1 reports that no file reload source exists.
   → [Reload signals remain safe without a file](#reload-signals-remain-safe-without-a-file)
 - **`-c -` always reads stdin**, even when the working directory contains a directory named `-`.
@@ -219,6 +221,13 @@ and `https_port`, respectively, as in Caddy. Previously they always bound
 
 **Upgrade:** Remove workarounds that repeat global ports in site addresses,
 or name an explicit port to keep a site on its previous listener.
+
+### Unnamed manual TLS fails closed
+
+Common configuration validation rejects manual certificate pairs on unnamed,
+empty-name, and `_` sites (#218). Startup and admin loads share this refusal;
+validation no longer approves a certificate source the runtime would ignore.
+Upgrade note: give the site a certificate hostname before configuring manual TLS.
 
 ### Reload signals remain safe without a file
 
