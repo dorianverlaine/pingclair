@@ -175,15 +175,19 @@ pub(crate) fn should_vary(config: &pingclair_core::config::ServerConfig, status:
 
 /// 🧊 Preserves every H3 Vary member while reserving the encoding cache key.
 pub(crate) fn vary_h3_on_accept_encoding(headers: &mut Vec<quiche::h3::Header>) {
-    let present = headers
+    if !vary_h3_covers_accept_encoding(headers) {
+        headers.push(quiche::h3::Header::new(b"vary", b"Accept-Encoding"));
+    }
+}
+
+/// 🧊 Preserves a static response's existing cache key even when encode is disabled.
+pub(crate) fn vary_h3_covers_accept_encoding(headers: &[quiche::h3::Header]) -> bool {
+    headers
         .iter()
         .filter(|header| header.name().eq_ignore_ascii_case(b"vary"))
         .filter_map(|header| std::str::from_utf8(header.value()).ok())
         .flat_map(|value| value.split(','))
-        .any(|token| token.trim() == "*" || token.trim().eq_ignore_ascii_case("accept-encoding"));
-    if !present {
-        headers.push(quiche::h3::Header::new(b"vary", b"Accept-Encoding"));
-    }
+        .any(|token| token.trim() == "*" || token.trim().eq_ignore_ascii_case("accept-encoding"))
 }
 
 /// 🗜️ Response facts borrow final headers, so policy does not require a second header map.

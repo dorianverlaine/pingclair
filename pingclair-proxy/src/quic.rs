@@ -6693,6 +6693,7 @@ fn apply_h3_response_policy(
     request_id: &str,
     state: Option<&ProxyState>,
 ) {
+    let varies_by_encoding = crate::response_encoding::vary_h3_covers_accept_encoding(headers);
     apply_h3_ops(headers, policy);
 
     let mut suppress_server = policy.suppresses_server();
@@ -6718,10 +6719,12 @@ fn apply_h3_response_policy(
     }
 
     apply_h3_trailer_headers(headers, suppress_server, request_id, state);
-    // 🧊 Local and upstream failures need the same encoding cache key as successful responses.
-    if state.is_some_and(|state| {
-        crate::response_encoding::should_vary(&state.config, response_status(headers))
-    }) {
+    // 🧊 Final header policy must preserve the selected body's cache key.
+    if varies_by_encoding
+        || state.is_some_and(|state| {
+            crate::response_encoding::should_vary(&state.config, response_status(headers))
+        })
+    {
         crate::response_encoding::vary_h3_on_accept_encoding(headers);
     }
 }

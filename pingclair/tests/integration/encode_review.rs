@@ -173,3 +173,89 @@ async fn static_matchers_read_policy_headers() {
         server.stop();
     }
 }
+
+#[tokio::test]
+#[ignore = "requires an HTTP/3 curl; set PINGCLAIR_H3_CURL and run explicitly"]
+async fn h3_static_policy_preserves_vary_without_encode() {
+    let tree = compressible_tree();
+    let curl = std::env::var("PINGCLAIR_H3_CURL").unwrap();
+    for policy in ["header Vary Origin", "header -Vary"] {
+        let mut server = TestServer::new_pingclairfile(&format!(
+            r#"
+{{
+    admin off
+    http_port __PINGCLAIR_TEST_HTTP_PORT__
+    https_port __PINGCLAIR_TEST_HTTPS_PORT__
+    servers {{
+        protocols h1 h2 h3
+    }}
+}}
+https://encode.test:__PINGCLAIR_TEST_HTTPS_PORT__ {{
+    tls internal
+    encode off
+    {policy}
+    root * {root}
+    file_server
+    @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+    respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+}}
+"#,
+            root = tree.path().display()
+        ));
+        assert!(server.wait_until_tls_ready("encode.test").await);
+        let artifacts = tempfile::tempdir().unwrap();
+        let headers = artifacts.path().join("headers");
+        let mut command = Command::new(&curl);
+        command
+            .args([
+                "--http3-only",
+                "--noproxy",
+                "*",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "15",
+            ])
+            .arg("--cacert")
+            .arg(
+                server
+                    ._temp_dir
+                    .path()
+                    .join("tls/pki/authorities/local/root.crt"),
+            )
+            .arg("--resolve")
+            .arg(format!(
+                "encode.test:{}:127.0.0.1",
+                server.address(0).port()
+            ))
+            .arg("--dump-header")
+            .arg(&headers)
+            .arg("--output")
+            .arg(artifacts.path().join("body"))
+            .arg(server.tls_url(0, "encode.test", "/big.txt"));
+        let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let headers = std::fs::read_to_string(headers)
+            .unwrap()
+            .to_ascii_lowercase();
+        let vary: Vec<_> = headers
+            .lines()
+            .filter_map(|line| line.strip_prefix("vary: "))
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .collect();
+        let expected = if policy == "header -Vary" {
+            vec!["accept-encoding"]
+        } else {
+            vec!["origin", "accept-encoding"]
+        };
+        assert_eq!(vary, expected, "{policy}: {headers}");
+        server.stop();
+    }
+}
