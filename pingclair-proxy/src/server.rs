@@ -6729,6 +6729,11 @@ impl ProxyHttp for PingclairProxy {
         // Refusing to store it would be a plausible-looking mistake — it reads
         // like a stricter choice, and it silently disables revalidation.
         let cache_control = CacheControl::from_resp_headers(response);
+        if crate::cache_policy::strips_vary(cache_control.as_ref()) {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+                "origin keeps Vary out of the stored copy",
+            )));
+        }
         let decision = filters::resp_cacheable(
             cache_control.as_ref(),
             response.clone(),

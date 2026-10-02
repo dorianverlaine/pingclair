@@ -56,6 +56,10 @@ mod version;
 #[path = "integration/cache.rs"]
 mod cache;
 
+// 🔐 Fields an origin keeps out of a shared copy with `private="…"`.
+#[path = "integration/cache_private_fields.rs"]
+mod cache_private_fields;
+
 // 🗜️ `Accept-Encoding` negotiation tests live beside this file for the same
 // reason; they reuse its `TestServer` harness.
 #[path = "integration/content_negotiation.rs"]

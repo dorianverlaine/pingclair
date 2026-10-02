@@ -168,6 +168,26 @@ fn status_may_be_stored(status: u16) -> bool {
     )
 }
 
+/// 🔀 Reports whether the origin asked for `Vary` itself to be left out of the
+/// stored copy, with `private="Vary"` or `no-cache="Vary"`.
+///
+/// Such a response is never stored. The stripped copy is what the variance key
+/// is computed from, so a stored entry without its `Vary` field cannot tell two
+/// requests apart: the first account's page was served to the next account.
+/// Keeping `Vary` anyway would ignore the origin, and an origin that hides its
+/// own variance from caches is not offering a response it is safe to share.
+pub(crate) fn strips_vary(cache_control: Option<&CacheControl>) -> bool {
+    let Some(cache_control) = cache_control else {
+        return false;
+    };
+    cache_control
+        .private_field_names()
+        .into_iter()
+        .flatten()
+        .chain(cache_control.no_cache_field_names().into_iter().flatten())
+        .any(|name| name.eq_ignore_ascii_case(b"vary"))
+}
+
 /// ⏳ What the origin's own headers say about how long a response stays fresh.
 pub(crate) enum OriginFreshness {
     /// 📜 The origin gave a lifetime Pingora could use, so Pingora's answer
