@@ -20,6 +20,12 @@
 //! are reached in the order streams were opened, and client stream ids only
 //! grow. One queue ordered both ways replaces a map and a timer wheel: the
 //! front is always the next deadline, and settling a stream is a binary search.
+//!
+//! 🧟 A stream opened only implicitly, by a higher one, may not exist in quiche
+//! yet when its deadline passes, so there is nothing to reset. It is kept as
+//! overdue instead, and refused the moment it sends its first byte: dropping
+//! it would have let a client open stream 8, wait out the deadline of 0 and 4,
+//! and then trickle a header on 0 with no deadline at all.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -38,6 +44,19 @@ pub(crate) struct PendingHeaders {
     next_unseen: u64,
     /// ⏱️ Unsettled streams with their deadlines, ascending in both.
     waiting: VecDeque<(u64, Instant)>,
+    /// 🧟 Implicitly opened streams whose deadline passed before quiche
+    /// instantiated them, ascending. Bounded like `waiting`: each still holds
+    /// stream credit, because quiche never collects a stream it never saw.
+    overdue: Vec<u64>,
+}
+
+/// 🧭 What the caller must do with a stream the client just sent bytes on.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Arrival {
+    /// 🎯 Nothing: it is on the clock, or already settled.
+    Timed,
+    /// 🚫 Reset it now: its deadline passed before it ever existed.
+    Overdue,
 }
 
 impl PendingHeaders {
@@ -47,6 +66,7 @@ impl PendingHeaders {
             timeout,
             next_unseen: 0,
             waiting: VecDeque::new(),
+            overdue: Vec::new(),
         }
     }
 
@@ -57,9 +77,19 @@ impl PendingHeaders {
     /// stream 8 first must not leave 0 and 4 outside the deadline. quiche
     /// refuses an id past the stream limit it advertised, which is what bounds
     /// the loop and the queue.
-    pub(crate) fn opened(&mut self, stream_id: u64) {
-        if !stream_id.is_multiple_of(CLIENT_BIDI_STEP) || stream_id < self.next_unseen {
-            return;
+    pub(crate) fn opened(&mut self, stream_id: u64) -> Arrival {
+        if !stream_id.is_multiple_of(CLIENT_BIDI_STEP) {
+            return Arrival::Timed;
+        }
+        if stream_id < self.next_unseen {
+            // 📌 Almost always empty, so a known stream costs one comparison.
+            return match self.overdue.binary_search(&stream_id) {
+                Ok(index) => {
+                    self.overdue.remove(index);
+                    Arrival::Overdue
+                }
+                Err(_) => Arrival::Timed,
+            };
         }
         let deadline = Instant::now() + self.timeout;
         let mut id = self.next_unseen;
@@ -68,6 +98,15 @@ impl PendingHeaders {
             id += CLIENT_BIDI_STEP;
         }
         self.next_unseen = id;
+        Arrival::Timed
+    }
+
+    /// 🧟 Records that an expired stream could not be reset because quiche
+    /// has not instantiated it, so its first byte is refused instead.
+    pub(crate) fn not_yet_open(&mut self, stream_id: u64) {
+        if let Err(index) = self.overdue.binary_search(&stream_id) {
+            self.overdue.insert(index, stream_id);
+        }
     }
 
     /// 🎯 Takes `stream_id` off the clock: its header arrived, or the client
@@ -119,5 +158,24 @@ mod tests {
         let later = Instant::now() + timeout;
         let expired: Vec<u64> = std::iter::from_fn(|| pending.pop_expired(later)).collect();
         assert_eq!((expired, pending.next_deadline()), (vec![0, 8], None));
+    }
+
+    /// 🧟 An expired stream that did not exist yet is refused on arrival,
+    /// once, while its neighbours are left alone.
+    #[test]
+    fn an_overdue_stream_is_refused_when_it_arrives() {
+        let mut pending = PendingHeaders::new(Duration::from_secs(60));
+        pending.opened(8);
+        pending.not_yet_open(4);
+        pending.not_yet_open(0);
+        assert_eq!(
+            [0, 4, 4, 8].map(|id| pending.opened(id)),
+            [
+                Arrival::Overdue,
+                Arrival::Overdue,
+                Arrival::Timed,
+                Arrival::Timed
+            ]
+        );
     }
 }

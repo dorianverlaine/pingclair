@@ -22,22 +22,80 @@ const SHORT_HEADER_DEADLINE: &str = r#"
 /// H3_REQUEST_INCOMPLETE, from the error codes in RFC 9114 §8.1.
 const H3_REQUEST_INCOMPLETE: u64 = 0x010d;
 
-/// ⏱️ What happened to the dribbled stream, as one value so a failure shows
-/// every part of it.
+/// 🧵 Frame type 0x01 (HEADERS) with a two-byte varint length of 100, so the
+/// server waits for a header block that never comes.
+const UNFINISHED_HEADERS: [u8; 3] = [0x01, 0x40, 0x64];
+
+/// ⏱️ How the server ended one dribbled stream, as one value so a failure
+/// shows every part of it.
 #[derive(Debug, PartialEq)]
 struct Outcome {
     /// The code the server reset the stream with, if it did.
     reset_code: Option<u64>,
-    /// Whether the reset arrived inside the window around the deadline.
-    near_deadline: bool,
+    /// Whether the reset came inside the window the test expects, measured
+    /// from the stream's first byte.
+    in_window: bool,
     /// Whether the connection itself was still open afterwards: the deadline
     /// is the stream's, and other requests may share the connection.
     connection_open: bool,
 }
 
-/// 🐌 Opens stream 0 with a HEADERS frame that announces 100 bytes, sends one
-/// of them every half second, and reports how the server ended the stream.
-async fn dribble_headers(server: SocketAddr, give_up: Duration) -> Outcome {
+/// 🐌 One dribbled stream: when it started and how the server ended it.
+struct Dribble {
+    stream_id: u64,
+    started: Option<tokio::time::Instant>,
+    next_byte: tokio::time::Instant,
+    reset: Option<(u64, Duration)>,
+}
+
+impl Dribble {
+    fn on(stream_id: u64) -> Self {
+        Self {
+            stream_id,
+            started: None,
+            next_byte: tokio::time::Instant::now(),
+            reset: None,
+        }
+    }
+
+    /// 🐌 Starts the stream, or sends its next byte every half second, and
+    /// notices the server ending it from either direction.
+    fn step(&mut self, conn: &mut quiche::Connection) {
+        let now = tokio::time::Instant::now();
+        let Some(began) = self.started else {
+            conn.stream_send(self.stream_id, &UNFINISHED_HEADERS, false)
+                .unwrap();
+            self.started = Some(now);
+            self.next_byte = now + Duration::from_millis(500);
+            return;
+        };
+        if now >= self.next_byte {
+            // 🐌 Keeps the stream and the connection busy, which is what used
+            // to keep both alive indefinitely.
+            match conn.stream_send(self.stream_id, &[0x00], false) {
+                Err(quiche::Error::StreamStopped(code)) => {
+                    self.reset = Some((code, began.elapsed()));
+                }
+                _ => self.next_byte = now + Duration::from_millis(500),
+            }
+        }
+        let mut sink = [0u8; 64];
+        if let Err(quiche::Error::StreamReset(code)) = conn.stream_recv(self.stream_id, &mut sink) {
+            self.reset = Some((code, began.elapsed()));
+        }
+    }
+}
+
+/// 🐌 Dribbles an unfinished HEADERS frame on stream 0 and reports how the
+/// server ended it, expecting the reset `window` seconds after stream 0's
+/// first byte.
+///
+/// With `decoy`, stream 8 is dribbled first and stream 0 only once 8 has been
+/// reset. Opening 8 opens 0 and 4 implicitly (RFC 9000 §3.2), so their
+/// deadlines run out alongside 8's while quiche has not instantiated them;
+/// stream 0 then arrives long after its deadline and has to be refused at
+/// once rather than given forever.
+async fn dribble_headers(server: SocketAddr, decoy: bool, window: std::ops::Range<f64>) -> Outcome {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
     config.verify_peer(false);
     config.set_application_protos(&[ALPN]).unwrap();
@@ -61,16 +119,15 @@ async fn dribble_headers(server: SocketAddr, give_up: Duration) -> Outcome {
 
     let mut out = [0u8; 1350];
     let mut buf = [0u8; 65535];
-    let mut started: Option<tokio::time::Instant> = None;
-    let mut next_byte = tokio::time::Instant::now();
-    let give_up_at = tokio::time::Instant::now() + give_up;
-    let mut reset: Option<(u64, Duration)> = None;
+    let give_up_at = tokio::time::Instant::now() + Duration::from_secs(if decoy { 14 } else { 10 });
+    let mut decoy = decoy.then(|| Dribble::on(8));
+    let mut target = Dribble::on(0);
 
     while let Ok((write, info)) = conn.send(&mut out) {
         socket.send_to(&out[..write], info.to).await.unwrap();
     }
 
-    while reset.is_none() && !conn.is_closed() {
+    while target.reset.is_none() && !conn.is_closed() {
         let timeout = conn
             .timeout()
             .unwrap_or(Duration::from_millis(50))
@@ -85,32 +142,9 @@ async fn dribble_headers(server: SocketAddr, give_up: Duration) -> Outcome {
         }
 
         if conn.is_established() {
-            let now = tokio::time::Instant::now();
-            match started {
-                None => {
-                    // 🧵 Frame type 0x01 (HEADERS) with a two-byte varint
-                    // length of 100, so the server waits for a block that
-                    // never comes.
-                    conn.stream_send(0, &[0x01, 0x40, 0x64], false).unwrap();
-                    started = Some(now);
-                    next_byte = now + Duration::from_millis(500);
-                }
-                Some(began) => {
-                    if now >= next_byte {
-                        // 🐌 Keeps the stream and the connection busy, which
-                        // is what used to keep both alive indefinitely.
-                        match conn.stream_send(0, &[0x00], false) {
-                            Err(quiche::Error::StreamStopped(code)) => {
-                                reset = Some((code, began.elapsed()));
-                            }
-                            _ => next_byte = now + Duration::from_millis(500),
-                        }
-                    }
-                    let mut sink = [0u8; 64];
-                    if let Err(quiche::Error::StreamReset(code)) = conn.stream_recv(0, &mut sink) {
-                        reset = Some((code, began.elapsed()));
-                    }
-                }
+            match decoy.as_mut() {
+                Some(first) if first.reset.is_none() => first.step(&mut conn),
+                _ => target.step(&mut conn),
             }
         }
 
@@ -120,20 +154,20 @@ async fn dribble_headers(server: SocketAddr, give_up: Duration) -> Outcome {
     }
 
     Outcome {
-        reset_code: reset.map(|(code, _)| code),
-        near_deadline: reset.is_some_and(|(_, after)| (1.5..5.0).contains(&after.as_secs_f64())),
+        reset_code: target.reset.map(|(code, _)| code),
+        in_window: target
+            .reset
+            .is_some_and(|(_, after)| window.contains(&after.as_secs_f64())),
         connection_open: !conn.is_closed(),
     }
 }
 
-/// ⏱️ `limits { header_timeout 2s }` resets a stream whose header is still
-/// arriving after two seconds, and leaves its connection alone.
-#[tokio::test]
-async fn h3_resets_a_stream_whose_header_never_finishes() {
+/// 🧾 Starts an H3 listener for [`SHORT_HEADER_DEADLINE`].
+async fn spawn_short_deadline_site() -> SocketAddr {
     let mut servers = pingclair_config::compile(SHORT_HEADER_DEADLINE)
         .unwrap()
         .servers;
-    let server = spawn_h3_listener(
+    spawn_h3_listener(
         move |address| {
             servers[0].listen = vec![address.to_string()];
             servers
@@ -141,16 +175,31 @@ async fn h3_resets_a_stream_whose_header_never_finishes() {
         &["h3.pingclair.test"],
         None,
     )
-    .await;
+    .await
+}
 
-    let outcome = dribble_headers(server, Duration::from_secs(10)).await;
+/// 🎯 What every test here expects: a stream reset, not a closed connection.
+const RESET_IN_WINDOW: Outcome = Outcome {
+    reset_code: Some(H3_REQUEST_INCOMPLETE),
+    in_window: true,
+    connection_open: true,
+};
 
-    assert_eq!(
-        outcome,
-        Outcome {
-            reset_code: Some(H3_REQUEST_INCOMPLETE),
-            near_deadline: true,
-            connection_open: true,
-        }
-    );
+/// ⏱️ `limits { header_timeout 2s }` resets a stream whose header is still
+/// arriving after two seconds, and leaves its connection alone.
+#[tokio::test]
+async fn h3_resets_a_stream_whose_header_never_finishes() {
+    let server = spawn_short_deadline_site().await;
+    let outcome = dribble_headers(server, false, 1.5..5.0).await;
+    assert_eq!(outcome, RESET_IN_WINDOW);
+}
+
+/// ⏱️ A stream opened implicitly, by a higher one, keeps the deadline it got
+/// then: when it finally sends something after that deadline, it is refused
+/// at once instead of being timed from scratch or not at all.
+#[tokio::test]
+async fn h3_refuses_an_implicit_stream_that_arrives_after_its_deadline() {
+    let server = spawn_short_deadline_site().await;
+    let outcome = dribble_headers(server, true, 0.0..1.0).await;
+    assert_eq!(outcome, RESET_IN_WINDOW);
 }

@@ -1337,7 +1337,17 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         // clock, before quiche consumes the bytes and an unfinished HEADERS
         // frame disappears into its buffer without an event.
         for stream_id in qconn.readable() {
-            self.pending_headers.opened(stream_id);
+            match self.pending_headers.opened(stream_id) {
+                crate::h3_header_deadline::Arrival::Timed => {}
+                crate::h3_header_deadline::Arrival::Overdue => {
+                    tracing::debug!(
+                        "⏱️ H3 {}: stream {} refused, it arrived after its header deadline",
+                        qconn.trace_id(),
+                        stream_id
+                    );
+                    Self::reset_request_incomplete(qconn, stream_id);
+                }
+            }
         }
 
         self.pump_h3_events(qconn);
@@ -1820,18 +1830,36 @@ impl H3App {
             return;
         }
         let now = tokio::time::Instant::now();
-        let code = quiche::h3::WireErrorCode::RequestIncomplete as u64;
         while let Some(stream_id) = self.pending_headers.pop_expired(now) {
             tracing::debug!(
                 "⏱️ H3 {}: stream {} reset, its header missed the deadline",
                 qconn.trace_id(),
                 stream_id
             );
-            // 📌 A stream the client already closed is gone from quiche, and
-            // shutting it down again is a harmless error.
-            let _ = qconn.stream_shutdown(stream_id, quiche::Shutdown::Read, code);
-            let _ = qconn.stream_shutdown(stream_id, quiche::Shutdown::Write, code);
+            if !Self::reset_request_incomplete(qconn, stream_id) {
+                self.pending_headers.not_yet_open(stream_id);
+            }
         }
+    }
+
+    /// 🚫 Shuts both halves of a request stream with H3_REQUEST_INCOMPLETE,
+    /// returning `false` when quiche has no such stream yet.
+    ///
+    /// 📌 quiche answers `Done` for a stream it has not instantiated: one the
+    /// client opened only implicitly, by opening a higher one, and has not
+    /// sent on (quiche 0.29.3 `Connection::stream_shutdown`). It also answers
+    /// `Done` for a read half already shut, which this never asks for twice;
+    /// were it to, the extra overdue entry would wait for bytes quiche no
+    /// longer delivers and cost nothing else. Any other error is a stream that
+    /// already ended, which needs nothing more.
+    fn reset_request_incomplete(
+        qconn: &mut tokio_quiche::quic::QuicheConnection,
+        stream_id: u64,
+    ) -> bool {
+        let code = quiche::h3::WireErrorCode::RequestIncomplete as u64;
+        let read = qconn.stream_shutdown(stream_id, quiche::Shutdown::Read, code);
+        let _ = qconn.stream_shutdown(stream_id, quiche::Shutdown::Write, code);
+        !matches!(read, Err(quiche::Error::Done))
     }
 
     fn pump_h3_events(&mut self, qconn: &mut tokio_quiche::quic::QuicheConnection) {
