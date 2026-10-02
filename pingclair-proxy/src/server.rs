@@ -7565,13 +7565,21 @@ impl ProxyHttp for PingclairProxy {
     where
         Self::CTX: Send + Sync,
     {
+        let h2 = session.as_downstream().is_http2();
         if let Some(bytes) = body.as_ref() {
-            Self::enforce_request_body_chunk(session, ctx, bytes.len()).await?;
+            let enforce = Self::enforce_request_body_chunk(session, ctx, bytes.len());
+            // 🐢 Pacing sleeps here, and that is this server's wait, not the
+            // client's, so the HTTP/2 body watch is stopped for it.
+            if h2 {
+                crate::body_timeout::H2BodyWatch::excused(enforce).await?;
+            } else {
+                enforce.await?;
+            }
         }
         // ⏱️ Every chunk Pingora reads pushes the HTTP/2 body deadline back,
         // and the last one stops it, so waiting on the upstream's answer
         // afterwards is never mistaken for a stalled upload.
-        if session.as_downstream().is_http2() {
+        if h2 {
             if end_of_stream {
                 crate::body_timeout::H2BodyWatch::arm(None);
             } else {

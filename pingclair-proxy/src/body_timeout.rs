@@ -151,6 +151,34 @@ impl H2BodyWatch {
         });
     }
 
+    /// 🐢 Runs `work` that this server chose to wait on, such as pacing an
+    /// upload to `upload_bytes_per_sec`, with the watch stopped, and starts
+    /// the clock again afterwards.
+    ///
+    /// The watch is meant to time the client, the way HTTP/1's per-read timer
+    /// does, and that timer is not running while the server sleeps between
+    /// reads either. Without this, a body slowed by the server's own rate
+    /// limit for longer than the pause was reset as if the client had stalled.
+    pub(crate) async fn excused<T>(work: impl Future<Output = T>) -> T {
+        let held = H2_BODY_WATCH
+            .try_with(|watch| watch.pause_ms.swap(0, Ordering::AcqRel))
+            .unwrap_or(0);
+        let output = work.await;
+        if held != 0 {
+            let _ = H2_BODY_WATCH.try_with(|watch| {
+                watch.moved_ms.store(watch.now_ms(), Ordering::Release);
+                // 📌 Only if nothing re-armed it meanwhile, which would be the
+                // newer word on what the pause is.
+                let _ =
+                    watch
+                        .pause_ms
+                        .compare_exchange(0, held, Ordering::AcqRel, Ordering::Acquire);
+                watch.rearmed.notify_one();
+            });
+        }
+        output
+    }
+
     /// ⏱️ Records that a body chunk arrived, pushing the deadline back.
     pub(crate) fn moved() {
         let _ = H2_BODY_WATCH.try_with(|watch| {

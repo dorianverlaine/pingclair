@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::TestServer;
 
@@ -60,6 +60,43 @@ async fn spawn_patient_upstream() -> u16 {
     port
 }
 
+/// 📮 An upstream that reads one request with a `Content-Length` body and
+/// answers `200 ok`, so a test can see an upload arrive in full.
+async fn spawn_answering_upstream() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let Ok(read @ 1..) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    seen.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&seen).to_ascii_lowercase();
+                    let Some(head_end) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = text[..head_end]
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if seen.len() >= head_end + 4 + length {
+                        break;
+                    }
+                }
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            });
+        }
+    });
+    port
+}
+
 /// ⏱️ How the stalled stream ended, and whether it ended near the deadline.
 #[derive(Debug, PartialEq)]
 enum Ended {
@@ -74,6 +111,13 @@ enum Ended {
 /// 🐌 Sends ten bytes of a hundred-byte body over h2c, keeps the stream open,
 /// and reports how the server ended it.
 async fn stall_an_upload(server: &TestServer) -> Ended {
+    upload(server, 100, 10).await
+}
+
+/// 📤 Announces `announced` body bytes over h2c, sends `sent` of them at
+/// once, ending the stream only when that is all of them, and reports how
+/// the server ended the request.
+async fn upload(server: &TestServer, announced: usize, sent: usize) -> Ended {
     let downstream = tokio::net::TcpStream::connect(server.address(0))
         .await
         .unwrap();
@@ -84,13 +128,14 @@ async fn stall_an_upload(server: &TestServer) -> Ended {
     let request = http::Request::builder()
         .method(http::Method::POST)
         .uri(format!("http://{}/upload.php", server.address(0)))
-        .header(http::header::CONTENT_LENGTH, "100")
+        .header(http::header::CONTENT_LENGTH, announced)
         .body(())
         .unwrap();
     let (response, mut send) = client.send_request(request, false).unwrap();
-    send.send_data(bytes::Bytes::from_static(&[b'x'; 10]), false)
+    send.send_data(bytes::Bytes::from(vec![b'x'; sent]), sent == announced)
         .unwrap();
-    // 📌 `send` stays alive and silent: no more DATA, no end of stream.
+    // 📌 `send` stays alive: a short body is followed by silence, not by an
+    // end of stream.
     let started = Instant::now();
     let response = tokio::time::timeout(Duration::from_secs(10), response).await;
     let near = (1.5..5.0).contains(&started.elapsed().as_secs_f64());
@@ -142,4 +187,20 @@ async fn test_a_quiet_h2_stream_on_a_long_connection_keeps_idle_timeout_off() {
     assert!(server.wait_until_ready().await, "server failed to start");
 
     assert_eq!(stall_an_upload(&server).await, Ended::StillOpen);
+}
+
+/// 🐢 Pacing an upload to `upload_bytes_per_sec` is this server waiting, not
+/// the client: a whole body sent at once and slowed to five seconds by the
+/// rate limit must arrive, not be taken for a two-second stall.
+#[tokio::test]
+async fn test_a_paced_h2_upload_is_not_taken_for_a_stall() {
+    let upstream = spawn_answering_upstream().await;
+    let mut server = TestServer::new_pingclairfile(&site_with_limits(
+        "body_timeout 2s\n upload_bytes_per_sec 1000",
+        &format!("reverse_proxy 127.0.0.1:{upstream}"),
+    ));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let ended = upload(&server, 5000, 5000).await;
+    assert!(matches!(ended, Ended::Answered(200, _)), "{ended:?}");
 }
