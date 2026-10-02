@@ -95,6 +95,18 @@ mod tests {
     }
 
     #[test]
+    fn encode_off_refuses_a_block() {
+        for disable in ["off", "none"] {
+            for settings in ["gzip", "zstd", "minimum_length 1024"] {
+                let result = compile(&format!(
+                    "http://:8080 {{\n encode {disable} {{\n {settings}\n }}\n respond ok\n}}"
+                ));
+                assert!(result.is_err(), "{disable}: {settings}");
+            }
+        }
+    }
+
+    #[test]
     fn encode_block_refuses_unknown_settings() {
         for setting in [
             "bogus_subdirective 42",

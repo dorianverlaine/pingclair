@@ -50,6 +50,8 @@ below, which ends with what to write instead.
   → [Automatic HTTPS follows the configured listener policy](#-automatic-https-follows-the-configured-listener-policy)
 - **Scheme-only site addresses inherit global ports.** Explicit ports stay as written.
   → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
+- **Disabled encoding rejects blocks.** Remove contradictory encode blocks.
+  → [Encode off rejects blocks](#encode-off-rejects-blocks)
 - **`encode` blocks now take effect and reject unknown settings.** Review size floors and response matchers.
   → [Encode blocks take effect](#encode-blocks-take-effect)
 - **Static compression offers exactly the encode list in order.**
@@ -247,6 +249,11 @@ and `https_port`, respectively, as in Caddy. Previously they always bound
 
 **Upgrade:** Remove workarounds that repeat global ports in site addresses,
 or name an explicit port to keep a site on its previous listener.
+### Encode off rejects blocks
+
+🚫 Explicit `encode off` or `encode none` cannot carry a block that overrides
+the disable. Upgrade: remove the block or explicitly enable its codings.
+
 ### Encode blocks take effect
 
 🗜️ `encode { gzip [level]; zstd; minimum_length; match { … } }` now preserves

@@ -456,6 +456,15 @@ pub(super) fn adapt_server(
                         }
                     }
                     if let Some(block) = &sub_d.block {
+                        if args
+                            .iter()
+                            .any(|arg| matches!(arg.to_lowercase().as_str(), "off" | "none"))
+                        {
+                            return Err(AdapterError::InvalidArgument(
+                                sub_d.name.clone(),
+                                "`off` cannot be combined with an encode block".into(),
+                            ));
+                        }
                         super::encode::adapt_block(block, &mut algos, &mut server.encode)?;
                     }
                     // 🗜️ Preserve the bare shorthand when no coding was named.
