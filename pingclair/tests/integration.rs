@@ -22,6 +22,9 @@ mod admin_compat;
 #[path = "integration/cli_tls_validate.rs"]
 mod cli_tls_validate;
 
+#[path = "integration/cli_args.rs"]
+mod cli_args;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;

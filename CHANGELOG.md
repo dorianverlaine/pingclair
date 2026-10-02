@@ -51,6 +51,8 @@ below, which ends with what to write instead.
 - **Scheme-only site addresses inherit global ports.** Explicit ports stay as written.
   → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
 
+- **CLI scripts can use Caddy-style configuration flags.** Explicit adapters override filename extensions.
+  → [Run and validate accept configuration flags](#run-and-validate-accept-configuration-flags)
 - **Validation now rejects unusable TLS material.** Fix malformed or mismatched manual pairs before deployment.
   → [Validate loads manual TLS material](#validate-loads-manual-tls-material)
 - **Routes are chosen in directive order**, not by the most specific path.
@@ -211,6 +213,16 @@ and `https_port`, respectively, as in Caddy. Previously they always bound
 
 **Upgrade:** Remove workarounds that repeat global ports in site addresses,
 or name an explicit port to keep a site on its previous listener.
+
+### Run and validate accept configuration flags
+
+`run` and `validate` accept `--config` / `-c` alongside the positional path,
+and `--adapter caddyfile|json` selects the file format explicitly (#222).
+Watch and signal reloads preserve the selected adapter. Unknown adapter names
+and simultaneous positional/flag paths are refused. Explicit adapters require
+a single file; directory loading keeps its existing per-file format inference.
+Upgrade note: existing positional commands still work; JSON uses Pingclair's
+schema, and an explicit adapter overrides the filename extension.
 
 ### Validate loads manual TLS material
 

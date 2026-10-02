@@ -18,6 +18,7 @@
 use clap::{Parser, Subcommand};
 
 pub(crate) mod admin;
+pub(crate) mod config;
 pub(crate) mod dispatch;
 pub(crate) mod service;
 pub(crate) mod storage;
@@ -49,9 +50,16 @@ pub(crate) struct Cli {
 pub(crate) enum Commands {
     /// Run the server with a configuration file
     Run {
-        /// Path to the configuration file (defaults to Pingclairfile or
-        /// Caddyfile in the current directory)
+        /// 🧾 Path to the configuration file (defaults to Pingclairfile or Caddyfile).
+        path: Option<String>,
+
+        /// 🧾 Path to the configuration file, as an alternative to the positional path.
+        #[arg(short = 'c', long, conflicts_with = "path")]
         config: Option<String>,
+
+        /// 🧾 Configuration format; overrides the filename extension.
+        #[arg(long, value_enum)]
+        adapter: Option<config::ConfigAdapter>,
 
         /// Use the config autosaved by the Admin API, like `caddy run
         /// --resume` (overrides the config path when present)
@@ -274,9 +282,16 @@ pub(crate) enum Commands {
 
     /// Validate a configuration file
     Validate {
-        /// Path to the configuration file (defaults to Pingclairfile or
-        /// Caddyfile in the current directory)
+        /// 🧾 Path to the configuration file (defaults to Pingclairfile or Caddyfile).
+        path: Option<String>,
+
+        /// 🧾 Path to the configuration file, as an alternative to the positional path.
+        #[arg(short = 'c', long, conflicts_with = "path")]
         config: Option<String>,
+
+        /// 🧾 Configuration format; overrides the filename extension.
+        #[arg(long, value_enum)]
+        adapter: Option<config::ConfigAdapter>,
     },
 
     /// Adapt a Pingclairfile to JSON and print it in this server's own schema

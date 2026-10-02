@@ -21,6 +21,7 @@ use std::sync::atomic::AtomicBool;
 /// describes what is running, so reloading it would silently undo the API.
 pub(super) async fn listen_for_reload(
     config_path: String,
+    adapter: Option<crate::cli::config::ConfigAdapter>,
     publisher_for_reload: Arc<dyn pingclair_proxy::server::ConfigPublisher>,
     api_changed_for_reload: Arc<AtomicBool>,
 ) {
@@ -72,13 +73,9 @@ pub(super) async fn listen_for_reload(
             "🔔 Received {signal_name}, reloading configuration from: {}",
             config_path
         );
-        // Step 1: Validate and load new configuration
+        // 🧾 Reload through the startup loader so an explicit adapter still wins.
         tracing::info!("📋 Step 1/3: Validating configuration...");
-        let result = if std::path::Path::new(&config_path).is_dir() {
-            pingclair_config::compile_directory(&config_path)
-        } else {
-            pingclair_config::compile_file(&config_path)
-        };
+        let result = crate::cli::config::load(&config_path, adapter);
 
         match result {
             Ok(new_config) => {

@@ -52,6 +52,15 @@ pub(crate) fn run_server(
     config_path: String,
     config: pingclair_core::config::PingclairConfig,
 ) -> anyhow::Result<()> {
+    run_server_with_adapter(config_path, config, None)
+}
+
+/// 🧾 Keeps an explicit CLI adapter attached to the source for signal reloads.
+pub(crate) fn run_server_with_adapter(
+    config_path: String,
+    config: pingclair_core::config::PingclairConfig,
+    adapter: Option<crate::cli::config::ConfigAdapter>,
+) -> anyhow::Result<()> {
     // Create a background Tokio runtime for async tasks (HTTP/3, SIGHUP, etc.)
     // We do this in a separate thread to avoid conflicts with Pingora's runtime.
     let bg_runtime = tokio::runtime::Runtime::new().expect("Failed to create background runtime");
@@ -347,6 +356,7 @@ pub(crate) fn run_server(
     if !config_path.is_empty() {
         bg_handle.spawn(reload::listen_for_reload(
             config_path.clone(),
+            adapter,
             config_publisher.clone(),
             api_changed.clone(),
         ));

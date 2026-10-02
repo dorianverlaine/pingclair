@@ -382,10 +382,13 @@ fn storage_import(input: &str, config: Option<&str>) -> anyhow::Result<()> {
 pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
     match command {
         Commands::Run {
+            path,
             config,
+            mut adapter,
             resume,
             watch,
         } => {
+            let config = config.or(path);
             let mut config_path = resolve_config_path(config.as_deref());
             // 🚫 No argument and no conventional file is the one case where the
             // generic "Failed to load config: No such file or directory" sends
@@ -421,6 +424,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                         autosave.display()
                     );
                     config_path = autosave.to_string_lossy().to_string();
+                    adapter = None;
                 } else {
                     tracing::warn!(
                         "⚠️ --resume requested but no autosave exists at {}; \
@@ -431,25 +435,8 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             }
             tracing::info!("🚀 Starting Pingclair with config: {}", config_path);
 
-            // Load configuration - support both single file and directory
-            let config = if std::path::Path::new(&config_path).is_dir() {
-                tracing::info!("📁 Loading configuration from directory: {}", config_path);
-                match pingclair_config::compile_directory(&config_path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("❌ Failed to load config from directory: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                match pingclair_config::compile_file(&config_path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("❌ Failed to load config: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            };
+            let config = super::config::load(&config_path, adapter)
+                .map_err(|error| anyhow::anyhow!("❌ Failed to load config: {error}"))?;
 
             // 🔀 A global `log { output … }` block points the process log at a
             // file, so it has to be applied here — where the configuration
@@ -481,7 +468,15 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 });
             }
 
-            run_server(config_path.clone(), config)?;
+            crate::run::run_server_with_adapter(
+                if config_path == "-" {
+                    String::new()
+                } else {
+                    config_path
+                },
+                config,
+                adapter,
+            )?;
         }
 
         Commands::Reload { config, address } => {
@@ -951,34 +946,15 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             run_server("".to_string(), config)?;
         }
 
-        Commands::Validate { config } => {
-            // 🧭 Caddy reads a config from stdin when the path is `-`; do the
-            // same so scripts can validate generated Caddyfiles.
-            let (compiled, label) = if config.as_deref() == Some("-") {
-                use std::io::Read;
-                let mut source = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut source)
-                    .map_err(|error| anyhow::anyhow!("❌ Failed to read stdin: {error}"))?;
-                (
-                    pingclair_config::compile(&source)
-                        .map_err(|error| anyhow::anyhow!("❌ Configuration Error: {error}"))?,
-                    "<stdin>".to_string(),
-                )
-            } else {
-                let config = resolve_config_path(config.as_deref());
-                tracing::info!("🔍 Validating config: {}", config);
-                let result = if std::path::Path::new(&config).is_dir() {
-                    tracing::info!("📁 Validating configuration directory: {}", config);
-                    pingclair_config::compile_directory(&config)
-                } else {
-                    pingclair_config::compile_file(&config)
-                };
-                (
-                    result.map_err(|error| anyhow::anyhow!("❌ Configuration Error: {error}"))?,
-                    config,
-                )
-            };
+        Commands::Validate {
+            path,
+            config,
+            adapter,
+        } => {
+            let path = resolve_config_path(config.or(path).as_deref());
+            let compiled = super::config::load(&path, adapter)
+                .map_err(|error| anyhow::anyhow!("❌ Configuration Error: {error}"))?;
+            let label = if path == "-" { "<stdin>" } else { &path };
 
             // 🔐 Read and match manual pairs through the startup loader without
             // opening listeners or provisioning automatic certificates.

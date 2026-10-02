@@ -134,6 +134,10 @@ Run Pingclair in the foreground:
 pingclair run Pingclairfile
 ```
 
+Both `run` and `validate` accept a positional path or `--config` / `-c`.
+Use `--adapter caddyfile` or `--adapter json` to override the filename extension;
+JSON must use Pingclair's schema. Other adapter names are rejected.
+
 Verify the response from another terminal:
 
 ```bash
