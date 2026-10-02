@@ -2480,6 +2480,19 @@ struct H3ImmediateResponse {
     headers: Vec<(String, String)>,
 }
 
+/// 🛡️ The path part of a request target, which is all a matcher may see.
+///
+/// `effective_uri` carries the query string so a rewrite can keep it, but
+/// matchers compare the path alone, as the router and HTTP/1-2 already do.
+/// Handing over `/secret?x=1` made a `basic_auth /secret` step miss a request
+/// the `/secret` route had just accepted, so a query string was enough to
+/// skip the guard. Borrowed, so the request path pays a scan and nothing more.
+fn uri_path(effective_uri: &str) -> &str {
+    effective_uri
+        .split_once('?')
+        .map_or(effective_uri, |(path, _)| path)
+}
+
 /// 🎯 Evaluates one H3 pipeline element's precompiled matcher.
 ///
 /// 🚨 Returns the *verdict*, not a boolean, because a `file` matcher can raise
@@ -2508,7 +2521,7 @@ fn h3_element_matcher_verdict(
         .map(authority_host)
         .unwrap_or("");
     let mut request = MatcherRequest {
-        path: effective_uri,
+        path: uri_path(effective_uri),
         method: request_header.method.as_str(),
         headers: &request_header.headers,
         host,
@@ -2540,7 +2553,7 @@ fn h3_resolve_try_files(
         .map(authority_host)
         .unwrap_or("");
     let mut request = MatcherRequest {
-        path: effective_uri,
+        path: uri_path(effective_uri),
         method: request_header.method.as_str(),
         headers: &request_header.headers,
         host,

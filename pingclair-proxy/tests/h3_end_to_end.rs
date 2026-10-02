@@ -32,6 +32,10 @@ mod malformed;
 #[path = "h3_end_to_end/response_framing.rs"]
 mod response_framing;
 
+// 🛡️ Path-scoped guards and the query string.
+#[path = "h3_end_to_end/scoped_guard_query.rs"]
+mod scoped_guard_query;
+
 // 🔤 SNI spelled with capital letters; a sibling file for the same reason.
 #[path = "h3_end_to_end/site_name_case.rs"]
 mod site_name_case;
