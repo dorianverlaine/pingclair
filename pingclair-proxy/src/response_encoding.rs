@@ -163,6 +163,11 @@ pub(crate) fn forbids_transform(header: &ResponseHeader) -> bool {
         .any(|token| token.eq_ignore_ascii_case("no-transform"))
 }
 
+/// 🛡️ A client's byte-preservation request binds both proxy transports.
+pub(crate) fn request_allows_encoding(headers: &http::HeaderMap) -> bool {
+    !field_tokens(headers, "cache-control").any(|token| token.eq_ignore_ascii_case("no-transform"))
+}
+
 /// 🧊 Encoding is part of the cache key even when this client receives identity.
 pub(crate) fn should_vary(config: &pingclair_core::config::ServerConfig, status: u16) -> bool {
     !config.encodings.is_empty() && status >= 200

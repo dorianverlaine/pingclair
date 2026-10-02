@@ -6171,7 +6171,8 @@ async fn reverse_proxy_upstream(
     }
     apply_h3_response_policy(&mut hdrs, &effective_policy, request_id, Some(state));
     // 🗜️ Final headers decide encoding, so outer policy cannot restore a strong validator.
-    let mut encoder = if intercept_file.is_none()
+    let mut encoder = if crate::response_encoding::request_allows_encoding(&client_header.headers)
+        && intercept_file.is_none()
         && intercept_replacement.is_none()
         && !immediate_stream
     {

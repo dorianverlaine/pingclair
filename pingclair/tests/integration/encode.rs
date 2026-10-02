@@ -41,7 +41,7 @@ async fn encode_block_controls_static_responses() {
 }
 
 /// 🔌 A deterministic origin keeps compression assertions independent of routing.
-async fn origin() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+pub(super) async fn origin() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -375,6 +375,8 @@ https://encode.test:__PINGCLAIR_TEST_HTTPS_PORT__ {{
     encode {{
         zstd
         gzip 9
+        match {{
+                }}
     }}
     @unavailable path /unavailable
     reverse_proxy @unavailable {unavailable_address}
@@ -392,13 +394,17 @@ https://encode.test:__PINGCLAIR_TEST_HTTPS_PORT__ {{
     let curl = std::env::var("PINGCLAIR_H3_CURL")
         .expect("set PINGCLAIR_H3_CURL to an ngtcp2/nghttp3 curl");
     let artifacts = tempfile::tempdir().unwrap();
-    for (accepted, expected) in [
-        ("*", None),
-        ("*, gzip", Some("gzip")),
-        ("gzip, *", Some("gzip")),
-        ("*;q=0.5, gzip;q=0.5", Some("gzip")),
+    for (accepted, cache_control, expected) in [
+        ("*", "", None),
+        ("*, gzip", "", Some("gzip")),
+        ("gzip, *", "", Some("gzip")),
+        ("*;q=0.5, gzip;q=0.5", "", Some("gzip")),
+        ("gzip", "max-age=0, No-Transform", None),
     ] {
         for path in ["/big.txt", "/proxy/text", "/unavailable"] {
+            if !cache_control.is_empty() && path != "/proxy/text" {
+                continue;
+            }
             let headers = artifacts.path().join("headers");
             let body = artifacts.path().join("body");
             let mut command = Command::new(&curl);
@@ -426,6 +432,8 @@ https://encode.test:__PINGCLAIR_TEST_HTTPS_PORT__ {{
                 ))
                 .arg("--header")
                 .arg(format!("Accept-Encoding: {accepted}"))
+                .arg("--header")
+                .arg(format!("Cache-Control: {cache_control}"))
                 .arg("--dump-header")
                 .arg(&headers)
                 .arg("--output")

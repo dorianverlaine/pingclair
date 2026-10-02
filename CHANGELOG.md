@@ -50,6 +50,8 @@ below, which ends with what to write instead.
   → [Automatic HTTPS follows the configured listener policy](#-automatic-https-follows-the-configured-listener-policy)
 - **Scheme-only site addresses inherit global ports.** Explicit ports stay as written.
   → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
+- **Request no-transform disables proxy encoding.** Expect identity responses.
+  → [Proxy encoding respects request no-transform](#proxy-encoding-respects-request-no-transform)
 - **Static gzip ETags include quality.** Expect one cache revalidation.
   → [Static gzip validators include quality](#static-gzip-validators-include-quality)
 - **Local encoding cache keys survive header policy.** Review downstream cache keys.
@@ -264,6 +266,12 @@ separate even when a `header Vary` directive replaces or removes the field.
 🏷️ Static gzip strong ETags include the configured quality, so different
 encoded bytes no longer share a validator across reloads or replicas. Upgrade:
 gzip caches revalidate once; identity validators remain stable.
+
+### Proxy encoding respects request no-transform
+
+🛡️ Both proxy transports honor `Cache-Control: no-transform` on the request,
+including multiple field lines and case-insensitive directives. Upgrade: these
+clients receive the upstream identity bytes even when they accept compression.
 
 ### Encode off rejects blocks
 

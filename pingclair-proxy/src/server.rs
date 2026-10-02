@@ -8433,6 +8433,7 @@ impl ProxyHttp for PingclairProxy {
         // `is_full_representation`: a re-encoded `206` would keep a
         // `Content-Range` counted in identity bytes.
         if let Some(encoding) = ctx.negotiated_encoding
+            && crate::response_encoding::request_allows_encoding(&session.req_header().headers)
             && let Some(state) = &ctx.state
             && crate::response_encoding::eligible(
                 &state.config,

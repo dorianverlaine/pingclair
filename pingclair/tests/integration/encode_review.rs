@@ -3,7 +3,7 @@
 
 //! 🗜️ Encoding policy must survive final header and representation decisions.
 
-use super::encode::proxy_site;
+use super::encode::{origin, proxy_site};
 use super::*;
 
 #[tokio::test]
@@ -97,4 +97,34 @@ async fn static_gzip_quality_has_distinct_validators() {
     assert_ne!(variants[0].1, variants[1].1);
     assert_ne!(variants[0].0, variants[1].0);
     assert_eq!(variants[0].2, variants[1].2);
+}
+
+#[tokio::test]
+async fn request_no_transform_disables_proxy_encoding() {
+    let (address, task) = origin().await;
+    let mut server = proxy_site(address, "encode gzip");
+    assert!(server.wait_until_ready().await);
+    let client = no_proxy_client();
+    for (lines, encoded) in [
+        (vec!["max-age=0"], true),
+        (vec!["max-age=0, No-Transform"], false),
+        (vec!["max-age=0", "no-transform"], false),
+    ] {
+        let mut request = client
+            .get(server.url(0, "/text"))
+            .header("Accept-Encoding", "gzip");
+        for line in lines {
+            request = request.header("Cache-Control", line);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.headers().contains_key("content-encoding"), encoded);
+        if !encoded {
+            assert_eq!(
+                response.bytes().await.unwrap(),
+                "compressible text ".repeat(512).as_bytes()
+            );
+        }
+    }
+    server.stop();
+    task.abort();
 }
