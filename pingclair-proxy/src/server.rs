@@ -3284,6 +3284,21 @@ impl PingclairProxy {
         })
     }
 
+    /// 🌊 The pause between two downstream reads on a long connection: the
+    /// `long_connections { idle_timeout }` when one is set (`off` meaning no
+    /// limit), else only what the ordinary configuration asks for. The default
+    /// body pause never applies, because a tunnel or stream may be quiet on
+    /// purpose.
+    fn long_connection_read_timeout(
+        route_read_ms: Option<u64>,
+        limits: &pingclair_core::config::ResourceLimitsConfig,
+    ) -> Option<Duration> {
+        match limits.long_connections.idle_timeout_ms {
+            Some(idle_ms) => (idle_ms > 0).then(|| Duration::from_millis(idle_ms)),
+            None => Self::configured_read_timeout(route_read_ms, limits),
+        }
+    }
+
     /// 🌊 Replaces ordinary deadlines for an intentional streaming response or tunnel.
     fn activate_long_connection(
         session: &mut Session,
@@ -3299,9 +3314,13 @@ impl PingclairProxy {
             ctx.request_deadline =
                 (request_ms > 0).then(|| ctx.start_time + Duration::from_millis(request_ms));
         }
+        let read_timeout = Self::long_connection_read_timeout(
+            ctx.request_body_read_timeout_ms,
+            &state.config.limits,
+        );
+        crate::body_timeout::H2BodyWatch::rearm(read_timeout);
         if let Some(idle_ms) = long.idle_timeout_ms {
             let timeout = (idle_ms > 0).then(|| Duration::from_millis(idle_ms));
-            crate::body_timeout::H2BodyWatch::rearm(timeout);
             session.as_mut().set_read_timeout(timeout);
             session.as_mut().set_write_timeout(timeout);
             session.as_mut().set_total_drain_timeout(timeout);
@@ -3313,13 +3332,8 @@ impl PingclairProxy {
             // tunnel or stream that is quiet on purpose: a WebSocket whose
             // client says nothing for a minute is healthy. Only what the
             // operator configured carries over to a long connection.
-            let timeout = Self::configured_read_timeout(
-                ctx.request_body_read_timeout_ms,
-                &state.config.limits,
-            );
-            crate::body_timeout::H2BodyWatch::rearm(timeout);
-            session.as_mut().set_read_timeout(timeout);
-            session.as_mut().set_total_drain_timeout(timeout);
+            session.as_mut().set_read_timeout(read_timeout);
+            session.as_mut().set_total_drain_timeout(read_timeout);
         }
     }
 
@@ -4067,18 +4081,21 @@ impl PingclairProxy {
 
     /// ⏱️ The longest pause allowed between two pieces of request body: what
     /// the configuration asks for, else [`DEFAULT_BODY_TIMEOUT`] — except on a
-    /// long connection, whose client may be quiet on purpose and keeps only a
-    /// configured value.
+    /// long connection, whose client may be quiet on purpose and keeps its
+    /// `long_connections` value; see `long_connection_read_timeout`. HTTP/1
+    /// gets the same answer through `set_read_timeout`.
     ///
     /// [`DEFAULT_BODY_TIMEOUT`]: crate::body_timeout::DEFAULT_BODY_TIMEOUT
     fn body_pause(ctx: &RequestContext) -> Option<Duration> {
-        let configured = ctx.state.as_ref().and_then(|state| {
-            Self::configured_read_timeout(ctx.request_body_read_timeout_ms, &state.config.limits)
-        });
+        let limits = &ctx.state.as_ref()?.config.limits;
+        let route_read_ms = ctx.request_body_read_timeout_ms;
         if ctx.long_connection {
-            configured
+            Self::long_connection_read_timeout(route_read_ms, limits)
         } else {
-            Some(configured.unwrap_or(crate::body_timeout::DEFAULT_BODY_TIMEOUT))
+            Some(
+                Self::configured_read_timeout(route_read_ms, limits)
+                    .unwrap_or(crate::body_timeout::DEFAULT_BODY_TIMEOUT),
+            )
         }
     }
 

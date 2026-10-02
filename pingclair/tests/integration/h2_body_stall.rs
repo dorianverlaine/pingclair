@@ -19,6 +19,11 @@ use super::TestServer;
 /// 🧾 A site whose route is written by the caller, with a two-second body
 /// pause so the test does not wait out the one-minute default.
 fn site(route: &str) -> String {
+    site_with_limits("body_timeout 2s", route)
+}
+
+/// 🧾 A site with the caller's `limits` body and route.
+fn site_with_limits(limits: &str, route: &str) -> String {
     format!(
         r#"
         {{
@@ -30,7 +35,7 @@ fn site(route: &str) -> String {
             respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
 
             limits {{
-                body_timeout 2s
+                {limits}
             }}
 
             {route}
@@ -122,4 +127,19 @@ async fn test_a_fastcgi_h2_upload_that_stops_is_answered_408() {
     assert!(server.wait_until_ready().await, "server failed to start");
 
     assert_eq!(stall_an_upload(&server).await, Ended::Answered(408, true));
+}
+
+/// 🌊 An immediate-flush route is a long connection, so its upload keeps the
+/// `long_connections` idle timeout instead of the ordinary body pause, as on
+/// HTTP/1. `off` means a quiet client stream is healthy and is never cut.
+#[tokio::test]
+async fn test_a_quiet_h2_stream_on_a_long_connection_keeps_idle_timeout_off() {
+    let upstream = spawn_patient_upstream().await;
+    let mut server = TestServer::new_pingclairfile(&site_with_limits(
+        "body_timeout 2s\n long_connections {\n idle_timeout off\n }",
+        &format!("reverse_proxy 127.0.0.1:{upstream} {{\n flush_interval -1\n }}"),
+    ));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    assert_eq!(stall_an_upload(&server).await, Ended::StillOpen);
 }
