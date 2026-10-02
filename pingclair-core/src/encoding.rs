@@ -442,3 +442,6 @@ fn gzip_type_matches(mime: &str, pattern: &str) -> bool {
     }
     mime.eq_ignore_ascii_case(pattern)
 }
+
+mod policy;
+pub use policy::{EncodePolicy, HeaderPattern};

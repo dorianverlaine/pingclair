@@ -1035,6 +1035,8 @@ pub fn is_compressible_content_type(content_type: &str, configured_types: &[Stri
 /// Mutable state for hot reloading
 #[derive(Clone)]
 pub struct ProxyState {
+    /// 🎯 Immutable response patterns are compiled at site load time.
+    pub(crate) encode_policy: pingclair_core::encoding::EncodePolicy,
     /// Server configuration
     pub config: Arc<ServerConfig>,
     /// Route matcher
@@ -1988,6 +1990,10 @@ impl ProxyState {
         }));
 
         Self {
+            encode_policy: pingclair_core::encoding::EncodePolicy::compile(
+                &config.encode,
+                &config.gzip_types,
+            ),
             config: Arc::new(config),
             router: Arc::new(router),
             error_route_precompiles,
@@ -8450,6 +8456,7 @@ impl ProxyHttp for PingclairProxy {
             && let Some(state) = &ctx.state
             && crate::response_encoding::eligible(
                 &state.config,
+                &state.encode_policy,
                 &session.req_header().method,
                 upstream_response,
             )

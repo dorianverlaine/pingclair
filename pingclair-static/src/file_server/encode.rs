@@ -24,11 +24,10 @@ impl FileServer {
         meta: &super::cache::FileMeta,
         request: &super::FileRequest<'_>,
     ) -> bool {
-        if self.config.encode.matcher.is_none() {
-            return pingclair_core::encoding::is_compressible_content_type(
-                meta.content_type.to_str().unwrap_or(""),
-                &self.config.gzip_types,
-            );
+        if !self.encode_policy.has_matcher() {
+            return self
+                .encode_policy
+                .allows_content_type(meta.content_type.to_str().unwrap_or(""));
         }
         let mut headers = http::HeaderMap::with_capacity(6);
         headers.insert("content-type", meta.content_type.clone());
@@ -47,11 +46,8 @@ impl FileServer {
         length: u64,
         request: &super::FileRequest<'_>,
     ) -> bool {
-        if self.config.encode.matcher.is_none() {
-            return pingclair_core::encoding::is_compressible_content_type(
-                "text/html",
-                &self.config.gzip_types,
-            );
+        if !self.encode_policy.has_matcher() {
+            return self.encode_policy.allows_content_type("text/html");
         }
         let mut headers = http::HeaderMap::with_capacity(3);
         headers.insert(
@@ -76,16 +72,13 @@ impl FileServer {
         {
             return false;
         }
-        self.config.encode.matches(status, |name, patterns| {
+        self.encode_policy.matches(status, |name, patterns| {
             headers
                 .get_all(name)
                 .iter()
                 .filter_map(|value| value.to_str().ok())
                 .any(|value| {
-                    patterns.is_empty()
-                        || patterns.iter().any(|pattern| {
-                            pingclair_core::encoding::header_pattern_matches(value, pattern)
-                        })
+                    patterns.is_empty() || patterns.iter().any(|pattern| pattern.matches(value))
                 })
         })
     }

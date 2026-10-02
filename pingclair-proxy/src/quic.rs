@@ -6196,7 +6196,12 @@ async fn reverse_proxy_upstream(
             .unwrap_or("");
         crate::encoding::negotiate(accepted, &state.config.encodings)
             .filter(|_| {
-                crate::response_encoding::eligible_h3(&state.config, &client_header.method, &hdrs)
+                crate::response_encoding::eligible_h3(
+                    &state.config,
+                    &state.encode_policy,
+                    &client_header.method,
+                    &hdrs,
+                )
             })
             .and_then(|encoding| {
                 crate::encoding::ResponseEncoder::at_gzip_level(

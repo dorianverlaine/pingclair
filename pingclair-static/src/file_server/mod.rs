@@ -295,6 +295,8 @@ impl Default for FileServerConfig {
 
 /// Static file server
 pub struct FileServer {
+    /// 🎯 Configured patterns are classified once per file server.
+    encode_policy: pingclair_core::encoding::EncodePolicy,
     config: FileServerConfig,
     /// Prebuilt response metadata per file identity (path, mtime, size).
     /// The values themselves are immutable `Arc`s, so a hit clones one
@@ -408,6 +410,10 @@ impl FileServer {
         static METADATA: std::sync::LazyLock<Arc<Budget>> =
             std::sync::LazyLock::new(|| Budget::new(FileServer::META_CACHE_CAP));
         Self {
+            encode_policy: pingclair_core::encoding::EncodePolicy::compile(
+                &config.encode,
+                &config.gzip_types,
+            ),
             config,
             meta_budget: METADATA.clone(),
             meta_cache: ArcSwap::from_pointee(HashMap::new()),

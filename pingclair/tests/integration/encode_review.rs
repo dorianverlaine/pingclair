@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-//! 🗜️ Encoding policy must survive final header and representation decisions.
+//! 🗜️ Encoding policy must survive the final header and representation decisions.
 
 use super::encode::{origin, proxy_site};
 use super::*;

@@ -198,8 +198,9 @@ struct EncodingFacts<'a> {
 
 fn eligible_facts(
     config: &pingclair_core::config::ServerConfig,
+    policy: &pingclair_core::encoding::EncodePolicy,
     facts: EncodingFacts<'_>,
-    matches_header: impl Fn(&str, &[String]) -> bool,
+    matches_header: impl Fn(&str, &[pingclair_core::encoding::HeaderPattern]) -> bool,
 ) -> bool {
     facts.full
         && !facts.no_transform
@@ -208,19 +209,20 @@ fn eligible_facts(
         && facts
             .length
             .is_none_or(|length| length >= config.encode.minimum_length)
-        && (config.encode.matcher.is_some()
-            || crate::server::is_compressible_content_type(facts.content_type, &config.gzip_types))
-        && config.encode.matches(facts.status, matches_header)
+        && (policy.has_matcher() || policy.allows_content_type(facts.content_type))
+        && policy.matches(facts.status, matches_header)
 }
 
 /// 🗜️ Both transports evaluate the same policy after response headers are finalized.
 pub(crate) fn eligible(
     config: &pingclair_core::config::ServerConfig,
+    policy: &pingclair_core::encoding::EncodePolicy,
     method: &http::Method,
     response: &ResponseHeader,
 ) -> bool {
     eligible_facts(
         config,
+        policy,
         EncodingFacts {
             status: response.status.as_u16(),
             content_type: response
@@ -244,10 +246,7 @@ pub(crate) fn eligible(
                 .iter()
                 .filter_map(|value| value.to_str().ok())
                 .any(|value| {
-                    patterns.is_empty()
-                        || patterns.iter().any(|pattern| {
-                            pingclair_core::encoding::header_pattern_matches(value, pattern)
-                        })
+                    patterns.is_empty() || patterns.iter().any(|pattern| pattern.matches(value))
                 })
         },
     )
@@ -263,11 +262,13 @@ fn h3_header<'a>(headers: &'a [quiche::h3::Header], name: &[u8]) -> Option<&'a s
 /// 🗜️ H3 borrows its wire headers rather than cloning them into an HTTP/1 header map.
 pub(crate) fn eligible_h3(
     config: &pingclair_core::config::ServerConfig,
+    policy: &pingclair_core::encoding::EncodePolicy,
     method: &http::Method,
     headers: &[quiche::h3::Header],
 ) -> bool {
     eligible_facts(
         config,
+        policy,
         EncodingFacts {
             status: h3_header(headers, b":status")
                 .and_then(|value| value.parse().ok())
@@ -302,10 +303,7 @@ pub(crate) fn eligible_h3(
                 .filter(|header| header.name().eq_ignore_ascii_case(name.as_bytes()))
                 .filter_map(|header| std::str::from_utf8(header.value()).ok())
                 .any(|value| {
-                    patterns.is_empty()
-                        || patterns.iter().any(|pattern| {
-                            pingclair_core::encoding::header_pattern_matches(value, pattern)
-                        })
+                    patterns.is_empty() || patterns.iter().any(|pattern| pattern.matches(value))
                 })
         },
     )
