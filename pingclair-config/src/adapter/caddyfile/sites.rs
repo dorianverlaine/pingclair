@@ -10,12 +10,14 @@ use super::directives::{
     adapt_handle_path, adapt_handler, adapt_header_directive, adapt_resource_limits,
     adapt_subroute_block,
 };
+use super::error_routes::adapt_handle_errors;
 use super::logs::adapt_log_block;
 use super::matchers::{
     parse_matcher_and_block, parse_matcher_definition, parse_route_matcher_and_block,
 };
 use super::options::is_wildcard_host;
 use super::order::DirectiveOrder;
+use super::root::parse_root_directive;
 use super::route_order::RouteOrderKey;
 use super::scoped_middleware;
 use super::tls::adapt_tls_directive;
@@ -199,54 +201,7 @@ pub(super) fn adapt_server(
                     });
                 }
                 "root" => {
-                    // 📂 `root /var/www` or `root * /var/www`: the optional
-                    // `*` matcher token is accepted and ignored, matching
-                    // Caddy's disambiguation syntax.
-                    let args = if sub_d.args.first().is_some_and(|a| a == "*") {
-                        &sub_d.args[1..]
-                    } else {
-                        &sub_d.args[..]
-                    };
-                    // 🏷️ `root @m /var/www` names a matcher, and this used to
-                    // be counted as an ordinary argument — so the refusal read
-                    // "expects 1 arguments, got 2" and pointed at the path.
-                    // The natural reading of that message is "drop one of the
-                    // two", and the one an operator would drop is the name
-                    // Caddy would have resolved. Resolving it here is what
-                    // makes the failure describe the actual mistake.
-                    if let Some(name) = args.first().filter(|arg| arg.starts_with('@')) {
-                        if !server.matchers.contains_key(name) {
-                            return Err(AdapterError::InvalidArgument(
-                                "root".into(),
-                                format!(
-                                    "matcher `{}` is not defined in this scope; define it in \
-                                     the site block or in this route/handle block",
-                                    name.strip_prefix('@').unwrap_or(name)
-                                ),
-                            ));
-                        }
-                        // 🚧 A matcher-scoped root is a per-request value
-                        // upstream — it compiles to a route whose handler sets
-                        // `vars.root` — while a root here is one value for the
-                        // whole server. Serving the whole site from it would
-                        // widen what is served, which is the failure mode a
-                        // matcher exists to prevent, so the configuration is
-                        // refused until the per-request form exists.
-                        return Err(AdapterError::UnsupportedFeature(
-                            "root <matcher>".into(),
-                            "a matcher-scoped root applies to the requests it matches; this \
-                             build has one document root per site, so accepting it would \
-                             serve the whole site from that path"
-                                .into(),
-                        ));
-                    }
-                    let path = args.first().ok_or_else(|| {
-                        AdapterError::ArgumentCount("root".into(), 1, sub_d.args.len())
-                    })?;
-                    if args.len() != 1 {
-                        return Err(AdapterError::ArgumentCount("root".into(), 1, args.len()));
-                    }
-                    server.root = Some(path.clone());
+                    server.root = Some(parse_root_directive(&sub_d, &server.matchers)?);
                 }
                 "vars" => {
                     // 🧰 `vars [<matcher>] <name> <value>` and
@@ -305,70 +260,8 @@ pub(super) fn adapt_server(
                     server.vars_routes.push(VarsRule { matcher, values });
                 }
                 "handle_errors" => {
-                    // 🚨 `handle_errors [<codes…>] { … }` registers a
-                    // server-level error route. Codes are three-digit
-                    // statuses or `Nxx` ranges, ORed together; no codes means
-                    // the route catches every error status. The block is a
-                    // route body — directives run in file order, and `handle`
-                    // blocks are mutually exclusive — exactly the shape the
-                    // upstream format parses.
-                    let mut codes = Vec::new();
-                    let mut hundreds = Vec::new();
-                    for arg in &sub_d.args {
-                        if arg.len() == 3
-                            && let Ok(code) = arg.parse::<u16>()
-                            && (100..=599).contains(&code)
-                        {
-                            codes.push(code);
-                        } else if arg.len() == 3
-                            && let Some(digit) = arg.strip_suffix("xx")
-                            && let Ok(hundred) = digit.parse::<u8>()
-                        {
-                            if !hundreds.contains(&hundred) {
-                                hundreds.push(hundred);
-                            }
-                        } else {
-                            return Err(AdapterError::InvalidArgument(
-                                "handle_errors".into(),
-                                format!("bad status value `{arg}`"),
-                            ));
-                        }
-                    }
-                    let block = sub_d.block.as_ref().ok_or_else(|| {
-                        AdapterError::InvalidArgument(
-                            "handle_errors".into(),
-                            "a block is required".into(),
-                        )
-                    })?;
-                    let mut handlers = Vec::new();
-                    for directive in &block.directives {
-                        let (matcher, _) = parse_matcher_and_block(directive)?;
-                        let mut handler_d = directive.clone();
-                        if matcher.is_some() {
-                            if handler_d.args.is_empty() {
-                                return Err(AdapterError::ArgumentCount(
-                                    directive.name.clone(),
-                                    1,
-                                    0,
-                                ));
-                            }
-                            handler_d.drop_first_arg();
-                        }
-                        let handler = adapt_handler(handler_d, &server.matchers, order)?;
-                        handlers.push(HandlerElement { matcher, handler });
-                    }
-                    if handlers.is_empty() {
-                        return Err(AdapterError::InvalidArgument(
-                            "handle_errors".into(),
-                            "at least one directive is required".into(),
-                        ));
-                    }
-                    let handlers = super::handle_groups::group_siblings(handlers);
-                    server.error_routes.push(ErrorRouteConfig {
-                        codes,
-                        hundreds,
-                        handlers,
-                    });
+                    let route = adapt_handle_errors(&sub_d, &server.matchers, order)?;
+                    server.error_routes.push(route);
                 }
                 "compress" | "encode" => {
                     // 🎯 The first directive reading its arguments from the

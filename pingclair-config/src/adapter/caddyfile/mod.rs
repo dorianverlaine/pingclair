@@ -26,6 +26,8 @@
 //! | [`addresses`] | What a site address means. |
 //! | [`matchers`] | The matcher token rule, and matcher definitions. |
 //! | [`directives`] | One parsing function per directive. |
+//! | [`error_routes`] | 🚨 `handle_errors` blocks become status-selective error routes. |
+//! | [`root`] | 📂 The `root` directive, shared by the site and its error routes. |
 //! | [`reverse_proxy`] | `reverse_proxy` alone, because its block is as large as most of the others combined. |
 //! | [`logs`] | The `log` block and its destinations. |
 //! | [`tls`] | The `tls` directive. |
@@ -39,6 +41,7 @@ mod addresses;
 mod args;
 mod directives;
 mod encode;
+mod error_routes;
 mod handle_groups;
 mod logs;
 mod matchers;
@@ -47,6 +50,7 @@ mod order;
 pub mod registry;
 mod retry_expr;
 mod reverse_proxy;
+mod root;
 mod route_order;
 mod scoped_middleware;
 mod sites;
@@ -54,6 +58,8 @@ mod tls;
 
 #[cfg(test)]
 mod block_matcher_tests;
+#[cfg(test)]
+mod error_routes_tests;
 #[cfg(test)]
 mod forward_auth_tls_tests;
 #[cfg(test)]

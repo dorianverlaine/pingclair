@@ -642,20 +642,35 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         }
     }
 
-    // 🚨 Error routes compile like routes: their handlers inherit the site
-    // root and named matchers, so a `file_server` inside `handle_errors`
-    // serves the same document root it would have outside.
+    // 🚨 Error routes compile like routes: their handlers inherit the named
+    // matchers and a document root, so a `file_server` inside `handle_errors`
+    // serves the same directory it would have outside — or the block's own
+    // `root`, which wins over the site's the way upstream's `{http.vars.root}`
+    // does when an error route sets it.
     config.error_routes = server
         .error_routes
         .iter()
         .map(|route| {
-            let handlers = route
+            let root = route.root.as_deref().or(server.root.as_deref());
+            let mut handlers = route
                 .handlers
                 .iter()
-                .map(|element| {
-                    compile_handler_element(element, &server.matchers, server.root.as_deref())
-                })
+                .map(|element| compile_handler_element(element, &server.matchers, root))
                 .collect::<CompileResult<Vec<_>>>()?;
+            // 🤡 The site root used to reach only `templates` here: a bare
+            // `file_server` kept its `"."` and served the error page from the
+            // process's working directory, whatever `root` the site named.
+            for element in &mut handlers {
+                if let Some(root) = root {
+                    if let Some(matcher) = &mut element.matcher {
+                        apply_site_root_to_matcher(matcher, root);
+                    }
+                    apply_site_root(&mut element.handler, root);
+                }
+                if config.encodings.is_empty() {
+                    apply_site_compression(&mut element.handler);
+                }
+            }
             Ok(pingclair_core::config::ErrorRouteConfig {
                 codes: route.codes.clone(),
                 hundreds: route.hundreds.clone(),

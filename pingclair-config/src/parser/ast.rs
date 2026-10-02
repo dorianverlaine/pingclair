@@ -299,6 +299,9 @@ pub struct ErrorRouteConfig {
     pub codes: Vec<u16>,
     /// `Nxx` ranges (`4xx` selects 400..=499) when the block wrote them.
     pub hundreds: Vec<u8>,
+    /// 📂 The block's own `root`, which its file servers serve from in place
+    /// of the site root; `None` inherits the site's.
+    pub root: Option<String>,
     /// 🧭 Matcher-guarded handlers in file order.
     pub handlers: Vec<HandlerElement>,
 }

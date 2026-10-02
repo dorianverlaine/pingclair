@@ -509,6 +509,18 @@ schema, and an explicit adapter overrides the filename extension.
 keys through the same loader as startup, without starting listeners (#218).
 Upgrade note: replace malformed PEM files or mismatched keys before validation.
 
+### 🚨 `handle_errors` takes its own `root`
+
+`root * /srv/errors` inside a `handle_errors` block was refused at load as a
+directive that "is not supported inside a route or handle block"; it is now
+the error route's document root, as in Caddy (#209). A bare `file_server` in
+an error route without one serves from the site's `root`. As upstream, the
+`root` line may sit anywhere in the block, and a matcher-scoped
+`root @name …` is refused there for the same reason it is at site level.
+
+**Upgrade:** Nothing to change. A configuration that kept its error pages
+under the site root to work around the refusal keeps working.
+
 ### 🚫 Non-goals for 0.2.0
 
 What this release deliberately does not do, so the rest can converge:
