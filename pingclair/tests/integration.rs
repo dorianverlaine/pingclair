@@ -20,6 +20,8 @@ mod admin_reload;
 mod admin_compat;
 #[path = "integration/encode.rs"]
 mod encode;
+#[path = "integration/encode_review.rs"]
+mod encode_review;
 
 #[path = "integration/cli_tls_validate.rs"]
 mod cli_tls_validate;

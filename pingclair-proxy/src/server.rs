@@ -4266,19 +4266,26 @@ impl PingclairProxy {
         }
     }
 
-    /// Apply response directives accumulated by handlers such as `header`
-    /// and `cors` to locally generated responses. Upstream responses receive
-    /// the same treatment in `response_filter`.
+    /// 🧊 Applies local header policy while preserving the body's encoding cache key.
     fn apply_local_response_headers(
         response: &mut ResponseHeader,
         ctx: &RequestContext,
     ) -> PingoraResult<()> {
+        let varies_by_encoding =
+            crate::response_encoding::vary_covers_accept_encoding(&response.headers);
         ctx.response_headers
             .apply_pingora(response, &ctx.request_id_value, None)?;
         if let Some(state) = &ctx.state {
             Self::apply_security_response_headers(response, state)?;
         }
         Self::apply_strict_transport(response, ctx)?;
+        if varies_by_encoding
+            || ctx.state.as_ref().is_some_and(|state| {
+                crate::response_encoding::should_vary(&state.config, response.status.as_u16())
+            })
+        {
+            crate::response_encoding::vary_on_accept_encoding(response)?;
+        }
         // 🚫 Every local write site sets `Content-Length` from the body it
         // built, and a 204 or 1xx must not carry one at all (RFC 9110 §8.6).
         // Stripped here, after the header policy, because this is the one

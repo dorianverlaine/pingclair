@@ -50,6 +50,8 @@ below, which ends with what to write instead.
   → [Automatic HTTPS follows the configured listener policy](#-automatic-https-follows-the-configured-listener-policy)
 - **Scheme-only site addresses inherit global ports.** Explicit ports stay as written.
   → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
+- **Local encoding cache keys survive header policy.** Review downstream cache keys.
+  → [Local header policy preserves encoding Vary](#local-header-policy-preserves-encoding-vary)
 - **Disabled encoding rejects blocks.** Remove contradictory encode blocks.
   → [Encode off rejects blocks](#encode-off-rejects-blocks)
 - **`encode` blocks now take effect and reject unknown settings.** Review size floors and response matchers.
@@ -249,6 +251,12 @@ and `https_port`, respectively, as in Caddy. Previously they always bound
 
 **Upgrade:** Remove workarounds that repeat global ports in site addresses,
 or name an explicit port to keep a site on its previous listener.
+### Local header policy preserves encoding Vary
+
+🧊 Static responses and generated upstream failures retain `Accept-Encoding`
+after header policy. Upgrade: caches keep identity and compressed variants
+separate even when a `header Vary` directive replaces or removes the field.
+
 ### Encode off rejects blocks
 
 🚫 Explicit `encode off` or `encode none` cannot carry a block that overrides

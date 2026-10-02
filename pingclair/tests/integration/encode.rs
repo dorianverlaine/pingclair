@@ -74,7 +74,7 @@ async fn origin() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (address, task)
 }
 
-fn proxy_site(address: SocketAddr, encode: &str) -> TestServer {
+pub(super) fn proxy_site(address: SocketAddr, encode: &str) -> TestServer {
     TestServer::new_pingclairfile(&format!(
         r#"
 {{

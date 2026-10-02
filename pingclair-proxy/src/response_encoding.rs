@@ -121,7 +121,7 @@ pub(crate) fn vary_map_on_accept_encoding(headers: &mut http::HeaderMap) {
 }
 
 /// 🔎 Whether `Vary` already names `Accept-Encoding`, or is `*`.
-fn vary_covers_accept_encoding(headers: &http::HeaderMap) -> bool {
+pub(crate) fn vary_covers_accept_encoding(headers: &http::HeaderMap) -> bool {
     field_tokens(headers, "vary")
         .any(|token| token == "*" || token.eq_ignore_ascii_case("accept-encoding"))
 }
