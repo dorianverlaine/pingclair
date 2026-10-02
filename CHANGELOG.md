@@ -93,6 +93,11 @@ below, which ends with what to write instead.
   `/admin/x`, as in Caddy; a site that used case to tell two routes apart
   needs a `path_regexp`.
   → [Every route path ignores letter case](#-every-route-path-ignores-letter-case)
+- **A malformed `hide` pattern is refused at load**, where it used to be
+  dropped with a warning while the server started. `hide [secret` has to
+  become a pattern whose `[` set closes.
+  → [Security](#-security)
+
 - **`handle_path`, `uri strip_prefix` and `uri strip_suffix` ignore letter
   case** too, so `handle_path /API/*` strips `/api` from `/api/x`.
   → [A strip ignores letter case like the route that chose it](#-a-strip-ignores-letter-case-like-the-route-that-chose-it)
@@ -3181,6 +3186,15 @@ immediately after the `101`, both ends seeing EOF with no error.
   the name's bytes, by the same matcher the `file` matcher's globs use: `*`
   and `?` take a byte that is not text, and a literal never matches one. No
   configuration change is needed.
+
+- 🙈 **A `hide` pattern that could not be compiled hid nothing.** A pattern
+  with a `[` set that never closes, such as `hide [secret`, was dropped with
+  a warning and the server started anyway, serving the files the rule was
+  written to keep private. It is now refused when the configuration loads,
+  from a Pingclairfile and from JSON alike.
+
+  ⚠️ **Behaviour change:** a configuration with such a pattern no longer
+  starts. Close the set, or write `[[]` for a literal `[`.
 
 - 🔒 **`rustls` moves to 0.23.45 for RUSTSEC-2026-0285.** Rustls accepted TLS
   1.3 handshake messages sent at the wrong encryption level when they followed a

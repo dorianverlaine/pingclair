@@ -138,10 +138,10 @@ pub struct HidePolicy {
 impl HidePolicy {
     /// 🙈 Compiles the configured patterns.
     ///
-    /// A pattern that will not compile is dropped with a warning rather than
-    /// failing the load: the alternative is a server that refuses to start
-    /// over a hide rule, and the rule that matters — the file stays visible —
-    /// is the one an operator can see in the log.
+    /// 🛡️ `validate_config` refuses a pattern that will not compile, so a
+    /// configuration that loaded never reaches the warning below. It stays as
+    /// a last line for a policy built some other way, and it keeps the server
+    /// up rather than panicking there.
     pub fn new(patterns: &[String], root: &Path) -> Self {
         let mut policy = Self::default();
         for pattern in patterns {

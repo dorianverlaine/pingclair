@@ -2092,9 +2092,12 @@ fn validate_matchers_under(handler: &HandlerConfig) -> CompileResult<()> {
         // 📁 The index is joined onto a directory after the request path has
         // already been confined, so it is the one path component nothing else
         // was treating as untrusted.
-        HandlerConfig::FileServer { index, .. } => {
+        HandlerConfig::FileServer { index, hide, .. } => {
             for entry in index {
                 validate_file_server_index(entry)?;
+            }
+            for pattern in hide {
+                validate_hide_pattern(pattern)?;
             }
         }
         _ => {}
@@ -2289,6 +2292,29 @@ fn validate_vars_matcher_key(key: &str) -> CompileResult<()> {
 /// Admin API deserialises straight into the canonical types and never sees the
 /// adapter. A rule that lives only in the DSL is a rule with a JSON-shaped hole
 /// in it — this codebase has paid for that one twice.
+/// 🙈 Refuses a `hide` glob that cannot be compiled.
+///
+/// The file server used to drop such a pattern with a warning and start
+/// anyway, so `hide [secret` hid nothing and served the files the operator
+/// meant to keep private. A hide rule is security policy, and a broken one
+/// fails closed: the server does not start until it is fixed.
+///
+/// 📌 Only a pattern without a separator is a glob; one with a separator is a
+/// literal path prefix, in which `[` is an ordinary character. The split is
+/// the one `HidePolicy::new` makes in pingclair-static.
+fn validate_hide_pattern(pattern: &str) -> CompileResult<()> {
+    let is_prefix = pattern.contains('/') || pattern.contains(std::path::MAIN_SEPARATOR);
+    if is_prefix || pingclair_core::server::ComponentGlob::new(pattern).is_some() {
+        return Ok(());
+    }
+    Err(CompileError::InvalidRoute {
+        message: format!(
+            "file_server hide pattern `{pattern}` has a `[` set that never closes, so it \
+             would hide nothing; close the set, or write `[[]` for a literal `[`"
+        ),
+    })
+}
+
 fn validate_file_server_index(index: &str) -> CompileResult<()> {
     let reject = |reason: &str| {
         Err(CompileError::InvalidRoute {
@@ -4070,6 +4096,43 @@ mod fail_closed_handler_tests {
             ])))
             .is_err(),
             "a bad entry hidden behind a good one was accepted"
+        );
+    }
+
+    /// 🙈 A `hide` pattern with a `[` set that never closes is refused, from
+    /// the DSL and from JSON alike. It used to be dropped with a warning, so
+    /// `hide [secret` served the very files it named.
+    #[test]
+    fn a_malformed_hide_pattern_is_refused() {
+        let file_server = |hide: &str| HandlerConfig::FileServer {
+            root: "/srv/www".to_string(),
+            index: Vec::new(),
+            browse: false,
+            browse_limit: None,
+            compress: false,
+            precompressed: Vec::new(),
+            hide: vec![hide.to_string()],
+            status: None,
+            pass_thru: false,
+            canonical_uris: true,
+            etag_file_extensions: Vec::new(),
+        };
+        let json = |hide: &str| validate_config(&config_with(file_server(hide))).is_ok();
+        let dsl = |hide: &str| {
+            crate::compile(&format!(":8080 {{\n file_server {{\n hide {hide}\n }}\n}}")).is_ok()
+        };
+        // 📁 A pattern with a separator is a literal path prefix, not a glob,
+        // so a `[` in it is just a character.
+        let verdicts =
+            ["[secret", "*.env", "[!a].env", "/srv/[x"].map(|hide| (hide, json(hide), dsl(hide)));
+        assert_eq!(
+            verdicts,
+            [
+                ("[secret", false, false),
+                ("*.env", true, true),
+                ("[!a].env", true, true),
+                ("/srv/[x", true, true),
+            ]
         );
     }
 
