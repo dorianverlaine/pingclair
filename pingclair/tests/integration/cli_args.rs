@@ -168,3 +168,50 @@ async fn cli_run_accepts_config_flags_and_explicit_adapter() {
         assert!(reloaded, "watch/signal reload lost the explicit adapter");
     }
 }
+
+#[test]
+fn cli_stdin_sentinel_precedes_directory_detection() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("-")).unwrap();
+    std::fs::write(dir.path().join("-/Pingclairfile"), "invalid directive").unwrap();
+    for (adapter, source) in [
+        (
+            Some("json"),
+            serde_json::to_string(
+                &pingclair_config::compile("http://localhost:8080 {\n respond hi\n}\n").unwrap(),
+            )
+            .unwrap(),
+        ),
+        (
+            None,
+            "http://localhost:8080 {\n respond hi\n}\n".to_string(),
+        ),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pingclair"));
+        command
+            .args(["validate", "-c", "-"])
+            .current_dir(dir.path());
+        if let Some(adapter) = adapter {
+            command.args(["--adapter", adapter]);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(source.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("<stdin>"));
+    }
+}

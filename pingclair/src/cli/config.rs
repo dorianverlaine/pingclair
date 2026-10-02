@@ -14,7 +14,7 @@ pub(crate) enum ConfigAdapter {
 /// 🧾 Explicit adapters override extensions; absent adapters preserve file inference.
 pub(crate) fn load(path: &str, adapter: Option<ConfigAdapter>) -> anyhow::Result<PingclairConfig> {
     let file = std::path::Path::new(path);
-    if file.is_dir() {
+    if path != "-" && file.is_dir() {
         if adapter.is_some() {
             anyhow::bail!("🚫 --adapter requires a single configuration file, not a directory");
         }

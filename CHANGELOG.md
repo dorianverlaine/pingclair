@@ -51,6 +51,8 @@ below, which ends with what to write instead.
 - **Scheme-only site addresses inherit global ports.** Explicit ports stay as written.
   → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
 
+- **`-c -` always reads stdin**, even when the working directory contains a directory named `-`.
+  → [Stdin takes precedence over filesystem entries](#stdin-takes-precedence-over-filesystem-entries)
 - **Running without a configuration now starts the admin API.** Supply an explicit path when a missing file must fail startup.
   → [Run starts empty when no default configuration exists](#run-starts-empty-when-no-default-configuration-exists)
 - **CLI scripts can use Caddy-style configuration flags.** Explicit adapters override filename extensions.
@@ -215,6 +217,12 @@ and `https_port`, respectively, as in Caddy. Previously they always bound
 
 **Upgrade:** Remove workarounds that repeat global ports in site addresses,
 or name an explicit port to keep a site on its previous listener.
+
+### Stdin takes precedence over filesystem entries
+
+`run` and `validate` resolve `-c -` as stdin before inspecting the filesystem
+(#222), with or without an explicit adapter.
+Upgrade note: use `./-` when you mean a directory literally named `-`.
 
 ### Run starts empty when no default configuration exists
 
