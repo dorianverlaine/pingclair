@@ -22,6 +22,8 @@ mod admin_compat;
 mod encode;
 #[path = "integration/encode_review.rs"]
 mod encode_review;
+#[path = "integration/encode_trailers.rs"]
+mod encode_trailers;
 
 #[path = "integration/cli_tls_validate.rs"]
 mod cli_tls_validate;

@@ -56,6 +56,8 @@ below, which ends with what to write instead.
   → [Static gzip validators include quality](#static-gzip-validators-include-quality)
 - **Static encode matchers see header policy.** Review header-based matchers.
   → [Static encode matchers see response policy headers](#static-encode-matchers-see-response-policy-headers)
+- **H3 compression removes identity digest trailers.** Update digest consumers.
+  → [H3 encoding removes obsolete integrity trailers](#h3-encoding-removes-obsolete-integrity-trailers)
 - **Local encoding cache keys survive header policy.** Review downstream cache keys.
   → [Local header policy preserves encoding Vary](#local-header-policy-preserves-encoding-vary)
 - **Disabled encoding rejects blocks.** Remove contradictory encode blocks.
@@ -262,6 +264,12 @@ or name an explicit port to keep a site on its previous listener.
 🧊 Static responses and generated upstream failures retain `Accept-Encoding`
 after header policy. Upgrade: caches keep identity and compressed variants
 separate even when a `header Vary` directive replaces or removes the field.
+
+### H3 encoding removes obsolete integrity trailers
+
+🧾 Re-encoded H3 responses drop identity digests from undeclared upstream
+trailers while preserving other trailers. Upgrade: clients must validate a
+digest for the encoded bytes, rather than relying on the upstream identity digest.
 
 ### Static encode matchers see response policy headers
 

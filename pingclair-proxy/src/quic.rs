@@ -6209,6 +6209,7 @@ async fn reverse_proxy_upstream(
     } else {
         None
     };
+    let reencoded = encoder.is_some();
     if let Some(encoder) = &encoder {
         crate::response_encoding::reencode_h3_headers(&mut hdrs, encoder.token());
     }
@@ -6389,7 +6390,12 @@ async fn reverse_proxy_upstream(
                             | "te"
                             | "trailer"
                             | "upgrade"
-                    ) {
+                    ) || (reencoded
+                        && matches!(
+                            lower,
+                            "content-digest" | "repr-digest" | "digest" | "content-md5"
+                        ))
+                    {
                         continue;
                     }
                     trailers.push(quiche::h3::Header::new(lower.as_bytes(), value.as_bytes()));
