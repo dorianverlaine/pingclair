@@ -42,12 +42,18 @@ async fn encode_block_controls_static_responses() {
 
 /// 🔌 A deterministic origin keeps compression assertions independent of routing.
 pub(super) async fn origin() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    origin_with_body("compressible text ".repeat(512)).await
+}
+
+/// 🔌 Quality tests supply a body whose deflate stream distinguishes intermediate levels.
+async fn origin_with_body(body: String) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
+            let body = body.clone();
             tokio::spawn(async move {
                 let mut request = [0; 8192];
                 let size = stream.read(&mut request).await.unwrap();
@@ -61,7 +67,6 @@ pub(super) async fn origin() -> (SocketAddr, tokio::task::JoinHandle<()>) {
                 } else {
                     (200, "text/plain", "\"origin\"")
                 };
-                let body = "compressible text ".repeat(512);
                 let header = format!(
                     "HTTP/1.1 {status} OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nETag: {etag}\r\nVary: Origin\r\nConnection: close\r\n\r\n",
                     body.len()
@@ -275,13 +280,50 @@ async fn static_and_proxy_share_the_content_type_policy() {
 #[tokio::test]
 async fn gzip_levels_reach_both_wire_encoders() {
     let tree = compressible_tree();
-    let (address, task) = origin().await;
+    let mut seed = 0x1234_5678_u32;
+    let mut words = Vec::new();
+    for _ in 0..128 {
+        let mut word = String::from("shared-prefix-");
+        for _ in 0..16 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            word.push((b'a' + (seed % 26) as u8) as char);
+        }
+        words.push(word);
+    }
+    let mut payload = String::new();
+    for _ in 0..200 {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        payload.push_str(&words[(seed as usize) % words.len()]);
+        payload.push(' ');
+    }
+    std::fs::write(tree.path().join("big.txt"), &payload).unwrap();
+    let reference = |level, flush| {
+        use std::io::Write as _;
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level));
+        encoder.write_all(payload.as_bytes()).unwrap();
+        if flush {
+            encoder.flush().unwrap();
+        }
+        encoder.finish().unwrap()
+    };
+    for flush in [false, true] {
+        assert!(
+            reference(5, flush) != reference(6, flush),
+            "fixture must distinguish 5 from 6"
+        );
+    }
+    let (address, task) = origin_with_body(payload.clone()).await;
     let client = no_proxy_client();
-    for (encode, extra_flags) in [
-        ("encode {\ngzip 1\n}", 4),
-        ("encode {\ngzip 9\n}", 2),
-        ("encode {\ngzip 5\n}", 0),
-        ("encode gzip", 0),
+    for (encode, level, extra_flags) in [
+        ("encode {\ngzip 1\n}", 1, 4),
+        ("encode {\ngzip 9\n}", 9, 2),
+        ("encode {\ngzip 5\n}", 5, 0),
+        ("encode gzip", 5, 0),
     ] {
         let mut static_server = file_server_site(tree.path().to_str().unwrap(), encode);
         let mut proxy_server = proxy_site(address, encode);
@@ -304,7 +346,41 @@ async fn gzip_levels_reach_both_wire_encoders() {
             flate2::read::GzDecoder::new(wire.as_ref())
                 .read_to_string(&mut decoded)
                 .unwrap();
-            assert_eq!(decoded, "compressible text ".repeat(512));
+            assert_eq!(decoded, payload);
+            // 🌊 TCP may split a body anywhere; compare quality at the observed sync-flush boundaries.
+            let mut boundaries = Vec::new();
+            for (offset, marker) in wire.windows(4).enumerate() {
+                if marker == [0, 0, 255, 255] {
+                    let mut prefix = Vec::new();
+                    let _ =
+                        flate2::read::GzDecoder::new(&wire[..offset + 4]).read_to_end(&mut prefix);
+                    if prefix.len() > boundaries.last().copied().unwrap_or(0) {
+                        boundaries.push(prefix.len());
+                    }
+                }
+            }
+            let reference_chunks = |level| {
+                use std::io::Write as _;
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level));
+                let mut start = 0;
+                for &end in &boundaries {
+                    encoder.write_all(&payload.as_bytes()[start..end]).unwrap();
+                    encoder.flush().unwrap();
+                    start = end;
+                }
+                encoder.write_all(&payload.as_bytes()[start..]).unwrap();
+                encoder.finish().unwrap()
+            };
+            assert!(
+                reference_chunks(5) != reference_chunks(6),
+                "chunked fixture must distinguish 5 from 6"
+            );
+            let expected = reference_chunks(level);
+            assert!(
+                wire[10..wire.len() - 8] == expected[10..expected.len() - 8],
+                "deflate bytes must use level {level}: {path}"
+            );
         }
         static_server.stop();
         proxy_server.stop();
