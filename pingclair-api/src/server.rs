@@ -1089,6 +1089,19 @@ fn commit_document(
     expected_admin_revision: u64,
     if_match: Option<&str>,
 ) -> Result<(), (StatusCode, String)> {
+    // 🙈 A masked read replaced each secret with a placeholder. Loading that
+    // placeholder would install it — as a header credential, or as the admin
+    // key itself — so it is refused with the reason, before anything else.
+    if crate::redaction::carries_placeholder(next) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Invalid config: a secret is the placeholder `{}` from a masked /config read; \
+                 put the real value back before loading this document",
+                pingclair_core::config::SecretString::REDACTED
+            ),
+        ));
+    }
     let config: PingclairConfig = serde_json::from_value(next.clone())
         .map_err(|error| (StatusCode::BAD_REQUEST, format!("Invalid config: {error}")))?;
     if let Err(error) = pingclair_config::compiler::validate_config(&config) {

@@ -256,7 +256,12 @@ any packet of it that had to be sent again.
 `api_key` and every DNS provider argument (a Cloudflare token, for instance)
 in plain text, so anything allowed to read the configuration also received
 the key that guards the API. Those reads now show `[redacted]` in their
-place. The stored configuration is unchanged, and traversal writes
+place. The same goes for credentials written as ordinary values: a header
+named `Authorization`, `Proxy-Authorization`, `Cookie` or `Set-Cookie`, or
+one whose name contains `api-key`, `token`, `secret` or `password` (in
+`header_up`, `header`, `health_headers` and the like), a FastCGI `env`
+entry named that way, and a basic-auth hash. The stored configuration is
+unchanged, and traversal writes
 (`POST`/`PUT`/`PATCH`/`DELETE /config/<path>`) still edit the real values.
 
 A document that carries `[redacted]` as a secret is refused by `/load` and
@@ -265,8 +270,8 @@ admin key. Caddy returns its configuration unmasked; this follows the
 project rule that admin dumps never carry secrets.
 
 📌 Upgrading: edit in place with a traversal write (`PATCH /config/...`), or
-restore the real `api_key` and DNS arguments in an exported document before
-posting it to `/load`.
+restore the real secrets in an exported document before posting it to
+`/load`.
 
 ### ☁️ `CF-Connecting-IP` counts only when `client_ip_headers` lists it
 

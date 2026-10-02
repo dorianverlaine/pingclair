@@ -100,3 +100,68 @@ async fn test_admin_config_reads_mask_secrets() {
         .status();
     assert_eq!(still_guarded, reqwest::StatusCode::OK);
 }
+
+/// 🙈 Credentials written into header and environment directives are masked
+/// too, and a masked one cannot be posted back.
+///
+/// They are plain strings in the configuration, not `SecretString`s, so the
+/// first round of masking passed them through: `header_up Authorization …`
+/// and `X-API-Key` reached every reader of `/config`.
+#[tokio::test]
+async fn test_admin_config_reads_mask_configured_credentials() {
+    let mut server = TestServer::new_pingclairfile(
+        r#"
+        {
+            admin __PINGCLAIR_TEST_ADMIN_LISTEN__
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            reverse_proxy http://127.0.0.1:9 {
+                header_up Authorization "Bearer upstream-credential"
+                header_up X-API-Key upstream-api-key
+                header_up X-Plain visible-value
+            }
+        }
+        "#,
+    );
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let whole = client
+        .get(server.admin_url("/config"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            whole.contains("upstream-credential"),
+            whole.contains("upstream-api-key"),
+            whole.contains("visible-value"),
+        ),
+        (false, false, true),
+        "credentials masked, ordinary values kept: {whole}"
+    );
+
+    let document: serde_json::Value = serde_json::from_str(&whole).unwrap();
+    let reload = client
+        .post(server.admin_url("/load"))
+        .json(&document)
+        .send()
+        .await
+        .unwrap();
+    let refused = (
+        reload.status().is_client_error(),
+        reload.text().await.unwrap(),
+    );
+    assert!(
+        refused.0 && refused.1.contains("redacted"),
+        "a masked credential must be refused: {}",
+        refused.1
+    );
+}
