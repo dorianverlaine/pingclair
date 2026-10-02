@@ -4297,7 +4297,7 @@ impl PingclairProxy {
     }
 
     /// 🛡️ Applies the vhost security policy consistently to local and upstream responses.
-    fn apply_security_response_headers(
+    pub(crate) fn apply_security_response_headers(
         response: &mut ResponseHeader,
         state: &ProxyState,
     ) -> PingoraResult<()> {
@@ -4985,10 +4985,23 @@ impl PingclairProxy {
                     // pingclair-static reads `Range`, `If-Range`, and the
                     // four preconditions from them itself, the same way for
                     // both transports.
+                    let encode_policy = |status, headers: &mut http::HeaderMap| {
+                        ctx.state.as_ref().is_some_and(|state| {
+                            crate::static_encode::apply_policy(
+                                &ctx.response_headers,
+                                state,
+                                &ctx.request_id_value,
+                                ctx.request_scheme == "https",
+                                status,
+                                headers,
+                            )
+                        })
+                    };
                     let request = pingclair_static::FileRequest::new(
                         &session.req_header().method,
                         &session.req_header().headers,
-                    );
+                    )
+                    .with_response_policy(&encode_policy);
                     let accept_encoding = session
                         .req_header()
                         .headers

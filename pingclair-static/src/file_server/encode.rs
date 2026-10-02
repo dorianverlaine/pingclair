@@ -17,36 +17,77 @@ use super::FileServer;
 use super::cache::FileKey;
 
 impl FileServer {
-    /// 🎯 Preconditions and body selection must choose the same representation.
-    pub(super) fn matches_file_encode(&self, status: u16, meta: &super::cache::FileMeta) -> bool {
-        (self.config.encode.matcher.is_some()
-            || pingclair_core::encoding::is_compressible_content_type(
+    /// 🎯 Preconditions and body selection see the final response header policy.
+    pub(super) fn matches_file_encode(
+        &self,
+        status: u16,
+        meta: &super::cache::FileMeta,
+        request: &super::FileRequest<'_>,
+    ) -> bool {
+        if self.config.encode.matcher.is_none() {
+            return pingclair_core::encoding::is_compressible_content_type(
                 meta.content_type.to_str().unwrap_or(""),
                 &self.config.gzip_types,
-            ))
-            && self.config.encode.matches(status, |name, patterns| {
-                let value = if name.eq_ignore_ascii_case("content-type") {
-                    meta.content_type.to_str().ok()
-                } else if name.eq_ignore_ascii_case("content-length") {
-                    meta.content_length.to_str().ok()
-                } else if name.eq_ignore_ascii_case("accept-ranges") {
-                    Some("bytes")
-                } else if name.eq_ignore_ascii_case("etag") {
-                    meta.etags.for_coding(None).to_str().ok()
-                } else if name.eq_ignore_ascii_case("last-modified") {
-                    meta.last_modified
-                        .as_ref()
-                        .and_then(|value| value.to_str().ok())
-                } else {
-                    None
-                };
-                value.is_some_and(|value| {
+            );
+        }
+        let mut headers = http::HeaderMap::with_capacity(6);
+        headers.insert("content-type", meta.content_type.clone());
+        headers.insert("content-length", meta.content_length.clone());
+        headers.insert("accept-ranges", http::HeaderValue::from_static("bytes"));
+        headers.insert("etag", meta.etags.for_coding(None).clone());
+        if let Some(value) = &meta.last_modified {
+            headers.insert("last-modified", value.clone());
+        }
+        self.matches_encode_headers(status, headers, request)
+    }
+
+    /// 🎯 Listings obey the same header policy as regular static files.
+    pub(super) fn matches_listing_encode(
+        &self,
+        length: u64,
+        request: &super::FileRequest<'_>,
+    ) -> bool {
+        if self.config.encode.matcher.is_none() {
+            return pingclair_core::encoding::is_compressible_content_type(
+                "text/html",
+                &self.config.gzip_types,
+            );
+        }
+        let mut headers = http::HeaderMap::with_capacity(3);
+        headers.insert(
+            "content-type",
+            http::HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        headers.insert("content-length", http::HeaderValue::from(length));
+        self.matches_encode_headers(200, headers, request)
+    }
+
+    /// 🧊 The matcher reads identity headers before encoding changes byte metadata.
+    fn matches_encode_headers(
+        &self,
+        status: u16,
+        mut headers: http::HeaderMap,
+        request: &super::FileRequest<'_>,
+    ) -> bool {
+        headers.insert("vary", http::HeaderValue::from_static("Accept-Encoding"));
+        if request
+            .response_policy
+            .is_some_and(|policy| !policy(status, &mut headers))
+        {
+            return false;
+        }
+        self.config.encode.matches(status, |name, patterns| {
+            headers
+                .get_all(name)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|value| {
                     patterns.is_empty()
                         || patterns.iter().any(|pattern| {
                             pingclair_core::encoding::header_pattern_matches(value, pattern)
                         })
                 })
-            })
+        })
     }
 
     // MARK: - Reading and compressing

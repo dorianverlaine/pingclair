@@ -4197,7 +4197,20 @@ async fn handle_request_inner(
             // 🏷️ The method and header fields go over whole, exactly as on
             // H1/H2; pingclair-static reads `Range`, `If-Range`, and the four
             // preconditions from them itself.
-            let request = pingclair_static::FileRequest::new(&header.method, &header.headers);
+            let encode_policy = |status, headers: &mut http::HeaderMap| {
+                http::HeaderValue::from_str(request_id).is_ok_and(|request_id| {
+                    crate::static_encode::apply_policy(
+                        response_policy,
+                        &state,
+                        &request_id,
+                        true,
+                        status,
+                        headers,
+                    )
+                })
+            };
+            let request = pingclair_static::FileRequest::new(&header.method, &header.headers)
+                .with_response_policy(&encode_policy);
             let accept_encoding = header
                 .headers
                 .get("accept-encoding")

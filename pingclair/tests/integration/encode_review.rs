@@ -128,3 +128,48 @@ async fn request_no_transform_disables_proxy_encoding() {
     server.stop();
     task.abort();
 }
+
+#[tokio::test]
+async fn static_matchers_read_policy_headers() {
+    let tree = compressible_tree();
+    let client = no_proxy_client();
+    for (matcher, policy, expected) in [
+        ("header X-Encode yes", "header X-Encode yes", true),
+        ("header !X-Encode", "header X-Encode yes", false),
+        (
+            "header Content-Type application/json*",
+            "header Content-Type application/json",
+            true,
+        ),
+        ("header !Content-Type", "header -Content-Type", true),
+    ] {
+        let settings = format!("{policy}\nencode {{\ngzip\nmatch {{\n{matcher}\n}}\n}}");
+        let mut server = file_server_site(tree.path().to_str().unwrap(), &settings);
+        assert!(server.wait_until_ready().await);
+        let response = client
+            .get(server.url(0, "/big.txt"))
+            .header("Accept-Encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().contains_key("content-encoding"),
+            expected,
+            "{matcher}"
+        );
+        let tag = response.headers()["etag"].clone();
+        let revalidated = client
+            .get(server.url(0, "/big.txt"))
+            .header("Accept-Encoding", "gzip")
+            .header("If-None-Match", tag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            revalidated.status(),
+            304,
+            "selection and preconditions must agree"
+        );
+        server.stop();
+    }
+}

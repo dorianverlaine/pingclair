@@ -372,11 +372,13 @@ https://encode.test:__PINGCLAIR_TEST_HTTPS_PORT__ {{
     tls internal
     root * {root}
     header ETag "\"origin\""
+    header X-Encode yes
     encode {{
         zstd
         gzip 9
         match {{
-                }}
+            header X-Encode yes
+        }}
     }}
     @unavailable path /unavailable
     reverse_proxy @unavailable {unavailable_address}

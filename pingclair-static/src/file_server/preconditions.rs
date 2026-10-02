@@ -30,6 +30,9 @@ use super::{FileServer, NotModified, ServedResponse};
 
 // MARK: - Request
 
+/// 🎯 Borrows the transport's response-dependent header policy during selection.
+type ResponsePolicy<'a> = dyn Fn(u16, &mut HeaderMap) -> bool + Sync + 'a;
+
 /// 📨 What the file server reads from a request: its method, and its header
 /// fields (`Range`, `If-Range`, and the four preconditions).
 ///
@@ -38,18 +41,30 @@ use super::{FileServer, NotModified, ServedResponse};
 /// three stored variants sends three tags), and only the full map keeps all
 /// of them. Both transports hand over the map they already hold, so building
 /// this costs nothing.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct FileRequest<'a> {
     /// 🧭 The request method: `GET` and `HEAD` get `304`, others `412`.
     pub method: &'a Method,
     /// 📋 The request header fields.
     pub headers: &'a HeaderMap,
+    /// 🎯 Encoding sees the same policy headers that the transport will emit.
+    pub(super) response_policy: Option<&'a ResponsePolicy<'a>>,
 }
 
 impl<'a> FileRequest<'a> {
     /// 📨 A request for `method` carrying `headers`.
     pub fn new(method: &'a Method, headers: &'a HeaderMap) -> Self {
-        Self { method, headers }
+        Self {
+            method,
+            headers,
+            response_policy: None,
+        }
+    }
+
+    /// 🎯 Borrows the transport's final header policy for encoding decisions.
+    pub fn with_response_policy(mut self, policy: &'a ResponsePolicy<'a>) -> Self {
+        self.response_policy = Some(policy);
+        self
     }
 
     /// 🧪 A plain `GET` with no header fields, for tests that are not about
@@ -179,7 +194,7 @@ impl FileServer {
             return Some(encoding);
         }
         if self.would_compress(file_size, accept_encoding)
-            && self.matches_file_encode(self.config.status.unwrap_or(200), meta)
+            && self.matches_file_encode(self.config.status.unwrap_or(200), meta, request)
         {
             return self.negotiate_encoding(accept_encoding);
         }

@@ -44,6 +44,7 @@ pub mod redaction;
 mod response_encoding;
 mod retry;
 pub mod server;
+mod static_encode;
 mod subrequest;
 pub mod tls_identity;
 pub mod tls_name_alert;

@@ -54,6 +54,8 @@ below, which ends with what to write instead.
   → [Proxy encoding respects request no-transform](#proxy-encoding-respects-request-no-transform)
 - **Static gzip ETags include quality.** Expect one cache revalidation.
   → [Static gzip validators include quality](#static-gzip-validators-include-quality)
+- **Static encode matchers see header policy.** Review header-based matchers.
+  → [Static encode matchers see response policy headers](#static-encode-matchers-see-response-policy-headers)
 - **Local encoding cache keys survive header policy.** Review downstream cache keys.
   → [Local header policy preserves encoding Vary](#local-header-policy-preserves-encoding-vary)
 - **Disabled encoding rejects blocks.** Remove contradictory encode blocks.
@@ -260,6 +262,13 @@ or name an explicit port to keep a site on its previous listener.
 🧊 Static responses and generated upstream failures retain `Accept-Encoding`
 after header policy. Upgrade: caches keep identity and compressed variants
 separate even when a `header Vary` directive replaces or removes the field.
+
+### Static encode matchers see response policy headers
+
+🎯 Static encode matchers inspect policy-added, replaced and removed response
+headers before selecting a body or evaluating conditional requests. Directory
+listings use the same policy. Upgrade: review encode matchers that depended on
+policy headers being invisible.
 
 ### Static gzip validators include quality
 

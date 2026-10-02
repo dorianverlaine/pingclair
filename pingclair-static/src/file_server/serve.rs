@@ -248,21 +248,8 @@ impl FileServer {
                     let (content, encoding) = if self
                         .would_compress(listing.len() as u64, accept_encoding)
                         && range.is_none()
-                        && (self.config.encode.matcher.is_some()
-                            || pingclair_core::encoding::is_compressible_content_type(
-                                "text/html",
-                                &self.config.gzip_types,
-                            ))
-                        && self.config.encode.matches(200, |name, patterns| {
-                            name.eq_ignore_ascii_case("content-type")
-                                && (patterns.is_empty()
-                                    || patterns.iter().any(|pattern| {
-                                        pingclair_core::encoding::header_pattern_matches(
-                                            "text/html; charset=utf-8",
-                                            pattern,
-                                        )
-                                    }))
-                        }) {
+                        && self.matches_listing_encode(listing.len() as u64, &request)
+                    {
                         self.compress_content(listing.as_bytes(), accept_encoding)
                             .await?
                     } else {
@@ -396,7 +383,7 @@ impl FileServer {
         // size floor and the size ceiling both.
         let cache_encoding = if content_range.is_none()
             && self.would_compress(file_size, accept_encoding)
-            && self.matches_file_encode(status, &meta)
+            && self.matches_file_encode(status, &meta, &request)
         {
             self.negotiate_encoding(accept_encoding)
         } else {
