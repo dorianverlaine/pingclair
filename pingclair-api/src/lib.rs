@@ -9,6 +9,7 @@ mod auth;
 mod config_diagnostics;
 mod config_etag;
 mod config_tree;
+mod redaction;
 pub mod server;
 
 pub use server::{AdminPolicy, AdminServerOptions, PreparedAdminPolicy, run_admin_server};

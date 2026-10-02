@@ -43,6 +43,12 @@ impl std::fmt::Debug for SecretString {
 }
 
 impl SecretString {
+    /// 🙈 What the admin API's configuration reads show in place of a secret.
+    ///
+    /// 🚫 Configuration validation refuses a secret equal to this, so a masked
+    /// export posted back as-is cannot make a well-known string the admin key.
+    pub const REDACTED: &'static str = "[redacted]";
+
     /// 🔓 The secret itself, for the code that has to send it somewhere.
     ///
     /// Named for grepping: every place a configured secret leaves this process

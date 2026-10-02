@@ -431,17 +431,24 @@ async fn handle_request_inner(
                 .unwrap())
         }
         (&Method::GET, path) if path == "/config" || path == "/config/" => {
-            // 🧭 Exports the active document so the output can be POSTed back
-            // to /load or traversed with /config/<path>.
-            let guard = document;
-            Ok(config_response(path, guard))
+            // 🧭 Exports the active document for reading or traversal.
+            //
+            // 🙈 Secrets are masked: the repository rule is that admin dumps
+            // never carry them, and this one would otherwise hand out the very
+            // key that guards it. A masked export therefore cannot be POSTed
+            // back as-is; `/load` refuses the placeholder by name.
+            let masked = crate::redaction::redacted(document);
+            Ok(config_response(path, &masked))
         }
         (&Method::GET, path) if path.starts_with("/config/") => {
             let segments = normalize_config_segments(config_tree::segments_from_path(
                 &path["/config/".len()..],
             ));
             let guard = document;
-            match config_tree::get(guard, &segments) {
+            // 🙈 Masked before traversal, so `/config/admin/api_key` is masked
+            // too: a bare string has no key left to recognise it by.
+            let masked = crate::redaction::redacted(guard);
+            match config_tree::get(&masked, &segments) {
                 Ok(node) => Ok(config_response(path, node)),
                 Err(TreeError::NotFound) => Ok(config_response(path, &Value::Null)),
                 Err(error) => Ok(response(
@@ -962,8 +969,9 @@ async fn apply_id_request(
     let mut segments = base;
     segments.extend(config_tree::segments_from_path(tail));
     if method == Method::GET {
-        let guard = ctx.document;
-        return match config_tree::get(guard, &segments) {
+        // 🙈 The same masking as `/config`; an `@id` is only another way in.
+        let masked = crate::redaction::redacted(ctx.document);
+        return match config_tree::get(&masked, &segments) {
             Ok(node) => {
                 let json = serde_json::to_string_pretty(node).unwrap_or_default();
                 Ok(Response::new(Full::new(Bytes::from(json))))

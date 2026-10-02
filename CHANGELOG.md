@@ -106,6 +106,9 @@ below, which ends with what to write instead.
   behind Cloudflare that relied on it must add
   `servers { client_ip_headers CF-Connecting-IP }`.
   → [`CF-Connecting-IP` counts only when `client_ip_headers` lists it](#️-cf-connecting-ip-counts-only-when-client_ip_headers-lists-it)
+- **Admin `/config` reads mask secrets.** An export can no longer be posted
+  back to `/load` unchanged; put the real `api_key` and DNS arguments back.
+  → [The admin API's configuration reads mask secrets](#-the-admin-apis-configuration-reads-mask-secrets)
 
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
@@ -245,6 +248,25 @@ while it was still in flight saw nothing running and ended at once, losing
 any packet of it that had to be sent again.
 
 📌 Upgrading: nothing to change. (#211)
+
+### 🙈 The admin API's configuration reads mask secrets
+
+**Breaking for scripts that export `/config` and load it back.** `GET
+/config`, `GET /config/<path>` and `GET /id/<name>` used to return the admin
+`api_key` and every DNS provider argument (a Cloudflare token, for instance)
+in plain text, so anything allowed to read the configuration also received
+the key that guards the API. Those reads now show `[redacted]` in their
+place. The stored configuration is unchanged, and traversal writes
+(`POST`/`PUT`/`PATCH`/`DELETE /config/<path>`) still edit the real values.
+
+A document that carries `[redacted]` as a secret is refused by `/load` and
+`POST /config`, because loading it would make that well-known string the
+admin key. Caddy returns its configuration unmasked; this follows the
+project rule that admin dumps never carry secrets.
+
+📌 Upgrading: edit in place with a traversal write (`PATCH /config/...`), or
+restore the real `api_key` and DNS arguments in an exported document before
+posting it to `/load`.
 
 ### ☁️ `CF-Connecting-IP` counts only when `client_ip_headers` lists it
 

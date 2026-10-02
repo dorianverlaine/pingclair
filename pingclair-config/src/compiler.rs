@@ -1016,6 +1016,43 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
             }
         }
     }
+    // 🙈 The admin API masks secrets in what it exports. Posting that export
+    // back unchanged would install the placeholder itself as the admin key or
+    // the DNS token — a string anyone can read in this source — so it is
+    // refused, and the message says to put the real value back.
+    let providers = [
+        config.global.dns.as_ref(),
+        config.global.acme_dns.as_ref().and_then(Option::as_ref),
+    ]
+    .into_iter()
+    .chain(config.servers.iter().map(|server| {
+        server
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.dns_challenge.as_ref())
+            .and_then(|challenge| challenge.provider.as_ref())
+    }))
+    .flatten();
+    let masked = |secret: &pingclair_core::config::SecretString| {
+        secret.expose() == pingclair_core::config::SecretString::REDACTED
+    };
+    if config
+        .admin
+        .as_ref()
+        .and_then(|admin| admin.api_key.as_ref())
+        .is_some_and(masked)
+        || providers
+            .flat_map(|provider| provider.arguments.iter())
+            .any(masked)
+    {
+        return Err(CompileError::InvalidServer {
+            message: format!(
+                "a secret is the placeholder `{}` from a masked /config export; \
+                 put the real value back before loading this document",
+                pingclair_core::config::SecretString::REDACTED
+            ),
+        });
+    }
     // 🛡️ Checked here as well as in the DSL adapter, so a JSON document cannot
     // hand the runtime a header name it would have to drop. A dropped name
     // means the client address quietly comes from a source nobody chose.

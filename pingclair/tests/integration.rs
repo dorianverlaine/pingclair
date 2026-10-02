@@ -185,6 +185,10 @@ mod ip_matchers;
 #[path = "integration/client_ip_headers.rs"]
 mod client_ip_headers;
 
+// 🙈 What the admin API's configuration reads show of a configured secret.
+#[path = "integration/admin_secrets.rs"]
+mod admin_secrets;
+
 // 📁 Filenames that are not valid UTF-8; 🐧 Linux only, APFS refuses them.
 #[cfg(target_os = "linux")]
 #[path = "integration/non_utf8_paths.rs"]
