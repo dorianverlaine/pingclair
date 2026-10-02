@@ -345,14 +345,18 @@ impl RuntimeListeners {
     ) -> Result<PreparedManualCerts, ConfigApplyError> {
         let mut entries = Vec::new();
         for server in &config.servers {
-            let (Some(tls), Some(name)) = (server.tls.as_ref(), server.name.as_deref()) else {
+            let Some(tls) = server.tls.as_ref() else {
                 continue;
             };
-            if let (Some(cert), Some(key)) = (&tls.cert, &tls.key)
-                && !name.is_empty()
-                && name != "_"
-            {
-                entries.push((name.to_string(), cert.clone(), key.clone()));
+            let (Some(cert), Some(key)) = (&tls.cert, &tls.key) else {
+                continue;
+            };
+            // 🏠 Filed under every name the site answers to, as at startup,
+            // so a reload neither drops nor forgets a second address (#202).
+            for name in crate::certs::site_names(server) {
+                if !name.is_empty() && name != "_" {
+                    entries.push((name.clone(), cert.clone(), key.clone()));
+                }
             }
         }
         self.tls_manager
@@ -392,13 +396,15 @@ impl ConfigPublisher for RuntimeListeners {
             .config
             .servers
             .iter()
-            .filter_map(|server| {
-                let tls = server.tls.as_ref()?;
-                (tls.cert.is_some() && tls.key.is_some())
-                    .then(|| server.name.clone())
-                    .flatten()
+            .filter(|server| {
+                server
+                    .tls
+                    .as_ref()
+                    .is_some_and(|tls| tls.cert.is_some() && tls.key.is_some())
             })
-            .filter(|name| !name.is_empty() && name != "_")
+            .flat_map(crate::certs::site_names)
+            .filter(|name| !name.is_empty() && *name != "_")
+            .cloned()
             .collect();
         let prepared_h3_certs = self
             .h3_cert_table

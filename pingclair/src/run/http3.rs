@@ -10,7 +10,7 @@
 //! from its listener, so clients are never told to come back to a port that
 //! no longer answers.
 
-use crate::certs::refresh_h3_cert_table;
+use crate::certs::{h3_certificate_domains, refresh_h3_cert_table, site_names};
 use parking_lot::RwLock;
 use pingclair_proxy::server::PingclairProxy;
 use std::collections::{HashMap, HashSet};
@@ -51,12 +51,7 @@ pub(super) fn start(
     } = sockets;
     // 📜 The domains whose certificates seed the SNI cert table, and the
     // upstream pool size and L4 blocklist kept consistent with H1/H2.
-    let h3_domains: Vec<String> = config
-        .servers
-        .iter()
-        .filter_map(|s| s.name.clone())
-        .filter(|n| !n.is_empty() && n != "_" && n != "*" && !n.starts_with(':'))
-        .collect();
+    let h3_domains = h3_certificate_domains(config);
     let manual_h3_domains: HashSet<&str> = config
         .servers
         .iter()
@@ -66,7 +61,8 @@ pub(super) fn start(
                 .as_ref()
                 .is_some_and(|tls| tls.cert.is_some() && tls.key.is_some())
         })
-        .filter_map(|server| server.name.as_deref())
+        .flat_map(site_names)
+        .map(String::as_str)
         .collect();
     let h3_periodic_domains: Vec<String> = h3_domains
         .iter()

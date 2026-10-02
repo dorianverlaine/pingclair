@@ -22,6 +22,9 @@ readonly binary="${PINGCLAIR_BINARY:-${repository_root}/target/debug/pingclair}"
 readonly run_dir="$(mktemp -d "${TMPDIR:-/tmp}/pingclair-h3-matrix.XXXXXX")"
 readonly primary_host="h3-primary.local"
 readonly secondary_host="h3-secondary.local"
+# 🏠 The secondary site's second address. A two-name site once served only its
+# first name over QUIC, because the certificate table was seeded from it (#202).
+readonly secondary_alias_host="h3-secondary-alias.local"
 readonly opted_out_host="h3-opted-out.local"
 pingclair_pid=""
 upstream_pid=""
@@ -273,7 +276,7 @@ https://${primary_host}:${h3_port} {
 	}
 }
 
-https://${secondary_host}:${h3_port} {
+https://${secondary_host}:${h3_port}, https://${secondary_alias_host}:${h3_port} {
 	bind 127.0.0.1
 	tls internal
 	request_body {
@@ -337,6 +340,8 @@ check_eq "primary SNI routes to its own vhost" "primary" \
     "$(h3 "${primary_host}" "https://${primary_host}:${h3_port}/who")"
 check_eq "secondary SNI routes to its own vhost" "secondary" \
     "$(h3 "${secondary_host}" "https://${secondary_host}:${h3_port}/who")"
+check_eq "a site's second name is served over QUIC too" "secondary" \
+    "$(h3 "${secondary_alias_host}" "https://${secondary_alias_host}:${h3_port}/who")"
 
 log ""
 log "🔎 A site that turned HTTP/3 off is not served over QUIC"

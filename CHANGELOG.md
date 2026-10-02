@@ -96,6 +96,10 @@ below, which ends with what to write instead.
 - **`handle_path`, `uri strip_prefix` and `uri strip_suffix` ignore letter
   case** too, so `handle_path /API/*` strips `/api` from `/api/x`.
   → [A strip ignores letter case like the route that chose it](#-a-strip-ignores-letter-case-like-the-route-that-chose-it)
+- **Every address of a multi-name site gets a certificate**, on every
+  protocol. `tls internal` issues one more leaf per extra name, and a
+  `tls <cert> <key>` pair now also answers for the site's other names.
+  → [Every address of a site has a certificate](#-every-address-of-a-site-has-a-certificate)
 - **A request header has one minute by default**, start to finish, where it
   had no limit unless `limits { header_timeout }` was set. An idle HTTP/1
   keepalive connection is therefore closed after a minute without a request.
@@ -579,6 +583,24 @@ Letters outside ASCII still compare exactly.
 removes the prefix or suffix. A configuration that relied on case to keep a
 prefix in place needs a case-sensitive `path_regexp` and `rewrite` instead.
 (#214)
+
+### 🏠 Every address of a site has a certificate
+
+A site written with two addresses, such as
+`*.example.com, example.com { … }`, now has a certificate for both. The
+certificate sources read only the site's first address: `tls internal`
+issued no leaf for the second, a `tls <cert> <key>` pair was filed under the
+first name only, and the HTTP/3 certificate table was seeded from the first
+name alone. With public certificates the second name still worked over
+HTTP/1.1 and HTTP/2, which obtain a certificate during the handshake, but its
+HTTP/3 handshake was refused; with internal or manual certificates it failed
+on every protocol. Each source now covers every address, as Caddy manages one
+certificate per hostname.
+
+**Upgrading:** `tls internal` issues one more leaf for each extra address,
+and the second address of a site now presents the site's manual certificate
+instead of failing the handshake; make sure that certificate names it.
+(#202)
 
 ### 🧩 A `*` anywhere in a route's path matches
 

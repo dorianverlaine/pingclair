@@ -11,7 +11,7 @@
 //! source — an `acme_server` site, a DNS provider it does not ship — are
 //! refused here rather than discovered at the first renewal.
 
-use crate::certs::{public_issuance_domains, site_renewal_windows};
+use crate::certs::{public_issuance_domains, site_names, site_renewal_windows};
 use crate::paths::tls_store_dir_with;
 use std::sync::Arc;
 
@@ -144,16 +144,20 @@ pub(super) fn prepare(
             continue;
         };
 
+        // 🏠 One leaf per name the site answers to, as Caddy manages one
+        // certificate per hostname; issuing for the first address only left
+        // the second without a certificate on every transport (#202).
         if tls.internal {
-            let name = server_config.name.as_deref().unwrap_or_default();
-            match tls_runtime.block_on(tls_manager.enable_internal_domain(name)) {
-                Ok(_) => {
-                    tracing::info!("🏛️ Prepared an internal TLS certificate for {}", name);
-                }
-                Err(error) => {
-                    anyhow::bail!(
-                        "failed to prepare the internal TLS certificate for {name}: {error}"
-                    );
+            for name in site_names(server_config) {
+                match tls_runtime.block_on(tls_manager.enable_internal_domain(name)) {
+                    Ok(_) => {
+                        tracing::info!("🏛️ Prepared an internal TLS certificate for {}", name);
+                    }
+                    Err(error) => {
+                        anyhow::bail!(
+                            "failed to prepare the internal TLS certificate for {name}: {error}"
+                        );
+                    }
                 }
             }
         }
@@ -162,26 +166,30 @@ pub(super) fn prepare(
             continue;
         };
 
-        let Some(name) = server_config.name.as_deref() else {
+        let names = site_names(server_config);
+        if names.is_empty() {
             tracing::warn!(
                 "⚠️ TLS cert/key configured on an unnamed server, skipping manual certificate load"
             );
             continue;
-        };
-        if name.is_empty() || name == "_" {
-            tracing::warn!(
-                "⚠️ Skipping manual TLS certificate for wildcard/unnamed server '{}'",
-                name
-            );
-            continue;
         }
+        for name in names {
+            if name.is_empty() || name == "_" {
+                tracing::warn!(
+                    "⚠️ Skipping manual TLS certificate for wildcard/unnamed server '{}'",
+                    name
+                );
+                continue;
+            }
 
-        // 🔐 Collected rather than loaded here. Reading them one at a time
-        // meant a half-written pair could be installed on its own, and the
-        // failure would surface at handshake time to a real client rather than
-        // at load time to the operator. `refresh_manual_certs` reads and
-        // validates the whole set, then publishes it or nothing.
-        manual_certs.push((name.to_string(), cert_path.clone(), key_path.clone()));
+            // 🔐 Collected rather than loaded here. Reading them one at a time
+            // meant a half-written pair could be installed on its own, and the
+            // failure would surface at handshake time to a real client rather
+            // than at load time to the operator. `refresh_manual_certs` reads
+            // and validates the whole set, then publishes it or nothing. 🏠 The
+            // one pair is filed under every name the site answers to.
+            manual_certs.push((name.clone(), cert_path.clone(), key_path.clone()));
+        }
     }
 
     // 🏛️ `pki` and `acme_server` parse, validate and serialise; this build

@@ -485,6 +485,37 @@ pub(crate) fn site_renewal_windows(
     windows
 }
 
+/// 🏠 Every name one site answers to, which is every name it needs a
+/// certificate for.
+///
+/// A site written `*.example.com, example.com` keeps its first address in
+/// `name` and all of its addresses in `names`; a JSON document may instead
+/// carry a listener label in `name` and the hostnames in `names`. Reading
+/// `name` alone is how the second address of a two-name site went without a
+/// certificate: no internal leaf, no manual pair, and no entry in the HTTP/3
+/// table, so its handshakes were refused (#202).
+pub(crate) fn site_names(server: &pingclair_core::config::ServerConfig) -> &[String] {
+    if server.names.is_empty() {
+        server.name.as_slice()
+    } else {
+        &server.names
+    }
+}
+
+/// 🌐 The names whose certificates seed the HTTP/3 table: every hostname of
+/// every site, without the catch-all spellings, which name no certificate.
+pub(crate) fn h3_certificate_domains(
+    config: &pingclair_core::config::PingclairConfig,
+) -> Vec<String> {
+    config
+        .servers
+        .iter()
+        .flat_map(site_names)
+        .filter(|name| !name.is_empty() && *name != "_" && *name != "*" && !name.starts_with(':'))
+        .cloned()
+        .collect()
+}
+
 /// Populate the HTTP/3 SNI certificate table from the TLS manager.
 ///
 /// Uses `peek_pem`, which only returns certificates that already exist
@@ -564,6 +595,23 @@ mod tests {
         assert!(
             TlsConfig::default().http3,
             "the per-site default has to be on, or an unmentioned site is indistinguishable from one that opted out"
+        );
+    }
+
+    /// 🏠 The HTTP/3 table is seeded with every address of a site, not the
+    /// first one only. `*.wild.test, wild.test` used to seed the wildcard
+    /// alone, so a QUIC handshake for `wild.test` found no certificate (#202).
+    #[test]
+    fn h3_certificate_domains_name_every_address_of_a_site() {
+        let config = pingclair_config::compile(
+            "*.wild.test, wild.test {\n\ttls internal\n\trespond \"ok\"\n}\n\
+             single.test {\n\ttls internal\n\trespond \"ok\"\n}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            h3_certificate_domains(&config),
+            ["*.wild.test", "wild.test", "single.test"]
         );
     }
 

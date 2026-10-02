@@ -181,6 +181,10 @@ mod strict_transport;
 #[path = "integration/alt_svc_opt_out.rs"]
 mod alt_svc_opt_out;
 
+// 🏠 Every address of a two-name site has a certificate.
+#[path = "integration/two_name_sites.rs"]
+mod two_name_sites;
+
 // 🛡️ A malformed `blocked_ips` entry is refused at the Admin door.
 #[path = "integration/blocked_ips.rs"]
 mod blocked_ips;
