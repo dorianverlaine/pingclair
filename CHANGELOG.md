@@ -51,6 +51,8 @@ below, which ends with what to write instead.
 - **Scheme-only site addresses inherit global ports.** Explicit ports stay as written.
   → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
 
+- **Empty and stdin startup survive reload signals.** SIGHUP is ignored; SIGUSR1 reports that no file reload source exists.
+  → [Reload signals remain safe without a file](#reload-signals-remain-safe-without-a-file)
 - **`-c -` always reads stdin**, even when the working directory contains a directory named `-`.
   → [Stdin takes precedence over filesystem entries](#stdin-takes-precedence-over-filesystem-entries)
 - **Running without a configuration now starts the admin API.** Supply an explicit path when a missing file must fail startup.
@@ -217,6 +219,13 @@ and `https_port`, respectively, as in Caddy. Previously they always bound
 
 **Upgrade:** Remove workarounds that repeat global ports in site addresses,
 or name an explicit port to keep a site on its previous listener.
+
+### Reload signals remain safe without a file
+
+Empty and stdin startup install the same SIGHUP and SIGUSR1 handlers as file
+startup (#175, #222). SIGHUP is ignored and SIGUSR1 leaves the active document
+serving while reporting that no configuration file is available.
+Upgrade note: reload these processes through the admin API instead of SIGUSR1.
 
 ### Stdin takes precedence over filesystem entries
 

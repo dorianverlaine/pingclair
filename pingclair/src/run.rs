@@ -354,7 +354,7 @@ pub(crate) fn run_server_with_adapter(
 
     // 🔔 SIGUSR1 reloads the configuration file; see `reload`.
     #[cfg(unix)]
-    if !config_path.is_empty() {
+    {
         bg_handle.spawn(reload::listen_for_reload(
             config_path.clone(),
             adapter,

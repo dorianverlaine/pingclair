@@ -68,6 +68,11 @@ pub(super) async fn listen_for_reload(
             );
             continue;
         }
+        if config_path.is_empty() {
+            tracing::warn!("🚫 SIGUSR1 reload unavailable: startup has no configuration file");
+            notify_systemd_status("Serving (SIGUSR1 reload ignored: no configuration file)");
+            continue;
+        }
         let reload_start = std::time::Instant::now();
         tracing::info!(
             "🔔 Received {signal_name}, reloading configuration from: {}",
