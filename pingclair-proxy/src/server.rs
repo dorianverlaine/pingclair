@@ -707,7 +707,16 @@ impl TrustedProxyPolicy {
             return fallback.to_string();
         }
 
-        let Ok(Some(mut chain)) = parse_forwarded_chain(headers, "x-forwarded-for") else {
+        // 🛡️ When `client_ip_headers` leaves `X-Forwarded-For` out, the
+        // incoming chain is not a source this server believes, so it is not
+        // passed on either: the upstream chain starts from the client the
+        // configured headers named. Forwarding it used to hand the origin an
+        // address the client chose, while this server itself ignored it.
+        let incoming_chain = match &self.client_ip_headers {
+            Some(names) if !names.iter().any(|name| name == "x-forwarded-for") => Ok(None),
+            _ => parse_forwarded_chain(headers, "x-forwarded-for"),
+        };
+        let Ok(Some(mut chain)) = incoming_chain else {
             let client = self.verified_client_ip_with_fallback(transport_peer, fallback, headers);
             return if client == transport_peer {
                 transport_peer.to_string()

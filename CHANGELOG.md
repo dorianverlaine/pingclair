@@ -281,7 +281,10 @@ when it is listed.
 Caddy's `client_ip_headers` server option is implemented to list it, in the
 global `servers` block or an addressed `servers <address>` block for one
 listener. Listed headers are the only sources, consulted in order; the
-first that names a client decides. Without the option, the client comes from
+first that names a client decides. When the list leaves out
+`X-Forwarded-For`, an incoming `X-Forwarded-For` is not passed upstream
+either: the chain the origin receives starts from the client the listed
+headers named. Without the option, the client comes from
 `X-Forwarded-For` and `Forwarded`, with `X-Real-IP` when neither was sent, as
 before. Caddy's default is `X-Forwarded-For` alone.
 

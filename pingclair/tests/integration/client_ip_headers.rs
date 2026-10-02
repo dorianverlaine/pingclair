@@ -90,3 +90,85 @@ async fn test_configured_client_ip_headers_are_the_only_source() {
     .await;
     assert_eq!(seen, vec!["203.0.113.7", "127.0.0.1"]);
 }
+
+/// 🪞 An origin whose body is the `X-Forwarded-For` it received.
+async fn spawn_forwarded_for_echo() -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 16384];
+                let Ok(read) = stream.read(&mut buffer).await else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let chain = request
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.trim()
+                            .eq_ignore_ascii_case("x-forwarded-for")
+                            .then(|| value.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{chain}",
+                    chain.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    address
+}
+
+/// 📤 The chain sent upstream follows the same restriction.
+///
+/// With `client_ip_headers X-Real-Client`, a client-supplied
+/// `X-Forwarded-For` names nobody here — yet it used to be forwarded upstream
+/// as the start of the chain, so an origin that reads `X-Forwarded-For` saw
+/// whatever address the client chose. The upstream chain now starts from the
+/// client the configured header named.
+#[tokio::test]
+async fn test_upstream_forwarded_for_starts_from_the_configured_client() {
+    let origin = spawn_forwarded_for_echo().await;
+    let mut server = TestServer::new_pingclairfile(&format!(
+        r#"
+        {{
+            admin off
+            servers {{
+                trusted_proxies static 127.0.0.1/32
+                client_ip_headers X-Real-Client
+            }}
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            reverse_proxy http://{origin}
+        }}
+        "#
+    ));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let seen = identities(
+        &server,
+        &[
+            &[
+                ("X-Real-Client", "203.0.113.7"),
+                ("X-Forwarded-For", "10.9.9.9"),
+            ],
+            &[("X-Forwarded-For", "10.9.9.9")],
+        ],
+    )
+    .await;
+    assert_eq!(seen, vec!["203.0.113.7, 127.0.0.1", "127.0.0.1"]);
+}
