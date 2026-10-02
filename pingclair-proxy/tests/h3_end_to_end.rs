@@ -60,6 +60,14 @@ mod preconditions;
 #[path = "h3_end_to_end/goaway.rs"]
 mod goaway;
 
+// 🔌 A stream that outlives the grace period, and the close that ends it.
+#[path = "h3_end_to_end/grace_close.rs"]
+mod grace_close;
+
+// 🌊 A response still unacknowledged when the stop begins keeps the drain open.
+#[path = "h3_end_to_end/unacked_drain.rs"]
+mod unacked_drain;
+
 // 🧾 `max_header_bytes`: one oversized request, one connection that survives.
 #[path = "h3_end_to_end/header_limits.rs"]
 mod header_limits;

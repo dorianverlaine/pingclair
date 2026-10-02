@@ -198,6 +198,29 @@ What this release deliberately does not do, so the rest can converge:
 - Plugins; `pingclair-plugin` stays an unwired skeleton, and a
   plugin handler is refused.
 
+### 🔌 An HTTP/3 request cut by a stop ends at `grace_period`, not at an idle timeout
+
+When `grace_period` ran out with an HTTP/3 request still running — a
+server-sent-events stream, a long download — the process exited without
+telling the client. A TCP client hears the kernel close its socket at exit;
+a QUIC connection exists only in the server's memory, so the client heard
+nothing and kept waiting until its own idle timeout gave up, about seventy
+seconds in a production-like restart. The same could happen to a connection
+whose last request had just finished, if the process exited before that
+connection's close left it. Now every HTTP/3 connection still open when the
+drain ends is closed with `H3_NO_ERROR` (after the `GOAWAY` it already
+received), and the process exits only once those closes have been sent, or
+after at most half a second more. A request cut this way ends without its
+final bytes, so the client can tell it was incomplete.
+
+The drain also waits for a response that had finished just before the stop
+but was not yet acknowledged. Such a response used to stop counting the
+moment its last byte was handed to the QUIC stack, so a stop that began
+while it was still in flight saw nothing running and ended at once, losing
+any packet of it that had to be sent again.
+
+📌 Upgrading: nothing to change. (#211)
+
 ### 📊 Metrics are collected only when `metrics` is set
 
 **Breaking for anyone scraping `/metrics` without asking for it.** A

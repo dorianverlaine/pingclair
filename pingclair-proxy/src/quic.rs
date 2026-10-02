@@ -1148,10 +1148,17 @@ struct H3App {
     /// Handing the last bytes to quiche is not delivering them: they still
     /// wait in its send buffer for the network and for loss recovery. If the
     /// in-flight token ended there, the process could exit, or this
-    /// connection close, with the tail of a response unsent. So while
-    /// stopping, each finished stream keeps its token here until quiche has
-    /// collected the stream, which it does only once every byte is acked.
+    /// connection close, with the tail of a response unsent. So each finished
+    /// stream keeps its token here until quiche has collected the stream,
+    /// which it does only once every byte is acked — from the moment it
+    /// finishes, because a stop can begin while those bytes are in flight.
     lingering: Vec<(u64, crate::drain::InFlight)>,
+    /// 🔌 Holds the process exit until this connection's close is on the
+    /// wire; see [`crate::drain::stop`]. Taken once quiche has written the
+    /// close, and dropped with the app on every other ending.
+    open: Option<crate::drain::OpenConnection>,
+    /// 🔌 The drain's "close now" has woken this connection once already.
+    close_woken: bool,
 }
 
 impl Drop for H3App {
@@ -1214,6 +1221,9 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         // never completes its handshake is not one this server is serving, and
         // counting it would make the gauge drift upward on scanning traffic.
         crate::metrics::H3_CONNECTIONS.inc();
+        // 🔌 From here on the client believes it has a connection, so it is
+        // owed a close before the process may exit.
+        self.open = Some(crate::drain::OpenConnection::enter());
         Ok(())
     }
 
@@ -1234,8 +1244,19 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
     /// — so a cancelled future has either not yet dequeued, or fully applied.
     async fn wait_for_data(
         &mut self,
-        _qconn: &mut tokio_quiche::quic::QuicheConnection,
+        qconn: &mut tokio_quiche::quic::QuicheConnection,
     ) -> tokio_quiche::QuicResult<()> {
+        // 🔌 The worker calls this only after it has flushed the packets it
+        // gathered, and quiche enters draining the moment it writes a close
+        // into one. So once draining shows here, the close has left the
+        // process and the exit no longer has to wait for this connection.
+        if self.open.is_some() && (qconn.is_draining() || qconn.is_closed()) {
+            self.open = None;
+        }
+        // 🔌 Woken once by the drain's "close now"; `process_writes` closes on
+        // the iteration that follows. Only once, or every later wait would
+        // return at once while the close is still on its way out.
+        let watch_close = self.open.is_some() && !self.close_woken;
         // 🧲 Applies deferred or channel-head events first: a previous
         // iteration may have parked one while its stream was over the body
         // cap, and capacity may have opened since.
@@ -1245,9 +1266,15 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         // 🛑 A parked event means the channel head cannot be applied yet.
         // Receiving anything else would violate ordering, so wait for the
         // next worker iteration (an inbound packet) instead; `process_writes`
-        // frees capacity and retries the parked event there.
+        // frees capacity and retries the parked event there. A close is the
+        // one thing that must not wait for the client to send something.
         if self.deferred.is_some() {
-            std::future::pending::<()>().await;
+            if watch_close {
+                crate::drain::closing().await;
+                self.close_woken = true;
+            } else {
+                std::future::pending::<()>().await;
+            }
             return Ok(());
         }
         tokio::select! {
@@ -1270,6 +1297,7 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
             // `process_writes` sends `GOAWAY` on the iteration that follows.
             // Only until it has, or every later wait would return at once.
             _ = crate::drain::stopping(), if self.goaway_from.is_none() => {}
+            _ = crate::drain::closing(), if watch_close => self.close_woken = true,
         }
         // 🧲 Applies anything that queued behind the event that woke us.
         self.apply_available_events();
@@ -1344,18 +1372,34 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         // deferred events again before the worker goes back to waiting.
         self.apply_available_events();
 
-        if crate::drain::is_stopping() {
-            let lingering = &mut self.lingering;
-            self.streams.retain(|id, s| {
-                if s.dead
-                    && let Some(token) = s.in_flight.take()
-                {
-                    lingering.push((*id, token));
-                }
-                !s.dead
+        // 🌊 A finished stream keeps its in-flight token until quiche has
+        // every byte acknowledged, whether or not a stop has begun. Moving it
+        // only once stopping had begun missed the response whose last bytes
+        // entered quiche just before SIGTERM: its token was already gone, the
+        // drain saw zero requests and exited, and the unacknowledged tail —
+        // including anything that needed retransmitting — was discarded
+        // although `grace_period` had time to spare.
+        let lingering = &mut self.lingering;
+        self.streams.retain(|id, s| {
+            if s.dead
+                && let Some(token) = s.in_flight.take()
+            {
+                lingering.push((*id, token));
+            }
+            !s.dead
+        });
+        // 🌊 quiche forgets a stream once it is complete, so "no such stream"
+        // is the signal that every byte of that response was acknowledged.
+        // 🏎️ The list holds only responses still awaiting acknowledgement,
+        // usually a round trip's worth, and an empty one costs one length
+        // check per iteration.
+        if !self.lingering.is_empty() {
+            self.lingering.retain(|(stream_id, _)| {
+                !matches!(
+                    qconn.stream_capacity(*stream_id),
+                    Err(quiche::Error::InvalidStreamState(_))
+                )
             });
-        } else {
-            self.streams.retain(|_, s| !s.dead);
         }
         self.stop_gracefully(qconn);
         Ok(())
@@ -1616,6 +1660,8 @@ impl QuicServer {
                 goaway_from: None,
                 last_request_stream: None,
                 lingering: Vec::new(),
+                open: None,
+                close_woken: false,
             });
         }
 
@@ -1674,6 +1720,12 @@ impl H3App {
     /// 📌 Closing is what lets an idle connection go at once rather than when
     /// the process exits; a busy one closes once its last response has been
     /// acknowledged (see `lingering`).
+    ///
+    /// 🔌 Once the grace period is over, the drain says "close now" and a busy
+    /// connection closes too, with its unfinished responses cut. The client
+    /// sees the close within a round trip and its incomplete streams end
+    /// without a FIN, which is the honest answer. Exiting without it left
+    /// curl waiting about seventy seconds for an idle timeout (#211).
     fn stop_gracefully(&mut self, qconn: &mut tokio_quiche::quic::QuicheConnection) {
         if !crate::drain::is_stopping() {
             return;
@@ -1681,6 +1733,7 @@ impl H3App {
         let Some(h3) = self.h3.as_mut() else {
             return;
         };
+        let closing = crate::drain::is_closing();
         if self.goaway_from.is_none() {
             let first_refused = self.last_request_stream.map_or(0, |last| last + 4);
             match h3.send_goaway(qconn, first_refused) {
@@ -1694,26 +1747,30 @@ impl H3App {
                 }
                 // 🔁 A control stream without room this iteration is retried
                 // on the next one; the flag keeps this method coming back.
-                Err(quiche::h3::Error::StreamBlocked) => return,
+                // A close that is due does not wait for it.
+                Err(quiche::h3::Error::StreamBlocked) if !closing => return,
                 Err(e) => {
                     tracing::debug!("🛑 H3 {}: GOAWAY not sent: {:?}", qconn.trace_id(), e);
                     self.goaway_from = Some(first_refused);
                 }
             }
         }
-        // 🌊 quiche forgets a stream once it is complete, so "no such stream"
-        // is the signal that every byte of that response was acknowledged.
-        self.lingering.retain(|(stream_id, _)| {
-            !matches!(
-                qconn.stream_capacity(*stream_id),
-                Err(quiche::Error::InvalidStreamState(_))
-            )
-        });
-        if self.streams.is_empty()
-            && self.lingering.is_empty()
-            && !qconn.is_closed()
-            && !qconn.is_draining()
-        {
+        // 🌊 `lingering` was just pruned by `process_writes`, so an empty one
+        // means every response this connection sent has been acknowledged.
+        let finished = self.streams.is_empty() && self.lingering.is_empty();
+        if (finished || closing) && !qconn.is_closed() && !qconn.is_draining() {
+            if !finished {
+                tracing::debug!(
+                    "🔪 H3 {}: grace period over, closing with {} unfinished stream(s)",
+                    qconn.trace_id(),
+                    self.streams.len()
+                );
+                // 🛑 Their handlers would otherwise keep an upstream busy
+                // until the process is gone.
+                for stream in self.streams.values_mut() {
+                    cancel_stream_handler(stream);
+                }
+            }
             let _ = qconn.close(true, quiche::h3::WireErrorCode::NoError as u64, b"");
         }
     }

@@ -13,9 +13,13 @@
 //!    sends HTTP/2 `GOAWAY` on open connections so clients retry elsewhere.
 //! 3. **Let running requests finish**, for at most `grace_period`. The wait
 //!    ends as soon as the last one does, so an idle server exits at once.
-//! 4. **Flush the access log, then the tracing queue**, because
+//! 4. **Close every HTTP/3 connection still open**, cutting what the grace
+//!    period did not cover. TCP needs no step here because the kernel closes
+//!    those sockets at exit; a QUIC client hears nothing unless this process
+//!    tells it, and otherwise waits out its idle timeout (#211).
+//! 5. **Flush the access log, then the tracing queue**, because
 //!    `std::process::exit` runs no destructors and would lose both.
-//! 5. **Exit.**
+//! 6. **Exit.**
 //!
 //! Before this module, step 3 did not happen: the signal handler went
 //! straight to step 4 and exited about a quarter of a second after SIGTERM,
@@ -152,9 +156,6 @@ pub(crate) async fn drain_then_exit(
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
-    // 📣 Pingora's broadcast reached only the transports it owns; this tells
-    // the HTTP/3 server to send `GOAWAY` and stop taking new requests.
-    pingclair_proxy::drain::begin_stopping();
     let running = pingclair_proxy::drain::in_flight();
     if running > 0 {
         tracing::info!(
@@ -163,12 +164,24 @@ pub(crate) async fn drain_then_exit(
             running
         );
     }
-    let cut = pingclair_proxy::drain::wait_idle(grace).await;
-    if cut > 0 {
+    // 📣 Pingora's broadcast reached only the transports it owns; the drain
+    // tells the HTTP/3 server to send `GOAWAY`, waits for the running
+    // requests, and then has every QUIC connection still open send its close,
+    // because a QUIC client is not told when a process exits and would wait
+    // out its idle timeout instead.
+    let stopped = pingclair_proxy::drain::stop(grace).await;
+    if stopped.cut > 0 {
         tracing::warn!(
-            "⏱️ Grace period of {}s ended with {} request(s) still running; they will be cut",
+            "⏱️ Grace period of {}s ended with {} request(s) still running; they were cut",
             grace.as_secs(),
-            cut
+            stopped.cut
+        );
+    }
+    if stopped.unclosed > 0 {
+        tracing::warn!(
+            "🔌 {} HTTP/3 connection(s) did not send their close in time; \
+             their clients will wait for an idle timeout",
+            stopped.unclosed
         );
     }
     shutdown_and_exit()
