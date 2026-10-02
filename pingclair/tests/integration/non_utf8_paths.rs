@@ -95,3 +95,46 @@ async fn test_try_files_path_reaches_a_non_utf8_name() {
 
     assert_eq!(response, (200, "latin-1".to_string()));
 }
+
+/// 🙈 `hide` hides a file whose name is not valid UTF-8.
+///
+/// Hide patterns were matched as text, and a name that is not text never
+/// matched, while the file server one step later served it by its bytes: with
+/// `hide *.env`, `/secret%E9.env` was downloadable. The `.txt` beside it
+/// shows the server still reaches such a name when nothing hides it.
+#[tokio::test]
+async fn test_hide_covers_a_non_utf8_name() {
+    let root = tempfile::tempdir().unwrap();
+    for (name, body) in [
+        (&b"secret\xe9.env"[..], "API_KEY=1"),
+        (&b"caf\xe9.txt"[..], "latin-1"),
+    ] {
+        std::fs::write(root.path().join(OsStr::from_bytes(name)), body).unwrap();
+    }
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            root * {}
+            file_server {{
+                hide *.env
+            }}
+        }}
+        "#,
+        root.path().to_str().unwrap()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let hidden = get(&server, "/secret%E9.env").await.0;
+    let visible = get(&server, "/caf%E9.txt").await;
+    server.stop();
+
+    assert_eq!((hidden, visible), (404, (200, "latin-1".to_string())));
+}

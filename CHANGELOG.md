@@ -3173,6 +3173,15 @@ immediately after the `101`, both ends seeing EOF with no error.
   a minute is now reset. Set `limits { body_timeout … }`, or
   `flush_interval -1` on the route, to allow longer silences.
 
+- 🙈 **`hide` did not hide a file whose name is not valid UTF-8.** On Linux a
+  filename is bytes, and the file server serves `secret\xE9.env` to a request
+  for `/secret%E9.env`. The `hide` patterns were matched as text, and a name
+  that was not text never matched any of them, so `hide *.env` hid
+  `secret.env` and served `secret\xE9.env`. Patterns are now matched against
+  the name's bytes, by the same matcher the `file` matcher's globs use: `*`
+  and `?` take a byte that is not text, and a literal never matches one. No
+  configuration change is needed.
+
 - 🔒 **`rustls` moves to 0.23.45 for RUSTSEC-2026-0285.** Rustls accepted TLS
   1.3 handshake messages sent at the wrong encryption level when they followed a
   key-changing message in the same record — a plaintext `EncryptedExtensions`

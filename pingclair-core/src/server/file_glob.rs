@@ -61,6 +61,30 @@ pub(super) fn expand(root: &Path, pattern: &str, limit: usize) -> Vec<PathBuf> {
     found
 }
 
+/// 🙈 One glob compiled to match a single path component by its bytes.
+///
+/// The `file_server` `hide` list matches each component of a resolved path
+/// against its patterns, and that path is bytes: the file server serves
+/// `secret\xE9.env` from `/secret%E9.env`. Matching through the `glob` crate
+/// skipped every such name (`Pattern::matches_path`, glob 0.3.4, returns
+/// `false` when `Path::to_str` fails), so `hide *.env` hid `secret.env` and
+/// served `secret\xE9.env`. This is the same matcher the `file` matcher's
+/// expansion uses, so the two agree on what a pattern names.
+#[derive(Debug, Clone)]
+pub struct ComponentGlob(Box<[u8]>);
+
+impl ComponentGlob {
+    /// 🧾 Compiles `pattern`, or returns `None` when a `[` set never closes.
+    pub fn new(pattern: &str) -> Option<Self> {
+        is_well_formed(pattern.as_bytes()).then(|| Self(pattern.as_bytes().into()))
+    }
+
+    /// 🔍 Reports whether `name`, one path component, matches.
+    pub fn matches(&self, name: &std::ffi::OsStr) -> bool {
+        crate::percent::path_bytes(Path::new(name)).is_some_and(|name| matches(&self.0, name))
+    }
+}
+
 /// 🚶 Matches `rest` below `base`, depth first, appending hits to `found`.
 fn walk(base: PathBuf, rest: &[&str], limit: usize, found: &mut Vec<PathBuf>) {
     if found.len() >= limit {

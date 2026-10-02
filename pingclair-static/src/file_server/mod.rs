@@ -53,6 +53,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use http::HeaderValue;
+use pingclair_core::server::ComponentGlob;
 
 use budget::Budget;
 use cache::{BodyCache, FileKey, FileMeta, MetaKey};
@@ -127,8 +128,9 @@ impl PrecompressedFormat {
 /// nothing hidden — is a single `is_empty` check.
 #[derive(Debug, Default, Clone)]
 pub struct HidePolicy {
-    /// Patterns with no separator, matched against each path component.
-    components: Vec<glob::Pattern>,
+    /// Patterns with no separator, matched against each path component by
+    /// its bytes, so a name that is not UTF-8 is hidden like any other.
+    components: Vec<ComponentGlob>,
     /// Patterns containing a separator, matched as a path prefix.
     prefixes: Vec<PathBuf>,
 }
@@ -155,13 +157,12 @@ impl HidePolicy {
                 });
                 continue;
             }
-            match glob::Pattern::new(pattern) {
-                Ok(compiled) => policy.components.push(compiled),
-                Err(error) => {
+            match ComponentGlob::new(pattern) {
+                Some(compiled) => policy.components.push(compiled),
+                None => {
                     tracing::warn!(
-                        "🙈 file_server hide pattern {:?} is not a valid glob and will not                          hide anything: {}",
-                        pattern,
-                        error
+                        "🙈 file_server hide pattern {:?} has a [ set that never closes and will not hide anything",
+                        pattern
                     );
                 }
             }
@@ -179,9 +180,7 @@ impl HidePolicy {
         }
         path.components().any(|component| {
             let name = component.as_os_str();
-            self.components
-                .iter()
-                .any(|pattern| pattern.matches_path(Path::new(name)))
+            self.components.iter().any(|pattern| pattern.matches(name))
         })
     }
 
@@ -466,6 +465,24 @@ mod subdirective_tests {
         let policy = HidePolicy::new(&["*.env".to_string()], Path::new("/srv"));
         assert!(policy.hides(Path::new("/srv/.production.env")));
         assert!(!policy.hides(Path::new("/srv/env.js")));
+    }
+
+    /// 🔤 A filename that is not valid UTF-8 is hidden like any other. The
+    /// file server serves such a name byte for byte, so a pattern that could
+    /// not see it left `secret\xE9.env` downloadable under `hide *.env`.
+    #[cfg(unix)]
+    #[test]
+    fn hide_matches_names_that_are_not_utf8() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let policy = HidePolicy::new(&["*.env".to_string()], Path::new("/srv"));
+        let latin1 = Path::new(std::ffi::OsStr::from_bytes(b"/srv/secret\xe9.env"));
+        let nested = Path::new(std::ffi::OsStr::from_bytes(b"/srv/caf\xe9/a.env"));
+        let visible = Path::new(std::ffi::OsStr::from_bytes(b"/srv/caf\xe9.txt"));
+        assert_eq!(
+            [latin1, nested, visible].map(|path| policy.hides(path)),
+            [true, true, false]
+        );
     }
 
     /// 🕳️ Nothing configured must cost nothing and hide nothing — this is the
