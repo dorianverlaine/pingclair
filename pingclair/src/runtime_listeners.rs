@@ -9,11 +9,17 @@
 //! stayed behind. This module owns the common preparation step and the only
 //! post-start publication path.
 //!
-//! Listener topology is deliberately restart-required for now. Pingora cannot
-//! add a service after `run_forever`, and the old side accept loop created only
-//! TCP/H1/H2. Reporting success for that listener meant H3 was absent and TLS
-//! lacked the startup mTLS safeguards. Refusing is the safe, honest answer
-//! until all transports can be constructed and rolled back as one unit.
+//! 🏗️ An admin-only process can publish its first plaintext listener generation.
+//! Later topology changes and first TLS listeners remain restart-required:
+//! Pingora cannot add services to its running server, and a separate TCP-only
+//! service must never pretend to provide the startup TLS and H3 safeguards.
+//! Encrypted topology changes need every transport prepared and rolled back
+//! together before this restriction can be lifted.
+
+#[cfg(unix)]
+mod bootstrap;
+#[cfg(unix)]
+pub(crate) use bootstrap::BootstrapRuntime;
 
 use crate::listen::{normalize_listen_addr, server_requires_tls, servers_by_bind_address};
 use parking_lot::{Mutex, RwLock};
@@ -203,15 +209,19 @@ pub(crate) struct RuntimeListeners {
     pub(crate) tls_manager: Arc<TlsManager>,
     pub(crate) h3_cert_table: Option<Arc<pingclair_proxy::quic::CertTable>>,
     pub(crate) admin_policy: Arc<AdminPolicy>,
-    pub(crate) listener_policies: HashMap<String, Arc<PublishedListenerPolicy>>,
+    pub(crate) listener_policies: RwLock<HashMap<String, Arc<PublishedListenerPolicy>>>,
     pub(crate) automatic_http_available: bool,
     pub(crate) api_changed: Arc<AtomicBool>,
+    #[cfg(unix)]
+    bootstrap: BootstrapRuntime,
     current: RwLock<ActiveRuntimeConfig>,
     publication: Mutex<()>,
 }
 
 /// 🧩 Shared runtime handles captured by the configuration publisher.
 pub(crate) struct RuntimePublisherInputs {
+    #[cfg(unix)]
+    pub(crate) bootstrap: BootstrapRuntime,
     pub(crate) port_proxies: Arc<RwLock<HashMap<String, PingclairProxy>>>,
     pub(crate) tls_manager: Arc<TlsManager>,
     pub(crate) h3_cert_table: Option<Arc<pingclair_proxy::quic::CertTable>>,
@@ -233,7 +243,9 @@ impl RuntimeListeners {
             tls_manager: inputs.tls_manager,
             h3_cert_table: inputs.h3_cert_table,
             admin_policy: inputs.admin_policy,
-            listener_policies: inputs.listener_policies,
+            listener_policies: RwLock::new(inputs.listener_policies),
+            #[cfg(unix)]
+            bootstrap: inputs.bootstrap,
             automatic_http_available: inputs.automatic_http_available,
             api_changed: inputs.api_changed,
             current: RwLock::new(ActiveRuntimeConfig {
@@ -275,7 +287,18 @@ impl RuntimeListeners {
         let current_addresses: HashSet<&str> =
             current.listeners.keys().map(String::as_str).collect();
         let next_addresses: HashSet<&str> = next.keys().map(String::as_str).collect();
-        if current_addresses != next_addresses {
+        let bootstrap = current.listeners.is_empty()
+            && current.config.servers.is_empty()
+            && !next.is_empty()
+            && cfg!(unix)
+            && next
+                .values()
+                .all(|policy| !policy.is_https && !policy.proxy_protocol)
+            && next_config
+                .servers
+                .iter()
+                .all(|server| server.tls.is_none());
+        if current_addresses != next_addresses && !bootstrap {
             let added: Vec<&str> = next_addresses
                 .difference(&current_addresses)
                 .copied()
@@ -291,7 +314,10 @@ impl RuntimeListeners {
         }
 
         for (address, next_policy) in next {
-            let current_policy = &current.listeners[address];
+            let Some(current_policy) = current.listeners.get(address) else {
+                // 🏗️ The first plaintext generation has no captured transport policy yet.
+                continue;
+            };
             if next_policy.is_https != current_policy.is_https {
                 return Err(ConfigApplyError::restart_required(format!(
                     "listener {address} changes between plaintext and TLS"
@@ -328,7 +354,8 @@ impl RuntimeListeners {
                 }
             }
 
-            let published = &self.listener_policies[address];
+            let published_policies = self.listener_policies.read();
+            let published = &published_policies[address];
             if !next_policy.client_auth.is_empty() && !published.client_auth_reload_capable() {
                 return Err(ConfigApplyError::restart_required(format!(
                     "listener {address} enables client_auth after its TLS context issued \
@@ -417,11 +444,21 @@ impl ConfigPublisher for RuntimeListeners {
             })
             .transpose()
             .map_err(|error| ConfigApplyError::invalid(error.to_string()))?;
+        #[cfg(unix)]
+        let bootstrap_listeners = if current.listeners.is_empty() && !next.is_empty() {
+            self.bootstrap.prepare(config, &next, &self.tls_manager)?
+        } else {
+            Vec::new()
+        };
 
         let targets = {
             let proxies = self.port_proxies.read();
             let mut targets = Vec::with_capacity(next.len());
             for (address, policy) in &next {
+                #[cfg(unix)]
+                if !bootstrap_listeners.is_empty() {
+                    continue;
+                }
                 let Some(proxy) = proxies.get(address).cloned() else {
                     return Err(ConfigApplyError {
                         kind: pingclair_proxy::server::ConfigApplyErrorKind::Unavailable,
@@ -452,8 +489,18 @@ impl ConfigPublisher for RuntimeListeners {
         self.tls_manager
             .set_public_issuance_domains(crate::certs::public_issuance_domains(config));
         for (address, client_auth, routes) in targets {
-            self.listener_policies[&address].publish(client_auth, routes);
+            self.listener_policies.read()[&address].publish(client_auth, routes);
             tracing::info!(listener = %address, "♻️ Published listener configuration");
+        }
+        #[cfg(unix)]
+        for listener in bootstrap_listeners {
+            self.port_proxies
+                .write()
+                .insert(listener.address.clone(), listener.proxy.clone());
+            self.listener_policies
+                .write()
+                .insert(listener.address.clone(), listener.policy.clone());
+            self.bootstrap.start(listener);
         }
         pingclair_proxy::access_log::register_channels(&config.logging.channels);
         // 🔁 A reload that adds or removes `metrics` takes effect here, not at
@@ -489,6 +536,6 @@ impl ConfigPublisher for RuntimeListeners {
             self.api_changed.store(true, Ordering::SeqCst);
         }
 
-        Ok(self.listener_policies.len())
+        Ok(self.listener_policies.read().len())
     }
 }

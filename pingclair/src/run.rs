@@ -303,6 +303,9 @@ pub(crate) fn run_server_with_adapter(
         &bg_handle,
     );
 
+    #[cfg(unix)]
+    let (stop_requested, stop_watch) = tokio::sync::watch::channel(false);
+
     // 🛑 `POST /stop` notifies this; the shutdown task treats it like SIGTERM.
     let admin_shutdown = Arc::new(tokio::sync::Notify::new());
     // 🚫 Caddy disables SIGUSR1 reloads once the Admin API has changed the
@@ -330,6 +333,12 @@ pub(crate) fn run_server_with_adapter(
     let config_publisher: Arc<dyn pingclair_proxy::server::ConfigPublisher> =
         Arc::new(RuntimeListeners::new(
             RuntimePublisherInputs {
+                #[cfg(unix)]
+                bootstrap: crate::runtime_listeners::BootstrapRuntime {
+                    handle: bg_handle.clone(),
+                    configuration: server.configuration.clone(),
+                    shutdown: stop_watch.clone(),
+                },
                 port_proxies: port_proxies.clone(),
                 tls_manager: tls_manager.clone(),
                 h3_cert_table,
@@ -388,8 +397,6 @@ pub(crate) fn run_server_with_adapter(
     // request from now on, Pingora reads it through `SignalWatch` and closes
     // the listeners, and the drain task then waits for running requests,
     // flushes the logs, and exits.
-    #[cfg(unix)]
-    let (stop_requested, stop_watch) = tokio::sync::watch::channel(false);
     #[cfg(unix)]
     bg_handle.spawn(crate::shutdown::listen_for_stop(
         admin_shutdown.clone(),

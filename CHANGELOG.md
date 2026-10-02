@@ -51,6 +51,8 @@ below, which ends with what to write instead.
 - **Scheme-only site addresses inherit global ports.** Explicit ports stay as written.
   → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
 
+- **Empty startup can load its first HTTP listeners.** TLS listeners and later topology changes still require restart.
+  → [Admin-only startup accepts its first HTTP generation](#admin-only-startup-accepts-its-first-http-generation)
 - **Manual TLS requires a named site.** Unnamed and `_` sites are rejected instead of silently ignoring their certificate sources.
   → [Unnamed manual TLS fails closed](#unnamed-manual-tls-fails-closed)
 - **Empty and stdin startup survive reload signals.** SIGHUP is ignored; SIGUSR1 reports that no file reload source exists.
@@ -222,6 +224,16 @@ and `https_port`, respectively, as in Caddy. Previously they always bound
 **Upgrade:** Remove workarounds that repeat global ports in site addresses,
 or name an explicit port to keep a site on its previous listener.
 
+### Admin-only startup accepts its first HTTP generation
+
+On Unix, an admin-only process can load its first plaintext HTTP listener set
+through `/load` (#175). Every socket and route is prepared before publication;
+a bind failure leaves the empty document intact and releases prepared sockets.
+The listeners use Pingora's H1/H2 proxy, resource guards, and graceful shutdown
+watch, and later route reloads publish through the existing transaction path.
+Upgrade note: this bootstrap supports plaintext HTTP without PROXY protocol;
+start with a file for TLS/H3, and restart for later listener topology changes.
+
 ### Unnamed manual TLS fails closed
 
 Common configuration validation rejects manual certificate pairs on unnamed,
@@ -249,8 +261,9 @@ With no path and neither `Pingclairfile` nor `Caddyfile` in the working director
 following Caddy (#175). `--resume` checks the autosave first, even without default
 files. There is no file watcher or signal file reload for an empty configuration.
 Explicit missing paths and absent `validate` input continue to fail.
-Upgrade note: orchestration may start Pingclair before creating a configuration;
-supply an explicit file path if its absence should stop the process.
+Upgrade note: orchestration may start Pingclair before creating a plaintext HTTP
+configuration and load it through the admin API on Unix; supply an explicit file
+path if its absence should stop the process or if TLS/H3 is required.
 
 ### Run and validate accept configuration flags
 

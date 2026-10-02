@@ -139,6 +139,9 @@ directory. If neither exists, it starts with no HTTP sites and only the admin AP
 at `127.0.0.1:2019`, matching `caddy run`. `--resume` loads an available admin
 autosave before using the file or empty configuration. Explicit missing paths
 still fail, and `validate` still requires a configuration file or stdin.
+On Unix, an empty process accepts its first plaintext HTTP listener generation
+through `/load`; later loads can update routes on those addresses. First TLS
+listeners and subsequent listener topology changes require a restart.
 
 Both `run` and `validate` accept a positional path or `--config` / `-c`.
 Use `--adapter caddyfile` or `--adapter json` to override the filename extension;
