@@ -52,7 +52,7 @@ pub(super) fn expand(root: &Path, pattern: &str, limit: usize) -> Vec<PathBuf> {
     if components.contains(&"..")
         || components
             .iter()
-            .any(|component| has_meta(component) && !is_well_formed(component.as_bytes()))
+            .any(|component| has_meta(component) && Glob::compile(component).is_none())
     {
         return Vec::new();
     }
@@ -70,18 +70,21 @@ pub(super) fn expand(root: &Path, pattern: &str, limit: usize) -> Vec<PathBuf> {
 /// `false` when `Path::to_str` fails), so `hide *.env` hid `secret.env` and
 /// served `secret\xE9.env`. This is the same matcher the `file` matcher's
 /// expansion uses, so the two agree on what a pattern names.
+///
+/// 🏎️ Compiled once, when the configuration loads: every `[…]` set is parsed
+/// into its ranges here, so matching a request's path allocates nothing.
 #[derive(Debug, Clone)]
-pub struct ComponentGlob(Box<[u8]>);
+pub struct ComponentGlob(Glob);
 
 impl ComponentGlob {
     /// 🧾 Compiles `pattern`, or returns `None` when a `[` set never closes.
     pub fn new(pattern: &str) -> Option<Self> {
-        is_well_formed(pattern.as_bytes()).then(|| Self(pattern.as_bytes().into()))
+        Glob::compile(pattern).map(Self)
     }
 
     /// 🔍 Reports whether `name`, one path component, matches.
     pub fn matches(&self, name: &std::ffi::OsStr) -> bool {
-        crate::percent::path_bytes(Path::new(name)).is_some_and(|name| matches(&self.0, name))
+        crate::percent::path_bytes(Path::new(name)).is_some_and(|name| self.0.matches(name))
     }
 }
 
@@ -107,7 +110,11 @@ fn walk(base: PathBuf, rest: &[&str], limit: usize, found: &mut Vec<PathBuf>) {
         walk(base.join(component), after, limit, found);
         return;
     }
-    for name in matching_entries(&base, component.as_bytes()) {
+    // 📌 `expand` refused a malformed component before the walk began.
+    let Some(glob) = Glob::compile(component) else {
+        return;
+    };
+    for name in matching_entries(&base, &glob) {
         walk(base.join(name), after, limit, found);
         if found.len() >= limit {
             return;
@@ -131,10 +138,10 @@ fn walk_recursive(base: PathBuf, rest: &[&str], limit: usize, found: &mut Vec<Pa
 }
 
 /// 📂 The names in `dir` that match one pattern component, in byte order.
-fn matching_entries(dir: &Path, pattern: &[u8]) -> Vec<std::ffi::OsString> {
+fn matching_entries(dir: &Path, glob: &Glob) -> Vec<std::ffi::OsString> {
     sorted_entries(dir, |entry| {
         crate::percent::path_bytes(Path::new(&entry.file_name()))
-            .is_some_and(|name| matches(pattern, name))
+            .is_some_and(|name| glob.matches(name))
     })
 }
 
@@ -166,20 +173,105 @@ fn has_meta(component: &str) -> bool {
         .any(|byte| matches!(byte, b'*' | b'?' | b'['))
 }
 
-/// 🧾 Reports whether every `[` in a component opens a set that closes.
-fn is_well_formed(pattern: &[u8]) -> bool {
-    let mut index = 0;
-    while index < pattern.len() {
-        if pattern[index] == b'[' {
-            match class_end(pattern, index) {
-                Some(end) => index = end,
-                None => return false,
+/// 🧩 One piece of a compiled component pattern.
+#[derive(Debug, Clone)]
+enum Token {
+    /// 🌟 `*`: any run of characters, including none.
+    Star,
+    /// ❓ `?`: exactly one character.
+    One,
+    /// 🔤 A character that must appear as written.
+    Literal(char),
+    /// 🧺 `[…]`: one character inside (or, negated, outside) these inclusive
+    /// ranges; a single member is a range of one.
+    Set {
+        negated: bool,
+        ranges: Box<[(char, char)]>,
+    },
+}
+
+/// 🔍 A component pattern parsed into tokens, so matching a name is a walk
+/// over them with no parsing and no allocation.
+#[derive(Debug, Clone)]
+struct Glob(Box<[Token]>);
+
+impl Glob {
+    /// 🧾 Parses `pattern`, or returns `None` when a `[` set never closes.
+    fn compile(pattern: &str) -> Option<Self> {
+        let bytes = pattern.as_bytes();
+        let mut tokens = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'*' => {
+                    tokens.push(Token::Star);
+                    index += 1;
+                }
+                b'?' => {
+                    tokens.push(Token::One);
+                    index += 1;
+                }
+                b'[' => {
+                    let end = class_end(bytes, index)?;
+                    tokens.push(parse_set(&pattern[index + 1..end - 1]));
+                    index = end;
+                }
+                _ => {
+                    // 📌 `pattern` is a `str`, so a character starts here.
+                    let literal = pattern[index..].chars().next()?;
+                    tokens.push(Token::Literal(literal));
+                    index += literal.len_utf8();
+                }
             }
-        } else {
-            index += 1;
         }
+        Some(Self(tokens.into()))
     }
-    true
+
+    /// 🔍 Matches one name, as bytes.
+    ///
+    /// The classic single-star backtracking scan: remember the last `*` and
+    /// how much of the name it had taken, and on a mismatch let it take one
+    /// more unit. It never recurses and never allocates, and it is linear in
+    /// practice for the short names and patterns a filesystem holds.
+    fn matches(&self, name: &[u8]) -> bool {
+        let tokens = &self.0;
+        let (mut t, mut n) = (0, 0);
+        let mut star: Option<(usize, usize)> = None;
+        while n < name.len() {
+            let (unit, width) = next_unit(&name[n..]);
+            let fits = match tokens.get(t) {
+                Some(Token::Star) => {
+                    star = Some((t, n));
+                    t += 1;
+                    continue;
+                }
+                Some(Token::One) => true,
+                Some(Token::Literal(literal)) => unit == Some(*literal),
+                // 🔤 A byte that is not text is outside every set a pattern
+                // can spell, so only a negated set admits it.
+                Some(Token::Set { negated, ranges }) => unit.map_or(*negated, |unit| {
+                    ranges
+                        .iter()
+                        .any(|&(low, high)| (low..=high).contains(&unit))
+                        != *negated
+                }),
+                None => false,
+            };
+            if fits {
+                t += 1;
+                n += width;
+            } else if let Some((star_t, star_n)) = star {
+                // 🔁 Let the last `*` swallow one more unit and retry.
+                let (_, swallowed) = next_unit(&name[star_n..]);
+                star = Some((star_t, star_n + swallowed));
+                t = star_t + 1;
+                n = star_n + swallowed;
+            } else {
+                return false;
+            }
+        }
+        tokens[t..].iter().all(|token| matches!(token, Token::Star))
+    }
 }
 
 /// 📏 The index just past the `]` closing the set that opens at `open`.
@@ -199,6 +291,33 @@ fn class_end(pattern: &[u8], open: usize) -> Option<usize> {
         index += 1;
     }
     None
+}
+
+/// 🧺 Parses a set's body (between the brackets) into its ranges.
+///
+/// `a-c` is a range when a member follows the `-`; any other `-` is itself a
+/// member.
+fn parse_set(body: &str) -> Token {
+    let (negated, body) = match body.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, body),
+    };
+    let members: Vec<char> = body.chars().collect();
+    let mut ranges = Vec::with_capacity(members.len());
+    let mut index = 0;
+    while index < members.len() {
+        if index + 2 < members.len() && members[index + 1] == '-' {
+            ranges.push((members[index], members[index + 2]));
+            index += 3;
+        } else {
+            ranges.push((members[index], members[index]));
+            index += 1;
+        }
+    }
+    Token::Set {
+        negated,
+        ranges: ranges.into(),
+    }
 }
 
 /// 🔤 The character at the front of `bytes` and how many bytes it spans.
@@ -223,82 +342,14 @@ fn next_unit(bytes: &[u8]) -> (Option<char>, usize) {
     }
 }
 
-/// 🔍 Matches one component pattern against one name, both as bytes.
-///
-/// The classic single-star backtracking scan: remember the last `*` and how
-/// much of the name it had taken, and on a mismatch let it take one more
-/// unit. It never recurses and never allocates, and it is linear in practice
-/// for the short names and patterns a filesystem holds.
-fn matches(pattern: &[u8], name: &[u8]) -> bool {
-    let (mut p, mut n) = (0, 0);
-    let mut star: Option<(usize, usize)> = None;
-    while n < name.len() {
-        let (unit, width) = next_unit(&name[n..]);
-        let step = match pattern.get(p) {
-            Some(b'*') => {
-                star = Some((p, n));
-                p += 1;
-                continue;
-            }
-            Some(b'?') => Some(p + 1),
-            Some(b'[') => {
-                class_end(pattern, p).filter(|&end| class_contains(&pattern[p + 1..end - 1], unit))
-            }
-            Some(_) => {
-                let (literal, literal_width) = next_unit(&pattern[p..]);
-                (literal.is_some() && literal == unit).then_some(p + literal_width)
-            }
-            None => None,
-        };
-        match (step, star) {
-            (Some(next), _) => {
-                p = next;
-                n += width;
-            }
-            (None, Some((star_p, star_n))) => {
-                // 🔁 Let the last `*` swallow one more unit and retry.
-                let (_, swallowed) = next_unit(&name[star_n..]);
-                star = Some((star_p, star_n + swallowed));
-                p = star_p + 1;
-                n = star_n + swallowed;
-            }
-            (None, None) => return false,
-        }
-    }
-    pattern[p..].iter().all(|&byte| byte == b'*')
-}
-
-/// 🧺 Reports whether a set's body (between the brackets) admits `unit`.
-fn class_contains(body: &[u8], unit: Option<char>) -> bool {
-    let (negated, body) = match body.split_first() {
-        Some((b'!', rest)) => (true, rest),
-        _ => (false, body),
-    };
-    let Some(unit) = unit else {
-        // 🔤 A byte that is not text is outside every set a pattern can spell.
-        return negated;
-    };
-    let Ok(body) = std::str::from_utf8(body) else {
-        return false;
-    };
-    let members: Vec<char> = body.chars().collect();
-    let mut index = 0;
-    let mut hit = false;
-    while index < members.len() {
-        if index + 2 < members.len() && members[index + 1] == '-' {
-            hit |= (members[index]..=members[index + 2]).contains(&unit);
-            index += 3;
-        } else {
-            hit |= members[index] == unit;
-            index += 1;
-        }
-    }
-    hit != negated
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔍 Compiles and matches in one step, for the tables below.
+    fn matches(pattern: &str, name: &[u8]) -> bool {
+        Glob::compile(pattern).is_some_and(|glob| glob.matches(name))
+    }
 
     /// 🧭 The pattern language the `glob` crate accepted keeps its meaning.
     #[test]
@@ -323,7 +374,7 @@ mod tests {
         ];
         for (pattern, name, expected) in cases {
             assert_eq!(
-                matches(pattern.as_bytes(), name),
+                matches(pattern, name),
                 expected,
                 "{pattern} against {}",
                 String::from_utf8_lossy(name)
@@ -335,18 +386,18 @@ mod tests {
     /// `*` take the stray byte, a literal never does.
     #[test]
     fn non_utf8_names_match_by_bytes() {
-        assert!(matches(b"caf*.js", b"caf\xe9.js"));
-        assert!(matches(b"caf?.js", b"caf\xe9.js"));
-        assert!(matches(b"caf[!a].js", b"caf\xe9.js"));
-        assert!(!matches(b"caf[a-z].js", b"caf\xe9.js"));
-        assert!(!matches("café.js".as_bytes(), b"caf\xe9.js"));
+        assert!(matches("caf*.js", b"caf\xe9.js"));
+        assert!(matches("caf?.js", b"caf\xe9.js"));
+        assert!(matches("caf[!a].js", b"caf\xe9.js"));
+        assert!(!matches("caf[a-z].js", b"caf\xe9.js"));
+        assert!(!matches("café.js", b"caf\xe9.js"));
     }
 
     /// 🧾 An unterminated set is a malformed pattern and names nothing.
     #[test]
     fn a_malformed_set_names_nothing() {
-        assert!(!is_well_formed(b"a[bc"));
-        assert!(is_well_formed(b"a[]]"));
+        assert!(Glob::compile("a[bc").is_none());
+        assert!(Glob::compile("a[]]").is_some());
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a[bc"), "").unwrap();
         assert!(expand(dir.path(), "/a[bc", 8).is_empty());
