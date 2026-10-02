@@ -73,7 +73,7 @@ use crate::client_auth::{
 use crate::connection_filter::PingclairConnectionFilter;
 use crate::http_policy::{
     CorsDecision, ResponseContent, ResponseHeaderPolicy, authority_host, evaluate_cors,
-    resolve_request_id, rewrite_uri,
+    resolve_request_id, rewrite_uri, strip_path_prefix,
 };
 use crate::server::{PingclairProxy, ProxyState, error_reason, resolve_caddy_placeholders};
 use crate::server::{is_streaming_content_type, wants_immediate_flush};
@@ -2785,11 +2785,9 @@ async fn plan_h3_handler_with_connector(
             Ok(H3Plan::Continue)
         }
         HandlerConfig::HandlePath { prefix, handlers } => {
-            if effective_uri
-                .split_once('?')
-                .map_or(effective_uri.as_str(), |(path, _)| path)
-                .starts_with(prefix.as_str())
-            {
+            // 🔤 The route matcher chose this group without regard to case, so
+            // the strip compares the same way (#214).
+            if strip_path_prefix(uri_path(effective_uri), prefix).is_some() {
                 *effective_uri =
                     rewrite_uri(effective_uri, Some(prefix.as_str()), None, None, None, None);
                 request_header
@@ -8475,6 +8473,45 @@ mod tests {
 
         assert!(matches!(plan, H3Plan::Terminal(H3Terminal::ReverseProxy)));
         assert_eq!(uri, "/users?q=1");
+    }
+
+    /// 🔤 `handle_path /API/*` is chosen for `/api/users` because route paths
+    /// ignore case (#198), so HTTP/3 must strip that prefix too (#214).
+    #[tokio::test]
+    async fn h3_handle_path_strips_a_prefix_spelled_in_another_case() {
+        let handler = HandlerConfig::HandlePath {
+            prefix: "/API".to_string(),
+            handlers: vec![HandlerElement::plain(HandlerConfig::ReverseProxy(
+                Default::default(),
+            ))],
+        };
+        let state = proxy_state(handler.clone());
+        let mut request = RequestHeader::build(http::Method::GET, b"/api/users?q=1", None).unwrap();
+        let mut uri = "/api/users?q=1".to_string();
+        let mut policy = ResponseHeaderPolicy::default();
+
+        let plan = plan_h3_handler(
+            &handler,
+            &state,
+            0,
+            &mut request,
+            &mut uri,
+            &mut policy,
+            "203.0.113.7",
+            None,
+            false,
+            &mut crate::http_policy::RequestVars::default(),
+            &mut None,
+            &mut RequestBodyPlan::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(plan, H3Plan::Terminal(H3Terminal::ReverseProxy)));
+        assert_eq!(
+            (uri.as_str(), request.uri.to_string()),
+            ("/users?q=1", "/users?q=1".to_string())
+        );
     }
 
     /// 🧭 A standalone interceptor survives planning until the proxied response arrives.

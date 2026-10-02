@@ -71,3 +71,54 @@ async fn test_mixed_case_requests_reach_the_same_route_as_lowercase_ones() {
         ]
     );
 }
+
+/// 🪚 A prefix strip agrees with the case-insensitive route that chose it
+/// (#214). `handle_path /API/*` is selected for `/api/users`, so it must also
+/// strip `/api`; before the fix it compared bytes exactly and forwarded the
+/// path untouched. `uri strip_prefix` and `uri strip_suffix` share the rule,
+/// as in Caddy, where both go through one case-insensitive trim.
+#[tokio::test]
+async fn test_prefix_strips_agree_with_case_insensitive_routes() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle_path /API/* {
+                respond "handle_path {path}" 200
+            }
+            handle /static/* {
+                uri strip_prefix /STATIC
+                respond "strip_prefix {path}" 200
+            }
+            @php path *.php
+            handle @php {
+                uri strip_suffix .PHP
+                respond "strip_suffix {path}" 200
+            }
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let mut answers = Vec::new();
+    for path in ["/api/users", "/Api/users", "/static/app.js", "/index.php"] {
+        let reply = client.get(server.url(0, path)).send().await.unwrap();
+        answers.push((path, reply.text().await.unwrap()));
+    }
+
+    assert_eq!(
+        answers,
+        [
+            ("/api/users", "handle_path /users".to_string()),
+            ("/Api/users", "handle_path /users".to_string()),
+            ("/static/app.js", "strip_prefix /app.js".to_string()),
+            ("/index.php", "strip_suffix /index".to_string()),
+        ]
+    );
+}

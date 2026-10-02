@@ -1439,6 +1439,40 @@ pub(crate) fn resolve_request_id(raw: Option<&str>) -> String {
         .unwrap_or_else(generate_request_id)
 }
 
+/// 🔤 Returns what follows `prefix` in `path`, ignoring ASCII letter case.
+///
+/// A route path matches without regard to case (#198), so `handle_path /API/*`
+/// is chosen for `/api/x`. The strip that follows has to agree with that
+/// choice, or the route is selected and then forwards `/api/x` untouched.
+/// Caddy's `trimPathPrefix` compares with `strings.EqualFold` for the same
+/// reason (from memory, modules/caddyhttp/rewrite/rewrite.go, v2.x). The fold
+/// is ASCII only, like the route matcher's, and it borrows: nothing is copied
+/// to compare.
+pub(crate) fn strip_path_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = path.as_bytes().get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix.as_bytes()) {
+        return None;
+    }
+    // 🛡️ Bytes that differ only in ASCII case are both ASCII, so the cut lands
+    // where it lands in `prefix`, on a character boundary; `get` keeps that a
+    // `None` rather than a panic if the reasoning is ever wrong.
+    path.get(prefix.len()..)
+}
+
+/// 🔤 Returns `path` without `suffix`, ignoring ASCII letter case.
+///
+/// The mirror of [`strip_path_prefix`]: Caddy trims a suffix by running the
+/// same case-insensitive prefix trim over the reversed strings (from memory,
+/// as above), and a `*.PHP` route matches `/index.php`.
+pub(crate) fn strip_path_suffix<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
+    let cut = path.len().checked_sub(suffix.len())?;
+    let tail = path.as_bytes().get(cut..)?;
+    if !tail.eq_ignore_ascii_case(suffix.as_bytes()) {
+        return None;
+    }
+    path.get(..cut)
+}
+
 /// 🧭 Rewrites one URI while preserving the original query when appropriate.
 pub(crate) fn rewrite_uri(
     current: &str,
@@ -1449,27 +1483,22 @@ pub(crate) fn rewrite_uri(
     regex_replace: Option<&str>,
 ) -> String {
     let (path, query) = current.split_once('?').unwrap_or((current, ""));
-    let mut rewritten = path.to_string();
-
-    if let Some(prefix) = strip_prefix
-        && let Some(rest) = rewritten.strip_prefix(prefix)
-    {
-        rewritten = if rest.is_empty() {
-            "/".to_string()
-        } else if rest.starts_with('/') {
-            rest.to_string()
-        } else {
-            format!("/{rest}")
-        };
-    }
+    // 🏎️ The prefix is cut from the borrowed path, so a strip costs one copy
+    // of what remains rather than a copy of the whole path and then another.
+    let mut rewritten = match strip_prefix.and_then(|prefix| strip_path_prefix(path, prefix)) {
+        Some("") => "/".to_string(),
+        Some(rest) if rest.starts_with('/') => rest.to_string(),
+        Some(rest) => format!("/{rest}"),
+        None => path.to_string(),
+    };
     if let Some(suffix) = strip_suffix
-        && let Some(rest) = rewritten.strip_suffix(suffix)
+        && let Some(kept) = strip_path_suffix(&rewritten, suffix).map(str::len)
     {
-        rewritten = if rest.is_empty() {
-            "/".to_string()
-        } else {
-            rest.to_string()
-        };
+        // 🏎️ Truncating in place reuses the buffer instead of copying again.
+        rewritten.truncate(kept);
+        if rewritten.is_empty() {
+            rewritten.push('/');
+        }
     }
     if let Some(replacement) = replace {
         rewritten = replacement.to_string();
@@ -2590,6 +2619,35 @@ mod tests {
                 .collect::<HashMap<&str, &str>>()
                 .get("access-control-allow-origin"),
             Some(&"https://app.example")
+        );
+    }
+
+    /// 🔤 Prefix and suffix strips agree with the case-insensitive route
+    /// matcher (#214): a route chosen for `/api/x` by `/API/*` must strip it.
+    #[test]
+    fn rewrite_strips_prefix_and_suffix_without_regard_to_case() {
+        let rewrites = [
+            rewrite_uri("/api/users?q=1", Some("/API"), None, None, None, None),
+            rewrite_uri("/Api", Some("/aPI"), None, None, None, None),
+            rewrite_uri("/apiary", Some("/API"), None, None, None, None),
+            rewrite_uri("/other", Some("/API"), None, None, None, None),
+            rewrite_uri("/index.php", None, Some(".PHP"), None, None, None),
+            rewrite_uri("/x/\u{e9}A", Some("/X/\u{e9}"), None, None, None, None),
+            rewrite_uri("/x/\u{e9}a", Some("/X/\u{c9}"), None, None, None, None),
+        ];
+        assert_eq!(
+            rewrites,
+            [
+                "/users?q=1",
+                "/",
+                "/ary",
+                "/other",
+                "/index",
+                "/A",
+                // 🧭 The fold is ASCII only, like the route matcher's, so an
+                // accented capital is a different letter.
+                "/x/\u{e9}a",
+            ]
         );
     }
 

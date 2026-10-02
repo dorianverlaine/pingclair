@@ -46,7 +46,7 @@ use crate::cache_policy::{
 use crate::encoding::{ResponseEncoder, negotiate};
 use crate::http_policy::{
     CorsDecision, ResponseContent, ResponseHeaderPolicy, evaluate_cors, generate_request_id,
-    is_websocket_upgrade, rewrite_uri, sanitize_request_id, via_value,
+    is_websocket_upgrade, rewrite_uri, sanitize_request_id, strip_path_prefix, via_value,
 };
 use crate::listener_generation::RouteTable;
 use crate::metrics;
@@ -5287,7 +5287,9 @@ impl PingclairProxy {
                     .path_and_query()
                     .map(|value| value.as_str())
                     .unwrap_or(path);
-                let rewritten = if path.starts_with(prefix) {
+                // 🔤 The route matcher chose this group without regard to
+                // case, so the strip compares the same way (#214).
+                let rewritten = if strip_path_prefix(path, prefix).is_some() {
                     rewrite_uri(current, Some(prefix), None, None, None, None)
                 } else {
                     current.to_string()

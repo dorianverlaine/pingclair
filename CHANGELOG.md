@@ -93,6 +93,9 @@ below, which ends with what to write instead.
   `/admin/x`, as in Caddy; a site that used case to tell two routes apart
   needs a `path_regexp`.
   → [Every route path ignores letter case](#-every-route-path-ignores-letter-case)
+- **`handle_path`, `uri strip_prefix` and `uri strip_suffix` ignore letter
+  case** too, so `handle_path /API/*` strips `/api` from `/api/x`.
+  → [A strip ignores letter case like the route that chose it](#-a-strip-ignores-letter-case-like-the-route-that-chose-it)
 - **A request header has one minute by default**, start to finish, where it
   had no limit unless `limits { header_timeout }` was set. An idle HTTP/1
   keepalive connection is therefore closed after a minute without a request.
@@ -561,6 +564,21 @@ compare exactly.
 A site that relied on case to send `/Admin` and `/admin` to different
 routes, or to keep `/Private/*` from answering `/private/x`, needs a
 case-sensitive `path_regexp` matcher instead. (#198)
+
+### 🪚 A strip ignores letter case like the route that chose it
+
+**Breaking.** `handle_path`, `uri strip_prefix` and `uri strip_suffix` now
+compare without regard to ASCII letter case, as Caddy's path trim does.
+Once route paths ignored case (#198), `handle_path /API/*` was chosen for
+`/api/users` but still compared the prefix byte for byte, so it forwarded
+`/api/users` untouched instead of `/users`; the same happened on HTTP/3.
+The comparison borrows the path and folds nothing, so it costs no copy.
+Letters outside ASCII still compare exactly.
+
+**Upgrading:** a strip whose spelling differs in case from the request now
+removes the prefix or suffix. A configuration that relied on case to keep a
+prefix in place needs a case-sensitive `path_regexp` and `rewrite` instead.
+(#214)
 
 ### 🧩 A `*` anywhere in a route's path matches
 
