@@ -25,7 +25,7 @@
 //! several upstreams. A variant rather than the primary key, so a purge by URL
 //! still reaches every upstream's copy.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use pingclair_core::config::{RouteConfig, ServerConfig};
@@ -48,15 +48,50 @@ struct ScopeIdentity<'a> {
     route_index: usize,
 }
 
+/// 🔑 One loaded configuration's route scopes, parallel to its routes, held
+/// as a lease on the registry [`known_scopes`] reads.
+///
+/// Dropping the last configuration that uses a scope forgets it. Entries
+/// stored under a forgotten scope can stay in the store until the LRU evicts
+/// them, but no request can reach them — nothing loaded produces that scope —
+/// so purge has no reason to either. A later load that produces the same
+/// scope again registers it again, and purge reaches those entries once more.
+pub(crate) struct RouteScopes {
+    scopes: Vec<Option<CacheScope>>,
+}
+
+impl RouteScopes {
+    /// 🔑 The scope of the route at `route_index`, or `None` if it does not cache.
+    pub(crate) fn get(&self, route_index: usize) -> Option<CacheScope> {
+        self.scopes.get(route_index).copied().flatten()
+    }
+}
+
+impl Drop for RouteScopes {
+    fn drop(&mut self) {
+        let mut registry = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for scope in self.scopes.iter().flatten() {
+            if let Some(leases) = registry.get_mut(scope) {
+                *leases -= 1;
+                if *leases == 0 {
+                    registry.remove(scope);
+                }
+            }
+        }
+    }
+}
+
 /// 🔑 Computes the scope of each route in `config` that caches, parallel to
-/// `config.routes`, and records it for [`known_scopes`].
+/// `config.routes`, and leases each one in the registry for [`known_scopes`].
 ///
 /// 📌 Runs at configuration load, not per request, so it optimizes for being
-/// obviously right: it serializes the route and hashes the bytes.
+/// obviously right: it serializes the site and hashes the bytes.
 pub(crate) fn route_scopes(
     config: &ServerConfig,
     caches: impl Fn(&RouteConfig) -> bool,
-) -> Vec<Option<CacheScope>> {
+) -> RouteScopes {
     let scopes: Vec<Option<CacheScope>> = config
         .routes
         .iter()
@@ -90,31 +125,33 @@ pub(crate) fn route_scopes(
     let mut registry = registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    registry.extend(scopes.iter().flatten().copied());
-    scopes
+    for scope in scopes.iter().flatten() {
+        *registry.entry(*scope).or_insert(0) += 1;
+    }
+    RouteScopes { scopes }
 }
 
-/// 🧹 Every scope any configuration loaded by this process has used, so the
-/// purge endpoint can reach an entry whichever route stored it.
+/// 🧹 Every scope a currently loaded configuration uses, so the purge
+/// endpoint can reach an entry whichever live route stored it.
 ///
-/// The set only grows: an entry stored under a scope from an earlier load can
-/// still be in the cache, and purge must reach it. It grows by 16 bytes per
-/// distinct caching route configuration ever loaded, which is bounded by what
-/// operators write, not by traffic.
+/// Bounded by the caching routes of the configurations still alive — the
+/// current one, and a previous one until its last request finishes — not by
+/// how many reloads the process has seen.
 pub(crate) fn known_scopes() -> Vec<CacheScope> {
     registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
+        .keys()
         .copied()
         .collect()
 }
 
-/// 🔒 A `Mutex` is enough: it is taken at configuration load and by the admin
-/// purge endpoint, never on the request path.
-fn registry() -> &'static Mutex<HashSet<CacheScope>> {
-    static SCOPES: OnceLock<Mutex<HashSet<CacheScope>>> = OnceLock::new();
-    SCOPES.get_or_init(|| Mutex::new(HashSet::new()))
+/// 🔒 Scope to the number of loaded configurations leasing it. A `Mutex` is
+/// enough: it is taken at configuration load and drop and by the admin purge
+/// endpoint, never on the request path.
+fn registry() -> &'static Mutex<HashMap<CacheScope, usize>> {
+    static SCOPES: OnceLock<Mutex<HashMap<CacheScope, usize>>> = OnceLock::new();
+    SCOPES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// 🧭 A digest of the upstream a placeholder dial resolved to.
@@ -165,6 +202,40 @@ mod tests {
     fn primary_does_not_conflate_adjacent_fields() {
         let scope = [0; 16];
         assert_ne!(primary(&scope, "ab", "c"), primary(&scope, "a", "bc"));
+    }
+
+    /// 🧹 A scope stays known only while a loaded configuration uses it.
+    ///
+    /// The registry used to keep every scope any configuration had ever used,
+    /// so repeated reloads grew it without bound and every purge walked the
+    /// whole history. nextest runs each test in its own process, so the
+    /// registry starts empty here.
+    #[test]
+    fn a_scope_is_forgotten_when_its_configuration_is_dropped() {
+        let config = ServerConfig {
+            routes: vec![RouteConfig {
+                path: "/*".to_string(),
+                handler: pingclair_core::config::HandlerConfig::Respond {
+                    status: 200,
+                    body: Some("cached".to_string()),
+                    headers: Default::default(),
+                },
+                methods: None,
+                matcher: None,
+            }],
+            ..ServerConfig::default()
+        };
+
+        let first = route_scopes(&config, |_| true);
+        let second = route_scopes(&config, |_| true);
+        let while_loaded = known_scopes().len();
+        drop(first);
+        let one_load_left = known_scopes().len();
+        drop(second);
+        assert_eq!(
+            (while_loaded, one_load_left, known_scopes().len()),
+            (1, 1, 0)
+        );
     }
 
     /// 🔑 Purge and the request path may differ in host case; the key may not.

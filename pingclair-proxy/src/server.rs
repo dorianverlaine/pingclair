@@ -1135,7 +1135,7 @@ pub struct ProxyState {
     pub(crate) route_buffering: Vec<RouteBuffering>,
     /// 🔑 Per route, the scope that keeps its cache entries apart from every
     /// other route's; `None` for a route that does not cache.
-    pub(crate) cache_scopes: Vec<Option<crate::cache_key::CacheScope>>,
+    pub(crate) cache_scopes: Arc<crate::cache_key::RouteScopes>,
     /// 🧭 Whether configured runtime text can observe original-URI variables.
     /// Most sites cannot, so their requests never build those owned map entries.
     needs_original_uri_vars: bool,
@@ -2008,9 +2008,9 @@ impl ProxyState {
         target_entries.extend(named_targets);
         let log_targets = crate::access_log::LogTargets::new(target_entries);
         let strict_transport = crate::http_policy::StrictTransport::from_security(&config.security);
-        let cache_scopes = crate::cache_key::route_scopes(&config, |route| {
+        let cache_scopes = Arc::new(crate::cache_key::route_scopes(&config, |route| {
             find_reverse_proxy_config(&route.handler).is_some_and(|proxy| proxy.cache.is_some())
-        });
+        }));
 
         Self {
             config: Arc::new(config),
@@ -6619,7 +6619,7 @@ impl ProxyHttp for PingclairProxy {
         let Some((state, route_index)) = ctx.state.as_ref().zip(ctx.route_index) else {
             return Ok(());
         };
-        let Some(route_scope) = state.cache_scopes.get(route_index).copied().flatten() else {
+        let Some(route_scope) = state.cache_scopes.get(route_index) else {
             return Ok(());
         };
         // 🧭 A dial with placeholders reaches a different upstream per request,
