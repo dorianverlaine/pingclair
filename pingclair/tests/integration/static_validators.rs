@@ -81,7 +81,7 @@ async fn test_file_server_etag_differs_per_content_coding() {
     assert!(!identity.0.starts_with("W/"), "the tag must stay strong");
     assert_eq!(
         gzip.0,
-        format!("{}-gzip\"", identity.0.trim_end_matches('"')),
+        format!("{}-gzip-5\"", identity.0.trim_end_matches('"')),
         "the gzip body gets its own strong tag"
     );
 }

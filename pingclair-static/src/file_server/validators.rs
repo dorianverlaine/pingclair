@@ -26,8 +26,8 @@ use http::HeaderValue;
 
 /// 🏷️ One strong entity tag per representation of a file.
 ///
-/// The encoded tags are the identity tag with the coding appended inside the
-/// quotes, so `"1f-17a…"` becomes `"1f-17a…-gzip"`. Built once per file
+/// 🗜️ Encoded tags include coding and, for gzip, quality inside the quotes:
+/// `"1f-17a…"` becomes `"1f-17a…-gzip-5"`. Built once per file
 /// identity; a request only picks one and clones it, which is a reference
 /// count increment.
 pub(super) struct EntityTags {
@@ -38,7 +38,8 @@ pub(super) struct EntityTags {
 }
 
 impl EntityTags {
-    /// 🏷️ Derives the tags from a file's size and nanosecond mtime, or from a
+    /// 🏷️ Includes gzip quality so different encoded bytes cannot share a strong tag.
+    /// Derives the tags from a file's size and nanosecond mtime, or from a
     /// sidecar-supplied tag when the site keeps one.
     ///
     /// Nanoseconds rather than seconds because the second is exactly the
@@ -50,12 +51,17 @@ impl EntityTags {
     /// has passed [`SidecarTag::parse`]. Appending `-br` and friends inside
     /// the quotes keeps both properties, which is why the conversions below
     /// cannot fail.
-    pub(super) fn derive(size: u64, mtime_ns: u128, sidecar: Option<SidecarTag>) -> Self {
+    pub(super) fn derive(
+        size: u64,
+        mtime_ns: u128,
+        sidecar: Option<SidecarTag>,
+        gzip_level: u32,
+    ) -> Self {
         let identity = sidecar.map_or_else(|| format!("\"{size:x}-{mtime_ns:x}\""), |tag| tag.0);
         Self {
             br: Self::coded(&identity, "br"),
             zstd: Self::coded(&identity, "zstd"),
-            gzip: Self::coded(&identity, "gzip"),
+            gzip: Self::coded(&identity, &format!("gzip-{gzip_level}")),
             identity: Self::header(identity),
         }
     }
@@ -207,7 +213,7 @@ mod tests {
     fn representations_never_share_a_tag() {
         // 🎯 §8.8.1: a strong tag shared by the gzip and identity bodies is
         // not strong. Every coding this crate can emit must get its own.
-        let tags = EntityTags::derive(0x1f, 0x17a, None);
+        let tags = EntityTags::derive(0x1f, 0x17a, None, 5);
         let all: Vec<&str> = [None, Some("br"), Some("zstd"), Some("gzip")]
             .into_iter()
             .map(|coding| tags.for_coding(coding).to_str().unwrap())
@@ -218,7 +224,7 @@ mod tests {
                 "\"1f-17a\"",
                 "\"1f-17a-br\"",
                 "\"1f-17a-zstd\"",
-                "\"1f-17a-gzip\""
+                "\"1f-17a-gzip-5\""
             ]
         );
     }
@@ -237,8 +243,8 @@ mod tests {
         // 🔢 Same size, same whole second, one nanosecond apart: this is the
         // pair whole-second resolution could not tell apart, and the pair a
         // deploy that writes a file twice in quick succession produces.
-        let first = EntityTags::derive(0x1f, 1_700_000_000_000_000_000, None);
-        let next_nanosecond = EntityTags::derive(0x1f, 1_700_000_000_000_000_001, None);
+        let first = EntityTags::derive(0x1f, 1_700_000_000_000_000_000, None, 5);
+        let next_nanosecond = EntityTags::derive(0x1f, 1_700_000_000_000_000_001, None, 5);
         assert_eq!(
             first.for_coding(None).to_str().unwrap().split('-').next(),
             next_nanosecond
@@ -257,15 +263,15 @@ mod tests {
 
         // 📌 And a later second still differs, so the fix was not bought by
         // dropping the time component out of the tag.
-        let next_second = EntityTags::derive(0x1f, 1_700_000_001_000_000_000, None);
+        let next_second = EntityTags::derive(0x1f, 1_700_000_001_000_000_000, None, 5);
         assert_ne!(first.for_coding(None), next_second.for_coding(None));
     }
 
     #[test]
     fn a_sidecar_tag_keeps_its_own_shape_per_coding() {
-        let strong = EntityTags::derive(1, 1, SidecarTag::parse("\"abc\"".to_string()));
-        assert_eq!(strong.for_coding(Some("gzip")), "\"abc-gzip\"");
-        let weak = EntityTags::derive(1, 1, SidecarTag::parse("W/\"abc\"".to_string()));
+        let strong = EntityTags::derive(1, 1, SidecarTag::parse("\"abc\"".to_string()), 5);
+        assert_eq!(strong.for_coding(Some("gzip")), "\"abc-gzip-5\"");
+        let weak = EntityTags::derive(1, 1, SidecarTag::parse("W/\"abc\"".to_string()), 5);
         assert_eq!(weak.for_coding(Some("br")), "W/\"abc-br\"");
         assert_eq!(weak.for_coding(None), "W/\"abc\"");
     }

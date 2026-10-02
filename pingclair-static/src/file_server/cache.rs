@@ -208,6 +208,7 @@ impl FileServer {
                 metadata,
                 size,
                 &self.config.etag_file_extensions,
+                self.config.encode.gzip_level,
             )));
         };
 
@@ -220,8 +221,13 @@ impl FileServer {
             return Ok(meta.clone());
         }
 
-        let mut meta =
-            Self::build_meta(file_path, metadata, size, &self.config.etag_file_extensions);
+        let mut meta = Self::build_meta(
+            file_path,
+            metadata,
+            size,
+            &self.config.etag_file_extensions,
+            self.config.encode.gzip_level,
+        );
         let _guard = self.meta_write.lock().unwrap();
         // Whoever published first wins; the double-check avoids rebuilding
         // the map after a concurrent miss already inserted the entry.
@@ -252,6 +258,7 @@ impl FileServer {
         metadata: &std::fs::Metadata,
         size: u64,
         etag_file_extensions: &[String],
+        gzip_level: u32,
     ) -> FileMeta {
         // 🧭 One place decides what a file's type is. This used to inline
         // exactly what `guess_mime_type` does, and the duplication is why
@@ -276,6 +283,7 @@ impl FileServer {
             size,
             mtime_ns,
             read_sidecar_etag(file_path, etag_file_extensions),
+            gzip_level,
         );
 
         // 🛡️ Both values are the server's own ASCII, never file contents: the
@@ -606,7 +614,7 @@ mod meta_cache_tests {
         let fs = server(dir.path());
         let metadata = std::fs::metadata(&path).unwrap();
         let cached = meta_for(&fs, &path);
-        let rebuilt = FileServer::build_meta(&path, &metadata, metadata.len(), &[]);
+        let rebuilt = FileServer::build_meta(&path, &metadata, metadata.len(), &[], 5);
 
         assert_eq!(
             header_text(cached.etags.for_coding(None)),

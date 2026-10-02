@@ -50,6 +50,8 @@ below, which ends with what to write instead.
   → [Automatic HTTPS follows the configured listener policy](#-automatic-https-follows-the-configured-listener-policy)
 - **Scheme-only site addresses inherit global ports.** Explicit ports stay as written.
   → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
+- **Static gzip ETags include quality.** Expect one cache revalidation.
+  → [Static gzip validators include quality](#static-gzip-validators-include-quality)
 - **Local encoding cache keys survive header policy.** Review downstream cache keys.
   → [Local header policy preserves encoding Vary](#local-header-policy-preserves-encoding-vary)
 - **Disabled encoding rejects blocks.** Remove contradictory encode blocks.
@@ -256,6 +258,12 @@ or name an explicit port to keep a site on its previous listener.
 🧊 Static responses and generated upstream failures retain `Accept-Encoding`
 after header policy. Upgrade: caches keep identity and compressed variants
 separate even when a `header Vary` directive replaces or removes the field.
+
+### Static gzip validators include quality
+
+🏷️ Static gzip strong ETags include the configured quality, so different
+encoded bytes no longer share a validator across reloads or replicas. Upgrade:
+gzip caches revalidate once; identity validators remain stable.
 
 ### Encode off rejects blocks
 

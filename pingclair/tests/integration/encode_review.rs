@@ -56,3 +56,45 @@ async fn local_policy_preserves_encoding_vary() {
     assert_eq!(vary, ["Origin", "Accept-Encoding"]);
     server.stop();
 }
+
+#[tokio::test]
+async fn static_gzip_quality_has_distinct_validators() {
+    let tree = compressible_tree();
+    let client = no_proxy_client();
+    let mut variants = Vec::new();
+    for level in [1, 9] {
+        let mut server = file_server_site(
+            tree.path().to_str().unwrap(),
+            &format!("encode {{\ngzip {level}\n}}"),
+        );
+        assert!(server.wait_until_ready().await);
+        let response = client
+            .get(server.url(0, "/big.txt"))
+            .header("Accept-Encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+        let tag = response.headers()["etag"].clone();
+        let wire = response.bytes().await.unwrap();
+        let identity = client.get(server.url(0, "/big.txt")).send().await.unwrap();
+        variants.push((tag, wire, identity.headers()["etag"].clone()));
+        if variants.len() == 2 {
+            let response = client
+                .get(server.url(0, "/big.txt"))
+                .header("Accept-Encoding", "gzip")
+                .header("If-None-Match", &variants[0].0)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                200,
+                "another quality cannot validate these bytes"
+            );
+        }
+        server.stop();
+    }
+    assert_ne!(variants[0].1, variants[1].1);
+    assert_ne!(variants[0].0, variants[1].0);
+    assert_eq!(variants[0].2, variants[1].2);
+}
