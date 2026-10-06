@@ -52,6 +52,10 @@ mod connect;
 #[path = "h3_end_to_end/fastcgi_buffering.rs"]
 mod fastcgi_buffering;
 
+// 🔪 FastCGI failures must reset the HTTP/3 response stream.
+#[path = "h3_end_to_end/fastcgi_truncation.rs"]
+mod fastcgi_truncation;
+
 // 🚫 What a locally raised error status says about itself.
 #[path = "h3_end_to_end/error_responses.rs"]
 mod error_responses;

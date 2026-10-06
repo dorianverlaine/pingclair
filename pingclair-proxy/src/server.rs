@@ -3885,6 +3885,19 @@ impl PingclairProxy {
         }
         Self::apply_local_response_headers(&mut response, ctx)?;
 
+        // 🌊 A lengthless HTTP/1.1 body needs chunked framing: otherwise a
+        // responder failure closes a close-delimited response normally.
+        if session.req_header().version == http::Version::HTTP_11
+            && ResponseContent::for_response(
+                response.status.as_u16(),
+                session.req_header().method == http::Method::HEAD,
+            )
+            .has_body()
+            && !response.headers.contains_key(http::header::CONTENT_LENGTH)
+        {
+            response.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
+        }
+
         // 📂 A response-subroute file server takes over after the file opens.
         // The abort comes first, before a single downstream byte: the responder
         // is already known to be unwanted, and holding its connection open for
@@ -3947,13 +3960,9 @@ impl PingclairProxy {
             };
             match read {
                 Ok(Some(chunk)) => {
-                    if session
-                        .write_response_body(Some(chunk), false)
-                        .await
-                        .is_err()
-                    {
+                    if let Err(error) = session.write_response_body(Some(chunk), false).await {
                         exchange.abort().await;
-                        break;
+                        return Err(error);
                     }
                 }
                 Ok(None) => {
@@ -3965,8 +3974,9 @@ impl PingclairProxy {
                     break;
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "🧵 FastCGI body read failed");
-                    break;
+                    // 🔪 Propagate the failure so `fail_to_proxy` abandons the
+                    // committed response instead of declaring it complete.
+                    return Err(protocol_error(error));
                 }
             }
         }

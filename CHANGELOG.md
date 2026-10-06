@@ -33,6 +33,9 @@ Most configurations keep working unchanged. These are the changes most
 likely to alter what an existing configuration does; each links to its entry
 below, which ends with what to write instead.
 
+- **Broken FastCGI bodies now abort the response.** Treat a reset or incomplete
+  response as a failed download and retry only when safe.
+  → [FastCGI body failures](#-fastcgi-body-failures-abort-the-response)
 - **Admin config writes honor `If-Match`.** Refresh the config and its Etag
   after a 412 before retrying.
   → [Admin config validators](#️-admin-config-validators)
@@ -187,6 +190,19 @@ below, which ends with what to write instead.
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
 [Known defect — WebSocket upgrades under load](#-known-defect--websocket-upgrades-under-load).
+
+### 🔪 FastCGI body failures abort the response
+
+A FastCGI responder that disconnects or sends an invalid record after its headers
+now closes the HTTP/1 connection or resets the HTTP/2 or HTTP/3 stream. Previously,
+a partial body without `Content-Length` ended normally and looked complete.
+Lengthless HTTP/1.1 bodies use chunked framing so a missing final chunk exposes
+the failure. Buffered bytes from an incomplete response are discarded without
+a clean end.
+
+📦 **Upgrade:** Configurations need no change. Clients must treat an incomplete
+response as failed rather than storing or displaying it as a complete document;
+retry only requests that are safe to repeat.
 
 ### 🚫 A block directive takes `*`, a `/path` or `@name`
 

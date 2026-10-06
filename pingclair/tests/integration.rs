@@ -160,6 +160,10 @@ mod connect;
 #[path = "integration/fastcgi_buffering.rs"]
 mod fastcgi_buffering;
 
+// 🔪 A broken FastCGI body must remain visibly incomplete.
+#[path = "integration/fastcgi_truncation.rs"]
+mod fastcgi_truncation;
+
 // 🚫 What a locally raised error status says about itself.
 #[path = "integration/error_responses.rs"]
 mod error_responses;

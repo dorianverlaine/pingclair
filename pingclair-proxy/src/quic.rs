@@ -5184,7 +5184,7 @@ async fn fastcgi_upstream(
     let mut response_buffer = buffering
         .response
         .map(crate::body_buffer::BufferedBody::new);
-    loop {
+    let completion = loop {
         match exchange.read_body_chunk().await {
             Ok(Some(bytes)) => {
                 let bytes = match response_buffer.as_mut() {
@@ -5203,15 +5203,15 @@ async fn fastcgi_upstream(
                     pace_h3_body(&mut download_pacer, request_deadline, held.len()).await?;
                     send_body(resp_tx, stream_id, held, false).await;
                 }
-                break;
+                break H3BodyCompletion::Complete;
             }
             Err(error) => {
                 tracing::warn!(%error, "🧵 H3 FastCGI response stream failed");
-                break;
+                break H3BodyCompletion::Truncated;
             }
         }
-    }
-    send_body(resp_tx, stream_id, Bytes::new(), true).await;
+    };
+    finish_h3_response(resp_tx, stream_id, completion, None).await;
     let stderr = exchange.take_stderr();
     if !stderr.is_empty() {
         let text = String::from_utf8_lossy(&stderr);
