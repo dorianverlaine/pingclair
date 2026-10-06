@@ -83,3 +83,18 @@ pub(crate) fn error_page_method(method: &http::Method) -> &'static http::Method 
         &http::Method::GET
     }
 }
+
+impl crate::server::ProxyState {
+    /// 🚨 Whether any error route answers `status`.
+    ///
+    /// Asked on the failure paths that used to answer directly — a proxy that
+    /// could not reach its upstream, a body over its limit — so that a site
+    /// without a matching route keeps its error page and `Proxy-Status`
+    /// exactly as before. At most one comparison per configured route.
+    pub(crate) fn has_error_route_for(&self, status: u16) -> bool {
+        self.config
+            .error_routes
+            .iter()
+            .any(|route| route.matches(status))
+    }
+}

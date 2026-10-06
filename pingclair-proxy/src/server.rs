@@ -7417,6 +7417,16 @@ impl ProxyHttp for PingclairProxy {
                     .and_then(|v| v.parse::<u64>().ok())
                 && content_length > limit
             {
+                // 🚨 Too large is an error the handler chain raised, so a
+                // `handle_errors` route that answers 413 renders it, as in
+                // Caddy. The connection still closes: the body was never
+                // read, so nothing after it can be trusted as a next request.
+                if state.has_error_route_for(413) {
+                    session.as_mut().set_keepalive(None);
+                    ctx.route_index = route_index;
+                    self.handle_raised_error(session, ctx, 413).await?;
+                    return Ok(true);
+                }
                 let mut header = pingora_http::ResponseHeader::build(413, Some(4)).unwrap();
                 header.insert_header("Connection", "close").unwrap();
                 Self::apply_local_response_headers(&mut header, ctx)?;
@@ -8932,6 +8942,21 @@ impl ProxyHttp for PingclairProxy {
             // wrap itself recursively.
             ctx.intercept_handlers.clear();
             self.handle_raised_error(session, ctx, status).await.is_ok()
+        } else if code > 0
+            && !ctx.handling_error
+            && ctx
+                .state
+                .as_ref()
+                .is_some_and(|state| state.has_error_route_for(code))
+        {
+            // 🚨 A proxy that could not reach its upstream (502, 503, 504), a
+            // body over its limit (413) or a stalled one (408) is an error the
+            // handler chain produced, and Caddy hands every such error to
+            // `handle_errors`. Only when no route answers the status does the
+            // site's error page below take it. `handling_error` is the loop
+            // guard: an error route that itself fails is answered directly.
+            ctx.intercept_handlers.clear();
+            self.handle_raised_error(session, ctx, code).await.is_ok()
         } else {
             code > 0 && self.serve_error_page(session, ctx, code).await.is_ok()
         };

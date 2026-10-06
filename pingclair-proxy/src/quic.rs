@@ -3953,6 +3953,7 @@ async fn handle_request_inner(
     // done, and it is what the streaming checks enforce. Same reasoning, same
     // precomputed value, as the H1/H2 path.
     let site_body_limit = state.config.client_max_body_size;
+    let mut raised = None;
     let declared_limit = match state.route_body_ceiling(route_index) {
         Some(ceiling) if ceiling > site_body_limit => ceiling,
         Some(0) => 0,
@@ -3966,19 +3967,29 @@ async fn handle_request_inner(
             .and_then(|v| v.parse::<u64>().ok())
         && content_length > declared_limit
     {
-        return Err((413, "Request Entity Too Large"));
+        // 🚨 A `handle_errors` route that answers 413 renders it, as on
+        // H1/H2; without one the site's error page answers as before. The
+        // rest of the route then does not run: no guard, no handler, and the
+        // body is never read.
+        if !state.has_error_route_for(413) {
+            return Err((413, "Request Entity Too Large"));
+        }
+        raised = Some(413);
     }
 
     // 🛡️ HTTP/3 enforces the same compiled access policy before authentication or dispatch.
-    if !state.allows_access(route_index, &verified_client_ip_text, &header.headers) {
+    if raised.is_none()
+        && !state.allows_access(route_index, &verified_client_ip_text, &header.headers)
+    {
         return Err((403, "Forbidden"));
     }
 
     // 🚦 HTTP/3 charges the same exact limiter and identity source as H1 and H2.
-    if let Some(limiter) = state
-        .rate_limiters
-        .get(route_index)
-        .and_then(|l| l.as_ref())
+    if raised.is_none()
+        && let Some(limiter) = state
+            .rate_limiters
+            .get(route_index)
+            .and_then(|l| l.as_ref())
     {
         let decision = limiter.check_request(&verified_client_ip_text, &header.headers);
         for (name, value) in decision.info.to_headers() {
@@ -4000,23 +4011,44 @@ async fn handle_request_inner(
         .map(|route| &route.matcher_precompile);
     let mut response_handlers = None;
     let mut body_plan = RequestBodyPlan::default();
-    let plan = plan_h3_handler_with_connector(
-        handler,
-        &state,
-        Some(connector),
-        route_index,
-        &mut header,
-        &mut effective_uri,
-        response_policy,
-        &verified_client_ip_text,
-        addresses,
-        route_precompile,
-        false,
-        &mut request_vars,
-        &mut response_handlers,
-        &mut body_plan,
-    )
-    .await?;
+    let plan = match raised {
+        Some(status) => {
+            h3_raise_status(
+                status,
+                &state,
+                Some(connector),
+                route_index,
+                &mut header,
+                &mut effective_uri,
+                response_policy,
+                &verified_client_ip_text,
+                addresses,
+                false,
+                &mut request_vars,
+                &mut response_handlers,
+            )
+            .await?
+        }
+        None => {
+            plan_h3_handler_with_connector(
+                handler,
+                &state,
+                Some(connector),
+                route_index,
+                &mut header,
+                &mut effective_uri,
+                response_policy,
+                &verified_client_ip_text,
+                addresses,
+                route_precompile,
+                false,
+                &mut request_vars,
+                &mut response_handlers,
+                &mut body_plan,
+            )
+            .await?
+        }
+    };
 
     // 📥 Planning is done, so whichever `request_body` handler actually ran
     // has had its say. Everything that reads the body from here on uses these.
@@ -4106,7 +4138,11 @@ async fn handle_request_inner(
         }
     };
 
-    if !matches!(&handler, H3Terminal::ReverseProxy | H3Terminal::FastCgi) {
+    // 🚨 An error raised by now has not read the body, and must not: it was
+    // refused for its size.
+    let drained = if raised.is_none()
+        && !matches!(&handler, H3Terminal::ReverseProxy | H3Terminal::FastCgi)
+    {
         drain_local_h3_body(
             body_rx,
             body_notify,
@@ -4115,189 +4151,41 @@ async fn handle_request_inner(
             state.config.limits.upload_bytes_per_sec,
             request_deadline,
         )
-        .await?;
-    }
+        .await
+    } else {
+        Ok(())
+    };
     let mut download_pacer = state
         .config
         .limits
         .download_bytes_per_sec
         .map(StreamPacer::new);
 
-    match handler {
-        H3Terminal::Respond {
-            status,
-            body,
-            headers,
-        } => {
-            let body = body.unwrap_or_default();
-            let mut hdrs = http::HeaderMap::new();
-            for (k, v) in &headers {
-                if let (Ok(name), Ok(value)) = (
-                    http::header::HeaderName::from_bytes(k.as_bytes()),
-                    http::HeaderValue::from_str(v),
-                ) {
-                    hdrs.insert(name, value);
-                }
-            }
-            send_h3_local_response(
-                resp_tx,
-                stream_id,
-                &state,
-                &header,
-                &effective_uri,
-                &verified_client_ip_text,
-                &request_vars,
-                response_handlers.as_deref(),
-                status,
-                hdrs,
-                H3LocalBody::Bytes(Bytes::from(body)),
-                response_policy,
-                request_id,
-                request_deadline,
-                &mut download_pacer,
-            )
-            .await
-        }
-
-        H3Terminal::Redirect { to, code } => {
-            let mut hdrs = http::HeaderMap::new();
-            if let Ok(value) = http::HeaderValue::from_str(&to) {
-                hdrs.insert("location", value);
-            }
-            send_h3_local_response(
-                resp_tx,
-                stream_id,
-                &state,
-                &header,
-                &effective_uri,
-                &verified_client_ip_text,
-                &request_vars,
-                response_handlers.as_deref(),
-                code,
-                hdrs,
-                H3LocalBody::Bytes(Bytes::new()),
-                response_policy,
-                request_id,
-                request_deadline,
-                &mut download_pacer,
-            )
-            .await
-        }
-
-        H3Terminal::Templates { root } => {
-            let root = root.unwrap_or_else(|| ".".to_string());
-            let relative = effective_uri.split('?').next().unwrap_or("/");
-            // 🛡️ Confined here as well as in the plan that selected this
-            // terminal. The plan always runs first today, so this is the second
-            // line that does not depend on the first having run — the same reason
-            // the static file server re-checks a configured index. It used to
-            // join the request path with no `..` check of its own at all.
-            let Some(mut file_path) =
-                pingclair_core::percent::resolve_under_root(std::path::Path::new(&root), relative)
-            else {
-                return Err((404, "Not Found"));
-            };
-            if file_path.is_dir() {
-                file_path = file_path.join("index.html");
-            }
-            let source = std::fs::read_to_string(&file_path).map_err(|_| (404, "Not Found"))?;
-            let body = crate::server::render_template(&source, &root)
-                .map_err(|_| (500, "Template Rendering Failed"))?;
-            let mut hdrs = http::HeaderMap::new();
-            hdrs.insert(
-                "content-type",
-                http::HeaderValue::from_static("text/html; charset=utf-8"),
-            );
-            send_h3_local_response(
-                resp_tx,
-                stream_id,
-                &state,
-                &header,
-                &effective_uri,
-                &verified_client_ip_text,
-                &request_vars,
-                response_handlers.as_deref(),
-                200,
-                hdrs,
-                H3LocalBody::Bytes(Bytes::from(body)),
-                response_policy,
-                request_id,
-                request_deadline,
-                &mut download_pacer,
-            )
-            .await
-        }
-
-        H3Terminal::FileServer { error } => {
-            // 🚨 Inside an error route the file server is that route's own,
-            // and the page goes out with the error's status, as on H1/H2.
-            let maybe_fs = match error {
-                Some(scope) => state
-                    .error_routes
-                    .get(scope.route)
-                    .and_then(|route| route.file_server.clone()),
-                None => state.file_servers.get(route_index).and_then(|f| f.clone()),
-            };
-            let Some(fs) = maybe_fs else {
-                return Err((503, "File Server Unavailable"));
-            };
-            let status_for = |own: u16| error.map_or(own, |scope| scope.status);
-
-            // 🏷️ The method and header fields go over whole, exactly as on
-            // H1/H2; pingclair-static reads `Range`, `If-Range`, and the four
-            // preconditions from them itself. An error page is read plainly
-            // instead; see `error_page_method`. The encode policy sees the
-            // status that actually goes out, which for an error page is the
-            // error's.
-            let encode_policy = |status, headers: &mut http::HeaderMap| {
-                http::HeaderValue::from_str(request_id).is_ok_and(|request_id| {
-                    crate::static_encode::apply_policy(
-                        response_policy,
-                        &state,
-                        &request_id,
-                        true,
-                        status_for(status),
-                        headers,
-                    )
-                })
-            };
-            let no_fields = http::HeaderMap::new();
-            let request = match error {
-                Some(_) => pingclair_static::FileRequest::new(
-                    crate::error_routes::error_page_method(&header.method),
-                    &no_fields,
-                ),
-                None => pingclair_static::FileRequest::new(&header.method, &header.headers),
-            }
-            .with_response_policy(&encode_policy);
-            let accept_encoding = header
-                .headers
-                .get("accept-encoding")
-                .and_then(|v| v.to_str().ok());
-
-            let effective_path = effective_uri.split('?').next().unwrap_or("/");
-            // 🔁 `req.path` is what the client asked for, before any rewrite:
-            // the canonical redirect is decided against it and points back to
-            // it, or a `try_files` that already produced the canonical form
-            // would be redirected away from — see `serve_auto`.
-            let original_path = match error {
-                Some(_) => effective_path,
-                None => req.path.split('?').next().unwrap_or("/"),
-            };
-            match fs
-                .serve_auto(effective_path, original_path, request, accept_encoding)
-                .await
-            {
-                // 🧊 Same fields as the H1/H2 304: validators and `Vary`, no
-                // content and no `Content-Length`.
-                Ok(Some(ServedResponse::NotModified(not_modified))) => {
+    // 🚨 The terminal runs at most twice: once for the route, and once more
+    // for the `handle_errors` route that answers an error it raised — a proxy
+    // that could not reach its upstream, a body over its limit. The second
+    // run is never routed again, which is the guard against an error route
+    // that fails itself; it is answered the way any error is.
+    let mut next = drained.map(|()| handler);
+    let mut error_routed = raised.is_some();
+    loop {
+        let outcome = match next {
+            Err(error) => Err(error),
+            Ok(handler) => match handler {
+                H3Terminal::Respond {
+                    status,
+                    body,
+                    headers,
+                } => {
+                    let body = body.unwrap_or_default();
                     let mut hdrs = http::HeaderMap::new();
-                    hdrs.insert("etag", not_modified.etag);
-                    if let Some(lm) = not_modified.last_modified {
-                        hdrs.insert("last-modified", lm);
-                    }
-                    if not_modified.vary_accept_encoding {
-                        crate::response_encoding::vary_map_on_accept_encoding(&mut hdrs);
+                    for (k, v) in &headers {
+                        if let (Ok(name), Ok(value)) = (
+                            http::header::HeaderName::from_bytes(k.as_bytes()),
+                            http::HeaderValue::from_str(v),
+                        ) {
+                            hdrs.insert(name, value);
+                        }
                     }
                     send_h3_local_response(
                         resp_tx,
@@ -4308,9 +4196,9 @@ async fn handle_request_inner(
                         &verified_client_ip_text,
                         &request_vars,
                         response_handlers.as_deref(),
-                        304,
+                        status,
                         hdrs,
-                        H3LocalBody::Bytes(Bytes::new()),
+                        H3LocalBody::Bytes(Bytes::from(body)),
                         response_policy,
                         request_id,
                         request_deadline,
@@ -4318,52 +4206,10 @@ async fn handle_request_inner(
                     )
                     .await
                 }
-                // 🚫 Same answer as H1/H2, `Allow` included.
-                Ok(Some(ServedResponse::MethodNotAllowed)) => {
+
+                H3Terminal::Redirect { to, code } => {
                     let mut hdrs = http::HeaderMap::new();
-                    hdrs.insert("allow", http::HeaderValue::from_static("GET, HEAD"));
-                    send_h3_local_response(
-                        resp_tx,
-                        stream_id,
-                        &state,
-                        &header,
-                        &effective_uri,
-                        &verified_client_ip_text,
-                        &request_vars,
-                        response_handlers.as_deref(),
-                        405,
-                        hdrs,
-                        H3LocalBody::Bytes(Bytes::new()),
-                        response_policy,
-                        request_id,
-                        request_deadline,
-                        &mut download_pacer,
-                    )
-                    .await
-                }
-                Ok(Some(ServedResponse::PreconditionFailed)) => {
-                    send_h3_local_response(
-                        resp_tx,
-                        stream_id,
-                        &state,
-                        &header,
-                        &effective_uri,
-                        &verified_client_ip_text,
-                        &request_vars,
-                        response_handlers.as_deref(),
-                        412,
-                        http::HeaderMap::new(),
-                        H3LocalBody::Bytes(Bytes::new()),
-                        response_policy,
-                        request_id,
-                        request_deadline,
-                        &mut download_pacer,
-                    )
-                    .await
-                }
-                Ok(Some(ServedResponse::Redirect(location))) => {
-                    let mut hdrs = http::HeaderMap::new();
-                    if let Ok(value) = http::HeaderValue::from_str(&location) {
+                    if let Ok(value) = http::HeaderValue::from_str(&to) {
                         hdrs.insert("location", value);
                     }
                     send_h3_local_response(
@@ -4375,7 +4221,7 @@ async fn handle_request_inner(
                         &verified_client_ip_text,
                         &request_vars,
                         response_handlers.as_deref(),
-                        308,
+                        code,
                         hdrs,
                         H3LocalBody::Bytes(Bytes::new()),
                         response_policy,
@@ -4385,34 +4231,33 @@ async fn handle_request_inner(
                     )
                     .await
                 }
-                Ok(Some(ServedResponse::Stream(stream))) => {
+
+                H3Terminal::Templates { root } => {
+                    let root = root.unwrap_or_else(|| ".".to_string());
+                    let relative = effective_uri.split('?').next().unwrap_or("/");
+                    // 🛡️ Confined here as well as in the plan that selected this
+                    // terminal. The plan always runs first today, so this is the second
+                    // line that does not depend on the first having run — the same reason
+                    // the static file server re-checks a configured index. It used to
+                    // join the request path with no `..` check of its own at all.
+                    let Some(mut file_path) = pingclair_core::percent::resolve_under_root(
+                        std::path::Path::new(&root),
+                        relative,
+                    ) else {
+                        return Err((404, "Not Found"));
+                    };
+                    if file_path.is_dir() {
+                        file_path = file_path.join("index.html");
+                    }
+                    let source =
+                        std::fs::read_to_string(&file_path).map_err(|_| (404, "Not Found"))?;
+                    let body = crate::server::render_template(&source, &root)
+                        .map_err(|_| (500, "Template Rendering Failed"))?;
                     let mut hdrs = http::HeaderMap::new();
-                    hdrs.insert("content-type", stream.content_type.clone());
-                    hdrs.insert("content-length", stream.content_length.clone());
-                    hdrs.insert("accept-ranges", http::HeaderValue::from_static("bytes"));
-                    // 🪟 A streamed body can be partial or already compressed, so
-                    // its status and these two headers come from the stream rather
-                    // than being assumed. Answering 200 with no `Content-Range` to
-                    // a range request tells the client it received the whole file.
-                    if let Some(range) = &stream.content_range {
-                        hdrs.insert("content-range", range.clone());
-                    }
-                    if let Some(encoding) = &stream.content_encoding {
-                        hdrs.insert("content-encoding", encoding.clone());
-                    }
-                    // 🧊 The file server already decided whether this path's
-                    // representation depends on `Accept-Encoding`; H1/H2 reads
-                    // the same flag, so a cache keys both transports alike.
-                    if stream.vary_accept_encoding {
-                        crate::response_encoding::vary_map_on_accept_encoding(&mut hdrs);
-                    }
-                    if let Some(lm) = &stream.last_modified {
-                        hdrs.insert("last-modified", lm.clone());
-                    }
-                    if let Some(etag) = &stream.etag {
-                        hdrs.insert("etag", etag.clone());
-                    }
-                    let stream_status = status_for(stream.status);
+                    hdrs.insert(
+                        "content-type",
+                        http::HeaderValue::from_static("text/html; charset=utf-8"),
+                    );
                     send_h3_local_response(
                         resp_tx,
                         stream_id,
@@ -4422,9 +4267,9 @@ async fn handle_request_inner(
                         &verified_client_ip_text,
                         &request_vars,
                         response_handlers.as_deref(),
-                        stream_status,
+                        200,
                         hdrs,
-                        H3LocalBody::File(Box::new(stream)),
+                        H3LocalBody::Bytes(Bytes::from(body)),
                         response_policy,
                         request_id,
                         request_deadline,
@@ -4432,147 +4277,415 @@ async fn handle_request_inner(
                     )
                     .await
                 }
-                Ok(Some(ServedResponse::Buffered(file))) => {
-                    let mut hdrs = http::HeaderMap::new();
-                    hdrs.insert("content-type", file.content_type.clone());
-                    hdrs.insert("content-length", file.content_length.clone());
-                    hdrs.insert("accept-ranges", http::HeaderValue::from_static("bytes"));
-                    if let Some(range) = &file.content_range
-                        && let Ok(value) = http::HeaderValue::from_str(range)
+
+                H3Terminal::FileServer { error } => {
+                    // 🚨 Inside an error route the file server is that route's own,
+                    // and the page goes out with the error's status, as on H1/H2.
+                    let maybe_fs = match error {
+                        Some(scope) => state
+                            .error_routes
+                            .get(scope.route)
+                            .and_then(|route| route.file_server.clone()),
+                        None => state.file_servers.get(route_index).and_then(|f| f.clone()),
+                    };
+                    let Some(fs) = maybe_fs else {
+                        return Err((503, "File Server Unavailable"));
+                    };
+                    let status_for = |own: u16| error.map_or(own, |scope| scope.status);
+
+                    // 🏷️ The method and header fields go over whole, exactly as on
+                    // H1/H2; pingclair-static reads `Range`, `If-Range`, and the four
+                    // preconditions from them itself. An error page is read plainly
+                    // instead; see `error_page_method`. The encode policy sees the
+                    // status that actually goes out, which for an error page is the
+                    // error's.
+                    let encode_policy = |status, headers: &mut http::HeaderMap| {
+                        http::HeaderValue::from_str(request_id).is_ok_and(|request_id| {
+                            crate::static_encode::apply_policy(
+                                response_policy,
+                                &state,
+                                &request_id,
+                                true,
+                                status_for(status),
+                                headers,
+                            )
+                        })
+                    };
+                    let no_fields = http::HeaderMap::new();
+                    let request = match error {
+                        Some(_) => pingclair_static::FileRequest::new(
+                            crate::error_routes::error_page_method(&header.method),
+                            &no_fields,
+                        ),
+                        None => pingclair_static::FileRequest::new(&header.method, &header.headers),
+                    }
+                    .with_response_policy(&encode_policy);
+                    let accept_encoding = header
+                        .headers
+                        .get("accept-encoding")
+                        .and_then(|v| v.to_str().ok());
+
+                    let effective_path = effective_uri.split('?').next().unwrap_or("/");
+                    // 🔁 `req.path` is what the client asked for, before any rewrite:
+                    // the canonical redirect is decided against it and points back to
+                    // it, or a `try_files` that already produced the canonical form
+                    // would be redirected away from — see `serve_auto`.
+                    let original_path = match error {
+                        Some(_) => effective_path,
+                        None => req.path.split('?').next().unwrap_or("/"),
+                    };
+                    match fs
+                        .serve_auto(effective_path, original_path, request, accept_encoding)
+                        .await
                     {
-                        hdrs.insert("content-range", value);
+                        // 🧊 Same fields as the H1/H2 304: validators and `Vary`, no
+                        // content and no `Content-Length`.
+                        Ok(Some(ServedResponse::NotModified(not_modified))) => {
+                            let mut hdrs = http::HeaderMap::new();
+                            hdrs.insert("etag", not_modified.etag);
+                            if let Some(lm) = not_modified.last_modified {
+                                hdrs.insert("last-modified", lm);
+                            }
+                            if not_modified.vary_accept_encoding {
+                                crate::response_encoding::vary_map_on_accept_encoding(&mut hdrs);
+                            }
+                            send_h3_local_response(
+                                resp_tx,
+                                stream_id,
+                                &state,
+                                &header,
+                                &effective_uri,
+                                &verified_client_ip_text,
+                                &request_vars,
+                                response_handlers.as_deref(),
+                                304,
+                                hdrs,
+                                H3LocalBody::Bytes(Bytes::new()),
+                                response_policy,
+                                request_id,
+                                request_deadline,
+                                &mut download_pacer,
+                            )
+                            .await
+                        }
+                        // 🚫 Same answer as H1/H2, `Allow` included.
+                        Ok(Some(ServedResponse::MethodNotAllowed)) => {
+                            let mut hdrs = http::HeaderMap::new();
+                            hdrs.insert("allow", http::HeaderValue::from_static("GET, HEAD"));
+                            send_h3_local_response(
+                                resp_tx,
+                                stream_id,
+                                &state,
+                                &header,
+                                &effective_uri,
+                                &verified_client_ip_text,
+                                &request_vars,
+                                response_handlers.as_deref(),
+                                405,
+                                hdrs,
+                                H3LocalBody::Bytes(Bytes::new()),
+                                response_policy,
+                                request_id,
+                                request_deadline,
+                                &mut download_pacer,
+                            )
+                            .await
+                        }
+                        Ok(Some(ServedResponse::PreconditionFailed)) => {
+                            send_h3_local_response(
+                                resp_tx,
+                                stream_id,
+                                &state,
+                                &header,
+                                &effective_uri,
+                                &verified_client_ip_text,
+                                &request_vars,
+                                response_handlers.as_deref(),
+                                412,
+                                http::HeaderMap::new(),
+                                H3LocalBody::Bytes(Bytes::new()),
+                                response_policy,
+                                request_id,
+                                request_deadline,
+                                &mut download_pacer,
+                            )
+                            .await
+                        }
+                        Ok(Some(ServedResponse::Redirect(location))) => {
+                            let mut hdrs = http::HeaderMap::new();
+                            if let Ok(value) = http::HeaderValue::from_str(&location) {
+                                hdrs.insert("location", value);
+                            }
+                            send_h3_local_response(
+                                resp_tx,
+                                stream_id,
+                                &state,
+                                &header,
+                                &effective_uri,
+                                &verified_client_ip_text,
+                                &request_vars,
+                                response_handlers.as_deref(),
+                                308,
+                                hdrs,
+                                H3LocalBody::Bytes(Bytes::new()),
+                                response_policy,
+                                request_id,
+                                request_deadline,
+                                &mut download_pacer,
+                            )
+                            .await
+                        }
+                        Ok(Some(ServedResponse::Stream(stream))) => {
+                            let mut hdrs = http::HeaderMap::new();
+                            hdrs.insert("content-type", stream.content_type.clone());
+                            hdrs.insert("content-length", stream.content_length.clone());
+                            hdrs.insert("accept-ranges", http::HeaderValue::from_static("bytes"));
+                            // 🪟 A streamed body can be partial or already compressed, so
+                            // its status and these two headers come from the stream rather
+                            // than being assumed. Answering 200 with no `Content-Range` to
+                            // a range request tells the client it received the whole file.
+                            if let Some(range) = &stream.content_range {
+                                hdrs.insert("content-range", range.clone());
+                            }
+                            if let Some(encoding) = &stream.content_encoding {
+                                hdrs.insert("content-encoding", encoding.clone());
+                            }
+                            // 🧊 The file server already decided whether this path's
+                            // representation depends on `Accept-Encoding`; H1/H2 reads
+                            // the same flag, so a cache keys both transports alike.
+                            if stream.vary_accept_encoding {
+                                crate::response_encoding::vary_map_on_accept_encoding(&mut hdrs);
+                            }
+                            if let Some(lm) = &stream.last_modified {
+                                hdrs.insert("last-modified", lm.clone());
+                            }
+                            if let Some(etag) = &stream.etag {
+                                hdrs.insert("etag", etag.clone());
+                            }
+                            let stream_status = status_for(stream.status);
+                            send_h3_local_response(
+                                resp_tx,
+                                stream_id,
+                                &state,
+                                &header,
+                                &effective_uri,
+                                &verified_client_ip_text,
+                                &request_vars,
+                                response_handlers.as_deref(),
+                                stream_status,
+                                hdrs,
+                                H3LocalBody::File(Box::new(stream)),
+                                response_policy,
+                                request_id,
+                                request_deadline,
+                                &mut download_pacer,
+                            )
+                            .await
+                        }
+                        Ok(Some(ServedResponse::Buffered(file))) => {
+                            let mut hdrs = http::HeaderMap::new();
+                            hdrs.insert("content-type", file.content_type.clone());
+                            hdrs.insert("content-length", file.content_length.clone());
+                            hdrs.insert("accept-ranges", http::HeaderValue::from_static("bytes"));
+                            if let Some(range) = &file.content_range
+                                && let Ok(value) = http::HeaderValue::from_str(range)
+                            {
+                                hdrs.insert("content-range", value);
+                            }
+                            if let Some(lm) = &file.last_modified {
+                                hdrs.insert("last-modified", lm.clone());
+                            }
+                            if let Some(etag) = &file.etag {
+                                hdrs.insert("etag", etag.clone());
+                            }
+                            if let Some(enc) = &file.content_encoding
+                                && let Ok(value) = http::HeaderValue::from_str(enc)
+                            {
+                                hdrs.insert("content-encoding", value);
+                            }
+                            // 🧊 Same flag, same rule as the streamed branch above.
+                            if file.vary_accept_encoding {
+                                crate::response_encoding::vary_map_on_accept_encoding(&mut hdrs);
+                            }
+                            send_h3_local_response(
+                                resp_tx,
+                                stream_id,
+                                &state,
+                                &header,
+                                &effective_uri,
+                                &verified_client_ip_text,
+                                &request_vars,
+                                response_handlers.as_deref(),
+                                status_for(file.status),
+                                hdrs,
+                                H3LocalBody::Bytes(file.content),
+                                response_policy,
+                                request_id,
+                                request_deadline,
+                                &mut download_pacer,
+                            )
+                            .await
+                        }
+                        // 🚨 A missing file is a 404 the handler chain raised, so
+                        // an error route that answers it renders its page, as on
+                        // H1/H2. Inside an error route it is answered directly.
+                        Ok(None) if error.is_none() && state.has_error_route_for(404) => {
+                            Err((404, "Not Found"))
+                        }
+                        Ok(None) => {
+                            send_h3_local_response(
+                                resp_tx,
+                                stream_id,
+                                &state,
+                                &header,
+                                &effective_uri,
+                                &verified_client_ip_text,
+                                &request_vars,
+                                response_handlers.as_deref(),
+                                404,
+                                http::HeaderMap::new(),
+                                H3LocalBody::Bytes(Bytes::new()),
+                                response_policy,
+                                request_id,
+                                request_deadline,
+                                &mut download_pacer,
+                            )
+                            .await
+                        }
+                        Err(e) => {
+                            tracing::error!("❌ H3 FileServer error: {}", e);
+                            Err((500, "File Server Error"))
+                        }
                     }
-                    if let Some(lm) = &file.last_modified {
-                        hdrs.insert("last-modified", lm.clone());
-                    }
-                    if let Some(etag) = &file.etag {
-                        hdrs.insert("etag", etag.clone());
-                    }
-                    if let Some(enc) = &file.content_encoding
-                        && let Ok(value) = http::HeaderValue::from_str(enc)
-                    {
-                        hdrs.insert("content-encoding", value);
-                    }
-                    // 🧊 Same flag, same rule as the streamed branch above.
-                    if file.vary_accept_encoding {
-                        crate::response_encoding::vary_map_on_accept_encoding(&mut hdrs);
-                    }
-                    send_h3_local_response(
-                        resp_tx,
-                        stream_id,
+                }
+
+                H3Terminal::Subrequest(response) => {
+                    stream_h3_subrequest_response(
+                        connector,
+                        response,
                         &state,
                         &header,
                         &effective_uri,
                         &verified_client_ip_text,
                         &request_vars,
                         response_handlers.as_deref(),
-                        status_for(file.status),
-                        hdrs,
-                        H3LocalBody::Bytes(file.content),
                         response_policy,
                         request_id,
+                        stream_id,
+                        resp_tx,
                         request_deadline,
                         &mut download_pacer,
                     )
                     .await
                 }
-                Ok(None) => {
-                    send_h3_local_response(
-                        resp_tx,
-                        stream_id,
+
+                H3Terminal::ReverseProxy => {
+                    reverse_proxy_upstream(
+                        proxy,
+                        connector,
                         &state,
+                        route_index,
+                        req,
                         &header,
                         &effective_uri,
+                        peer_ip,
                         &verified_client_ip_text,
+                        request_id,
+                        response_policy,
+                        body_limit,
+                        body_timeout_ms,
+                        stream_id,
+                        body_rx,
+                        resp_tx,
+                        body_notify,
+                        request_started,
                         &request_vars,
                         response_handlers.as_deref(),
-                        404,
-                        http::HeaderMap::new(),
-                        H3LocalBody::Bytes(Bytes::new()),
-                        response_policy,
-                        request_id,
-                        request_deadline,
-                        &mut download_pacer,
                     )
                     .await
                 }
-                Err(e) => {
-                    tracing::error!("❌ H3 FileServer error: {}", e);
-                    Err((500, "File Server Error"))
+                H3Terminal::FastCgi => {
+                    fastcgi_upstream(
+                        proxy,
+                        &state,
+                        route_index,
+                        req,
+                        &header,
+                        &effective_uri,
+                        peer_ip,
+                        peer_port,
+                        &verified_client_ip_text,
+                        request_id,
+                        response_policy,
+                        body_limit,
+                        body_timeout_ms,
+                        stream_id,
+                        body_rx,
+                        resp_tx,
+                        body_notify,
+                        request_started,
+                        &request_vars,
+                        response_handlers.as_deref(),
+                    )
+                    .await
                 }
+            },
+        };
+        let Err((status, _)) = outcome else {
+            return outcome;
+        };
+        if error_routed || resp_tx.response_started() || !state.has_error_route_for(status) {
+            return outcome;
+        }
+        error_routed = true;
+        // 🧭 A `handle_response` belongs to the upstream response that never
+        // arrived; it must not wrap the error page.
+        response_handlers = None;
+        let plan = h3_raise_status(
+            status,
+            &state,
+            Some(connector),
+            route_index,
+            &mut header,
+            &mut effective_uri,
+            response_policy,
+            &verified_client_ip_text,
+            addresses,
+            false,
+            &mut request_vars,
+            &mut response_handlers,
+        )
+        .await?;
+        next = match plan {
+            H3Plan::Terminal(handler) => Ok(handler),
+            H3Plan::Respond(response) => {
+                send_immediate_response(
+                    resp_tx,
+                    stream_id,
+                    response,
+                    response_policy,
+                    request_id,
+                    &state,
+                    &header,
+                    &effective_uri,
+                    &verified_client_ip_text,
+                    &request_vars,
+                    None,
+                )
+                .await?;
+                return Ok(());
             }
-        }
-
-        H3Terminal::Subrequest(response) => {
-            stream_h3_subrequest_response(
-                connector,
-                response,
-                &state,
-                &header,
-                &effective_uri,
-                &verified_client_ip_text,
-                &request_vars,
-                response_handlers.as_deref(),
-                response_policy,
-                request_id,
-                stream_id,
-                resp_tx,
-                request_deadline,
-                &mut download_pacer,
-            )
-            .await
-        }
-
-        H3Terminal::ReverseProxy => {
-            reverse_proxy_upstream(
-                proxy,
-                connector,
-                &state,
-                route_index,
-                req,
-                &header,
-                &effective_uri,
-                peer_ip,
-                &verified_client_ip_text,
-                request_id,
-                response_policy,
-                body_limit,
-                body_timeout_ms,
-                stream_id,
-                body_rx,
-                resp_tx,
-                body_notify,
-                request_started,
-                &request_vars,
-                response_handlers.as_deref(),
-            )
-            .await
-        }
-        H3Terminal::FastCgi => {
-            fastcgi_upstream(
-                proxy,
-                &state,
-                route_index,
-                req,
-                &header,
-                &effective_uri,
-                peer_ip,
-                peer_port,
-                &verified_client_ip_text,
-                request_id,
-                response_policy,
-                body_limit,
-                body_timeout_ms,
-                stream_id,
-                body_rx,
-                resp_tx,
-                body_notify,
-                request_started,
-                &request_vars,
-                response_handlers.as_deref(),
-            )
-            .await
-        }
+            H3Plan::Continue => return outcome,
+            H3Plan::Abort => {
+                send_reset(
+                    resp_tx,
+                    stream_id,
+                    quiche::h3::WireErrorCode::RequestCancelled,
+                )
+                .await;
+                return Ok(());
+            }
+        };
     }
 }
 

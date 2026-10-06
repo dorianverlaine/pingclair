@@ -122,8 +122,9 @@ below, which ends with what to write instead.
   → [Run and validate accept configuration flags](#run-and-validate-accept-configuration-flags)
 - **Validation now rejects unusable TLS material.** Fix malformed or mismatched manual pairs before deployment.
   → [Validate loads manual TLS material](#validate-loads-manual-tls-material)
-- **`handle_errors` pages render.** An error route ending in `file_server`
-  serves its page with the error's status instead of the error text.
+- **`handle_errors` pages render, and answer proxy and body-size errors.**
+  An error route ending in `file_server` serves its page with the error's
+  status, and a `502` or `413` now reaches the error routes too.
   → [`handle_errors` serves its own pages](#-handle_errors-serves-its-own-pages)
 - **Routes are chosen in directive order**, not by the most specific path.
   A `redir`, `route` or `handle` catch-all can now answer requests that a more
@@ -530,9 +531,23 @@ raised status, as Caddy's does, and is read as a plain `GET`: the failed
 request's `Range` and validators belong to the resource that failed, so they
 can no longer turn an error into a `206` or a `304`.
 
+Errors the server produces itself now reach `handle_errors` too, on every
+protocol, as they do in Caddy: a `reverse_proxy` that cannot reach its
+upstream (`502`, `503`, `504`), a request body over its `request_body`
+limit (`413`, whether its length was declared or it streamed past the limit),
+a body that stops arriving (`408`), and, on HTTP/3, a missing file (`404`,
+which HTTP/1.1 and HTTP/2 already routed). They used to answer with the
+built-in text or the site's `error_page` whatever the error routes said. A
+site with no error route for the status answers exactly as before, and an
+error route that fails itself is answered directly rather than routed again.
+
 **Upgrade:** Nothing to change for a configuration that already worked. One
 whose error route ends in `file_server` now answers with the page it names
-instead of the error text, with the error's status rather than `200`.
+instead of the error text, with the error's status rather than `200`. A
+catch-all `handle_errors { … }` now also answers gateway and body-size
+errors; give it status codes (`handle_errors 404 { … }`) to keep it to the
+ones it was written for. Its gateway answers carry no `Proxy-Status`, which
+the built-in gateway error still does.
 
 ### 🚫 Non-goals for 0.2.0
 
