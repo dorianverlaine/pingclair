@@ -45,6 +45,8 @@ below, which ends with what to write instead.
   → [Static ranges stream when compression is enabled](#static-ranges-stream-when-compression-is-enabled)
 - **Precompressed sidecars have independent validators.**
   → [Precompressed sidecars have independent validators](#precompressed-sidecars-have-independent-validators)
+- **Empty static bodies have a shared entry ceiling.**
+  → [Empty static bodies have a shared entry ceiling](#empty-static-bodies-have-a-shared-entry-ceiling)
 
 - **A middle `*` no longer jumps ahead of an equal-length sibling.** Put the
   intended winner first when equal-length patterns overlap.
@@ -252,6 +254,12 @@ Large ranges on compressible static files now stream in bounded chunks while ret
 Precompressed files use their own size and modification time for ETags, with tags distinct from live compression. Sidecars take precedence over cached live-encoded bodies, and conditional requests use the selected sidecar tag.
 
 **Upgrade:** Sidecar ETags change once; clients revalidate their encoded copies. Replacing only a sidecar now invalidates that copy.
+
+### Empty static bodies have a shared entry ceiling
+
+Static body caches share a 16,384-entry ceiling in addition to their existing byte budgets. Empty files and stale file identities compete for those slots; eviction and teardown return them.
+
+**Upgrade:** No configuration change is needed; sites with many tiny or empty files may see more cache eviction.
 
 ### 🚫 HTTP parser decisions follow Go
 

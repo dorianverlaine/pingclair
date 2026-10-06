@@ -581,3 +581,7 @@ mod subdirective_tests {
 #[cfg(test)]
 #[path = "range_streaming_tests.rs"]
 mod range_streaming_tests;
+
+#[cfg(test)]
+#[path = "empty_cache_tests.rs"]
+mod empty_cache_tests;

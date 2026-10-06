@@ -109,21 +109,26 @@ pub(super) struct BodyCache {
     lru: VecDeque<FileKey>,
     bytes: usize,
     budget: Arc<Budget>,
+    entry_budget: Arc<Budget>,
 }
 
 /// 🧮 Eviction releases the retained-byte charge; response clones are in-flight memory.
 pub(super) struct CachedBody {
     value: Bytes,
     _reservation: Reservation,
+    _entry_reservation: Reservation,
 }
 
 impl BodyCache {
     pub(super) fn new(budget: Arc<Budget>) -> Self {
+        // 🧮 Keys and LRU slots consume memory even when a body holds no bytes.
+        static ENTRIES: std::sync::OnceLock<Arc<Budget>> = std::sync::OnceLock::new();
         Self {
             entries: HashMap::new(),
             lru: VecDeque::new(),
             bytes: 0,
             budget,
+            entry_budget: ENTRIES.get_or_init(|| Budget::new(16_384)).clone(),
         }
     }
 
@@ -157,9 +162,11 @@ impl BodyCache {
         }
         // 🧮 Evict only this route's LRU entries. If other routes hold the budget,
         // serve uncached rather than introducing a cross-route request lock.
-        let reservation = loop {
-            if let Some(reservation) = self.budget.reserve(size) {
-                break reservation;
+        let (reservation, entry_reservation) = loop {
+            if let Some(reservation) = self.budget.reserve(size)
+                && let Some(entry_reservation) = self.entry_budget.reserve(1)
+            {
+                break (reservation, entry_reservation);
             }
             let Some(evicted) = self.lru.pop_front() else {
                 return;
@@ -173,6 +180,7 @@ impl BodyCache {
             CachedBody {
                 value,
                 _reservation: reservation,
+                _entry_reservation: entry_reservation,
             },
         );
         self.bytes += size;
