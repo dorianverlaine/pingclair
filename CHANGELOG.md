@@ -3980,6 +3980,15 @@ immediately after the `101`, both ends seeing EOF with no error.
   key. Found by review, and `0.2.0-dev` only: `v0.1.7` had no mutual TLS to
   downgrade.
 
+- 📡 **`hickory-resolver`, `hickory-proto` and `hickory-net` moved to 0.26.3.**
+  0.26.1 had three published advisories: a truncated-response retry loop in
+  the name-server pool with no bound, so an upstream DNS server that keeps
+  answering truncated can spin the resolver; CNAME records unrelated to the
+  query were followed; and the lookup APIs hid DNSSEC validation failures.
+  The DNS-01 propagation check and the dynamic-upstream sources are the only
+  callers, and neither turns on DNSSEC, so the first two are the ones that
+  reached this server.
+
 - 📡 **`hickory-resolver` moved from 0.24 to 0.26 for RUSTSEC-2026-0119.**
   `hickory-proto` 0.24.4 can be driven into quadratic work while compressing
   names during message encoding; the advisory's fix is 0.26.1. The DNS-01
