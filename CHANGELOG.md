@@ -47,6 +47,8 @@ below, which ends with what to write instead.
   → [Precompressed sidecars have independent validators](#precompressed-sidecars-have-independent-validators)
 - **Empty static bodies have a shared entry ceiling.**
   → [Empty static bodies have a shared entry ceiling](#empty-static-bodies-have-a-shared-entry-ceiling)
+- **Immediate-flush routes bypass the response cache.**
+  → [Immediate-flush routes bypass the response cache](#immediate-flush-routes-bypass-the-response-cache)
 
 - **A middle `*` no longer jumps ahead of an equal-length sibling.** Put the
   intended winner first when equal-length patterns overlap.
@@ -260,6 +262,12 @@ Precompressed files use their own size and modification time for ETags, with tag
 Static body caches share a 16,384-entry ceiling in addition to their existing byte budgets. Empty files and stale file identities compete for those slots; eviction and teardown return them.
 
 **Upgrade:** No configuration change is needed; sites with many tiny or empty files may see more cache eviction.
+
+### Immediate-flush routes bypass the response cache
+
+Routes with `flush_interval -1` bypass response-cache admission using state computed when configuration loads. The existing SSE content-type safeguard remains in effect.
+
+**Upgrade:** Remove reliance on cached responses from immediate-flush routes; use a separate ordinary route if caching is desired.
 
 ### 🚫 HTTP parser decisions follow Go
 

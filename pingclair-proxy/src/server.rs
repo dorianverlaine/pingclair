@@ -648,6 +648,8 @@ pub struct ProxyState {
     /// 🔑 Per route, the scope that keeps its cache entries apart from every
     /// other route's; `None` for a route that does not cache.
     pub(crate) cache_scopes: Arc<crate::cache_key::RouteScopes>,
+    /// 🌊 Cache admission reads this before upstream selection can set response flags.
+    route_streaming: Vec<bool>,
     /// 🧭 Whether configured runtime text can observe original-URI variables.
     /// Most sites cannot, so their requests never build those owned map entries.
     needs_original_uri_vars: bool,
@@ -1488,6 +1490,15 @@ impl ProxyState {
             find_reverse_proxy_config(&route.handler).is_some_and(|proxy| proxy.cache.is_some())
         }));
 
+        let route_streaming = config
+            .routes
+            .iter()
+            .map(|route| {
+                find_reverse_proxy_config(&route.handler)
+                    .is_some_and(|proxy| wants_immediate_flush(proxy.flush_interval))
+            })
+            .collect();
+
         Self {
             encode_policy: pingclair_core::encoding::EncodePolicy::compile(
                 &config.encode,
@@ -1515,6 +1526,7 @@ impl ProxyState {
             route_body_timeouts,
             route_buffering,
             cache_scopes,
+            route_streaming,
             needs_original_uri_vars,
             log_targets,
             strict_transport,
@@ -6202,6 +6214,17 @@ impl ProxyHttp for PingclairProxy {
         let Some((state, route_index)) = ctx.state.as_ref().zip(ctx.route_index) else {
             return Ok(());
         };
+        // 🌊 Immediate-flush routes bypass storage before upstream selection.
+        // 🧮 Their loaded policy is available before response flags are set.
+        if state
+            .route_streaming
+            .get(route_index)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
         let Some(route_scope) = state.cache_scopes.get(route_index) else {
             return Ok(());
         };
@@ -6231,13 +6254,6 @@ impl ProxyHttp for PingclairProxy {
             }
         };
         let cache_scope = route_scope;
-
-        // 🌊 A streaming route hands chunks downstream as they arrive; storing
-        // that response means buffering it whole, which is the memory bug this
-        // project has already shipped twice.
-        if ctx.streaming_response {
-            return Ok(());
-        }
 
         ctx.cache_ttl_secs = Some(cache_ttl_secs);
         ctx.cache_scope = Some(cache_scope);
@@ -6982,9 +6998,7 @@ impl ProxyHttp for PingclairProxy {
             };
             let handler = state.config.routes.get(index).map(|route| &route.handler);
 
-            let immediate_flush = self
-                .get_proxy_config(&state, index)
-                .is_some_and(|config| wants_immediate_flush(config.flush_interval));
+            let immediate_flush = state.route_streaming.get(index).copied().unwrap_or(false);
             if immediate_flush || is_websocket_upgrade(&session.req_header().headers) {
                 Self::activate_long_connection(session, ctx, &state);
             }

@@ -15412,3 +15412,6 @@ mod static_range_streaming;
 
 #[path = "integration/static_sidecar_identity.rs"]
 mod static_sidecar_identity;
+
+#[path = "integration/cache_streaming_routes.rs"]
+mod cache_streaming_routes;
