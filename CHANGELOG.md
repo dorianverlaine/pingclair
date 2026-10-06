@@ -152,6 +152,9 @@ below, which ends with what to write instead.
   → [Automatic HTTPS follows the configured listener policy](#-automatic-https-follows-the-configured-listener-policy)
 - **Scheme-only site addresses inherit global ports.** Explicit ports stay as written.
   → [Scheme-only addresses use global ports](#-scheme-only-addresses-use-global-ports)
+- **`http://[::1]` names a site instead of becoming the catch-all; a malformed
+  bracketed address is refused.** Other `Host` values stop reaching that block.
+  → [Bracketed IPv6 site addresses name a site](#-bracketed-ipv6-site-addresses-name-a-site)
 - **Request no-transform disables proxy encoding.** Expect identity responses.
   → [Proxy encoding respects request no-transform](#proxy-encoding-respects-request-no-transform)
 - **Static gzip ETags include quality.** Expect one cache revalidation.
@@ -688,6 +691,24 @@ and `https_port`, respectively, as in Caddy. Previously they always bound
 
 **Upgrade:** Remove workarounds that repeat global ports in site addresses,
 or name an explicit port to keep a site on its previous listener.
+
+### 🌐 Bracketed IPv6 site addresses name a site
+
+`http://[::1]` and `https://[::1]` used to be split on the last colon, which
+sits inside the brackets, so the address parsed to nothing: the block became
+the unnamed catch-all for every `Host` on the port, had no listener of its own,
+and `https://[::1]` lost TLS. They now name the host `[::1]` on the scheme's
+global port, exactly as `http://127.0.0.1` does, and `https://[::1]` gets the
+local certificate authority like any IP-literal site. A request for
+`Host: [::1]:8080` now reaches a site named `[::1]`, with or without a port in
+its address; before, no request could. A bracket that does not hold an IPv6
+address, or is followed by anything but `:port` (`http://[::1]x`), is refused
+when the configuration loads (#267).
+
+📌 Upgrade note: a block written as `http://[::1]` answered every unmatched
+`Host`; it now answers only `[::1]`. Add a catch-all site (`:80`, `http://`)
+for traffic that relied on it. Caddy parses these addresses the same way
+(from memory, caddyserver/caddy#80).
 ### Local header policy preserves encoding Vary
 
 🧊 Static responses and generated upstream failures retain `Accept-Encoding`

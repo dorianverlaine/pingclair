@@ -2151,7 +2151,12 @@ impl PingclairProxy {
                 // 🔤 Canonical at publication, so a lookup never has to guess
                 // which spelling the operator used. `RouteTable::get` applies
                 // the same canonicalisation to the requested name.
-                let domain = crate::http_policy::canonical_host(domain).into_owned();
+                //
+                // 🌐 The request side drops an IPv6 literal's brackets
+                // (`Host: [::1]:8080` is looked up as `::1`), so the site name
+                // `[::1]` must drop them too; kept, it was a key no request
+                // could ever produce.
+                let domain = crate::http_policy::request_host(domain).into_owned();
                 let state = Arc::new(ProxyState::new_with_previous(
                     config.clone(),
                     previous.hosts.get(&domain).map(Arc::as_ref),

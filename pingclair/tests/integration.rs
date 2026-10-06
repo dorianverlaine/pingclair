@@ -56,6 +56,9 @@ mod process_log;
 #[path = "integration/addressed_servers.rs"]
 mod addressed_servers;
 
+#[path = "integration/bracketed_ipv6_site.rs"]
+mod bracketed_ipv6_site;
+
 // 🏷️ Static-file validator tests live beside this file so the gate stops
 // growing in one place; they reuse its `TestServer` harness.
 #[path = "integration/static_validators.rs"]

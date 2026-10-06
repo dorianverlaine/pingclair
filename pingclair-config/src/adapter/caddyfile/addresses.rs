@@ -11,7 +11,10 @@ pub(super) fn is_local_https_default(name: &str) -> bool {
         || name.ends_with(".localhost")
         || name.ends_with(".local")
         || name.ends_with(".internal")
-        || name.parse::<std::net::IpAddr>().is_ok()
+        // 🔐 Site names keep IPv6 brackets (`[::1]`), and an IP literal is one
+        // with or without them; checking only the bare form served
+        // `https://[::1]` without TLS.
+        || is_ip_literal(name)
 }
 
 /// 🚫 Rejects a site address that cannot mean anything, before it becomes a
@@ -57,6 +60,25 @@ pub(super) fn reject_impossible_address(addr: &str) -> Result<(), AdapterError> 
         .strip_prefix("https://")
         .or_else(|| addr.strip_prefix("http://"))
         .unwrap_or(addr);
+    // 🚫 A bracket opens an IPv6 literal, and only a closing bracket and an
+    // optional `:port` may follow it. Anything else used to parse to no
+    // address at all, which made the site the unnamed catch-all for every
+    // Host on the listener; refusing it fails closed instead.
+    if let Some(literal) = bare.strip_prefix('[') {
+        let well_formed = literal.split_once(']').is_some_and(|(host, after)| {
+            // 📌 A zone (`%eth0`) is let through so the unsupported-feature
+            // check can name it, rather than calling it malformed here.
+            (host.contains('%') || host.parse::<std::net::Ipv6Addr>().is_ok())
+                && (after.is_empty() || after.starts_with(':'))
+        });
+        if !well_formed {
+            return Err(AdapterError::InvalidArgument(
+                "site address".into(),
+                format!("`{addr}` is not a bracketed IPv6 address such as `[::1]` or `[::1]:8080`"),
+            ));
+        }
+    }
+
     let after_bracket = bare.rfind(']').map_or(bare, |i| &bare[i..]);
     if let Some((_, port)) = after_bracket.rsplit_once(':')
         && !port.is_empty()
@@ -155,16 +177,43 @@ pub(super) fn parse_server_address(addr: &str, global: &GlobalBlock) -> Option<P
         (Scheme::Http, addr)
     };
     let explicit_scheme = addr.contains("://");
+    // 🔢 An address without a port listens on its scheme's global port.
+    let default_port = |scheme| match scheme {
+        Scheme::Https => global.https_port.unwrap_or(443),
+        Scheme::Http => global.http_port.unwrap_or(80),
+    };
 
     // rest is either: "host:port", ":port", "host", ""
     if rest.is_empty() {
         return None;
     }
 
+    // 🌐 An IPv6 literal carries its own colons, so the brackets (RFC 3986
+    // §3.2.2), not the last colon, decide where the host ends. Splitting
+    // `[::1]` on its last colon left host `[:` and port `1]`, the address
+    // parsed to nothing, and the site became the unnamed catch-all.
+    let bracketed = rest
+        .starts_with('[')
+        .then(|| rest.find(']'))
+        .flatten()
+        .map(|close| rest.split_at(close + 1));
+
     let (hostname, port, explicit_port) = if let Some(port) = rest.strip_prefix(':') {
         // :port
         let p = port.parse::<u16>().ok()?;
         ("[::]".to_string(), Some(p), true)
+    } else if let Some((host, after)) = bracketed {
+        // 📌 A zoned literal (`[fe80::1%eth0]`) is not one this parser binds;
+        // `None` sends it to the unsupported-address refusal.
+        if !is_ip_literal(host) {
+            return None;
+        }
+        match after.strip_prefix(':') {
+            Some(port) => (host.to_string(), Some(port.parse::<u16>().ok()?), true),
+            // 🌐 `http://[::1]` takes the scheme's port, as `http://127.0.0.1` does.
+            None if after.is_empty() => (host.to_string(), Some(default_port(scheme)), false),
+            None => return None,
+        }
     } else if let Some(colon_pos) = rest.rfind(':') {
         // host:port
         let h = &rest[..colon_pos];
@@ -172,11 +221,7 @@ pub(super) fn parse_server_address(addr: &str, global: &GlobalBlock) -> Option<P
         (h.to_string(), Some(p), true)
     } else {
         // 🌐 Scheme-only addresses inherit the configured listener port.
-        let p = match scheme {
-            Scheme::Https => Some(global.https_port.unwrap_or(443)),
-            Scheme::Http => Some(global.http_port.unwrap_or(80)),
-        };
-        (rest.to_string(), p, false)
+        (rest.to_string(), Some(default_port(scheme)), false)
     };
 
     // Caddy/nginx semantics: only an IP literal in the site address is a
