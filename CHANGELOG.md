@@ -174,6 +174,9 @@ below, which ends with what to write instead.
   long new attempts may start, so a slow answer or a long event stream is
   bounded by `transport http` timeouts instead.
   → [`lb_try_duration` limits retrying, not the response](#-lb_try_duration-limits-retrying-not-the-response)
+- **A missed upstream keepalive reuse is logged at `DEBUG`**, not `ERROR`.
+  Alerts matching `failed to acquire reusable stream` stop firing.
+  → [A keepalive reuse miss is not an error](#-a-keepalive-reuse-miss-is-not-an-error)
 - **A request header has one minute by default**, start to finish, where it
   had no limit unless `limits { header_timeout }` was set. An idle HTTP/1
   keepalive connection is therefore closed after a minute without a request,
@@ -873,6 +876,21 @@ request deadline, on every protocol.
 slow backend may take must set `transport http { response_header_timeout … }`
 or `read_timeout` for that. Long streams behind a route with
 `lb_try_duration` now run to completion. (#206)
+
+### 🔁 A keepalive reuse miss is not an error
+
+Under ordinary concurrent load the process log carried a steady trickle of
+`ERROR failed to acquire reusable stream`, with no failed request behind any
+of them. The record comes from Pingora's upstream connection pool: now and
+then it takes an idle connection back while the task watching that
+connection has not quite released it, so it drops the connection and dials a
+new one. The request is unaffected; the cost is one extra connect. As in
+nginx, which logs an unusable cached keepalive connection at `debug`, the
+record is now emitted at `DEBUG`, with its `log.target`, `log.file` and
+`log.line` fields unchanged. Every other record Pingora logs keeps its level.
+
+**Upgrading:** set `log { level DEBUG }` to see these records again; an
+alert keyed on the message at `ERROR` no longer fires. (#212)
 
 ### 🧩 A `*` anywhere in a route's path matches
 

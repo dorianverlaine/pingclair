@@ -29,6 +29,7 @@
 //! | [`paths`] | The config path and the store directory, both answered by convention. |
 //! | [`systemd`] | The two sentences this process says to systemd. |
 //! | [`resource_guard`] | Per-listener connection limits, wrapping the Pingora app. |
+//! | [`log_bridge`] | Pingora's `log` records, forwarded to `tracing` at the level they deserve. |
 //!
 //! 📌 What stays here is only what has to run before anything can read a flag:
 //! the no-argument help path, the rustls provider installed before any TLS code
@@ -36,7 +37,7 @@
 //! `#[global_allocator]` is only valid in the crate root.
 
 use clap::Parser;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::layer::SubscriberExt;
 
 mod addr;
 mod certs;
@@ -44,6 +45,7 @@ mod cli;
 mod fd_budget;
 mod header_deadline;
 mod listen;
+mod log_bridge;
 mod logging;
 mod paths;
 mod resource_guard;
@@ -123,14 +125,20 @@ fn main() -> anyhow::Result<()> {
     // visible, and that message is emitted before any configuration exists.
     let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(filter);
     let writer = logging::NonBlockingWriter::spawn();
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(writer)
-                .event_format(logging::ProcessLogFormat),
-        )
-        .with(filter)
-        .init();
+    // 🔁 Installed by hand rather than with `.init()`, which would also install
+    // a stock `log` forwarder: Pingora's records go through [`log_bridge`]
+    // instead, so a routine keepalive reuse miss is not reported as an error.
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(writer)
+                    .event_format(logging::ProcessLogFormat),
+            )
+            .with(filter),
+    )
+    .expect("🧭 the process tracing subscriber is installed exactly once");
+    log_bridge::install().expect("🧭 the process `log` bridge is installed exactly once");
     logging::remember_filter(
         move |directives| {
             filter_handle

@@ -2529,6 +2529,7 @@ dependencies = [
  "http",
  "ipnet",
  "libc",
+ "log",
  "parking_lot",
  "pingclair-api",
  "pingclair-config",
@@ -2547,6 +2548,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "uuid",
 ]
