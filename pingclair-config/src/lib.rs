@@ -26,6 +26,7 @@
 
 pub mod adapter;
 pub mod compiler;
+mod header_fields;
 pub mod parser;
 mod retired_placeholders;
 mod shared_ports;

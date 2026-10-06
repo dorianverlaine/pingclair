@@ -88,6 +88,9 @@ below, which ends with what to write instead.
 - **An upstream weight of 0 drains it; weights above 100 are refused.** A pool
   whose every primary has weight 0 is refused too.
   → [A zero upstream weight drains that upstream](#-a-zero-upstream-weight-drains-that-upstream)
+- **A configured header with CR, LF or NUL in its value, or a name that is not
+  a token, is refused at load.** Remove the stray bytes.
+  → [Configured header fields must be valid fields](#-configured-header-fields-must-be-valid-fields)
 - **A middle `*` no longer jumps ahead of an equal-length sibling.** Put the
   intended winner first when equal-length patterns overlap.
   → [Equal-length route patterns keep file order](#-equal-length-route-patterns-keep-file-order)
@@ -377,6 +380,20 @@ drain, not only round robin (#266).
 refused, because the selector expands each weight into that many table slots;
 scale the weights down to keep the same ratio. A pool in which every primary
 upstream has weight 0 is refused, since it could answer nothing but errors.
+
+### 🚫 Configured header fields must be valid fields
+
+`header X-Inject "legit\r\nInjected-Header: pwned"` used to validate. HTTP/1.1
+and HTTP/2 then cancelled every response on that route, while HTTP/3 put the
+bytes on the wire, where a strict client dropped the connection and a lenient
+one silently lost the field. RFC 9110 §5.5 calls CR, LF and NUL in a field
+value invalid and dangerous, so `pingclair validate`, the Admin API, a reload
+and a JSON document now refuse them in `header`, `request_header`,
+`header_up` and `header_down` values, and refuse a `header` or
+`request_header` name that is not a valid field name (#255).
+
+📌 Upgrading: a configuration that loads today and carries such a value was
+already broken on every transport; remove the stray bytes.
 
 ### 🚫 HTTP parser decisions follow Go
 

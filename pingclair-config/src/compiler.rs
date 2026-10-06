@@ -1292,6 +1292,8 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
             }
             validate_matchers_under(&route.handler)?;
             validate_gated_headers(&route.handler, false)?;
+            // 🚫 CR, LF or NUL in a configured header (see that module).
+            crate::header_fields::validate_header_fields(&route.handler)?;
         }
         for error_route in &server.error_routes {
             for element in &error_route.handlers {
@@ -1303,6 +1305,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
                 }
                 validate_matchers_under(&element.handler)?;
                 validate_gated_headers(&element.handler, false)?;
+                crate::header_fields::validate_header_fields(&element.handler)?;
             }
         }
 
