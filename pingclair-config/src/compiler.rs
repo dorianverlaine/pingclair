@@ -2065,6 +2065,8 @@ fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<(
                 validate_health_check(health)?;
             }
             validate_upstream_tls(&proxy.upstream_tls)?;
+            // ⚖️ A drained pool or an out-of-range weight (see that module).
+            crate::upstream_weights::validate_upstream_weights(proxy)?;
         }
         HandlerConfig::RateLimit {
             requests,

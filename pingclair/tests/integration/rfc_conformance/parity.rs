@@ -204,7 +204,6 @@ async fn test_truncated_upstream_answers_an_h2_client() {
 /// cutover is entitled to have the configuration mean what it says, and a
 /// silently clamped weight is the one answer that satisfies neither reading.
 #[tokio::test]
-#[ignore = "pingclair#266 — weight 0 is clamped to 1 and the drained backend keeps serving"]
 async fn test_zero_weight_upstream_receives_no_traffic() {
     let drained = ScriptedUpstream::start(
         vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()],

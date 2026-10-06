@@ -85,6 +85,9 @@ below, which ends with what to write instead.
 - **`servers { trusted_proxies … }` takes Caddy's module spelling.** Write
   `trusted_proxies static <ranges>` there, and one line per scope.
   → [`trusted_proxies` inside `servers` reads as upstream](#-trusted_proxies-inside-servers-reads-as-upstream)
+- **An upstream weight of 0 drains it; weights above 100 are refused.** A pool
+  whose every primary has weight 0 is refused too.
+  → [A zero upstream weight drains that upstream](#-a-zero-upstream-weight-drains-that-upstream)
 - **A middle `*` no longer jumps ahead of an equal-length sibling.** Put the
   intended winner first when equal-length patterns overlap.
   → [Equal-length route patterns keep file order](#-equal-length-route-patterns-keep-file-order)
@@ -360,6 +363,20 @@ more peers than the same file does upstream (#142).
 option, is unchanged. Inside `servers {}`, put `static` in front of the
 ranges, and merge repeated lines — including a top-level line plus a
 `servers {}` one — into one.
+
+### 🔀 A zero upstream weight drains that upstream
+
+`lb_policy weighted_round_robin 0 1` now sends nothing to the first upstream.
+The zero used to be clamped to 1 at selection time, with no log line, so a
+backend drained for a cutover kept taking half the traffic. Caddy skips a
+zero-weight upstream the same way. The block spelling, `to … { weight 0 }`,
+used to be refused and now means the same thing. Any policy honours the
+drain, not only round robin (#266).
+
+📌 Upgrading: a weight above 100 used to be clamped to 100 silently and is now
+refused, because the selector expands each weight into that many table slots;
+scale the weights down to keep the same ratio. A pool in which every primary
+upstream has weight 0 is refused, since it could answer nothing but errors.
 
 ### 🚫 HTTP parser decisions follow Go
 

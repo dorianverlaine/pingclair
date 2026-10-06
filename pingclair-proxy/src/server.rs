@@ -8874,7 +8874,8 @@ pub(crate) fn find_reverse_proxy_config(handler: &HandlerConfig) -> Option<&Reve
 ///
 /// Repeating an identical backend is incorrect because Pingora stores its
 /// backend set by value and deduplicates those entries before selection.
-/// A defensive cap keeps every selector's internal weighted table bounded.
+/// A zero-weight upstream is drained and left out; a defensive cap keeps
+/// every selector's internal weighted table bounded.
 ///
 /// Addresses are *not* resolved here: the load balancer keeps the parsed
 /// specs so a hostname can be re-resolved later, and an upstream that is not
@@ -8908,7 +8909,18 @@ fn build_weighted_upstreams(
             dynamic_templates.push(option.address);
             continue;
         }
-        let weight = option.weight.clamp(1, 100);
+        // ⚖️ Zero drains the upstream: it is left out of the pool, so no
+        // policy can pick it. `validate_config` refuses a pool where every
+        // primary is drained and any weight above 100, so nothing is clamped
+        // here; the `min` only bounds the selector's table should a
+        // configuration ever arrive unvalidated.
+        //
+        // 🤡 Until #266 this was `clamp(1, 100)`: weight 0 became 1, and a
+        // backend drained for a cutover kept taking its share of traffic.
+        if option.weight == 0 {
+            continue;
+        }
+        let weight = option.weight.min(100);
         let target = if option.backup {
             &mut backup
         } else {

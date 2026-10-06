@@ -631,12 +631,11 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                                                 raw.clone(),
                                             )
                                         })?;
-                                        if upstream.weight == 0 {
-                                            return Err(AdapterError::InvalidArgument(
-                                                "reverse_proxy to weight".into(),
-                                                "weight must be greater than zero".into(),
-                                            ));
-                                        }
+                                        // ⚖️ Zero drains the upstream, as in
+                                        // `weighted_round_robin`; the range and
+                                        // the all-drained pool are checked in
+                                        // `validate_config`, so both spellings
+                                        // and JSON share one rule.
                                     }
                                     "backup" => {
                                         upstream.backup = option
