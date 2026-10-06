@@ -3656,6 +3656,31 @@ impl PingclairProxy {
             })
     }
 
+    /// 🧭 Writes the answer this hop gives itself — a refused `TRACE` or
+    /// `CONNECT`, or a spent `OPTIONS` — and ends the request.
+    ///
+    /// 🔌 Shared by the matched-site and no-matching-site paths, because a
+    /// `CONNECT` must be refused the same way whether or not its authority
+    /// names a site, and the connection must end with the refusal: a tunnel
+    /// client may already be sending tunnel bytes behind its request, and
+    /// those must not be read as the next one (RFC 9931 §8).
+    async fn write_local_hop_answer(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        answer: crate::http_policy::LocalHopAnswer,
+    ) -> PingoraResult<bool> {
+        if answer.ends_connection() {
+            session.as_mut().set_keepalive(None);
+        }
+        let mut header = Self::build_downstream_header(session, answer.status(), Some(2))?;
+        header.insert_header("Allow", crate::http_policy::ALLOWED_METHODS)?;
+        header.insert_header("Content-Length", "0")?;
+        self.write_local_response(session, ctx, header, LocalResponseBody::Empty, false)
+            .await?;
+        Ok(true)
+    }
+
     /// 🧭 Runs a local response through the same interception decision as a proxy response.
     async fn write_local_response(
         &self,
@@ -6709,6 +6734,21 @@ impl ProxyHttp for PingclairProxy {
             let state = match ctx.state.clone().or_else(|| generation.routes().get(host)) {
                 Some(s) => s,
                 None => {
+                    // 🔌 A `CONNECT` whose authority names no site is refused
+                    // exactly as on a matched one, and before the redirect and
+                    // the empty 200 below. That 200 told the client its tunnel
+                    // was open, and the bytes it then sent were parsed and
+                    // served as the next request (RFC 9110 §9.3.6, RFC 9931 §8).
+                    if request_header.method == http::Method::CONNECT
+                        && let Some(answer) = crate::http_policy::local_hop_answer(
+                            &request_header.method,
+                            authority,
+                            &request_header.headers,
+                        )
+                    {
+                        return self.write_local_hop_answer(session, ctx, answer).await;
+                    }
+
                     // 🔄 Before falling to 404: is this the request an automatic
                     // HTTPS redirect exists for?
                     //
@@ -6933,24 +6973,17 @@ impl ProxyHttp for PingclairProxy {
                 .expect("sanitized request id is valid header bytes");
         }
 
-        // 🧭 RFC 9110 §7.6.2: `TRACE` and `CONNECT` are refused and `OPTIONS`
-        // with a spent `Max-Forwards` stops here, before any handler could forward either.
-        // HTTP/3 asks the same question at the same point in its dispatch.
+        // 🧭 `CONNECT` is refused (RFC 9110 §9.3.6), `TRACE` is refused by
+        // this server's own policy, and `OPTIONS` with a spent `Max-Forwards`
+        // (RFC 9110 §7.6.2) stops here, before any handler could forward
+        // them. HTTP/3 asks the same question at the same point in its dispatch.
+        let request = session.req_header();
         if let Some(answer) = crate::http_policy::local_hop_answer(
-            &session.req_header().method,
-            &session.req_header().headers,
+            &request.method,
+            crate::http_policy::request_authority(request),
+            &request.headers,
         ) {
-            // 🔌 A refused `CONNECT` client may already be sending tunnel bytes
-            // behind its request, and those must not be read as the next one.
-            if answer == crate::http_policy::LocalHopAnswer::ConnectRefused {
-                session.as_mut().set_keepalive(None);
-            }
-            let mut header = Self::build_downstream_header(session, answer.status(), Some(2))?;
-            header.insert_header("Allow", crate::http_policy::ALLOWED_METHODS)?;
-            header.insert_header("Content-Length", "0")?;
-            self.write_local_response(session, ctx, header, LocalResponseBody::Empty, false)
-                .await?;
-            return Ok(true);
+            return self.write_local_hop_answer(session, ctx, answer).await;
         }
 
         // 🗜️ Negotiate the response coding against this server's `encode`

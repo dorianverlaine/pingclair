@@ -112,7 +112,7 @@ it" is not what settles an argument. The order is **RFC > Caddy > nginx**:
    the same one — "Caddy does it too" is a description of the world, not a
    defence of the behaviour. Open examples from the 2026-10-06 audit: a `CONNECT`
    that matches no site answered `200` with a reusable connection where
-   RFC 9110 §9.3.6 and §8.6 require a refusal that ends it (#283); a proxied `204`
+   RFC 9110 §9.3.6 and §8.6 require a refusal that ends it (#283, since fixed); a proxied `204`
    forwarded with `Content-Length` on HTTP/1.1 (§8.6, #270); a field named in the
    upstream's `Connection` header passed on to the client (§7.6.1, #263); field
    values padded with SP/HTAB emitted on HTTP/2 and HTTP/3 (§8.2.1, #256).

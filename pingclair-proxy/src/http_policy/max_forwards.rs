@@ -17,7 +17,14 @@
 //! another host (RFC 9110 §9.3.6), which is a forward proxy's job; this server
 //! is a reverse proxy and never opens one. The method is understood and simply
 //! not offered, so the answer is 405 with `Allow` on every transport rather
-//! than a 404 from routing or a 501 on one protocol only.
+//! than a 404 from routing or a 501 on one protocol only. A `CONNECT` whose
+//! target has no usable port is a malformed request before it is a refused
+//! one, and §9.3.6 says a server "MUST reject" it, typically with 400.
+//!
+//! 🛡️ Either refusal ends an HTTP/1.1 connection. A client that asked for a
+//! tunnel may already be writing tunnel bytes behind its request, and reading
+//! those as the next request lets whoever wrote them choose what this server
+//! serves next — RFC 9931 §8 requires the close for exactly that reason.
 
 use http::{HeaderMap, Method, header::MAX_FORWARDS};
 
@@ -38,6 +45,9 @@ pub(crate) enum LocalHopAnswer {
     OptionsFinalRecipient,
     /// 🔌 `CONNECT`: this server opens no tunnels, so 405 with `Allow`.
     ConnectRefused,
+    /// 🚫 `CONNECT` to an empty, missing, or out-of-range port: 400, because
+    /// RFC 9110 §9.3.6 makes the target itself invalid.
+    ConnectBadTarget,
 }
 
 impl LocalHopAnswer {
@@ -45,18 +55,41 @@ impl LocalHopAnswer {
     pub(crate) fn status(self) -> u16 {
         match self {
             Self::TraceRefused | Self::ConnectRefused => 405,
+            Self::ConnectBadTarget => 400,
             Self::OptionsFinalRecipient => 200,
+        }
+    }
+
+    /// 🛡️ Whether the HTTP/1.1 connection must end with this answer.
+    ///
+    /// True for every `CONNECT` refusal (RFC 9931 §8): the bytes behind a
+    /// tunnel request belong to the tunnel, never to a next request.
+    pub(crate) fn ends_connection(self) -> bool {
+        match self {
+            Self::ConnectRefused | Self::ConnectBadTarget => true,
+            Self::TraceRefused | Self::OptionsFinalRecipient => false,
         }
     }
 }
 
 /// 🧭 Whether this request stops here. `None` means route it as usual.
-pub(crate) fn local_hop_answer(method: &Method, headers: &HeaderMap) -> Option<LocalHopAnswer> {
+///
+/// `authority` is the request target's authority — for `CONNECT`, the whole
+/// target — and is only read for `CONNECT`.
+pub(crate) fn local_hop_answer(
+    method: &Method,
+    authority: &str,
+    headers: &HeaderMap,
+) -> Option<LocalHopAnswer> {
     if method == Method::TRACE {
         return Some(LocalHopAnswer::TraceRefused);
     }
     if method == Method::CONNECT {
-        return Some(LocalHopAnswer::ConnectRefused);
+        return Some(if connect_target_has_port(authority) {
+            LocalHopAnswer::ConnectRefused
+        } else {
+            LocalHopAnswer::ConnectBadTarget
+        });
     }
     if method == Method::OPTIONS && max_forwards(headers) == Some(0) {
         return Some(LocalHopAnswer::OptionsFinalRecipient);
@@ -75,6 +108,31 @@ pub(crate) fn forwarded_max_forwards(method: &Method, headers: &HeaderMap) -> Op
         return None;
     }
     max_forwards(headers)?.checked_sub(1)
+}
+
+/// 🔌 Whether a `CONNECT` target is `host:port` with a real port.
+///
+/// RFC 9110 §9.3.6 defines the target as exactly a host and a port, and a
+/// server "MUST reject" one whose port is empty or invalid. So `example.com`,
+/// `example.com:`, `example.com:0`, `example.com:65536` and `[::1]` all fail,
+/// while `[::1]:443` passes: the brackets of an IPv6 literal (RFC 3986 §3.2.2)
+/// are what tell its colons apart from the port separator.
+fn connect_target_has_port(authority: &str) -> bool {
+    let port = match authority.strip_prefix('[') {
+        Some(bracketed) => match bracketed.split_once(']') {
+            Some((host, rest)) if !host.is_empty() => rest.strip_prefix(':'),
+            _ => None,
+        },
+        None => authority
+            .rsplit_once(':')
+            .filter(|(host, _)| !host.is_empty() && !host.contains(':'))
+            .map(|(_, port)| port),
+    };
+    // 🔢 Digits only: `u16::from_str` also accepts a leading `+`, which is
+    // not a port.
+    port.filter(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|port| port.parse::<u16>().ok())
+        .is_some_and(|port| port != 0)
 }
 
 /// 🧭 Reads `Max-Forwards` as `1*DIGIT` straight from the field bytes.
@@ -113,21 +171,42 @@ mod tests {
     fn trace_is_always_refused() {
         for value in [None, Some("0"), Some("5")] {
             assert_eq!(
-                local_hop_answer(&Method::TRACE, &headers(value)),
+                local_hop_answer(&Method::TRACE, "", &headers(value)),
                 Some(LocalHopAnswer::TraceRefused),
                 "{value:?}"
             );
         }
     }
 
-    /// 🔌 `CONNECT` stops here whatever else the request carries.
+    /// 🔌 `CONNECT` stops here whatever else the request carries: 405 for a
+    /// well-formed target, 400 for one without a usable port, and the
+    /// connection ends either way.
     #[test]
     fn connect_is_always_refused() {
-        assert_eq!(
-            local_hop_answer(&Method::CONNECT, &headers(Some("5"))),
-            Some(LocalHopAnswer::ConnectRefused)
-        );
-        assert_eq!(LocalHopAnswer::ConnectRefused.status(), 405);
+        let cases = [
+            ("example.com:443", LocalHopAnswer::ConnectRefused, 405),
+            ("[::1]:443", LocalHopAnswer::ConnectRefused, 405),
+            ("127.0.0.1:65535", LocalHopAnswer::ConnectRefused, 405),
+            ("example.com", LocalHopAnswer::ConnectBadTarget, 400),
+            ("example.com:", LocalHopAnswer::ConnectBadTarget, 400),
+            ("example.com:0", LocalHopAnswer::ConnectBadTarget, 400),
+            ("example.com:65536", LocalHopAnswer::ConnectBadTarget, 400),
+            ("example.com:+443", LocalHopAnswer::ConnectBadTarget, 400),
+            ("example.com:http", LocalHopAnswer::ConnectBadTarget, 400),
+            (":443", LocalHopAnswer::ConnectBadTarget, 400),
+            ("[::1]", LocalHopAnswer::ConnectBadTarget, 400),
+            ("[]:443", LocalHopAnswer::ConnectBadTarget, 400),
+            ("::1:443", LocalHopAnswer::ConnectBadTarget, 400),
+            ("", LocalHopAnswer::ConnectBadTarget, 400),
+        ];
+        for (target, answer, status) in cases {
+            let decided = local_hop_answer(&Method::CONNECT, target, &headers(Some("5")));
+            assert_eq!(
+                decided.map(|answer| (answer, answer.status(), answer.ends_connection())),
+                Some((answer, status, true)),
+                "{target:?}"
+            );
+        }
     }
 
     /// 🧭 Only a zero budget makes this hop the final recipient of `OPTIONS`,
@@ -148,7 +227,7 @@ mod tests {
             let headers = headers(value);
             assert_eq!(
                 (
-                    local_hop_answer(&Method::OPTIONS, &headers),
+                    local_hop_answer(&Method::OPTIONS, "", &headers),
                     forwarded_max_forwards(&Method::OPTIONS, &headers),
                 ),
                 (answer, forwarded),
@@ -163,7 +242,7 @@ mod tests {
         let headers = headers(Some("0"));
         assert_eq!(
             (
-                local_hop_answer(&Method::GET, &headers),
+                local_hop_answer(&Method::GET, "", &headers),
                 forwarded_max_forwards(&Method::GET, &headers),
             ),
             (None, None)

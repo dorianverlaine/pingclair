@@ -3808,6 +3808,27 @@ fn write_h3_access_log(
 /// 🧯 Carries an HTTP failure to the wrapper before response bytes are queued.
 type HandlerError = (u16, &'static str);
 
+/// 🧭 Sends the answer this hop gives itself, with `Allow` and an empty body.
+///
+/// `state` is the matched site, or `None` for a `CONNECT` whose authority
+/// named no site; the response policy then has no site headers to add.
+async fn send_local_hop_answer(
+    resp_tx: &ResponseSink,
+    stream_id: u64,
+    answer: crate::http_policy::LocalHopAnswer,
+    response_policy: &ResponseHeaderPolicy,
+    request_id: &str,
+    state: Option<&ProxyState>,
+) {
+    let mut headers = vec![
+        quiche::h3::Header::new(b":status", answer.status().to_string().as_bytes()),
+        quiche::h3::Header::new(b"allow", crate::http_policy::ALLOWED_METHODS.as_bytes()),
+        quiche::h3::Header::new(b"content-length", b"0"),
+    ];
+    apply_h3_response_policy(&mut headers, response_policy, request_id, state);
+    send_headers(resp_tx, stream_id, headers, true).await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_request_inner(
     proxy: &PingclairProxy,
@@ -3859,6 +3880,24 @@ async fn handle_request_inner(
     request_vars.set_remote(std::net::SocketAddr::new(peer_address, peer_port));
     let (state, route_index) = {
         let Some(state) = generation.routes().get(&host_bare) else {
+            // 🔌 A `CONNECT` naming no site gets the same refusal as on a
+            // matched one, as on H1/H2, rather than a 404 that differs by
+            // transport.
+            if method == http::Method::CONNECT
+                && let Some(answer) =
+                    crate::http_policy::local_hop_answer(&method, &req.authority, &header.headers)
+            {
+                send_local_hop_answer(
+                    resp_tx,
+                    stream_id,
+                    answer,
+                    response_policy,
+                    request_id,
+                    None,
+                )
+                .await;
+                return Ok(());
+            }
             return Err((404, "No Matching Virtual Host"));
         };
         for (index, rule) in state.config.vars_routes.iter().enumerate() {
@@ -3905,17 +3944,22 @@ async fn handle_request_inner(
             .map(|route| route.index);
         (state, route_index)
     };
-    // 🧭 RFC 9110 §7.6.2: the same hop decision H1/H2 makes once the virtual
-    // host is known — `TRACE` refused, a spent `OPTIONS` answered here.
-    if let Some(answer) = crate::http_policy::local_hop_answer(&method, &header.headers) {
-        let mut headers = vec![
-            quiche::h3::Header::new(b":status", answer.status().to_string().as_bytes()),
-            quiche::h3::Header::new(b"allow", crate::http_policy::ALLOWED_METHODS.as_bytes()),
-            quiche::h3::Header::new(b"content-length", b"0"),
-        ];
-        apply_h3_response_policy(&mut headers, response_policy, request_id, Some(&state));
+    // 🧭 The same hop decision H1/H2 makes once the virtual host is known —
+    // `CONNECT` and `TRACE` refused, a spent `OPTIONS` (RFC 9110 §7.6.2)
+    // answered here.
+    if let Some(answer) =
+        crate::http_policy::local_hop_answer(&method, &req.authority, &header.headers)
+    {
+        send_local_hop_answer(
+            resp_tx,
+            stream_id,
+            answer,
+            response_policy,
+            request_id,
+            Some(&state),
+        )
+        .await;
         *error_state = Some(state);
-        send_headers(resp_tx, stream_id, headers, true).await;
         return Ok(());
     }
     let Some(route_index) = route_index else {

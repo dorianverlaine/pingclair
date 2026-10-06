@@ -108,6 +108,10 @@ below, which ends with what to write instead.
 - **HTTP/1.1 without Host now closes after its 400 response.**
   → [Short HTTP requests answer and close](#-short-http-requests-answer-and-close)
 
+- **A CONNECT for a host no site names is refused and closes instead of
+  answering 200; a CONNECT without a port receives 400.**
+  → [An unmatched CONNECT is refused and closes](#-an-unmatched-connect-is-refused-and-closes)
+
 - **A specific address and a wildcard on one port share one listener.** A
   `bind`-restricted site beside a wildcard site on the same port is refused,
   and a `0.0.0.0` site beside a `[::]` site on one port answers over IPv6.
@@ -336,6 +340,24 @@ Stored responses account for upstream `Age`, apparent age from `Date`, and upstr
 
 **Upgrade:** Already-aged responses expire sooner; expect revalidation or origin requests earlier than the previous local-only countdown.
 
+### 🔌 An unmatched CONNECT is refused and closes
+
+A `CONNECT` whose authority named no site used to fall through to the
+no-matching-site answer: an empty `200` on plaintext listeners. A `200` to
+`CONNECT` tells the client its tunnel is open, so it starts sending tunnel
+bytes — and on HTTP/1.1 this server read those bytes as the next request and
+served it. Every `CONNECT` now gets the same refusal whether or not its
+authority names a site: `405` with `Allow`, and the HTTP/1.1 connection closes
+(RFC 9931 §8). A target without a usable port (`CONNECT example.com`,
+`example.com:0`) is malformed and receives `400` instead (RFC 9110 §9.3.6).
+HTTP/2 and HTTP/3 give the same answers; on HTTP/3 an unmatched `CONNECT` used
+to receive `404`.
+
+📌 Upgrade note: nothing that worked changes. A client that relied on the `200`
+was never given a tunnel; Pingclair is a reverse proxy and opens none. Send
+`CONNECT` targets as `host:port`. Caddy v2.11 answers an unmatched `CONNECT`
+with `200` too; this follows the RFC rather than that behaviour.
+
 ### 🧭 `uri` operands resolve placeholders
 
 `uri strip_prefix /api/static/{re.sample.1}` strips the prefix the
@@ -406,7 +428,7 @@ by their URL authority after the original Host is validated.
 
 📌 Upgrade note: use valid ASCII host authorities. A Host override no longer
 changes the destination of an absolute-form URL. Open a fresh HTTP/1 connection
-after a malformed nonempty Host, 501, or 505. CONNECT remains 405 on all
+after a malformed nonempty Host, 501, or 505. CONNECT remains refused on all
 transports because Pingclair does not implement generic tunnels; the former
 default body ceiling has already been removed.
 

@@ -192,10 +192,10 @@ async fn test_invalid_h2_preface_terminates_the_connection() {
 /// requires the connection to be closed when a `CONNECT` is rejected, with or
 /// without a `close` connection option.
 ///
-/// The host-specific fixture is the point: a matched site already refuses
-/// `CONNECT` (405, `Allow`, close), while the no-matching-site path answers 200.
+/// The host-specific fixture is the point: a matched site always refused
+/// `CONNECT` (405, `Allow`, close), while the no-matching-site path answered 200
+/// until pingclair#283.
 #[tokio::test]
-#[ignore = "pingclair#283 — an unmatched CONNECT gets 200 and the connection stays usable"]
 async fn test_unmatched_connect_is_refused_and_ends_the_connection() {
     let fixture = r#"
         {
