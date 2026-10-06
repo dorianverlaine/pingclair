@@ -40,7 +40,7 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use crate::cache_policy::{
     OriginFreshness, cache_defaults, heuristic_lifetime, origin_freshness,
@@ -209,6 +209,10 @@ pub struct RequestContext {
     pub request_id_value: http::HeaderValue,
     /// Start time for logging
     pub start_time: std::time::Instant,
+    /// ⏳ The upstream attempt starts before connection setup, for RFC 9111 response delay.
+    cache_request_started: Option<std::time::Instant>,
+    /// 🔁 Raw 304 clock fields survive Pingora's selective merge into the stored response.
+    cache_revalidation_headers: Option<crate::cache_age::RevalidationHeaders>,
     /// ⏱️ When the first response byte was handed downstream, for TTFB.
     /// `None` when the response failed before producing any byte.
     pub first_byte_at: Option<std::time::Instant>,
@@ -339,6 +343,8 @@ impl Default for RequestContext {
             response_bytes: 0,
             request_id_value,
             start_time: std::time::Instant::now(),
+            cache_request_started: None,
+            cache_revalidation_headers: None,
             first_byte_at: None,
             active_connection_metric: None,
             _in_flight: None,
@@ -6309,6 +6315,11 @@ impl ProxyHttp for PingclairProxy {
         response: &ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> pingora_core::Result<RespCacheable> {
+        let corrected_response = ctx
+            .cache_revalidation_headers
+            .as_ref()
+            .map(|headers| headers.apply(response));
+        let response = corrected_response.as_ref().unwrap_or(response);
         let Some(ttl_secs) = ctx.cache_ttl_secs else {
             return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
                 "cache not enabled for this route",
@@ -6319,17 +6330,8 @@ impl ProxyHttp for PingclairProxy {
             return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(reason)));
         }
 
-        // 📜 The freshness rules are RFC 9111's, and Pingora already implements
-        // them: `Cache-Control` (`no-store`, `private`, `no-cache`, `max-age`,
-        // `s-maxage`), the `Expires` fallback, `Age`, stale-while-revalidate,
-        // stale-if-error, and stripping the fields `private=<field>` names.
-        // Re-deriving any of that here would be a second, worse copy.
-        //
-        // `no-cache` is the one worth spelling out: it means "store, but
-        // revalidate before reuse", and Pingora expresses that as a zero
-        // freshness duration, which lands the entry in cache already stale.
-        // Refusing to store it would be a plausible-looking mistake — it reads
-        // like a stricter choice, and it silently disables revalidation.
+        // 📜 Pingora applies storage restrictions and sanitizes private fields;
+        // RFC 9111 age accounting below supplies the time already spent upstream.
         let cache_control = CacheControl::from_resp_headers(response);
         if crate::cache_policy::strips_vary(cache_control.as_ref()) {
             return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
@@ -6350,17 +6352,25 @@ impl ProxyHttp for PingclairProxy {
         // lifetime knows more about its content than the proxy config does,
         // so it wins; the route only answers for responses that say nothing.
         //
-        // 🔐 Both rebuilds below take their headers from `meta`, never from
-        // `response`. Pingora has already removed the fields `private="..."`
-        // and `no-cache="..."` name from `meta`; the raw upstream header still
-        // has them, and storing that copy replays the first visitor's
-        // `X-User-Token` to everyone who follows.
+        // 🔐 Age correction retains Pingora's sanitized stored headers. Raw
+        // clock fields must not restore fields stripped by private or no-cache.
         let RespCacheable::Cacheable(meta) = decision else {
             return Ok(decision);
         };
-        let created = SystemTime::now();
+        let delay = ctx
+            .cache_request_started
+            .map_or(Duration::ZERO, |started| started.elapsed());
         match origin_freshness(cache_control.as_ref(), response) {
-            OriginFreshness::Stated => return Ok(RespCacheable::Cacheable(meta)),
+            OriginFreshness::Stated => {
+                let lifetime = Duration::from_secs(meta.fresh_sec());
+                return Ok(crate::cache_age::account(
+                    meta,
+                    response,
+                    cache_control.as_ref(),
+                    lifetime,
+                    delay,
+                ));
+            }
             OriginFreshness::StaleOnArrival => {
                 // 🔁 One second in the past is how Pingora itself stores a
                 // response that must be revalidated before every reuse.
@@ -6368,13 +6378,13 @@ impl ProxyHttp for PingclairProxy {
                     status = response.status.as_u16(),
                     "🔁 origin sent conflicting Expires; stored stale, route ttl not applied"
                 );
-                return Ok(RespCacheable::Cacheable(CacheMeta::new(
-                    created - Duration::from_secs(1),
-                    created,
-                    meta.stale_while_revalidate_sec(),
-                    meta.stale_if_error_sec(),
-                    meta.response_header_copy(),
-                )));
+                return Ok(crate::cache_age::account(
+                    meta,
+                    response,
+                    cache_control.as_ref(),
+                    Duration::ZERO,
+                    delay,
+                ));
             }
             OriginFreshness::Silent => {}
         }
@@ -6388,14 +6398,13 @@ impl ProxyHttp for PingclairProxy {
                 "no lifetime for this status",
             )));
         };
-        let fresh_until = created + fresh_for;
-        Ok(RespCacheable::Cacheable(CacheMeta::new(
-            fresh_until,
-            created,
-            meta.stale_while_revalidate_sec(),
-            meta.stale_if_error_sec(),
-            meta.response_header_copy(),
-        )))
+        Ok(crate::cache_age::account(
+            meta,
+            response,
+            cache_control.as_ref(),
+            fresh_for,
+            delay,
+        ))
     }
 
     /// 🎯 Builds the variance key from the request fields `Vary` names, and
@@ -7289,6 +7298,8 @@ impl ProxyHttp for PingclairProxy {
         Self::CTX: Send + Sync,
     {
         ctx.upstream_attempted = true;
+        ctx.cache_request_started = ctx.cache_ttl_secs.map(|_| std::time::Instant::now());
+        ctx.cache_revalidation_headers = None;
         let route_index = if let Some(index) = ctx.route_index {
             index
         } else {
@@ -7769,6 +7780,13 @@ impl ProxyHttp for PingclairProxy {
     where
         Self::CTX: Send + Sync,
     {
+        if ctx.cache_ttl_secs.is_some()
+            && upstream_response.status == http::StatusCode::NOT_MODIFIED
+        {
+            ctx.cache_revalidation_headers = Some(
+                crate::cache_age::RevalidationHeaders::from_response(upstream_response),
+            );
+        }
         if upstream_response.headers.contains_key("trailer") {
             tracing::warn!(
                 "🚫 Rejecting an upstream response that requires unsupported trailer forwarding"
@@ -7895,6 +7913,10 @@ impl ProxyHttp for PingclairProxy {
         Self::CTX: Send + Sync,
     {
         Self::enforce_request_deadline(ctx)?;
+        if let Some(headers) = &ctx.cache_revalidation_headers {
+            // 🔁 A validated body's clock updates even when the 304 forbids storage.
+            headers.apply_to(upstream_response);
+        }
         if upstream_response
             .headers
             .get("content-type")

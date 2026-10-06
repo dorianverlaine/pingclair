@@ -51,6 +51,8 @@ below, which ends with what to write instead.
   → [Immediate-flush routes bypass the response cache](#immediate-flush-routes-bypass-the-response-cache)
 - **Response cache budgets apply at load and reload.**
   → [Response cache budgets apply at load and reload](#response-cache-budgets-apply-at-load-and-reload)
+- **Response cache freshness includes upstream age.**
+  → [Response cache freshness includes upstream age](#response-cache-freshness-includes-upstream-age)
 
 - **A middle `*` no longer jumps ahead of an equal-length sibling.** Put the
   intended winner first when equal-length patterns overlap.
@@ -277,6 +279,11 @@ The process-wide response-cache ceiling is configured before traffic and resized
 
 **Upgrade:** Use the same `max_size` on every caching route. Reloads now apply a changed ceiling without a restart.
 
+### Response cache freshness includes upstream age
+
+Stored responses account for upstream `Age`, apparent age from `Date`, and upstream response delay under RFC 9111. Cache hits retain that age, and `Expires` supplies a lifetime relative to `Date`. Route TTL remains a fallback and sanitized private headers stay stripped. Validated bodies use the new clock even when the validation forbids storage; extremely old responses bypass caching.
+
+**Upgrade:** Already-aged responses expire sooner; expect revalidation or origin requests earlier than the previous local-only countdown.
 ### 🚫 HTTP parser decisions follow Go
 
 Invalid nonempty Host values receive 400 and close on HTTP/1; HTTP/2 fields

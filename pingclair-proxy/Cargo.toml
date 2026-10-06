@@ -58,6 +58,7 @@ foreign-types.workspace = true
 thiserror.workspace = true
 minijinja = "2"
 chrono = "0.4"
+httpdate = "1"
 # 📤 Derives the admin API's cache-status payload; the endpoint lives in
 # pingclair-api but the accounting it reports lives here.
 serde = { workspace = true, features = ["derive"] }

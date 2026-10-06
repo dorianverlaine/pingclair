@@ -2647,6 +2647,7 @@ dependencies = [
  "h2",
  "hickory-resolver",
  "http",
+ "httpdate",
  "ipnet",
  "libc",
  "minijinja",

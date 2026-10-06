@@ -16,6 +16,7 @@ mod acme_challenge;
 pub mod alt_svc;
 mod body_buffer;
 pub mod body_timeout;
+mod cache_age;
 mod cache_budget;
 mod cache_key;
 mod cache_policy;

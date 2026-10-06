@@ -15418,3 +15418,6 @@ mod cache_streaming_routes;
 
 #[path = "integration/cache_budget_reload.rs"]
 mod cache_budget_reload;
+
+#[path = "integration/cache_age.rs"]
+mod cache_age;
