@@ -661,6 +661,10 @@ pub(super) fn adapt_subroute_block(
     order: &DirectiveOrder,
     sorted: bool,
 ) -> Result<Handler, AdapterError> {
+    // 🚫 Nested blocks take their matcher elsewhere, but must refuse a token
+    // that is not one just as a site-level block does, or `handle *.php`
+    // inside a `route` answers everything.
+    parse_route_matcher_and_block(d)?;
     let elements = match &d.block {
         Some(block) => collect_subroute_elements(block, parent_matchers, order, sorted)?,
         None => Vec::new(),

@@ -162,12 +162,28 @@ pub(super) fn parse_route_matcher_and_block(
     d: &Directive,
 ) -> Result<(Option<Matcher>, Option<&Block>), AdapterError> {
     let block = d.block.as_ref();
-    let matcher = match d.args.first() {
-        Some(arg) if arg.starts_with('@') => Some(Matcher::Named(arg.clone())),
-        Some(arg) if arg.starts_with('/') => Some(Matcher::Path(PathMatcher {
+    let matcher = match d.args.as_slice() {
+        [] => None,
+        [arg] if arg == "*" => None,
+        [arg] if arg.starts_with('@') => Some(Matcher::Named(arg.clone())),
+        [arg] if arg.starts_with('/') => Some(Matcher::Path(PathMatcher {
             patterns: vec![arg.clone()],
         })),
-        _ => None,
+        // 🚫 Anything else used to be dropped, so `handle *.php { … }`
+        // compiled into a block with no matcher that answered every request
+        // on the site. A matcher token is `*`, a path starting with `/`, or a
+        // `@name`, and a block directive takes at most one; the reference
+        // refuses the rest the same way.
+        _ => {
+            return Err(AdapterError::InvalidArgument(
+                d.name.clone(),
+                format!(
+                    "expected at most one matcher (`*`, a path starting with `/`, or \
+                     `@name`) before the block, got `{}`",
+                    d.args.join(" ")
+                ),
+            ));
+        }
     };
     Ok((matcher, block))
 }

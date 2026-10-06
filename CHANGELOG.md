@@ -179,10 +179,26 @@ below, which ends with what to write instead.
 - **Admin `/config` reads mask secrets.** An export can no longer be posted
   back to `/load` unchanged; put the real `api_key` and DNS arguments back.
   → [The admin API's configuration reads mask secrets](#-the-admin-apis-configuration-reads-mask-secrets)
+- **`handle`, `handle_path` and `route` refuse a token that is not a
+  matcher.** `handle *.php { … }` used to compile into a block that answered
+  every request; write `handle @php { … }` with `@php path *.php`.
+  → [A block directive takes `*`, a `/path` or `@name`](#-a-block-directive-takes--a-path-or-name)
 
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
 [Known defect — WebSocket upgrades under load](#-known-defect--websocket-upgrades-under-load).
+
+### 🚫 A block directive takes `*`, a `/path` or `@name`
+
+`handle`, `handle_path` and `route` take at most one matcher token before
+their block, and that token is `*`, a path starting with `/`, or a named
+matcher. Anything else used to be dropped without a word, so
+`handle *.php { php_fastcgi … }` became a block with no matcher that answered
+every request on the site, PHP or not. Such a configuration is now refused at
+load with the token it did not understand, at site level and inside nested
+blocks alike.
+
+**Upgrade:** Name the matcher: `@php path *.php` and `handle @php { … }`.
 
 ### 🏷️ Admin config validators
 
