@@ -41,6 +41,9 @@ Most configurations keep working unchanged. These are the changes most
 likely to alter what an existing configuration does; each links to its entry
 below, which ends with what to write instead.
 
+- **Static ranges stream when compression is enabled.**
+  → [Static ranges stream when compression is enabled](#static-ranges-stream-when-compression-is-enabled)
+
 - **A middle `*` no longer jumps ahead of an equal-length sibling.** Put the
   intended winner first when equal-length patterns overlap.
   → [Equal-length route patterns keep file order](#-equal-length-route-patterns-keep-file-order)
@@ -235,6 +238,12 @@ below, which ends with what to write instead.
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
 [Known defect — WebSocket upgrades under load](#-known-defect--websocket-upgrades-under-load).
+
+### Static ranges stream when compression is enabled
+
+Large ranges on compressible static files now stream in bounded chunks while retaining identity encoding and the correct partial-response headers.
+
+**Upgrade:** No configuration change is needed; concurrent large range requests no longer allocate the complete range.
 
 ### 🚫 HTTP parser decisions follow Go
 

@@ -577,3 +577,7 @@ mod subdirective_tests {
         assert_eq!(config.etag_file_extensions, vec!["etag".to_string()]);
     }
 }
+
+#[cfg(test)]
+#[path = "range_streaming_tests.rs"]
+mod range_streaming_tests;

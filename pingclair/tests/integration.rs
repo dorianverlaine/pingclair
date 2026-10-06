@@ -15406,3 +15406,6 @@ mod error_routes;
 // 🔌 An IP-literal site and a hostname site on one port share one socket.
 #[path = "integration/shared_port_sites.rs"]
 mod shared_port_sites;
+
+#[path = "integration/static_range_streaming.rs"]
+mod static_range_streaming;
