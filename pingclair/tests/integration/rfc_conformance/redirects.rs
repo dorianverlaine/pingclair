@@ -26,7 +26,6 @@ fn directory_fixture() -> tempfile::TempDir {
 /// attacker can aim whenever a directory name is influenced by them — the class
 /// upstream tracks as caddyserver/caddy#8023.
 #[tokio::test]
-#[ignore = "pingclair#250 — `GET //sub` answers `Location: //sub/`"]
 async fn test_canonical_redirect_stays_on_this_origin() {
     let root = directory_fixture();
     let mut server = TestServer::new_pingclairfile(&site(&format!(
@@ -61,7 +60,6 @@ async fn test_canonical_redirect_stays_on_this_origin() {
 /// missing trailing slash has been sent somewhere it did not ask for, and a
 /// cache or tracker downstream sees a different resource.
 #[tokio::test]
-#[ignore = "pingclair#250 — the query string is dropped"]
 async fn test_canonical_redirect_keeps_the_query() {
     let root = directory_fixture();
     let mut server = TestServer::new_pingclairfile(&site(&format!(
