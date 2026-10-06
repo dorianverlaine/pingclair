@@ -112,6 +112,10 @@ mod retry_duration;
 #[path = "h3_end_to_end/error_routes.rs"]
 mod error_routes;
 
+// 🧭 `uri strip_prefix`, `strip_suffix` and `path_regexp` resolve their operands.
+#[path = "h3_end_to_end/uri_placeholders.rs"]
+mod uri_placeholders;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {

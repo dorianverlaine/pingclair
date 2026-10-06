@@ -78,7 +78,10 @@ below, which ends with what to write instead.
   → [Response cache budgets apply at load and reload](#response-cache-budgets-apply-at-load-and-reload)
 - **Response cache freshness includes upstream age.**
   → [Response cache freshness includes upstream age](#response-cache-freshness-includes-upstream-age)
-
+- **`uri strip_prefix`, `strip_suffix` and `path_regexp` resolve placeholders.**
+  A `${1}` group reference in a `path_regexp` replacement is now read as the
+  placeholder `{1}`; write `$1`.
+  → [`uri` operands resolve placeholders](#-uri-operands-resolve-placeholders)
 - **A middle `*` no longer jumps ahead of an equal-length sibling.** Put the
   intended winner first when equal-length patterns overlap.
   → [Equal-length route patterns keep file order](#-equal-length-route-patterns-keep-file-order)
@@ -323,6 +326,22 @@ The process-wide response-cache ceiling is configured before traffic and resized
 Stored responses account for upstream `Age`, apparent age from `Date`, and upstream response delay under RFC 9111. Cache hits retain that age, and `Expires` supplies a lifetime relative to `Date`. Route TTL remains a fallback and sanitized private headers stay stripped. Validated bodies use the new clock even when the validation forbids storage; extremely old responses bypass caching.
 
 **Upgrade:** Already-aged responses expire sooner; expect revalidation or origin requests earlier than the previous local-only countdown.
+
+### 🧭 `uri` operands resolve placeholders
+
+`uri strip_prefix /api/static/{re.sample.1}` strips the prefix the
+`path_regexp` matcher captured, and `uri path_regexp ^/old/(.*)$
+/new/{http.request.scheme}/$1` writes `/new/http/…`, on HTTP/1.1, HTTP/2 and
+HTTP/3. Only `rewrite`'s target used to be resolved: a strip compared the path
+against the literal braces, never matched, and forwarded the request untouched,
+and a regexp replacement put the braces themselves on the wire. Caddy resolves
+every operand, and so does this release (#278).
+
+📌 Upgrading: a literal operand behaves exactly as before. A `path_regexp`
+replacement is resolved before the regexp sees it, as upstream, so the braced
+group reference `${1}` reads as the placeholder `{1}` and disappears; write
+`$1`.
+
 ### 🚫 HTTP parser decisions follow Go
 
 Invalid nonempty Host values receive 400 and close on HTTP/1; HTTP/2 fields

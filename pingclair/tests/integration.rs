@@ -15429,3 +15429,9 @@ mod site_bind;
 // 🎯 An explicit site's name outranks a wildcard's `client_auth` (#259).
 #[path = "integration/client_auth_precedence.rs"]
 mod client_auth_precedence;
+
+// MARK: - URI operand placeholders
+
+// 🧭 `uri strip_prefix`, `strip_suffix` and `path_regexp` resolve their operands.
+#[path = "integration/uri_placeholders.rs"]
+mod uri_placeholders;

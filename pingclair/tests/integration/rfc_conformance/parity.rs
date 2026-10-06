@@ -308,7 +308,6 @@ async fn test_header_set_yields_one_field_line() {
 /// resolves these operands, so a `strip_prefix` containing a named-matcher
 /// capture is a directive that either works or should be refused.
 #[tokio::test]
-#[ignore = "pingclair#278 — `uri strip_prefix /api/{re.capture}` is a silent no-op"]
 async fn test_uri_strip_prefix_resolves_placeholders() {
     let upstream = ScriptedUpstream::start(
         vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()],

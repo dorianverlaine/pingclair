@@ -5203,36 +5203,47 @@ impl PingclairProxy {
                         }
                     }
                 }
-                // 🧭 A rewrite target is a template: `php_fastcgi` writes
-                // `{http.matchers.file.relative}`, and operators write
-                // `{host}` and friends. Resolving here keeps `apply_rewrite`
+                // 🧭 Every rewrite operand is a template: `php_fastcgi` writes
+                // `{http.matchers.file.relative}`, operators write `{host}`,
+                // and `uri strip_prefix /api/{re.tenant.1}` names a prefix
+                // only the matcher knows. Resolving here keeps `apply_rewrite`
                 // purely mechanical, like every other URI rewrite.
-                let verified_client_ip =
-                    if replace.as_deref().is_some_and(|value| value.contains('{')) {
-                        ctx.verified_client_ip.map(|ip| ip.to_string())
-                    } else {
-                        None
+                //
+                // 🤡 Until #278 only `replace` was resolved, so a strip whose
+                // prefix held a placeholder compared against literal braces,
+                // never matched, and forwarded the path untouched.
+                let verified_client_ip = if [replace, strip_prefix, strip_suffix, regex_replace]
+                    .iter()
+                    .any(|operand| operand.as_deref().is_some_and(|value| value.contains('{')))
+                {
+                    ctx.verified_client_ip.map(|ip| ip.to_string())
+                } else {
+                    None
+                };
+                let (resolved_prefix, resolved_suffix, resolved_replace, resolved_regex_replace) = {
+                    let operands = RewriteOperands {
+                        req: session.req_header(),
+                        verified_client_ip: verified_client_ip.as_deref(),
+                        scheme: ctx.request_scheme,
+                        vars: &ctx.request_vars,
                     };
-                let resolved_replace = replace.as_deref().map(|template| {
-                    resolve_caddy_placeholders(
-                        template,
-                        session.req_header(),
-                        verified_client_ip.as_deref(),
-                        ctx.request_scheme,
-                        &ctx.request_vars,
+                    (
+                        operands.resolve(strip_prefix.as_deref()),
+                        operands.resolve(strip_suffix.as_deref()),
+                        operands.resolve(replace.as_deref()),
+                        operands.resolve(regex_replace.as_deref()),
                     )
-                    .into_owned()
-                });
+                };
                 self.apply_rewrite(
                     session,
                     ctx,
                     route_index,
                     RewriteRule {
-                        strip_prefix: strip_prefix.as_deref(),
-                        strip_suffix: strip_suffix.as_deref(),
+                        strip_prefix: resolved_prefix.as_deref(),
+                        strip_suffix: resolved_suffix.as_deref(),
                         replace: resolved_replace.as_deref(),
                         regex: regex.as_deref(),
-                        regex_replace: regex_replace.as_deref(),
+                        regex_replace: resolved_regex_replace.as_deref(),
                     },
                 )?;
                 Ok(false)
@@ -5734,6 +5745,46 @@ pub(crate) fn resolve_caddy_placeholders<'a>(
     }
 
     std::borrow::Cow::Owned(result)
+}
+
+/// 🧭 Resolves rewrite operands against one request, borrowing from the
+/// configuration whenever an operand is a literal.
+///
+/// A `uri` operation's operands are templates — `uri strip_prefix
+/// /api/{re.tenant.1}` names a prefix that only exists once the matcher has
+/// run — so each one has to be resolved before the path is touched. Results
+/// borrow the configured text rather than the request, which is what lets the
+/// caller resolve every operand first and then hand the request to the rewrite
+/// mutably.
+pub(crate) struct RewriteOperands<'r> {
+    pub(crate) req: &'r RequestHeader,
+    pub(crate) verified_client_ip: Option<&'r str>,
+    pub(crate) scheme: &'static str,
+    pub(crate) vars: &'r crate::http_policy::RequestVars,
+}
+
+impl RewriteOperands<'_> {
+    /// 🏎️ A literal operand, the overwhelmingly common case, comes back as the
+    /// configured `&str` itself: no copy, nothing beyond the one `{` search.
+    pub(crate) fn resolve<'t>(
+        &self,
+        operand: Option<&'t str>,
+    ) -> Option<std::borrow::Cow<'t, str>> {
+        let template = operand?;
+        if !template.contains('{') {
+            return Some(std::borrow::Cow::Borrowed(template));
+        }
+        Some(std::borrow::Cow::Owned(
+            resolve_caddy_placeholders(
+                template,
+                self.req,
+                self.verified_client_ip,
+                self.scheme,
+                self.vars,
+            )
+            .into_owned(),
+        ))
+    }
 }
 
 /// 🧱 `fmt::Write` target backed by a fixed stack buffer, so short header

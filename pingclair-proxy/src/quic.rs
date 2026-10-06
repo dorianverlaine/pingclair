@@ -75,7 +75,9 @@ use crate::http_policy::{
     CorsDecision, ResponseContent, ResponseHeaderPolicy, authority_host, evaluate_cors,
     resolve_request_id, rewrite_uri, strip_path_prefix,
 };
-use crate::server::{PingclairProxy, ProxyState, error_reason, resolve_caddy_placeholders};
+use crate::server::{
+    PingclairProxy, ProxyState, RewriteOperands, error_reason, resolve_caddy_placeholders,
+};
 use crate::server::{is_streaming_content_type, wants_immediate_flush};
 use crate::tls_name_alert::install_name_alert;
 use pingclair_core::server::{
@@ -3213,29 +3215,33 @@ async fn plan_h3_handler_with_connector(
             // `{http.matchers.file.relative}` and the file server behind it
             // answered 404 for every request — the whole single-page
             // application pattern, silent, and only over HTTP/3.
-            let verified = replace
-                .as_deref()
-                .is_some_and(|value| value.contains('{'))
-                .then_some(verified_client_ip);
-            let resolved_replace = replace.as_deref().map(|template| {
-                resolve_caddy_placeholders(
-                    template,
-                    request_header,
-                    verified,
-                    "https",
-                    request_vars,
+            //
+            // 🤡 Until #278 only `replace` was resolved, on both transports: a
+            // `uri strip_prefix /api/{re.tenant.1}` compared against literal
+            // braces, never matched, and forwarded the path untouched.
+            let (resolved_prefix, resolved_suffix, resolved_replace, resolved_regex_replace) = {
+                let operands = RewriteOperands {
+                    req: request_header,
+                    verified_client_ip: Some(verified_client_ip),
+                    scheme: "https",
+                    vars: request_vars,
+                };
+                (
+                    operands.resolve(strip_prefix.as_deref()),
+                    operands.resolve(strip_suffix.as_deref()),
+                    operands.resolve(replace.as_deref()),
+                    operands.resolve(regex_replace.as_deref()),
                 )
-                .into_owned()
-            });
+            };
             *effective_uri = state
                 .rewrite_request_uri(
                     route_index,
                     effective_uri,
-                    strip_prefix.as_deref(),
-                    strip_suffix.as_deref(),
+                    resolved_prefix.as_deref(),
+                    resolved_suffix.as_deref(),
                     resolved_replace.as_deref(),
                     regex.as_deref(),
-                    regex_replace.as_deref(),
+                    resolved_regex_replace.as_deref(),
                 )
                 .map_err(|_| (500, "Rewrite Failed"))?;
             request_header
