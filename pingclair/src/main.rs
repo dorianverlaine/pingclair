@@ -43,7 +43,7 @@ mod addr;
 mod certs;
 mod cli;
 mod fd_budget;
-mod h1_request_line;
+mod h1_request_head;
 mod header_deadline;
 mod listen;
 mod log_bridge;

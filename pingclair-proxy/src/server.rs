@@ -6932,17 +6932,30 @@ impl ProxyHttp for PingclairProxy {
 
             // 🏠 RFC 9112 §3.2 makes this a MUST: exactly one well-formed Host,
             // or this proxy and the origin may resolve different virtual hosts.
-            if let Err(rejection) = crate::http_policy::check_request_host(
+            let host_rejection = crate::http_policy::check_request_host(
                 request_header.version,
                 &request_header.headers,
-            ) {
+            )
+            .err()
+            .or_else(|| {
+                request_header
+                    .uri
+                    .authority()
+                    .filter(|authority| {
+                        !crate::http_policy::request_host_is_valid(authority.as_str().as_bytes())
+                    })
+                    .map(|_| crate::http_policy::FramingRejection::MalformedHost)
+            });
+            if let Some(rejection) = host_rejection {
                 tracing::warn!(
                     "🚫 Rejected a request whose Host cannot be resolved: {}",
                     rejection.reason()
                 );
-                if rejection == crate::http_policy::FramingRejection::MissingHost {
-                    // 🔌 A missing required authority ends the HTTP/1 connection,
-                    // matching Go net/http's pre-handler rejection.
+                if rejection != crate::http_policy::FramingRejection::MalformedHost
+                    || !crate::http_policy::request_authority(session.req_header()).is_empty()
+                {
+                    // 🔌 Go closes malformed nonempty authorities and missing
+                    // required Host. An empty Host keeps its measured 400 reuse.
                     session.as_mut().set_keepalive(None);
                 }
                 Self::write_simple_response(session, ctx, 400, rejection.reason()).await?;

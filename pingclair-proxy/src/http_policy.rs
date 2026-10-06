@@ -1920,49 +1920,48 @@ pub(crate) fn check_h3_request_framing(
     Ok(())
 }
 
-/// 🏠 Rejects a request whose `Host` cannot be resolved to exactly one authority.
-///
-/// RFC 9112 §3.2 is unusually blunt here: a server **must** answer 400 to an
-/// HTTP/1.1 request that lacks `Host`, carries more than one, or carries one
-/// with an invalid value. The reason is the same shape as path confusion — this
-/// proxy picks a virtual host from the first field it finds, and an origin that
-/// picks the last one is serving a different site than the one whose policy was
-/// just applied.
-///
-/// Only HTTP/1.1 and later are checked. HTTP/1.0 predates `Host` and may
-/// legitimately omit it, and HTTP/2 and HTTP/3 carry `:authority` instead,
-/// which their own parsers already validate.
+/// 🏠 Requires Host on HTTP/1.1 and validates it whenever another protocol
+/// supplies the ordinary field. H2 and H3 may carry authority separately, but
+/// an invalid Host must not reach an HTTP/1 upstream through that exemption.
 pub(crate) fn check_request_host(
     version: http::Version,
     headers: &HeaderMap,
 ) -> Result<(), FramingRejection> {
-    if version == http::Version::HTTP_09 || version == http::Version::HTTP_10 {
-        return Ok(());
-    }
-    if version != http::Version::HTTP_11 {
-        return Ok(());
-    }
-
     let mut hosts = headers.get_all(http::header::HOST).into_iter();
     let Some(host) = hosts.next() else {
-        return Err(FramingRejection::MissingHost);
+        return if version == http::Version::HTTP_11 {
+            Err(FramingRejection::MissingHost)
+        } else {
+            Ok(())
+        };
     };
     if hosts.next().is_some() {
         return Err(FramingRejection::AmbiguousHost);
     }
-
-    // 🔍 An authority has no spaces, no control characters, and no embedded
-    // separators. Anything else lets two parsers disagree about the name.
-    let raw = host.as_bytes();
-    if raw.is_empty()
-        || raw
-            .iter()
-            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control() || *byte == b',')
-    {
+    if !request_host_is_valid(host.as_bytes()) {
         return Err(FramingRejection::MalformedHost);
     }
-
     Ok(())
+}
+
+/// 🏠 Shares Go net/http's Host character grammar across transports and the
+/// HTTP/1 header handoff. Paths, userinfo, fragments, non-ASCII bytes, and
+/// whitespace must fail before routing or reconciling absolute-form authority.
+/// Empty values name no site; the caller owns their protocol-specific response.
+pub fn request_host_is_valid(raw: &[u8]) -> bool {
+    // ⚡ Compile the grammar once so each request byte needs only a lookup.
+    static HOST_BYTES: [bool; 256] = {
+        let alphabet =
+            b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!$%&'()*+,-.:;=[]_~";
+        let mut allowed = [false; 256];
+        let mut index = 0;
+        while index < alphabet.len() {
+            allowed[alphabet[index] as usize] = true;
+            index += 1;
+        }
+        allowed
+    };
+    !raw.is_empty() && raw.iter().all(|byte| HOST_BYTES[usize::from(*byte)])
 }
 
 /// 🧭 Resolves `.` and `..` in a request path, the way nginx and Caddy do.
@@ -2252,7 +2251,7 @@ mod tests {
             ),
             Err(FramingRejection::AmbiguousHost)
         );
-        for bad in ["a b", "a\tb", "a,b", ""] {
+        for bad in ["a b", "a\tb", "a/b", "a\\b", "a?b", "a#b", "a@b", ""] {
             assert_eq!(
                 check_request_host(http::Version::HTTP_11, &headers_of(&[("host", bad)])),
                 Err(FramingRejection::MalformedHost),

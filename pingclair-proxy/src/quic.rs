@@ -1972,6 +1972,18 @@ impl H3App {
         // 🤐 Recorded once, before any response can be queued, so every exit
         // below answers `HEAD` with a header and no content.
         let head_request = req.method == "HEAD";
+        // 🏠 Validate before routing or URI construction can reinterpret an
+        // invalid authority as a path, using the same grammar as H1/H2.
+        if !crate::http_policy::request_host_is_valid(req.authority.as_bytes()) {
+            self.queue_simple_response(
+                qconn,
+                stream_id,
+                400,
+                "Malformed Host Header",
+                head_request,
+            );
+            return;
+        }
 
         // 📦 Routes and client-auth policy come from one generation, loaded
         // once here and handed to the request task, so a reload that lands

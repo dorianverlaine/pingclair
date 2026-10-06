@@ -48,7 +48,7 @@ fn site() -> String {
 /// its `Content-Length` promises. A connection that stays open afterwards is
 /// the keep-alive case, not a missing response — which is why the reader below
 /// cannot simply wait for EOF the way `read_http1_to_end` does.
-fn response_is_complete(bytes: &[u8]) -> bool {
+pub(super) fn response_is_complete(bytes: &[u8]) -> bool {
     let Some(head_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
         return false;
     };

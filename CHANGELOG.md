@@ -33,6 +33,9 @@ Most configurations keep working unchanged. These are the changes most
 likely to alter what an existing configuration does; each links to its entry
 below, which ends with what to write instead.
 
+- **Host validation and HTTP/1 parser decisions now follow Go.**
+  → [HTTP parser decisions follow Go](#-http-parser-decisions-follow-go)
+
 - **Malformed chunked request bodies now receive 400 and close instead of 500.**
   → [Malformed chunked bodies are client errors](#-malformed-chunked-bodies-are-client-errors)
 
@@ -212,6 +215,21 @@ below, which ends with what to write instead.
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
 [Known defect — WebSocket upgrades under load](#-known-defect--websocket-upgrades-under-load).
+
+### 🚫 HTTP parser decisions follow Go
+
+Invalid nonempty Host values receive 400 and close on HTTP/1; HTTP/2 fields
+and HTTP/3 authority use the same character grammar. Empty HTTP/1 Host retains
+its 400 response and reusable connection. HTTP/1 rejects leading blank lines,
+unfolds continued headers in place, answers unsupported transfer codings with
+501, and unsupported protocol versions with 505. Absolute-form requests route
+by their URL authority after the original Host is validated.
+
+📌 Upgrade note: use valid ASCII host authorities. A Host override no longer
+changes the destination of an absolute-form URL. Open a fresh HTTP/1 connection
+after a malformed nonempty Host, 501, or 505. CONNECT remains 405 on all
+transports because Pingclair does not implement generic tunnels; the former
+default body ceiling has already been removed.
 
 ### 🚫 Malformed chunked bodies are client errors
 

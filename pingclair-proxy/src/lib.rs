@@ -57,6 +57,7 @@ pub mod upstream_tls;
 pub use connection_filter::PingclairConnectionFilter;
 pub use header_limits::protocol_header_list_limit;
 pub use health_check::HealthChecker;
+pub use http_policy::request_host_is_valid;
 pub use load_balancer::{DnsRefresh, FAIL_COOLDOWN, LoadBalancer, Strategy, UpstreamEntry};
 pub use rate_limit::{RateLimitConfig, RateLimitInfo, RateLimiter};
 pub use server::PingclairProxy;

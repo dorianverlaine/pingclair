@@ -197,16 +197,14 @@ impl ResourceGuardedProxy {
         loop {
             // ⏱️ The whole header arrives before Pingora sees the connection;
             // see `header_deadline` for why Pingora's own timer cannot do this.
-            let head = crate::header_deadline::read_request_head(
+            let mut head = crate::header_deadline::read_request_head(
                 &mut stream,
                 header_deadline,
                 &mut shutdown_signal,
             )
             .await?;
-            if !crate::h1_request_line::valid_request_line(&head) {
-                let _ = stream
-                    .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 15\r\nContent-Type: text/plain\r\n\r\n400 Bad Request")
-                    .await;
+            if let Err(rejection) = crate::h1_request_head::prepare_request_head(&mut head) {
+                let _ = stream.write_all(rejection.response()).await;
                 let _ = stream.shutdown().await;
                 return None;
             }
