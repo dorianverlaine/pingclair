@@ -104,8 +104,13 @@ pub(super) fn adapt_server(
             // 🏠 Collect every hostname the site serves. The first one is the
             // primary name; the rest are additional virtual hosts sharing the
             // same configuration (Caddy's `example.com, www.example.com`).
+            //
+            // 🌐 A wildcard address (`[::]`, `0.0.0.0`) is not a name a client
+            // can send, so it makes the site a catch-all instead. Registering
+            // `0.0.0.0` as a virtual host left `http://0.0.0.0:P` answering
+            // nobody once it shared a socket with a hostname site.
             if !parsed.hostname.is_empty()
-                && parsed.hostname != "[::]"
+                && !is_wildcard_host(&parsed.hostname)
                 && !server.names.contains(&parsed.hostname)
             {
                 server.names.push(parsed.hostname);

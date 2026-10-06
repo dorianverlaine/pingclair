@@ -67,3 +67,45 @@ async fn test_literal_and_hostname_sites_share_one_listener() {
         ]
     );
 }
+
+/// 🌐 `0.0.0.0:P` beside `[::]:P` is one socket too. Linux refuses to bind
+/// the second of the two; macOS kept both, and the IPv4 wildcard answered
+/// every IPv4 request without carrying the hostname site.
+#[tokio::test]
+async fn test_ipv4_wildcard_and_dual_stack_sites_share_one_listener() {
+    let mut server = TestServer::new_pingclairfile(
+        r#"
+        {
+            admin off
+        }
+
+        http://0.0.0.0:__PINGCLAIR_TEST_PORT__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "any-ipv4"
+        }
+
+        http://example.test:__PINGCLAIR_TEST_PORT__ {
+            respond "named"
+        }
+        "#,
+    );
+    assert!(server.wait_until_ready().await, "server did not start");
+    let address = server.address(0);
+    let ipv6_loopback = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, address.port()));
+
+    let seen = vec![
+        body(address, "other.test", "/").await,
+        // 🎯 The hostname site over IPv4: the `0.0.0.0` socket did not carry it.
+        body(address, "example.test", "/").await,
+        body(ipv6_loopback, "example.test", "/").await,
+    ];
+    assert_eq!(
+        seen,
+        vec![
+            (200, "any-ipv4".to_string()),
+            (200, "named".to_string()),
+            (200, "named".to_string()),
+        ]
+    );
+}

@@ -72,7 +72,8 @@ below, which ends with what to write instead.
   → [Short HTTP requests answer and close](#-short-http-requests-answer-and-close)
 
 - **A specific address and a wildcard on one port share one listener.** A
-  `bind`-restricted site beside a wildcard site on the same port is refused.
+  `bind`-restricted site beside a wildcard site on the same port is refused,
+  and a `0.0.0.0` site beside a `[::]` site on one port answers over IPv6.
   → [One port, one listener](#-a-specific-address-and-a-wildcard-on-one-port-share-one-listener)
 - **`bind` now applies to a site with an explicit address or port.** Such a
   site listens only on its `bind` host; address a `servers` block to that host.
@@ -346,15 +347,25 @@ apart by `Host`, as Caddy does. An IP-literal site that is alone on its port
 still binds only its own address. Each fold is logged when the configuration
 loads.
 
+The same holds for `0.0.0.0:8080` beside `[::]:8080`, which Linux also refuses
+to bind as two sockets: every address on a port that has `[::]` is served
+through `[::]`. A port whose only wildcard is `0.0.0.0` carries that port's
+IPv4 addresses and leaves IPv6 ones on their own sockets. A site addressed
+`http://0.0.0.0:8080` is a catch-all, like `http://:8080`, instead of a site
+for a `Host` named `0.0.0.0` that no client sends.
+
 📦 **Upgrade:** Configurations need no change unless the port now carries
 conflicting socket policy, which is refused at load: a site restricted by
-`bind` (or `default_bind`) beside a wildcard site on the same port, a plaintext
-site beside a TLS site, PROXY protocol on only one of them, or a
-`servers <address>` block for the folded address. Bind every site on that port
+`bind` (or `default_bind`, including `bind 0.0.0.0` beside a `[::]` site)
+beside a wildcard site on the same port, a plaintext site beside a TLS site,
+PROXY protocol on only one of them, or a `servers <address>` block for the
+folded address. Bind every site on that port
 to the same addresses, move one of them to another port, or address the
 `servers` block to the wildcard. A literal site that shares a port with a
 wildcard site is reachable on every interface by a client that sends its
-`Host`; give it a port of its own if it must stay on loopback.
+`Host`; give it a port of its own if it must stay on loopback. Likewise a
+`0.0.0.0` site that shares its port with a `[::]` site now answers over IPv6
+too; give it a port of its own if it must stay IPv4-only.
 
 ### 📍 `bind` applies to every listener of a site
 

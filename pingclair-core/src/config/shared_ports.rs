@@ -30,7 +30,12 @@
 //! 🚫 A `bind` restriction is never folded. `bind 127.0.0.1` is an explicit
 //! promise that the site is unreachable from other interfaces, and serving it
 //! through a wildcard socket would quietly break that promise. That
-//! combination is refused instead.
+//! combination is refused instead, and so is `bind 0.0.0.0` beside a `[::]`
+//! site: it promises IPv4 only, and the dual-stack socket would add IPv6.
+//!
+//! 🌐 `0.0.0.0:P` is itself folded into `[::]:P` when both exist, since Linux
+//! binds only one of the two; on its own it keeps the IPv4 addresses of its
+//! port and leaves IPv6 ones, which do not collide with it, alone.
 //!
 //! 📌 Everything here runs at load time — validation, startup, and reload —
 //! and rewrites addresses in the configuration, so every later consumer
@@ -115,8 +120,8 @@ impl SharedPortFold {
                     return Err(SharedPortConflict(format!(
                         "site {} is restricted to {address} by `bind`, but port {} also has the \
                          wildcard listener {wildcard}; one port is one socket, so the site would \
-                         become reachable on every interface. Bind every site on that port to the \
-                         same addresses, or move the restricted site to another port",
+                         become reachable on interfaces `bind` excluded. Bind every site on that \
+                         port to the same addresses, or move the restricted site to another port",
                         server.name.as_deref().unwrap_or("_"),
                         wildcard.port(),
                     )));
@@ -195,15 +200,13 @@ impl SharedPortFold {
 /// `address`, if there is one.
 ///
 /// 📌 `[::]` is dual-stack (Pingora leaves `IPV6_V6ONLY` at the system
-/// default, which is off on Linux and macOS), so it covers IPv4 and IPv6
-/// addresses alike; `0.0.0.0` covers only IPv4. An IPv4 address prefers the
-/// `0.0.0.0` socket when both exist, because that is the one it collides with
-/// most directly.
+/// default, which is off on Linux and macOS), so it covers every address on
+/// its port: IPv4, IPv6, and `0.0.0.0` itself, which Linux refuses to bind
+/// beside it exactly as it refuses `127.0.0.1`. When there is no `[::]`,
+/// `0.0.0.0` covers the IPv4 addresses and leaves IPv6 ones alone, because an
+/// IPv6 socket does not collide with an IPv4 wildcard.
 fn covering_wildcard(address: &str, wildcards: &[SocketAddr]) -> Option<SocketAddr> {
     let specific = address.parse::<SocketAddr>().ok()?;
-    if specific.ip().is_unspecified() {
-        return None;
-    }
     let on_port = || {
         wildcards
             .iter()
@@ -212,7 +215,10 @@ fn covering_wildcard(address: &str, wildcards: &[SocketAddr]) -> Option<SocketAd
     let ipv4_wildcard = on_port().find(|wildcard| wildcard.is_ipv4());
     let ipv6_wildcard = on_port().find(|wildcard| wildcard.is_ipv6());
     match specific.ip() {
-        IpAddr::V4(_) => ipv4_wildcard.or(ipv6_wildcard).copied(),
+        // 📌 `[::]` is the socket everything folds into; it never folds.
+        IpAddr::V6(ip) if ip.is_unspecified() => None,
+        IpAddr::V4(ip) if ip.is_unspecified() => ipv6_wildcard.copied(),
+        IpAddr::V4(_) => ipv6_wildcard.or(ipv4_wildcard).copied(),
         IpAddr::V6(_) => ipv6_wildcard.copied(),
     }
 }
@@ -286,23 +292,45 @@ mod tests {
         );
     }
 
-    /// 🌐 IPv4 prefers `0.0.0.0`; IPv6 can only fold into `[::]`.
+    /// 🌐 Without `[::]`, `0.0.0.0` takes the IPv4 addresses and leaves IPv6
+    /// alone; with `[::]`, everything on the port folds into it, `0.0.0.0`
+    /// included, because Linux binds only one of `0.0.0.0:P` and `[::]:P`.
     #[test]
     fn address_families_pick_the_socket_that_covers_them() {
         let mut config = config(vec![
             site("a", &["127.0.0.1:8080", "[::1]:8080"]),
             site("b", &["0.0.0.0:8080"]),
-            site("c", &["[::1]:9090"]),
-            site("d", &["0.0.0.0:9090"]),
+            site("c", &["127.0.0.1:9090", "[::1]:9090", "0.0.0.0:9090"]),
+            site("d", &["[::]:9090"]),
         ]);
         SharedPortFold::plan(&config, &[])
             .expect("foldable")
             .apply(&mut config);
+        let listens: Vec<Vec<String>> = config
+            .servers
+            .iter()
+            .map(|server| server.listen.clone())
+            .collect();
         assert_eq!(
-            config.servers[0].listen,
-            vec!["0.0.0.0:8080".to_string(), "[::1]:8080".to_string()]
+            listens,
+            vec![
+                vec!["0.0.0.0:8080".to_string(), "[::1]:8080".to_string()],
+                vec!["0.0.0.0:8080".to_string()],
+                vec!["[::]:9090".to_string()],
+                vec!["[::]:9090".to_string()],
+            ]
         );
-        assert_eq!(config.servers[2].listen, vec!["[::1]:9090".to_string()]);
+    }
+
+    /// 🚫 `bind 0.0.0.0` excludes IPv6; folding it into `[::]` would add it.
+    #[test]
+    fn an_ipv4_wildcard_bind_beside_a_dual_stack_site_is_refused() {
+        let mut ipv4_only = site("v4.test", &[":80"]);
+        ipv4_only.bind = Some("0.0.0.0".to_string());
+        ipv4_only.apply_bind();
+        let config = config(vec![ipv4_only, site("public.test", &[":80"])]);
+        let error = SharedPortFold::plan(&config, &[]).expect_err("refused");
+        assert!(error.0.contains("`bind`"), "{error}");
     }
 
     /// 🚫 A `bind` restriction is a promise about exposure and is not folded.
