@@ -137,6 +137,9 @@ impl FileServer {
     /// [`ServedResponse::Buffered`]. One path resolution + one stat per
     /// request either way — no probe-then-fall-back double work.
     ///
+    /// 🔁 `original_uri` contains the original path and optional query, before
+    /// any rewrite. Canonical redirects retain that query verbatim.
+    ///
     /// 🏷️ `request` carries the method and the header fields this handler
     /// reads: `Range` and `If-Range`, and the four preconditions, which are
     /// answered with [`ServedResponse::NotModified`] or
@@ -144,10 +147,14 @@ impl FileServer {
     pub async fn serve_auto(
         &self,
         path: &str,
-        original_path: &str,
+        original_uri: &str,
         request: FileRequest<'_>,
         accept_encoding: Option<&str>,
     ) -> Result<Option<ServedResponse>> {
+        // 🔁 Keep the original query separate from filesystem and basename checks.
+        let (original_path, query) = original_uri
+            .split_once('?')
+            .map_or((original_uri, None), |(path, query)| (path, Some(query)));
         let range = request.range();
         // Lexical docroot check (rejects `..` traversal; no syscalls)
         let mut file_path = match self.resolve_path(path) {
@@ -195,12 +202,18 @@ impl FileServer {
             let needs_directory_slash = metadata.is_dir() && !original_path.ends_with('/');
             let needs_file_slash_removal = metadata.is_file() && original_path.ends_with('/');
             if needs_directory_slash {
-                return Ok(Some(ServedResponse::Redirect(format!("{original_path}/"))));
+                return Ok(Some(ServedResponse::Redirect(super::canonical::location(
+                    original_path,
+                    query,
+                    super::canonical::Entry::Directory,
+                ))));
             }
             if needs_file_slash_removal {
-                return Ok(Some(ServedResponse::Redirect(
-                    original_path.trim_end_matches('/').to_string(),
-                )));
+                return Ok(Some(ServedResponse::Redirect(super::canonical::location(
+                    original_path,
+                    query,
+                    super::canonical::Entry::File,
+                ))));
             }
         }
 

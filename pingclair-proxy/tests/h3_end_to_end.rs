@@ -64,6 +64,10 @@ mod fastcgi_params;
 #[path = "h3_end_to_end/error_responses.rs"]
 mod error_responses;
 
+// 🔁 Static redirects retain the query and remain on the same origin.
+#[path = "h3_end_to_end/canonical_redirect.rs"]
+mod canonical_redirect;
+
 // 🏷️ Conditional requests against `file_server`: 304 and 412.
 #[path = "h3_end_to_end/preconditions.rs"]
 mod preconditions;

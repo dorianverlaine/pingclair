@@ -27,6 +27,14 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🛡️ Canonical static redirects preserve the origin and query
+
+Directory and file redirects retain the original query string on HTTP/1.1,
+HTTP/2, and HTTP/3. Redirect paths clean repeated slashes and dot segments and
+escape literal backslashes, so a request such as `//sub?x=1` receives
+`Location: /sub/?x=1` instead of a reference to another host. Rewrites that
+change the filename and `disable_canonical_uris` retain their existing behavior.
+
 ### ⚠️ Before you upgrade
 
 Most configurations keep working unchanged. These are the changes most

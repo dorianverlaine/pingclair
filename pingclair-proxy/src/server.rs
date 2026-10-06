@@ -4556,7 +4556,10 @@ impl PingclairProxy {
                     // it is wherever the error route rewrote to.
                     let original_path = match error_scope {
                         Some(_) => path,
-                        None => ctx.orig_uri.path(),
+                        None => ctx
+                            .orig_uri
+                            .path_and_query()
+                            .map_or("/", |uri| uri.as_str()),
                     };
                     match file_server
                         .serve_auto(path, original_path, request, accept_encoding)
