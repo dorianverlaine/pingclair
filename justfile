@@ -80,6 +80,29 @@ h3:
     # limit, which is why it cannot live in the in-process H3 test suite.
     PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-local-resource-failure-local.sh
 
+# 🛰️ Add a pinned Go client to the maintained curl interoperability matrix.
+h3-go:
+    cargo +{{ rust }} build --release --locked
+    just h3-go-test
+
+# 🔬 Check the independent Go test module without launching Pingclair.
+h3-go-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd scripts/h3-go
+    export GOTOOLCHAIN=go1.27.1
+    formatting="$("$(go env GOROOT)/bin/gofmt" -l ./*.go)"
+    if [[ -n "$formatting" ]]; then
+        printf '🎨 Go formatting differs:\n%s\n' "$formatting"
+        exit 1
+    fi
+    go vet -mod=readonly ./...
+
+# 🔬 Verify an existing binary; an explicit path must be absolute.
+h3-go-test binary=(env("PINGCLAIR_BINARY", target-dir + "/release/pingclair")): h3-go-check
+    test -x "{{ binary }}"
+    cd scripts/h3-go && GOTOOLCHAIN=go1.27.1 PINGCLAIR_BINARY="{{ binary }}" go test -mod=readonly -race -count=1 -timeout=2m -v ./...
+
 # 💽 Report build-cache disk usage against the repository budget.
 disk:
     df -h .

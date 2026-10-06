@@ -30,7 +30,7 @@ workflow, so a red result never masks another.
 | `codespell.yml` | workflow_call | Spelling check |
 | `docs-lint.yml` | workflow_call | Markdown structure check via markdownlint-cli2 |
 | `blob-size-policy.yml` | workflow_call | 512 KB blob budget with an explicit allowlist |
-| `h3.yml` | workflow_call, dispatch | Full HTTP/3 functional matrix |
+| `h3.yml` | workflow_call, dispatch | HTTP/3 curl interoperability and Go behavioral matrices |
 | `release.yml` | push tag | Tag verification, native builds, checksums, multi-arch image |
 
 ## Rules for adding or changing checks
