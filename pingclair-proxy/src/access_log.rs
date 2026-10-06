@@ -14,11 +14,23 @@
 //! lines rather than requests. Size- and age-based rotation, gzip and
 //! retention live here too.
 //!
-//! ⚠️ Scope note: [`LogTargets`] decides *which* destinations a request
-//! reaches, from each logger's `hostnames`. The other two selection layers
-//! Caddy has — `include`/`exclude` over logger namespaces, and `sampling` —
-//! are not implemented yet and are refused rather than accepted, so no
-//! configuration can quietly believe it is filtering.
+//! 🔎 Three layers decide whether and where a line is written, and all three
+//! are implemented. [`LogTargets`] decides *which* destinations a request
+//! reaches, from each logger's `hostnames`. [`NamespaceFilter`] lets a
+//! destination subscribe to particular log-source namespaces through
+//! `include`/`exclude`, which is how a global `log` channel picks up the
+//! access records it asked for. `SamplingWindow` applies a destination's rate
+//! policy. All three are consulted before a record is built, so a line the
+//! configuration did not ask for costs a comparison rather than a formatting
+//! pass.
+//!
+//! ⚠️ This note used to claim the namespace and sampling layers "are not
+//! implemented yet and are refused rather than accepted". That was true when
+//! it was written and stopped being true within the hour, when both landed
+//! without the sentence being revisited (`4b1c11c`, `2cedc1b`, 2026-08-10).
+//! The shape of that mistake is worth keeping in view: a module comment is
+//! read as authoritative, and this one told an operator that a directive they
+//! had written was being rejected while the server was honouring it.
 
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
