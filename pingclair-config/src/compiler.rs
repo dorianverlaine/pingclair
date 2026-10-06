@@ -70,7 +70,11 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
         // 📌 Only the first address is taken. Upstream accepts a list, and
         // this server binds one host per listener — see the startup line that
         // says which one was used when a configuration names several.
+        //
+        // 🎧 A site whose `listen` named an interface has said where it
+        // belongs, so the default does not move it.
         if server_config.bind.is_none()
+            && !block.listens.iter().any(|listen| listen.explicit_interface)
             && let Some(first) = config.global.default_bind.first()
         {
             server_config.bind = Some(first.clone());

@@ -391,6 +391,11 @@ pub struct ListenAddr {
     /// commonly has one port behind an L4 balancer and another reached
     /// directly; a single global switch would break the direct one.
     pub proxy_protocol: bool,
+    /// 🎧 Whether a `listen` directive named this host as the interface
+    /// (`listen 127.0.0.1:8080`), as opposed to a site address, whose host
+    /// is a `Host` matcher first. Such a site names its own interface, so it
+    /// does not inherit `default_bind`, and a `bind` that disagrees is refused.
+    pub explicit_interface: bool,
 }
 
 /// URL scheme

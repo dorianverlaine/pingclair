@@ -11,6 +11,7 @@ use super::directives::{
     adapt_subroute_block,
 };
 use super::error_routes::adapt_handle_errors;
+use super::listen_directive::{adapt_listen, reject_listen_contradicting_bind};
 use super::logs::adapt_log_block;
 use super::matchers::{
     parse_matcher_and_block, parse_matcher_definition, parse_route_matcher_and_block,
@@ -87,6 +88,7 @@ pub(super) fn adapt_server(
                 }),
                 force_plaintext: !is_https,
                 proxy_protocol: false,
+                explicit_interface: false,
             });
             continue;
         }
@@ -168,37 +170,7 @@ pub(super) fn adapt_server(
                     server.bind = Some(sub_d.args[0].clone());
                 }
                 "listen" => {
-                    if sub_d.args.is_empty() {
-                        return Err(AdapterError::ArgumentCount("listen".into(), 1, 0));
-                    }
-                    let addr = &sub_d.args[0];
-                    // 🚩 Trailing flags are rejected rather than dropped. This
-                    // loop previously read `args[0]` only, so `listen :443
-                    // proxy_protocol` produced a listener that quietly did not
-                    // require the header it named.
-                    let mut proxy_protocol = false;
-                    for flag in &sub_d.args[1..] {
-                        match flag.as_str() {
-                            "proxy_protocol" => proxy_protocol = true,
-                            other => {
-                                return Err(AdapterError::InvalidArgument(
-                                    "listen".into(),
-                                    format!("unknown listener flag `{other}`"),
-                                ));
-                            }
-                        }
-                    }
-                    server.listens.push(ListenAddr {
-                        scheme: if addr.starts_with("https") {
-                            Scheme::Https
-                        } else {
-                            Scheme::Http
-                        },
-                        host: "[::]".to_string(),
-                        port: addr.split(':').next_back().and_then(|p| p.parse().ok()),
-                        force_plaintext: addr.starts_with("http://"),
-                        proxy_protocol,
-                    });
+                    server.listens.push(adapt_listen(&sub_d, global)?);
                 }
                 "root" => {
                     server.root = Some(parse_root_directive(&sub_d, &server.matchers)?);
@@ -706,6 +678,7 @@ pub(super) fn adapt_server(
         });
     }
 
+    reject_listen_contradicting_bind(&server)?;
     Ok(server)
 }
 

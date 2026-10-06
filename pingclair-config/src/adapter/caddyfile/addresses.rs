@@ -201,6 +201,7 @@ pub(super) fn parse_server_address(addr: &str, global: &GlobalBlock) -> Option<P
             force_plaintext: explicit_scheme && scheme == Scheme::Http,
             // 📍 A site address carries no listener flags; `listen` does.
             proxy_protocol: false,
+            explicit_interface: false,
         },
         // ⚙️ A bare hostname with neither scheme nor port is implicit; the
         // runtime decides the listener from TLS. Everything else (an IP

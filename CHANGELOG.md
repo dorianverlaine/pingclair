@@ -77,6 +77,10 @@ below, which ends with what to write instead.
 - **`bind` now applies to a site with an explicit address or port.** Such a
   site listens only on its `bind` host; address a `servers` block to that host.
   → [`bind` applies to every listener](#-bind-applies-to-every-listener-of-a-site)
+- **A site's `listen` directive keeps the address it names.** `listen
+  127.0.0.1:8080` binds loopback only; a hostname or an unbracketed IPv6
+  address in `listen` is refused.
+  → [`listen` keeps its address](#-listen-keeps-the-address-it-names)
 - **FastCGI HEAD and download limits apply on H1/H2.** Expect no HEAD body and
   budget download time according to configured rate limits.
   → [FastCGI body policy](#-fastcgi-bodies-honor-head-and-download-pacing)
@@ -368,6 +372,23 @@ reachable on other interfaces; that was the intent of writing `bind`. A
 (`servers 127.0.0.1:8080`), not the wildcard. A bound site beside a wildcard
 site on the same port is refused, as it already was for a site without an
 explicit port.
+
+### 🎧 `listen` keeps the address it names
+
+The per-site `listen` directive kept only the port of its address, so
+`listen 127.0.0.1:8080` listened on `[::]:8080`, every interface. It now reads
+its argument the way nginx does: `listen 127.0.0.1:8080` and
+`listen [::1]:8080` bind that address, `listen :8080`, `listen 8080` and
+`listen *:8080` bind every interface, and an address with no port takes the
+HTTP (or, with `https://`, the HTTPS) port. A site whose `listen` names an
+address does not inherit `default_bind`.
+
+📦 **Upgrade:** A `listen` that named a specific address now binds only that
+address; write `listen :<port>` to keep listening everywhere. These are
+refused at load, each with a message naming the fix: a hostname
+(`listen example.com:80`, since `listen` binds and never resolves), an IPv6
+address without brackets, a port that is not a number from 0 to 65535, and a
+`listen` address that disagrees with the site's `bind`.
 
 ### 🤐 FastCGI bodies honor HEAD and download pacing
 
