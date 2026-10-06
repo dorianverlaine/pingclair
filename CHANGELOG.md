@@ -27,6 +27,13 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🛑 HTTP/3 cancellation releases idle upstream requests
+
+Cancelling an HTTP/3 request now releases its upstream exchange even when the
+origin has stopped writing an SSE response or has not sent response headers.
+The other streams on that QUIC connection remain usable. Previously, a peer's
+`STOP_SENDING` could remain unnoticed until the next response write (#286).
+
 ### 🛡️ Canonical static redirects preserve the origin and query
 
 Directory and file redirects retain the original query string on HTTP/1.1,

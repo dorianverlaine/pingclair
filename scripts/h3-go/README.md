@@ -15,7 +15,7 @@ The post-merge HTTP/3 workflow runs both client matrices.
 | Test | Evidence |
 | --- | --- |
 | SSE | Four gated events arrive incrementally; an unrelated request succeeds on the same QUIC connection while the stream is open. |
-| Cancellation | Context cancellation and response-body close each release a continuously writing origin; the same QUIC connection still serves requests. |
+| Cancellation | Context cancellation and response-body close release both writing and idle SSE origins. Cancellation before response headers also releases the origin; sibling requests still succeed. |
 | Upstream reuse | Eight consumed responses reuse origin sockets, confirmed by repeated peer addresses and matching TCP accept counts below eight. |
 | Local exhaustion | A barrier starts 64 concurrent streams with a descriptor ceiling applied only to Pingclair. Logs must prove a local resource failure; the backend must remain eligible and answer an immediate follow-up. |
 | Invalid fields | Raw QPACK sends forbidden connection fields without net/http normalization. Each receives remote `H3_MESSAGE_ERROR`; the connection remains usable. |
@@ -37,20 +37,18 @@ Downstream FIN can precede return of an upstream session to its pool, so the
 reuse test proves actual socket reuse without demanding one socket for every
 back-to-back request.
 
-## 🔬 Idle-origin cancellation reproduction
+## 🛑 Idle-origin cancellation regression
 
-Tracked in [issue #286](https://github.com/dorianverlaine/pingclair/issues/286).
-When an origin stops writing after the fourth event, closing the response
-body currently does not release that origin within the deadline. This was
-reproduced with macOS debug and Linux ARM64 release binaries. The default
-cancellation tests explicitly cover continuously writing origins, as the
-existing curl cancellation script does. The idle case is retained under an
-opt-in build tag and is expected to fail until its separate transport defect
-is fixed:
+The default matrix includes the regression for
+[issue #286](https://github.com/dorianverlaine/pingclair/issues/286). After four
+gated SSE events, the origin stops writing. Both cancellation APIs must release
+it while keeping the QUIC connection usable. A second test cancels before the
+origin sends any response headers. Run these checks separately with:
 
 ```bash
 cd scripts/h3-go
 PINGCLAIR_BINARY=/absolute/path/to/pingclair GOTOOLCHAIN=go1.27.1 \
-  go test -mod=readonly -race -tags=h3_idle_repro \
-  -run '^TestIdleSSECancellation$' -count=1 -timeout=30s -v
+  go test -mod=readonly -race \
+  -run 'TestIdleSSECancellation|TestCancellationBeforeResponseHeaders' \
+  -count=1 -timeout=45s -v
 ```

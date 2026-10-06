@@ -35,6 +35,7 @@ production deployment.
 - **Reverse proxying** — Route to multiple upstreams with load-balancing
   policies, active health checks, retries, circuit breakers, and bounded
   overload queues.
+  HTTP/3 cancellation releases upstream requests even while the origin is idle.
 - **Static files and FastCGI** — Serve files with conditional and range
   requests, apply gzip or Zstandard compression, and run PHP through FastCGI.
   Canonical file and directory redirects preserve queries and stay on the same origin.

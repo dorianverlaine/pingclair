@@ -1392,15 +1392,34 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
 
         let dirty: Vec<u64> = self
             .streams
-            .iter()
-            .filter(|(_, s)| {
-                !s.dead
+            .iter_mut()
+            .filter_map(|(id, s)| {
+                // 🛑 STOP_SENDING must cancel an idle handler without waiting for
+                // another body chunk. Check every live stream here because quiche's
+                // writable iterator is empty when connection send credit is exhausted.
+                if !s.dead
+                    && matches!(
+                        qconn.stream_capacity(*id),
+                        Err(quiche::Error::StreamStopped(_))
+                    )
+                {
+                    cancel_stream_handler(s);
+                    if !s.req_stream_finished {
+                        let _ = qconn.stream_shutdown(
+                            *id,
+                            quiche::Shutdown::Read,
+                            quiche::h3::WireErrorCode::RequestCancelled as u64,
+                        );
+                    }
+                    s.dead = true;
+                }
+                (!s.dead
                     && (s.pending_headers.is_some()
                         || s.pending_body_bytes > 0
                         || s.pending_trailers.is_some()
-                        || (s.body_fin && !s.fin_sent))
+                        || (s.body_fin && !s.fin_sent)))
+                    .then_some(*id)
             })
-            .map(|(id, _)| *id)
             .collect();
         for stream_id in dirty {
             self.flush_stream(qconn, stream_id);
@@ -1408,8 +1427,7 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
 
         // 🌊 Flow control may have opened up on streams with nothing newly
         // queued, which is what lets a blocked large response resume.
-        let writable: Vec<u64> = qconn.writable().collect();
-        for stream_id in writable {
+        for stream_id in qconn.writable() {
             self.flush_stream(qconn, stream_id);
         }
 
