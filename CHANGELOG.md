@@ -33,6 +33,9 @@ Most configurations keep working unchanged. These are the changes most
 likely to alter what an existing configuration does; each links to its entry
 below, which ends with what to write instead.
 
+- **Raw spaces and controls in HTTP/1 request targets now receive 400 and close.**
+  → [Raw request targets reject whitespace](#-raw-request-targets-reject-whitespace)
+
 - **HTTP/1.1 without Host now closes after its 400 response.**
   → [Short HTTP requests answer and close](#-short-http-requests-answer-and-close)
 
@@ -206,6 +209,14 @@ below, which ends with what to write instead.
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
 [Known defect — WebSocket upgrades under load](#-known-defect--websocket-upgrades-under-load).
+
+### 🚫 Raw request targets reject whitespace
+
+Request-line validation runs before Pingora can percent-escape illegal raw
+bytes. Explicit percent-encoded targets retain their existing routing.
+
+📌 Upgrade note: encode spaces as `%20` in client URLs. A raw space or control
+byte in the request-target is refused and its HTTP/1 connection closes.
 
 ### 🚫 Short HTTP requests answer and close
 

@@ -203,6 +203,13 @@ impl ResourceGuardedProxy {
                 &mut shutdown_signal,
             )
             .await?;
+            if !crate::h1_request_line::valid_request_line(&head) {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 15\r\nContent-Type: text/plain\r\n\r\n400 Bad Request")
+                    .await;
+                let _ = stream.shutdown().await;
+                return None;
+            }
             let mut session = ServerSession::new_http1(stream);
             if let Some(persistent) = persistent.take() {
                 persistent.apply_to_session(&mut session);

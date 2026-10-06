@@ -52,3 +52,23 @@ async fn test_short_h1_requests_answer_and_close() {
     }
     server.stop();
 }
+
+#[tokio::test]
+async fn test_raw_space_in_request_target_is_refused_and_closed() {
+    let mut server = TestServer::new_pingclairfile(site());
+    assert!(server.wait_until_ready().await, "server failed to start");
+    for request in [
+        b"GET /a b HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+        b"GET /a\tb HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+    ] {
+        let (status, head, _) = closed_exchange(&server, request).await;
+        assert_eq!(status, 400, "{request:?}: {head}");
+    }
+    let (status, _, body) = closed_exchange(
+        &server,
+        b"GET /a%20b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!((status, body), (200, b"ok".to_vec()));
+    server.stop();
+}
