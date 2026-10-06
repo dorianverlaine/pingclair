@@ -1013,6 +1013,11 @@ fn validate_cache_ceiling_agrees(config: &PingclairConfig) -> CompileResult<()> 
 
 pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
     for server in &config.servers {
+        pingclair_core::server::Router::validate_paths(&server.routes).map_err(|error| {
+            CompileError::InvalidRoute {
+                message: format!("cannot compile route paths: {error}"),
+            }
+        })?;
         if !(1..=9).contains(&server.encode.gzip_level) {
             return Err(CompileError::InvalidServer {
                 message: "encode gzip level must be between 1 and 9".into(),

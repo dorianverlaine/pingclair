@@ -145,7 +145,7 @@ pub(super) fn build(routes: &[RouteConfig]) -> Candidates {
             // 🧩 Neither gets a node of its own; `covers` places them.
             RoutePath::Any | RoutePath::Wildcard(_) => {}
             RoutePath::Exact(path) => {
-                nodes.insert(path.to_string(), Node::Exact(path));
+                nodes.insert(escape_literal(path), Node::Exact(path));
             }
             RoutePath::Prefix(prefix) => {
                 nodes.insert(glob_to_matchit(path), Node::Prefix(prefix));
@@ -153,7 +153,7 @@ pub(super) fn build(routes: &[RouteConfig]) -> Candidates {
                     // 🪢 Every bare prefix is a prefix of the route's own
                     // path, so the node can borrow it from there.
                     let node = Node::Exact(&path[..bare.len()]);
-                    nodes.entry(bare).or_insert(node);
+                    nodes.entry(escape_literal(&bare)).or_insert(node);
                 }
             }
         }
@@ -208,15 +208,15 @@ fn bare_prefixes(path: &str) -> Vec<String> {
     }
 }
 
-/// 🔤 A glob in matchit's syntax: the trailing `*` becomes a named catch-all.
+/// 🔤 Escapes literal braces so matchit cannot widen a node's candidate list.
+fn escape_literal(path: &str) -> String {
+    path.replace('{', "{{").replace('}', "}}")
+}
+
+/// 🔤 Only the generated catch-all has parameter meaning in matchit's syntax.
 fn glob_to_matchit(path: &str) -> String {
-    if let Some(prefix) = path.strip_suffix("/*") {
-        format!("{prefix}/{{*rest}}")
-    } else if let Some(prefix) = path.strip_suffix('*') {
-        format!("{prefix}{{*rest}}")
-    } else {
-        path.to_string()
-    }
+    let prefix = path.strip_suffix('*').expect("prefix route has a wildcard");
+    format!("{}{{*rest}}", escape_literal(prefix))
 }
 
 // MARK: - Tests
@@ -295,5 +295,50 @@ mod tests {
             .map(|route| route.index)
             .collect();
         assert_eq!(candidates, [1, 2]);
+    }
+
+    #[test]
+    fn literal_braces_do_not_widen_radix_nodes() {
+        let router = router(&[
+            "*.php",
+            "/{id}",
+            "/open{",
+            "/close}",
+            "/{{id}}",
+            "/prefix/{id}/*",
+            "/*",
+        ]);
+        let answers: Vec<_> = [
+            "/x.php",
+            "/x",
+            "/{id}",
+            "/open{",
+            "/close}",
+            "/{{id}}",
+            "/prefix/{id}",
+            "/prefix/{id}/",
+            "/prefix/{id}/child",
+            "/prefix/value/child",
+            "/prefix/{id}/child.php",
+        ]
+        .into_iter()
+        .map(|path| answer(&router, path))
+        .collect();
+        assert_eq!(
+            answers,
+            [
+                Some(0),
+                Some(6),
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+                Some(5),
+                Some(5),
+                Some(6),
+                Some(0),
+            ]
+        );
     }
 }

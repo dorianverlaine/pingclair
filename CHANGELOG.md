@@ -33,6 +33,8 @@ Most configurations keep working unchanged. These are the changes most
 likely to alter what an existing configuration does; each links to its entry
 below, which ends with what to write instead.
 
+- **Braces in route paths are literal.** Use `path_regexp` for captures.
+  → [Route braces stay literal](#-route-braces-stay-literal)
 - **Host validation and HTTP/1 parser decisions now follow Go.**
   → [HTTP parser decisions follow Go](#-http-parser-decisions-follow-go)
 
@@ -389,6 +391,18 @@ missing config read. Replace the old metric names in dashboards, recording
 rules, and alerts with the names above; histogram `_bucket`, `_sum`, and
 `_count` series follow the renamed family. The old names are no longer exported.
 The names do not imply that Pingclair exports Caddy's complete label schema.
+
+### 🧭 Route braces stay literal
+
+🧭 Exact paths and wildcard prefixes escape braces before entering the radix
+tree (#228). `/{id}` matches only that literal path, and a sibling `*.php`
+route remains eligible for `/x.php`. Unmatched braces are accepted as literals;
+an unexpected radix insertion failure rejects configuration instead of dropping
+a route. Both HTTP transports use these candidate lists.
+
+**Upgrade:** Replace accidental brace parameters with a `path_regexp` matcher
+when captures are needed. Review fallbacks that relied on `/{id}` matching
+arbitrary path segments.
 
 ### 🔄 Automatic HTTPS follows the configured listener policy
 

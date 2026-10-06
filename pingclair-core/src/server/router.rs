@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-//! High-performance route matcher using radix tree
+//! 🌲 A radix pre-filter for literal paths and wildcard route patterns.
 //!
-//! Provides O(log n) path matching with support for wildcards and parameters.
+//! 🧭 Candidate lists retain directive order; braces never name parameters.
 
 use super::matcher_tree::MatcherNode;
 use super::path_pattern::PathPattern;
@@ -215,12 +215,8 @@ impl Router {
             .collect();
 
         let candidates = super::route_candidates::build(&routes);
-        let mut path_router = RadixRouter::new();
-        for (pattern, indices) in candidates.nodes {
-            if let Err(e) = path_router.insert(&pattern, indices) {
-                tracing::warn!("🧭 Failed to insert route {}: {}", pattern, e);
-            }
-        }
+        let path_router = Self::compile_paths(candidates.nodes)
+            .expect("route paths must pass configuration validation");
 
         Self {
             path_router,
@@ -228,6 +224,21 @@ impl Router {
             all_routes: routes,
             compiled_routes,
         }
+    }
+
+    /// 🛡️ Refuses paths the radix pre-filter cannot represent before publication.
+    pub fn validate_paths(routes: &[RouteConfig]) -> Result<(), matchit::InsertError> {
+        Self::compile_paths(super::route_candidates::build(routes).nodes).map(|_| ())
+    }
+
+    fn compile_paths(
+        nodes: Vec<(String, Box<[usize]>)>,
+    ) -> Result<RadixRouter<Box<[usize]>>, matchit::InsertError> {
+        let mut router = RadixRouter::new();
+        for (pattern, indices) in nodes {
+            router.insert(pattern, indices)?;
+        }
+        Ok(router)
     }
 
     /// 🔎 Returns the compiled route at `index`, matching the index the
