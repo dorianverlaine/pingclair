@@ -102,6 +102,62 @@
   through the same `set_http_version` — so it is not possible for the two to
   disagree about whether a connection may be reused.
 
+## 📜 Authority when servers disagree (2026-10-06)
+
+Pingclair answers a request the way a Caddyfile author expects, but "Caddy does
+it" is not what settles an argument. The order is **RFC > Caddy > nginx**:
+
+1. **An RFC requirement wins outright, Caddy included.** A response that breaks a
+   `MUST`/`SHOULD` is a defect here even when the reference implementation has
+   the same one — "Caddy does it too" is a description of the world, not a
+   defence of the behaviour. Open examples from the 2026-10-06 audit: a `CONNECT`
+   that matches no site answered `200` with a reusable connection where
+   RFC 9110 §9.3.6 and §8.6 require a refusal that ends it (#283); a proxied `204`
+   forwarded with `Content-Length` on HTTP/1.1 (§8.6, #270); a field named in the
+   upstream's `Connection` header passed on to the client (§7.6.1, #263); field
+   values padded with SP/HTAB emitted on HTTP/2 and HTTP/3 (§8.2.1, #256).
+2. **Otherwise Caddy is the reference**, because running a Caddyfile unchanged is
+   the product. A difference a configuration can reach is a compatibility gap
+   (issue template 🧩), not a preference to be argued case by case.
+3. **nginx is the tiebreaker of last resort**, and more often a source of a good
+   idea than an authority: when its behaviour is the stricter or the safer of the
+   two, say so in the issue rather than treating "nginx does it" as the reason.
+
+> 🎯 **The operable rule**: a test that pins protocol behaviour cites the RFC
+> clause, never another server. `pingclair/tests/integration/rfc_conformance/`
+> holds one test per requirement; a requirement the build does not meet yet is
+> `#[ignore]`d with its issue number, so the ignored set *is* the outstanding
+> list and `just conformance` runs it. The normal gate skips those, which is what
+> keeps CI green while the fix is still open — and what makes each one evidence
+> that fails without it.
+
+
+### 📅 A citation is evidence, so check its date (2026-10-06)
+
+Before a rule is justified by an RFC clause, check three things — and put the
+check in the issue, not just in the author's head:
+
+1. **Is the document still current?** The RFC Editor's index carries the
+   relations; `updated-by` is the one that matters most here. Worked example:
+   **RFC 9112 is updated by RFC 9931** ("Security Considerations for Optimistic
+   Protocol Transitions in HTTP/1.1", March 2026), whose §8 requires a proxy that
+   rejects a `CONNECT` to close the connection — a requirement that did not exist
+   when the surrounding code was written, and which produced issue #283.
+2. **Does the clause say what the summary says?** Two of this audit's first
+   drafts were wrong in the same direction, by treating another implementation's
+   behaviour as the standard: "CL+TE must be answered 400" (RFC 9112 §6.1 says
+   *MAY reject **or** process with the Transfer-Encoding alone*, plus a mandatory
+   close) and "a sender MUST NOT emit CR/LF in a field value" (RFC 9110 §5.5
+   binds the **recipient**: reject the message, or replace each character with
+   SP). Both were corrected and both are recorded in their issues.
+3. **Is there a verified erratum?** They are rare and mostly editorial, but the
+   errata page is two clicks from the text and settles arguments that would
+   otherwise be re-litigated.
+
+> 🎯 **The operable rule**: quote the clause in the issue, name the section, and
+> say when you checked. A citation that has drifted is worse than no citation —
+> it manufactures a requirement, and the next reader has no reason to doubt it.
+
 ## 📏 Measurement and verification
 
 > 🧭 This whole section comes out of M4.5 on 2026-08-05. That day produced nine

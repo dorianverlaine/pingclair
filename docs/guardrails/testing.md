@@ -229,6 +229,63 @@
 
 ---
 
+## 📜 Conformance tests say what the RFC says (2026-10-06)
+
+Protocol behaviour is tested in `pingclair/tests/integration/rfc_conformance/`,
+one requirement per test, and each test cites the clause that decides it. The
+authority order lives in `config.md` (RFC > Caddy > nginx); what belongs here is
+the mechanic that makes it work:
+
+- **An ignored test is the outstanding list.** A requirement the build does not
+  meet yet is `#[ignore]`d with its issue number in the attribute, so the normal
+  gate stays green and `just conformance` fails with one test per unfixed
+  requirement. Un-ignoring a test is part of the fix, not a follow-up.
+- **The test asserts the requirement, not a chosen remedy.** Where two fixes
+  would both satisfy the RFC — refuse the configuration, or normalise the value —
+  the test accepts either and rejects only the answer the clause forbids. Fixing
+  the defect should not require rewriting the test that describes it.
+- **Parity checks live in `parity.rs` and say so.** A property wanted because
+  Caddy or nginx has it, with no RFC behind it, is still worth a test; it just
+  never pretends to be a standard. The doc comment names the server it was
+  measured against, because "we differ from Caddy here, deliberately" is a
+  decision somebody will otherwise re-litigate.
+- **A conformance test is not a substitute for the integration suite.** It checks
+  the wire, not the product: streaming budgets, lifecycle, reload and the rest
+  stay where they already are.
+- **A conformance test asserts the clause, not a first draft's paraphrase.**
+  Two tests in this suite began as assertions of another server's behaviour:
+  "CL+TE must be answered 400" (the RFC allows resolving to chunked, and requires
+  only that the connection ends) and "a sender must not emit CR/LF" (the clause
+  binds the recipient: reject, or replace with SP). Both were corrected against
+  the RFC text, and both are now stricter in the right place — the first asserts
+  that no second response follows, the second that no injected field line
+  appears. Writing the citation into the doc comment is what made the mistakes
+  visible.
+
+### 🧪 h2spec and h3spec (2026-10-06)
+
+The conformance suite above pins the clauses this project has already been bitten
+by. The protocol-level suites check the rest, and they are cheap enough to run
+after any H2/H3 change:
+
+| suite | how | state at `4bb3951` |
+| --- | --- | --- |
+| h2spec, TLS | `brew install h2spec`, then `h2spec -h localhost -p <port> -t -k` | **146/146 pass** |
+| h2spec, h2c | `h2spec -h 127.0.0.1 -p <port>` (no `-t`: prior-knowledge cleartext) | 145/146 — §3.5/2 asks for a `GOAWAY` before the close; RFC 9113 §3.4 says the frame **MAY be omitted** for an invalid preface, so the tool is stricter than the standard here |
+| h3spec | prebuilt binary from the h3spec release page, `h3spec <host> <port> -n` | 77 examples, **18 failures**, all QUIC transport-parameter rules — issue #282, blocked on the dependency's error path |
+
+Two things those numbers say that are easy to misread:
+
+- **Our own HTTP/3 + QPACK layer is the strong half.** Of the 18 h3spec failures,
+  13 are cases Caddy v2.11.7 (quic-go) passes — every one a QUIC transport rule
+  *below* our code — while 13 *other* cases are ones quic-go fails and we pass,
+  all HTTP/3 and QPACK rules, which is the layer `quic.rs` owns. Reporting only
+  "18 failures" would hide that split, so compare against a second implementation
+  before drawing a conclusion.
+- **An h2spec or h3spec failure is not automatically a defect.** §3.5/2 is the
+  standing example: the clause permits what the tool flags. Read the section
+  cited in the case name, and write the verdict into the issue either way.
+
 ## 🧊 The shared build cache (2026-09-22)
 
 Compiled artifacts are shared between machines through R2. AGENTS.md owns the
