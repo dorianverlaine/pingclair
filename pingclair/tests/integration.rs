@@ -1816,16 +1816,8 @@ async fn test_bounded_upstream_status_retry_preserves_request_body_safety() {
                 route("/capped", 2, None, 0, vec!["GET"]),
                 // ⌛ `/deadline` pins the branch where the retry budget runs out
                 // *between* attempts, so the second attempt's own 503 is what
-                // the client sees. `response_filter` checks the budget before it
-                // looks at the response, so the whole assertion rests on attempt
-                // two's reply landing inside `total_timeout_ms`, and the slack for
-                // that is `total_timeout_ms - backoff_ms`. At 150/100 the slack
-                // was 50ms, which two upstream round trips plus timer wake-up
-                // scheduling can eat under a loaded machine — the budget then
-                // expires with the 503 already in hand and 504 is surfaced
-                // instead. 750/400 keeps the same branch (a third attempt still
-                // cannot fit, since `backoff_ms * 2` exceeds the budget) with
-                // 350ms of slack rather than 50ms.
+                // the client sees: a third attempt cannot fit, since
+                // `backoff_ms * 2` exceeds the budget.
                 route("/deadline", 3, Some(750), 400, vec!["GET"]),
                 route("/slow-deadline", 2, Some(100), 0, vec!["GET"]),
                 route("/post", 3, None, 0, vec!["GET"]),
@@ -1887,11 +1879,12 @@ async fn test_bounded_upstream_status_retry_preserves_request_body_safety() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 504);
-    assert!(started.elapsed() >= Duration::from_millis(70));
-    // 💤 The hit counter below is the definitive no-retry proof: a loaded
-    // runner can stretch one 100 ms budget past 250 ms, but it cannot make
-    // the upstream accept the same request twice.
+    // ⌛ The origin took longer than the whole retry budget to answer, and its
+    // answer is still what the client gets: `lb_try_duration` only stops a
+    // *new* attempt from starting, as in Caddy. The hit counter below proves
+    // no second attempt was made once the budget was gone.
+    assert_eq!(response.status(), 503);
+    assert!(started.elapsed() >= Duration::from_millis(280));
     assert!(started.elapsed() < Duration::from_millis(1_500));
     assert_eq!(slow_deadline_hits.load(Ordering::SeqCst), 1);
 
@@ -15374,3 +15367,10 @@ mod scoped_middleware;
 // 🛡️ A path guard and the file server agree on a percent-escaped path.
 #[path = "integration/encoded_path_guard.rs"]
 mod encoded_path_guard;
+
+// MARK: - Retry duration
+
+// ⌛ `lb_try_duration` limits how long to keep trying a backend, never how long
+// an answer already under way may take.
+#[path = "integration/retry_duration.rs"]
+mod retry_duration;

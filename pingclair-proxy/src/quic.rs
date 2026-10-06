@@ -5402,27 +5402,18 @@ async fn reverse_proxy_upstream(
         if request_timeout_ms.is_some() && request_budget.is_none() {
             return Err((408, "Request Timeout"));
         }
-        let retry_budget =
-            retry_deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()));
-        let attempt_budget = match (request_budget, retry_budget) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (Some(value), None) | (None, Some(value)) => Some(value),
-            (None, None) => None,
-        };
-        let mut peer = PingclairProxy::build_http_peer(
+        // ⌛ `lb_try_duration` only gates the start of an attempt (the check at
+        // the top of this loop), exactly as on H1/H2 and in Caddy. Bounding the
+        // attempt's own timers by it turned an origin that answered late into
+        // a 504 and cut event streams at the budget.
+        let peer = PingclairProxy::build_http_peer(
             &upstream,
             proxy_config,
-            attempt_budget,
-            attempt_budget,
+            request_budget,
+            request_budget,
             tls_policy,
         )
         .map_err(|_| (500, "Upstream Peer Configuration Error"))?;
-        // ⌛ The retry total bounds response-header wait even when phase timers are longer.
-        peer.options.read_timeout = match (peer.options.read_timeout, retry_budget) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (Some(value), None) | (None, Some(value)) => Some(value),
-            (None, None) => None,
-        };
 
         let (mut session, _reused) = match connector.get_http_session(&peer).await {
             Ok(result) => {
@@ -5797,9 +5788,6 @@ async fn reverse_proxy_upstream(
                 tracing::error!("❌ H3 upstream read response header failed: {}", error);
                 resp_tx.note_upstream_failure(&error);
                 session.shutdown().await;
-                if retry_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    return Err((504, "Upstream Retry Timeout"));
-                }
                 return Err((502, "Upstream Read Failed"));
             }
             let status = session
@@ -5940,23 +5928,10 @@ async fn reverse_proxy_upstream(
         session.shutdown().await;
         return Err((408, "Request Timeout"));
     }
-    let retry_remaining =
-        retry_deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()));
-    if retry_deadline.is_some() && retry_remaining.is_none() {
-        session.shutdown().await;
-        return Err((504, "Upstream Retry Timeout"));
-    }
-    let remaining = match (request_remaining, retry_remaining) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    };
-    request_deadline = match (request_deadline, retry_deadline) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    };
-    session.set_read_timeout(match (between_reads, remaining) {
+    // ⌛ The retry budget is spent once an answer is in hand: a response that
+    // arrived after it is still the answer, and its body streams under the
+    // request's own deadline and read timers only.
+    session.set_read_timeout(match (between_reads, request_remaining) {
         (Some(left), Some(right)) => Some(left.min(right)),
         (Some(value), None) | (None, Some(value)) => Some(value),
         (None, None) => None,

@@ -96,6 +96,10 @@ mod header_deadline;
 #[path = "h3_end_to_end/encoded_path_guard.rs"]
 mod encoded_path_guard;
 
+// ⌛ `lb_try_duration` bounds retrying, not an answer already under way.
+#[path = "h3_end_to_end/retry_duration.rs"]
+mod retry_duration;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {

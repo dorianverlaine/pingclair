@@ -270,7 +270,8 @@ pub struct RequestContext {
     upstream_connect_timed_out: bool,
     /// 🔢 Number of upstream attempts already started for this request.
     retry_attempts: usize,
-    /// ⌛ Request-local deadline shared by retry attempts and backoff.
+    /// ⌛ The moment after which no further upstream attempt may start
+    /// (`lb_try_duration`). Never a deadline on the attempt already running.
     retry_deadline: Option<std::time::Instant>,
     /// 💤 Whether the next upstream selection must apply retry backoff.
     retry_pending: bool,
@@ -3818,7 +3819,7 @@ impl PingclairProxy {
             {
                 // 🛡️ FastCGI is the one upstream path that never enters
                 // Pingora's proxy lifecycle, so the body limit, the request
-                // and retry deadlines, and the upload pacer have to be applied
+                // deadline, and the upload pacer have to be applied
                 // here explicitly. Skipping them would let `php_fastcgi` be the
                 // single route on which `client_max_body_size` does not hold.
                 if let Err(error) =
@@ -3985,20 +3986,6 @@ impl PingclairProxy {
         Ok(true)
     }
 
-    /// 🔁 Returns a gateway timeout when the route's total retry budget expired.
-    fn enforce_retry_deadline(ctx: &RequestContext) -> pingora_core::Result<()> {
-        if ctx
-            .retry_deadline
-            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-        {
-            return pingora_core::Error::e_explain(
-                pingora_core::ErrorType::HTTPStatus(504),
-                "upstream retry timeout exceeded",
-            );
-        }
-        Ok(())
-    }
-
     /// 📥 Enforces one streamed request-body chunk without retaining it.
     async fn enforce_request_body_chunk(
         session: &mut Session,
@@ -4006,7 +3993,6 @@ impl PingclairProxy {
         bytes: usize,
     ) -> pingora_core::Result<()> {
         Self::enforce_request_deadline(ctx)?;
-        Self::enforce_retry_deadline(ctx)?;
         ctx.request_body_bytes = ctx.request_body_bytes.saturating_add(bytes as u64);
         if ctx.state.as_ref().is_some_and(|state| {
             let limit = ctx
@@ -7842,26 +7828,23 @@ impl ProxyHttp for PingclairProxy {
                 ctx.headers_upstream_remove = proxy_config.headers_up_remove.clone();
                 ctx.streaming_response = wants_immediate_flush(proxy_config.flush_interval);
             }
+            // ⌛ Only the whole-request deadline bounds this attempt; see the
+            // note on the balanced branch below for why the retry budget does not.
             let request_budget = ctx
                 .request_deadline
                 .and_then(|deadline| deadline.checked_duration_since(std::time::Instant::now()));
-            let retry_budget = ctx
-                .retry_deadline
-                .and_then(|deadline| deadline.checked_duration_since(std::time::Instant::now()));
-            let attempt_budget = shortest_duration(request_budget, retry_budget);
             let read_budget = match state.config.limits.long_connections.idle_timeout_ms {
                 Some(0) => None,
                 Some(value) => Some(Duration::from_millis(value)),
-                None => attempt_budget,
+                None => request_budget,
             };
-            let mut peer = Self::build_http_peer(
+            let peer = Self::build_http_peer(
                 &upstream,
                 proxy_config,
-                attempt_budget,
+                request_budget,
                 read_budget,
                 tls_policy,
             )?;
-            peer.options.read_timeout = shortest_duration(peer.options.read_timeout, retry_budget);
             return Ok(Box::new(peer));
         }
 
@@ -7923,29 +7906,31 @@ impl ProxyHttp for PingclairProxy {
                 ctx.headers_upstream_remove = proxy_config.headers_up_remove.clone();
                 ctx.streaming_response = wants_immediate_flush(proxy_config.flush_interval);
             }
+            // ⌛ `lb_try_duration` is deliberately absent here. It decides
+            // whether another attempt may *start* (checked above and in
+            // `crate::retry`), as in Caddy; it is not a deadline on the attempt
+            // that is running. Folding it into these timers cut every event
+            // stream at the budget and turned an origin that answered late into
+            // a 504 — the answer had arrived, only the retrying had run out.
+            // The transport's own timeouts and the whole-request deadline are
+            // what bound an attempt in progress.
             let request_budget = ctx
                 .request_deadline
                 .and_then(|deadline| deadline.checked_duration_since(std::time::Instant::now()));
-            let retry_budget = ctx
-                .retry_deadline
-                .and_then(|deadline| deadline.checked_duration_since(std::time::Instant::now()));
-            let attempt_budget = shortest_duration(request_budget, retry_budget);
             let read_budget = match state.config.limits.long_connections.idle_timeout_ms {
                 Some(0) => None,
                 Some(value) => Some(Duration::from_millis(value)),
-                None => attempt_budget,
+                None => request_budget,
             };
 
             // 🌐 Builds the peer through the transport-neutral timeout policy.
-            let mut peer = Self::build_http_peer(
+            let peer = Self::build_http_peer(
                 &upstream,
                 proxy_config,
-                attempt_budget,
+                request_budget,
                 read_budget,
                 tls_policy,
             )?;
-            // ⌛ A configured retry total is a hard bound, even when phase timers are longer.
-            peer.options.read_timeout = shortest_duration(peer.options.read_timeout, retry_budget);
             return Ok(Box::new(peer));
         }
 
@@ -8201,7 +8186,6 @@ impl ProxyHttp for PingclairProxy {
     where
         Self::CTX: Send + Sync,
     {
-        Self::enforce_retry_deadline(ctx)?;
         if upstream_response.headers.contains_key("trailer") {
             tracing::warn!(
                 "🚫 Rejecting an upstream response that requires unsupported trailer forwarding"
@@ -8526,7 +8510,6 @@ impl ProxyHttp for PingclairProxy {
         ctx: &mut Self::CTX,
     ) -> pingora_core::Result<Option<Duration>> {
         Self::enforce_request_deadline(ctx)?;
-        Self::enforce_retry_deadline(ctx)?;
 
         // 🧭 A `handle_response` replacement emits its static body exactly
         // once and then discards every upstream chunk, keeping memory bounded
@@ -8600,15 +8583,6 @@ impl ProxyHttp for PingclairProxy {
             return pingora_core::Error::e_explain(
                 pingora_core::ErrorType::HTTPStatus(408),
                 "download rate budget exceeds whole-request deadline",
-            );
-        }
-        if delay.is_some_and(|delay| {
-            ctx.retry_deadline
-                .is_some_and(|deadline| std::time::Instant::now() + delay >= deadline)
-        }) {
-            return pingora_core::Error::e_explain(
-                pingora_core::ErrorType::HTTPStatus(504),
-                "download rate budget exceeds upstream retry deadline",
             );
         }
         Ok(delay)

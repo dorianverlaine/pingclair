@@ -2474,7 +2474,8 @@ pub struct RetryConfig {
     /// 🔢 Maximum upstream attempts, including the initial attempt.
     #[serde(default = "default_retry_attempts")]
     pub max_attempts: usize,
-    /// ⌛ Maximum elapsed time across every attempt and backoff.
+    /// ⌛ How long after the request arrived a new attempt may still start
+    /// (`lb_try_duration`). An attempt already running is not cut by it.
     #[serde(default)]
     pub total_timeout_ms: Option<u64>,
     /// 💤 Fixed delay before each retry.

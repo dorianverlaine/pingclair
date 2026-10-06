@@ -170,6 +170,10 @@ below, which ends with what to write instead.
   protocol. `tls internal` issues one more leaf per extra name, and a
   `tls <cert> <key>` pair now also answers for the site's other names.
   → [Every address of a site has a certificate](#-every-address-of-a-site-has-a-certificate)
+- **`lb_try_duration` no longer cuts a response.** It now only limits how
+  long new attempts may start, so a slow answer or a long event stream is
+  bounded by `transport http` timeouts instead.
+  → [`lb_try_duration` limits retrying, not the response](#-lb_try_duration-limits-retrying-not-the-response)
 - **A request header has one minute by default**, start to finish, where it
   had no limit unless `limits { header_timeout }` was set. An idle HTTP/1
   keepalive connection is therefore closed after a minute without a request,
@@ -852,6 +856,23 @@ certificate per hostname.
 and the second address of a site now presents the site's manual certificate
 instead of failing the handshake; make sure that certificate names it.
 (#202)
+
+### ⌛ `lb_try_duration` limits retrying, not the response
+
+`lb_try_duration` now means what it means in Caddy: how long after the
+request arrived the proxy may still *start* another attempt at a backend.
+It used to be applied as a deadline on the attempt itself, so an event
+stream was cut once the duration passed, and an origin that answered after
+it got a 504 even though its answer had arrived. On HTTP/3 the origin's
+complete response was replaced by that 504. A running attempt is now
+bounded by the `transport http` timeouts (`dial_timeout`,
+`response_header_timeout`, `read_timeout`, `write_timeout`) and the site's
+request deadline, on every protocol.
+
+**Upgrading:** a route that relied on `lb_try_duration` to cap how long a
+slow backend may take must set `transport http { response_header_timeout … }`
+or `read_timeout` for that. Long streams behind a route with
+`lb_try_duration` now run to completion. (#206)
 
 ### 🧩 A `*` anywhere in a route's path matches
 
