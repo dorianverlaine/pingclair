@@ -3238,11 +3238,19 @@ impl PingclairProxy {
                 .or_else(|| limits.idle_timeout_ms.map(Duration::from_millis)),
         );
         session.as_mut().set_total_drain_timeout(read_timeout);
-        session.as_mut().set_keepalive(Some(
-            limits
-                .idle_timeout_ms
-                .map_or(60, |idle_ms| idle_ms.div_ceil(1_000)),
-        ));
+        // 🔌 Preserve the parser's decision to close HTTP/1.0 or explicitly
+        // closed requests. Site timeouts may bound reuse, but cannot enable it.
+        if !session
+            .as_downstream()
+            .as_http1()
+            .is_some_and(|h1| !h1.will_keepalive())
+        {
+            session.as_mut().set_keepalive(Some(
+                limits
+                    .idle_timeout_ms
+                    .map_or(60, |idle_ms| idle_ms.div_ceil(1_000)),
+            ));
+        }
     }
 
     /// ⏱️ The pause between two downstream reads that the configuration asks
@@ -4157,6 +4165,11 @@ impl PingclairProxy {
         };
         ctx.intercepted_body_emitted = false;
         ctx.response_status = response.status.as_u16();
+        // 🧾 HTTP/1.0 clients receive their own protocol version even when a
+        // local handler constructs a header with the HTTP/1.1 default.
+        if session.req_header().version == http::Version::HTTP_10 {
+            response.set_version(http::Version::HTTP_10);
+        }
         Self::apply_local_response_headers(&mut response, ctx)?;
 
         match body {
@@ -6922,6 +6935,11 @@ impl ProxyHttp for PingclairProxy {
                     "🚫 Rejected a request whose Host cannot be resolved: {}",
                     rejection.reason()
                 );
+                if rejection == crate::http_policy::FramingRejection::MissingHost {
+                    // 🔌 A missing required authority ends the HTTP/1 connection,
+                    // matching Go net/http's pre-handler rejection.
+                    session.as_mut().set_keepalive(None);
+                }
                 Self::write_simple_response(session, ctx, 400, rejection.reason()).await?;
                 return Ok(true);
             }

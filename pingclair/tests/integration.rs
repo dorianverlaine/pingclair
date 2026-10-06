@@ -116,6 +116,10 @@ mod response_framing;
 #[path = "integration/request_framing.rs"]
 mod request_framing;
 
+// 🚫 Malformed input is answered before its connection can be reused.
+#[path = "integration/malformed_h1.rs"]
+mod malformed_h1;
+
 // 🔤 Site names written with capital letters live beside this file too.
 #[path = "integration/site_name_case.rs"]
 mod site_name_case;

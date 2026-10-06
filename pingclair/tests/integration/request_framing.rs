@@ -136,9 +136,8 @@ async fn test_request_without_a_version_is_refused_not_ignored() {
 
 /// 👍 HTTP/1.0 predates `Host` and is served without one.
 ///
-/// 📌 Caddy answers `HTTP/1.0 200 OK` here and this build answers `HTTP/1.1
-/// 200 OK`; the status and the body are what this test holds, and the version
-/// line is a known difference rather than one this test should enshrine.
+/// 🧾 Caddy answers `HTTP/1.0 200 OK`; the local response preserves the
+/// client's protocol version as well as its status and body.
 #[tokio::test]
 async fn test_http10_request_without_host_is_served() {
     let mut server = TestServer::new_pingclairfile(&site());
@@ -147,7 +146,7 @@ async fn test_http10_request_without_host_is_served() {
     let (head, body) = raw_exchange(&server, b"GET / HTTP/1.0\r\n\r\n").await;
     server.stop();
 
-    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.starts_with("http/1.0 200"), "{head}");
     assert_eq!(body, b"ok");
 }
 

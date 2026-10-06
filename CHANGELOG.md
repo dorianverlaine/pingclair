@@ -33,6 +33,9 @@ Most configurations keep working unchanged. These are the changes most
 likely to alter what an existing configuration does; each links to its entry
 below, which ends with what to write instead.
 
+- **HTTP/1.1 without Host now closes after its 400 response.**
+  → [Short HTTP requests answer and close](#-short-http-requests-answer-and-close)
+
 - **FastCGI HEAD and download limits apply on H1/H2.** Expect no HEAD body and
   budget download time according to configured rate limits.
   → [FastCGI body policy](#-fastcgi-bodies-honor-head-and-download-pacing)
@@ -203,6 +206,15 @@ below, which ends with what to write instead.
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
 [Known defect — WebSocket upgrades under load](#-known-defect--websocket-upgrades-under-load).
+
+### 🚫 Short HTTP requests answer and close
+
+Short requests are no longer held by h2c detection. A missing HTTP version
+receives 400 and closes; HTTP/1.1 without Host now closes after its 400, too.
+HTTP/1.0 without Host receives an HTTP/1.0 200 response and closes.
+
+📌 Upgrade note: monitoring clients may omit Host only with HTTP/1.0. Send
+a Host field with HTTP/1.1 and open a fresh connection after a rejection.
 
 ### 🤐 FastCGI bodies honor HEAD and download pacing
 
