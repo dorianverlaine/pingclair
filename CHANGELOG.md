@@ -82,6 +82,9 @@ below, which ends with what to write instead.
   A `${1}` group reference in a `path_regexp` replacement is now read as the
   placeholder `{1}`; write `$1`.
   → [`uri` operands resolve placeholders](#-uri-operands-resolve-placeholders)
+- **`servers { trusted_proxies … }` takes Caddy's module spelling.** Write
+  `trusted_proxies static <ranges>` there, and one line per scope.
+  → [`trusted_proxies` inside `servers` reads as upstream](#-trusted_proxies-inside-servers-reads-as-upstream)
 - **A middle `*` no longer jumps ahead of an equal-length sibling.** Put the
   intended winner first when equal-length patterns overlap.
   → [Equal-length route patterns keep file order](#-equal-length-route-patterns-keep-file-order)
@@ -341,6 +344,22 @@ every operand, and so does this release (#278).
 replacement is resolved before the regexp sees it, as upstream, so the braced
 group reference `${1}` reads as the placeholder `{1}` and disappears; write
 `$1`.
+
+### 🌐 `trusted_proxies` inside `servers` reads as upstream
+
+Inside `servers {}`, `trusted_proxies` names an ip_source module first, as in
+Caddy: `trusted_proxies static 12.34.56.0/24` and `trusted_proxies static
+private_ranges` load, and the bare `trusted_proxies 12.34.56.0/24` is refused
+with the `static` spelling in the message. Caddy refuses the bare form in that
+position too, so a file that loaded here could not be carried back. A second
+`trusted_proxies` line in the same scope is refused as well: Caddy keeps only
+the last line, while this build used to add the lines together and so trusted
+more peers than the same file does upstream (#142).
+
+📌 Upgrading: the top-level `trusted_proxies 10.0.0.0/8`, this build's own
+option, is unchanged. Inside `servers {}`, put `static` in front of the
+ranges, and merge repeated lines — including a top-level line plus a
+`servers {}` one — into one.
 
 ### 🚫 HTTP parser decisions follow Go
 

@@ -67,6 +67,8 @@ mod forward_auth_tls_tests;
 mod handle_groups_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod trusted_proxies_tests;
 
 use options::adapt_global;
 use registry::is_directive_name;

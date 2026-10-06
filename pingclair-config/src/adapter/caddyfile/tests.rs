@@ -2607,16 +2607,17 @@ mod fail_closed_tests {
         );
     }
 
-    /// 📌 The bare address list is a compatibility spelling kept on purpose. It
-    /// is asserted so that a future change cannot flip it silently in either
-    /// direction.
+    /// 📌 The bare address list is this build's own top-level option, which
+    /// Caddy does not have, and it keeps loading there on purpose. Inside
+    /// `servers {}` Caddy's module spelling is required instead (#142, see
+    /// `trusted_proxies_tests`). Asserted so neither can flip silently.
     #[test]
     fn trusted_proxies_bare_address_list_still_loads() {
         let config = crate::compile(
             "{\n    trusted_proxies 10.0.0.0/8\n}\n\
              example.com {\n    listen :80 proxy_protocol\n    respond \"x\"\n}",
         )
-        .expect("the pre-2.11 bare spelling must keep loading");
+        .expect("the top-level bare spelling must keep loading");
         assert_eq!(config.global.trusted_proxies, ["10.0.0.0/8"]);
     }
 

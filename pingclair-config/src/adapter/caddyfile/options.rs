@@ -19,6 +19,9 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
         // the loop below sees one flat list of options regardless of how the
         // operator chose to group them.
         let directives = expand_servers_block(&mut global, block.directives)?;
+        // 🛡️ Whether a `trusted_proxies` line has been seen in this block; see
+        // `refuse_second_trusted_proxies` for why a second one is an error.
+        let mut trusted_proxies_seen = false;
 
         for sub in directives {
             match sub.name.as_str() {
@@ -335,6 +338,7 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                     }
                 },
                 "trusted_proxies" => {
+                    refuse_second_trusted_proxies(&mut trusted_proxies_seen)?;
                     parse_trusted_proxies(&sub.args, &mut global.trusted_proxies)?;
                 }
                 "client_ip_headers" => {
@@ -620,6 +624,12 @@ pub(super) fn expand_servers_block(
             {
                 parse_metrics_options(inner, MetricsScope::Server)?;
             }
+            // 🌐 Checked before flattening, for the same reason as `metrics`:
+            // once lifted, a `servers` child is indistinguishable from the
+            // top-level option, which keeps its own bare spelling.
+            if child.name == "trusted_proxies" {
+                require_ip_source_module(&child.args)?;
+            }
         }
         // 🧭 The addressless form means "every listener", upstream included, so
         // its children are lifted to the global level exactly as written.
@@ -662,6 +672,8 @@ pub(super) fn expand_servers_block(
                     options.http3 = Some(protocols.contains(&Protocol::H3));
                 }
                 "trusted_proxies" => {
+                    let mut seen = options.trusted_proxies.is_some();
+                    refuse_second_trusted_proxies(&mut seen)?;
                     let mut rules = Vec::new();
                     parse_trusted_proxies(&child.args, &mut rules)?;
                     options.trusted_proxies = Some(rules);
@@ -725,10 +737,11 @@ fn parse_listener_wrappers_child(child: &Directive) -> Result<bool, AdapterError
 /// (`modules/caddyhttp/ip_range.go` at `ff6da121`) — so `static` is stripped and
 /// its ranges are what gets stored.
 ///
-/// 📌 The bare address list is kept as a compatibility spelling: every Caddyfile
-/// written for an older Caddy, and every configuration in this repository's own
-/// docs, uses it, and Caddy only started refusing it in 2.11. It is a divergence
-/// rather than a mistake, so it is named here rather than removed quietly.
+/// 📌 The bare address list is this build's own top-level option, which Caddy
+/// does not have at all, and which this repository's documentation has always
+/// spelled without `static`; it keeps loading there. Inside `servers {}`, the
+/// position Caddy does define, the bare form is refused before this function
+/// runs (`require_ip_source_module`), because Caddy refuses it too.
 fn parse_trusted_proxies(args: &[String], into: &mut Vec<String>) -> Result<(), AdapterError> {
     if args.is_empty() {
         return Err(AdapterError::ArgumentCount("trusted_proxies".into(), 1, 0));
@@ -761,6 +774,50 @@ fn parse_trusted_proxies(args: &[String], into: &mut Vec<String>) -> Result<(), 
             ));
         }
         into.push(rule.clone());
+    }
+    Ok(())
+}
+
+/// 🌐 Refuses a `servers {}` `trusted_proxies` line that does not name an
+/// ip_source module.
+///
+/// Inside `servers {}` Caddy reads the first token as a module name and refuses
+/// `trusted_proxies 10.0.0.0/8` with "module not registered:
+/// http.ip_sources.10.0.0.0/8" (from memory, `serveroptions.go`, v2.11). A file
+/// that loaded here would be one Caddy refuses, and the operator would carry
+/// the spelling that works nowhere else; refusing it with the fix in the
+/// message keeps one spelling valid on both.
+fn require_ip_source_module(args: &[String]) -> Result<(), AdapterError> {
+    match args.first() {
+        Some(first) if looks_like_address(first) => Err(AdapterError::InvalidArgument(
+            "trusted_proxies".into(),
+            format!(
+                "inside `servers {{}}` the first argument names an ip_source module; \
+                 write `trusted_proxies static {}`",
+                args.join(" ")
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// 🛡️ Refuses a second `trusted_proxies` line in one scope.
+///
+/// Caddy keeps only the last line in a `servers {}` block — each one replaces
+/// the source the previous one set (from memory, `serveroptions.go`, v2.11) —
+/// while this adapter used to add them together. The same file therefore
+/// trusted *more* peers here than upstream, and a peer that is trusted may name
+/// any client address it likes. Neither reading is obviously the one the
+/// operator meant, so the file is refused and the message says to put every
+/// range on one line.
+fn refuse_second_trusted_proxies(seen: &mut bool) -> Result<(), AdapterError> {
+    if std::mem::replace(seen, true) {
+        return Err(AdapterError::InvalidArgument(
+            "trusted_proxies".into(),
+            "a second `trusted_proxies` line in the same scope would replace the \
+             first in Caddy but add to it here; list every range on one line"
+                .into(),
+        ));
     }
     Ok(())
 }
