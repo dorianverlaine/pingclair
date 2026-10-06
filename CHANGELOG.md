@@ -1005,6 +1005,9 @@ error type is included: no backend address and no OS error text, because
 those would describe internal topology to any client. Responses forwarded
 from a backend, including its own 502s, are unchanged, and so are local
 responses that involve no backend, such as `respond` or a rate-limit 429.
+While a failed backend sits out its cooldown, the 502s answered without
+dialling it carry `error=destination_unavailable` on every protocol; only
+the first 502 used to carry the field (#203).
 
 ### 🚫 An addressed `servers` block may only carry the options a listener has
 

@@ -80,3 +80,40 @@ async fn h3_refused_backend_502_carries_proxy_status() {
     let local = h3_get(server, "/elsewhere").await.unwrap();
     assert_eq!((local.status, field(&local, "proxy-status")), (404, None));
 }
+
+/// 🩺 After a refused backend is marked down, the HTTP/3 502s that follow
+/// still carry `Proxy-Status`, naming the backend as unavailable — the same
+/// value HTTP/1.1 and HTTP/2 send for the same request.
+#[tokio::test]
+async fn h3_502_for_a_backend_marked_down_carries_proxy_status() {
+    // 🚪 Bound and dropped, so `connect()` meets `ECONNREFUSED`.
+    let dead_address = {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        listener.local_addr().unwrap()
+    };
+    let server = spawn_h3_site(&format!(
+        ":443 {{\n reverse_proxy http://{dead_address}\n}}"
+    ))
+    .await;
+
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let reply = h3_get(server, "/").await.unwrap();
+        seen.push((
+            reply.status,
+            field(&reply, "proxy-status").map(str::to_owned),
+        ));
+    }
+    assert_eq!(
+        seen,
+        [
+            (502, Some("pingclair; error=connection_refused".to_owned())),
+            (
+                502,
+                Some("pingclair; error=destination_unavailable".to_owned())
+            ),
+        ]
+    );
+}

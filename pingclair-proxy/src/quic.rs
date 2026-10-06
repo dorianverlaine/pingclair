@@ -971,6 +971,18 @@ impl ResponseSink {
             .store(error as u8, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// 🩺 Records that no backend could be chosen because every candidate is
+    /// in its failure cooldown — unless an earlier attempt of this request
+    /// already recorded a more specific reason, which then stands.
+    fn note_no_available_upstream(&self) {
+        let _ = self.proxy_error.compare_exchange(
+            0,
+            crate::proxy_status::ProxyError::DestinationUnavailable as u8,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// 🧹 Forgets an earlier attempt's failure once a later attempt
     /// connects, so an error unrelated to the next hop is not blamed on it.
     fn clear_upstream_failure(&self) {
@@ -5391,7 +5403,11 @@ async fn reverse_proxy_upstream(
                     proxy.select_admitted_upstream(state, route_index, Some(&ip_bytes), &excluded);
             }
             selected.map_err(|error| match error {
-                crate::server::UpstreamSelectionError::NoUpstream => (502, "No Upstream Available"),
+                // 🏷️ The same `Proxy-Status` H1/H2 sends from `upstream_peer`.
+                crate::server::UpstreamSelectionError::NoUpstream => {
+                    resp_tx.note_no_available_upstream();
+                    (502, "No Upstream Available")
+                }
                 crate::server::UpstreamSelectionError::Unavailable => (503, "Upstream Overloaded"),
             })?
         };

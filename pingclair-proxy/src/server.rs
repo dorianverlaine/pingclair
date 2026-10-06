@@ -7942,6 +7942,15 @@ impl ProxyHttp for PingclairProxy {
         } else {
             502
         };
+        // 🏷️ A backend in its failure cooldown is never dialled, so nothing
+        // after this point learns why the request failed. RFC 9209's
+        // `destination_unavailable` names exactly this case — recent attempts
+        // failed, so the next hop is considered down. A failure an earlier
+        // attempt of this same request recorded is more specific and wins.
+        if matches!(selected, Err(UpstreamSelectionError::NoUpstream)) {
+            ctx.proxy_error
+                .get_or_insert(crate::proxy_status::ProxyError::DestinationUnavailable);
+        }
         tracing::warn!(
             route = route_index,
             "⚠️ No upstream available for the matched route"

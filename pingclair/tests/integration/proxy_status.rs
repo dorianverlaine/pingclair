@@ -96,6 +96,40 @@ async fn test_upstream_response_timeout_carries_proxy_status() {
     );
 }
 
+/// 🩺 Once a refused backend is marked down, the 502s that follow still say
+/// this hop wrote them, and why: the backend is known to be unavailable.
+///
+/// Before the fix only the first 502 carried the field; every request during
+/// the cooldown got a bare 502 from the "no healthy upstream" path.
+#[tokio::test]
+async fn test_502_for_a_backend_marked_down_carries_proxy_status() {
+    let mut server = TestServer::new_pingclairfile(&proxy_site(refused_address(), ""));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let reply = client.get(server.url(0, "/")).send().await.unwrap();
+        seen.push((
+            reply.status().as_u16(),
+            reply
+                .headers()
+                .get("proxy-status")
+                .map(|value| value.to_str().unwrap().to_owned()),
+        ));
+    }
+    assert_eq!(
+        seen,
+        [
+            (502, Some("pingclair; error=connection_refused".to_owned())),
+            (
+                502,
+                Some("pingclair; error=destination_unavailable".to_owned())
+            ),
+        ]
+    );
+}
+
 /// 🚫 A 502 the origin sent itself is forwarded without a member from this
 /// hop, because this hop did not generate it.
 #[tokio::test]

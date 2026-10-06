@@ -57,8 +57,10 @@ pub enum ProxyError {
     ConnectionTerminated,
     /// 🧾 The backend's answer was not valid HTTP.
     HttpProtocolError,
-    /// 🧭 The backend failed in a way none of the specific types describes.
-    /// Still a remote failure, so this is not `proxy_internal_error`.
+    /// 🧭 The backend failed in a way none of the specific types describes,
+    /// or every backend is in its failure cooldown and none was dialled —
+    /// the RFC's own example of this type. Still a remote failure, so this is
+    /// not `proxy_internal_error`.
     DestinationUnavailable,
     /// 🧯 This process ran out of something (descriptors, ports) before any
     /// packet reached the backend.
