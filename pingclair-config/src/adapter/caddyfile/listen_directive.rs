@@ -141,6 +141,32 @@ fn socket_host(host: &str) -> Option<String> {
     }
 }
 
+/// 📍 The one address a `bind` or `default_bind` directive names.
+///
+/// 🚫 Caddy accepts several (`bind 127.0.0.1 ::1`) and opens every listener
+/// on each. This build puts each listener on one interface, and the second
+/// address used to be dropped without a word, leaving the site unreachable
+/// on an interface the operator listed. Until several are implemented, more
+/// than one is refused.
+pub(super) fn single_bind_address(
+    directive: &str,
+    args: &[String],
+) -> Result<String, AdapterError> {
+    match args {
+        [] => Err(AdapterError::ArgumentCount(directive.into(), 1, 0)),
+        [address] => Ok(address.clone()),
+        [_, ..] => Err(AdapterError::UnsupportedFeature(
+            directive.into(),
+            format!(
+                "`{directive} {}` names {} addresses, and this build binds one. Use one \
+                 address, `[::]` for every interface, or one site per interface",
+                args.join(" "),
+                args.len(),
+            ),
+        )),
+    }
+}
+
 /// 🚫 Refuses a `listen` address whose interface contradicts the site's
 /// `bind`.
 ///
@@ -258,6 +284,21 @@ mod tests {
                 vec!["10.0.0.1:9090".to_string()]
             ]
         );
+    }
+
+    /// 🚫 A second bind address is refused, not dropped.
+    #[test]
+    fn more_than_one_bind_address_is_refused() {
+        let site = compile("x.test {\n    bind 127.0.0.1 ::1\n    respond \"x\"\n}")
+            .expect_err("refused")
+            .to_string();
+        let global =
+            compile("{\n    default_bind 127.0.0.1 ::1\n}\nx.test {\n    respond \"x\"\n}")
+                .expect_err("refused")
+                .to_string();
+        for error in [site, global] {
+            assert!(error.contains("names 2 addresses"), "{error}");
+        }
     }
 
     /// 📍 `bind` agreeing with `listen`, in either order, is no contradiction.

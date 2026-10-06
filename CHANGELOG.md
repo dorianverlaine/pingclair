@@ -82,6 +82,9 @@ below, which ends with what to write instead.
   127.0.0.1:8080` binds loopback only; a hostname or an unbracketed IPv6
   address in `listen` is refused.
   → [`listen` keeps its address](#-listen-keeps-the-address-it-names)
+- **`bind` and `default_bind` with more than one address are refused.** Only
+  the first was ever used; write one address or one site per interface.
+  → [One bind address](#-bind-takes-one-address)
 - **FastCGI HEAD and download limits apply on H1/H2.** Expect no HEAD body and
   budget download time according to configured rate limits.
   → [FastCGI body policy](#-fastcgi-bodies-honor-head-and-download-pacing)
@@ -400,6 +403,17 @@ refused at load, each with a message naming the fix: a hostname
 (`listen example.com:80`, since `listen` binds and never resolves), an IPv6
 address without brackets, a port that is not a number from 0 to 65535, and a
 `listen` address that disagrees with the site's `bind`.
+
+### 🚫 `bind` takes one address
+
+`bind 127.0.0.1 ::1` and `default_bind 127.0.0.1 ::1` kept the first address
+and dropped the rest without a word, so the site was missing from an
+interface the operator listed. Caddy binds every listed address; this build
+puts each listener on one interface, so a second address is now refused at
+load instead of ignored.
+
+📦 **Upgrade:** Keep one address, use `[::]` for every interface, or write one
+site per interface.
 
 ### 🤐 FastCGI bodies honor HEAD and download pacing
 

@@ -456,10 +456,10 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 },
                 // 🌐 Addresses every site without its own `bind` inherits.
                 "default_bind" => {
-                    if sub.args.is_empty() {
-                        return Err(AdapterError::ArgumentCount("default_bind".into(), 1, 0));
-                    }
-                    global.default_bind = sub.args.clone();
+                    global.default_bind = vec![super::listen_directive::single_bind_address(
+                        "default_bind",
+                        &sub.args,
+                    )?];
                 }
                 "preferred_chains" => {
                     global.preferred_chains = Some(parse_preferred_chains(&sub)?);

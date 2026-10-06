@@ -67,9 +67,8 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
         // this is where the global block is in scope, and because "the site
         // said nothing" is only knowable next to what it did say.
         //
-        // 📌 Only the first address is taken. Upstream accepts a list, and
-        // this server binds one host per listener — see the startup line that
-        // says which one was used when a configuration names several.
+        // 📌 There is at most one address: this server binds one host per
+        // listener, so the adapter refuses a list.
         //
         // 🎧 A site whose `listen` named an interface has said where it
         // belongs, so the default does not move it.

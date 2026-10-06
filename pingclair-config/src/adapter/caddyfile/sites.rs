@@ -11,7 +11,9 @@ use super::directives::{
     adapt_subroute_block,
 };
 use super::error_routes::adapt_handle_errors;
-use super::listen_directive::{adapt_listen, reject_listen_contradicting_bind};
+use super::listen_directive::{
+    adapt_listen, reject_listen_contradicting_bind, single_bind_address,
+};
 use super::logs::adapt_log_block;
 use super::matchers::{
     parse_matcher_and_block, parse_matcher_definition, parse_route_matcher_and_block,
@@ -169,10 +171,7 @@ pub(super) fn adapt_server(
         for sub_d in block.directives {
             match sub_d.name.as_str() {
                 "bind" => {
-                    if sub_d.args.is_empty() {
-                        return Err(AdapterError::ArgumentCount("bind".into(), 1, 0));
-                    }
-                    server.bind = Some(sub_d.args[0].clone());
+                    server.bind = Some(single_bind_address("bind", &sub_d.args)?);
                 }
                 "listen" => {
                     server.listens.push(adapt_listen(&sub_d, global)?);
