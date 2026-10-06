@@ -35,7 +35,16 @@ jobs:
       - name: A real Pingclairfile must validate inside the image
         run: |
           mkdir -p /tmp/pingclair-certs
-          touch /tmp/pingclair-certs/example.com.pem /tmp/pingclair-certs/example.com.key
+          # 🔐 `validate` loads manual certificate files the way `run` does
+          # (#218), so empty placeholder files are now refused. A throwaway
+          # self-signed pair for the example's name is enough; world-readable
+          # so the image's non-root user can open the key.
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -nodes -days 1 -subj "/CN=example.com" \
+            -addext "subjectAltName=DNS:example.com" \
+            -keyout /tmp/pingclair-certs/example.com.key \
+            -out /tmp/pingclair-certs/example.com.pem
+          chmod 0644 /tmp/pingclair-certs/example.com.key /tmp/pingclair-certs/example.com.pem
           docker run --rm \
             -v "$PWD/examples:/examples:ro" \
             -v /tmp/pingclair-certs:/etc/pingclair/certs:ro \
