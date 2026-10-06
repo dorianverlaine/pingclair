@@ -33,6 +33,9 @@ Most configurations keep working unchanged. These are the changes most
 likely to alter what an existing configuration does; each links to its entry
 below, which ends with what to write instead.
 
+- **Oversized FastCGI parameters return 431.** Reduce the header or environment
+  value so each encoded parameter fits in one FastCGI record.
+  → [FastCGI parameter limits](#-oversized-fastcgi-parameters-return-431)
 - **Broken FastCGI bodies now abort the response.** Treat a reset or incomplete
   response as a failed download and retry only when safe.
   → [FastCGI body failures](#-fastcgi-body-failures-abort-the-response)
@@ -190,6 +193,18 @@ below, which ends with what to write instead.
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
 [Known defect — WebSocket upgrades under load](#-known-defect--websocket-upgrades-under-load).
+
+### 🧾 Oversized FastCGI parameters return 431
+
+An encoded FastCGI name/value pair larger than 65,500 bytes now returns 431 on
+H1, H2, and H3 before any PARAMS record is built or sent. Previously, a value
+was shortened after its full length was encoded, leaving malformed records.
+Valid pairs still span multiple records as complete pairs, compatible with
+PHP-FPM's per-record decoder. The serializer keeps one bounded scratch record.
+
+📦 **Upgrade:** Reduce large request headers or configured FastCGI environment
+values so their encoded pair fits the record limit. A larger HTTP header limit
+cannot increase the FastCGI pair limit.
 
 ### 🔪 FastCGI body failures abort the response
 

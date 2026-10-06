@@ -164,6 +164,10 @@ mod fastcgi_buffering;
 #[path = "integration/fastcgi_truncation.rs"]
 mod fastcgi_truncation;
 
+// 🧾 Large FastCGI parameters remain a complete byte stream.
+#[path = "integration/fastcgi_params.rs"]
+mod fastcgi_params;
+
 // 🚫 What a locally raised error status says about itself.
 #[path = "integration/error_responses.rs"]
 mod error_responses;

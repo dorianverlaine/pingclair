@@ -35,6 +35,14 @@ pub(crate) enum ExchangeError {
 }
 
 impl ExchangeError {
+    /// 🧾 Oversized client parameters are a 431, not a responder failure.
+    pub(crate) fn http_status(&self) -> u16 {
+        match self {
+            Self::Protocol(pingclair_fastcgi::FastCgiError::ParamsTooLarge) => 431,
+            Self::Dial(_) | Self::DialTimedOut | Self::Protocol(_) | Self::InvalidTarget => 502,
+        }
+    }
+
     /// 🩺 Whether this failure is evidence about the responder, or about us.
     ///
     /// FastCGI dials the responder itself rather than going through Pingora's
@@ -52,6 +60,9 @@ impl ExchangeError {
             Self::DialTimedOut => FailureOrigin::Remote,
             // 📡 Framing errors happen after the connection is up, so the
             // responder is the one that misbehaved.
+            // 🧾 A client environment that cannot be encoded says nothing
+            // about the responder's health.
+            Self::Protocol(pingclair_fastcgi::FastCgiError::ParamsTooLarge) => FailureOrigin::Local,
             Self::Protocol(_) => FailureOrigin::Remote,
             // 🏗️ A backend with no usable socket path is a configuration
             // problem on this side. Benching it would not make the next

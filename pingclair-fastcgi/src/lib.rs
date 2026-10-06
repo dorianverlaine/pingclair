@@ -135,6 +135,8 @@ pub enum FastCgiError {
     Protocol(String),
     /// 🏁 The responder rejected or abandoned the request.
     Rejected(ProtocolStatus),
+    /// 🧾 A parameter cannot fit the record boundary PHP-FPM requires.
+    ParamsTooLarge,
 }
 
 impl std::fmt::Display for FastCgiError {
@@ -143,6 +145,7 @@ impl std::fmt::Display for FastCgiError {
             Self::Io(error) => write!(f, "FastCGI I/O error: {error}"),
             Self::TimedOut => write!(f, "FastCGI deadline exceeded"),
             Self::Protocol(message) => write!(f, "FastCGI protocol error: {message}"),
+            Self::ParamsTooLarge => write!(f, "FastCGI parameter exceeds the record limit"),
             Self::Rejected(status) => {
                 write!(f, "FastCGI responder rejected the request: {status:?}")
             }
@@ -225,9 +228,9 @@ where
 
     /// 🧾 Sends the CGI environment as a stream of `PARAMS` records.
     ///
-    /// A single name-value pair can exceed the record ceiling; the pair is
-    /// then truncated rather than dropped, matching Caddy's client. The
-    /// final empty `PARAMS` record ends the stream.
+    /// 🐘 PHP-FPM decodes each record independently, so every pair must fit
+    /// in one record. Refuse an oversized pair before sending any `PARAMS`,
+    /// rather than silently changing the environment or emitting bad lengths.
     ///
     /// 📁 Values are bytes, not text: `SCRIPT_FILENAME` names a file, and on
     /// Unix a filename that is not valid UTF-8 is still a real file. The
@@ -236,22 +239,24 @@ where
         &mut self,
         params: &BTreeMap<String, V>,
     ) -> Result<(), FastCgiError> {
+        if params.iter().any(|(name, value)| {
+            parameter_size(name.len(), value.as_ref().len()) > MAX_RECORD_CONTENT
+        }) {
+            return Err(FastCgiError::ParamsTooLarge);
+        }
         let mut record = Vec::with_capacity(MAX_RECORD_CONTENT);
         for (name, value) in params {
             let value = value.as_ref();
-            let mut pair = Vec::with_capacity(1 + 1 + name.len() + value.len());
-            encode_size(&mut pair, name.len());
-            encode_size(&mut pair, value.len());
-            pair.extend_from_slice(name.as_bytes());
-            // 🧮 A value longer than the record ceiling is truncated, not
-            // dropped, so the earlier pairs still reach the responder.
-            let value = &value[..value.len().min(MAX_RECORD_CONTENT - pair.len())];
-            pair.extend_from_slice(value);
-            if record.len() + pair.len() > MAX_RECORD_CONTENT {
+            if record.len() + parameter_size(name.len(), value.len()) > MAX_RECORD_CONTENT {
                 self.write_record(RecordType::Params, &record).await?;
                 record.clear();
             }
-            record.extend_from_slice(&pair);
+            // 📦 Encode into the bounded record to avoid a temporary allocation
+            // for every environment entry.
+            encode_size(&mut record, name.len());
+            encode_size(&mut record, value.len());
+            record.extend_from_slice(name.as_bytes());
+            record.extend_from_slice(value);
         }
         if !record.is_empty() {
             self.write_record(RecordType::Params, &record).await?;
@@ -494,6 +499,12 @@ where
 }
 
 // MARK: - Record helpers
+
+/// 🧮 Include both length prefixes without overflowing on an oversized input.
+fn parameter_size(name_len: usize, value_len: usize) -> usize {
+    let prefixes = if name_len > 127 { 4 } else { 1 } + if value_len > 127 { 4 } else { 1 };
+    name_len.saturating_add(value_len).saturating_add(prefixes)
+}
 
 /// 📐 Encodes one name or value length the FastCGI way: one byte up to 127,
 /// otherwise four bytes with the high bit set.
@@ -921,3 +932,8 @@ mod tests {
         assert!(matches!(error, FastCgiError::TimedOut));
     }
 }
+
+// 🧾 Record-boundary regressions belong beside the parameter encoder.
+#[cfg(test)]
+#[path = "params_tests.rs"]
+mod params_tests;

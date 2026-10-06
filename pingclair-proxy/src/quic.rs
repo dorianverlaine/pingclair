@@ -4912,7 +4912,7 @@ async fn fastcgi_upstream(
 
     let exchange_error = |error: crate::fastcgi::ExchangeError| {
         tracing::warn!(%error, "🧵 H3 FastCGI exchange failed");
-        (502, "FastCGI Exchange Failed")
+        (error.http_status(), "FastCGI Exchange Failed")
     };
     exchange.begin(&environment).await.map_err(exchange_error)?;
     let limits = &state.config.limits;

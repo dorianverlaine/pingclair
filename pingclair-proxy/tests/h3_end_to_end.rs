@@ -56,6 +56,10 @@ mod fastcgi_buffering;
 #[path = "h3_end_to_end/fastcgi_truncation.rs"]
 mod fastcgi_truncation;
 
+// 🧾 Oversized FastCGI parameters share the HTTP rejection policy.
+#[path = "h3_end_to_end/fastcgi_params.rs"]
+mod fastcgi_params;
+
 // 🚫 What a locally raised error status says about itself.
 #[path = "h3_end_to_end/error_responses.rs"]
 mod error_responses;

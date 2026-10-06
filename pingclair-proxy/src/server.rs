@@ -3801,7 +3801,7 @@ impl PingclairProxy {
 
         let protocol_error = |error: crate::fastcgi::ExchangeError| {
             tracing::warn!(%error, "🧵 FastCGI exchange failed");
-            proxy_error(502, "FastCGI exchange failed")
+            proxy_error(error.http_status(), "FastCGI exchange failed")
         };
         exchange.begin(&env).await.map_err(protocol_error)?;
         // 🧱 `request_buffers` holds the body here, where FastCGI writes its own
