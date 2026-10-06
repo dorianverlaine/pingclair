@@ -18,7 +18,7 @@ use super::matchers::{
 use super::options::is_wildcard_host;
 use super::order::DirectiveOrder;
 use super::root::parse_root_directive;
-use super::route_order::RouteOrderKey;
+use super::route_order::{RouteOrderKey, Twins};
 use super::scoped_middleware;
 use super::tls::adapt_tls_directive;
 use crate::parser::ast::*;
@@ -611,6 +611,7 @@ pub(super) fn adapt_server(
             .as_mut()
             .map(|routes| std::mem::take(&mut routes.inner.arms))
             .unwrap_or_default();
+        let mut twins = Twins::default();
         let keyed: Vec<(RouteArm, RouteOrderKey)> = arms
             .into_iter()
             .enumerate()
@@ -618,6 +619,7 @@ pub(super) fn adapt_server(
                 let key = RouteOrderKey::for_arm(
                     order,
                     &server.matchers,
+                    &mut twins,
                     &arm.inner,
                     file_index,
                     pipeline_rank,

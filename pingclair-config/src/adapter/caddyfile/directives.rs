@@ -769,12 +769,13 @@ fn sort_handle_elements(
     matchers: &HashMap<String, Matcher>,
     order: &DirectiveOrder,
 ) {
+    let mut twins = super::route_order::Twins::default();
     let mut keyed: Vec<_> = std::mem::take(elements)
         .into_iter()
         .enumerate()
         .map(|(file_index, element)| {
             let key = super::route_order::RouteOrderKey::for_element(
-                order, matchers, &element, file_index,
+                order, matchers, &mut twins, &element, file_index,
             );
             (key, element)
         })

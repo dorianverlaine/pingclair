@@ -27,9 +27,22 @@
 //! 3. Between two routes with no single path pattern, one with a matcher
 //!    (say, a header) goes before one without, so a catch-all never hides a
 //!    narrower sibling of the same directive.
-//! 4. Between two patterns that are equal once trimmed, the exact one goes
-//!    first: `/foo` before `/foo*`.
+//! 4. Patterns that are equal once trimmed (twins, `/foo` and `/foo*`) sit
+//!    together where the first of them was written, and among the twins the
+//!    exact one goes first. Every other pair keeps file order.
 //! 5. Then file order, which is what is left when nothing else decides.
+//!
+//! 👯 Why step 4 groups twins instead of comparing them pairwise (#230):
+//! "exact before wildcard" holds only between twins, and "file order"
+//! between everything else, and the two can contradict each other. Write
+//! `/abb*`, then `/a*b`, then `/abb`: file order puts `/abb*` before `/a*b`
+//! and `/a*b` before `/abb`, while the twin rule puts `/abb` before `/abb*`.
+//! That is a cycle, and a sort fed a cycle produces whatever order its
+//! algorithm happens to visit. Giving every twin the file position of the
+//! group's first member makes the key a plain total order again. Only a
+//! pattern with a `*` before its end can notice the difference, because two
+//! different exact or trailing-`*` patterns of equal length never match the
+//! same path.
 //!
 //! 📜 Where this comes from: steps 2–5 reproduce `sortRoutes` in the
 //! reference's Caddyfile adapter (`caddyconfig/httpcaddyfile/httptype.go`),
@@ -67,8 +80,35 @@ pub(super) struct RouteOrderKey {
     /// longer first, and `None` (no single pattern) after every `Some`.
     path_length: Reverse<Option<usize>>,
     unmatched: bool,
+    /// 👯 The file index of the first route of this rank whose pattern is
+    /// equal to this one once trimmed; a route without a single pattern
+    /// uses its own file index. See the module documentation.
+    twin_anchor: usize,
+    /// 🪜 Ends with `*`. Only twins share an anchor, so this decides only
+    /// between `/foo` and `/foo*`, never between `/abb*` and `/a*b`.
     wildcard: bool,
     file_index: usize,
+}
+
+/// 👯 Remembers where each trimmed path pattern first appeared, per rank, so
+/// that twins share one position in the list.
+///
+/// 📌 Keys must be built in ascending file order with one `Twins`, because
+/// the first index recorded for a pattern is the one every later twin
+/// inherits. Keys built from different lists need separate values.
+#[derive(Debug, Default)]
+pub(super) struct Twins(HashMap<(usize, String), usize>);
+
+impl Twins {
+    /// 🔤 Letter case is folded because the router folds it: `/Foo` and
+    /// `/foo*` answer the same requests, so they are twins.
+    fn anchor(&mut self, rank: usize, pattern: Option<&str>, file_index: usize) -> usize {
+        let Some(pattern) = pattern else {
+            return file_index;
+        };
+        let trimmed = trim_wildcard(pattern).to_ascii_lowercase();
+        *self.0.entry((rank, trimmed)).or_insert(file_index)
+    }
 }
 
 impl RouteOrderKey {
@@ -85,6 +125,7 @@ impl RouteOrderKey {
     pub(super) fn for_arm(
         order: &DirectiveOrder,
         matchers: &HashMap<String, Matcher>,
+        twins: &mut Twins,
         arm: &RouteArm,
         file_index: usize,
         pipeline_rank: usize,
@@ -94,7 +135,7 @@ impl RouteOrderKey {
         } else {
             pipeline_rank
         };
-        Self::new(rank, matchers, arm.matcher.as_ref(), file_index)
+        Self::new(rank, matchers, twins, arm.matcher.as_ref(), file_index)
     }
 
     /// 🧩 The key for one element inside a `handle` block, where every
@@ -102,11 +143,12 @@ impl RouteOrderKey {
     pub(super) fn for_element(
         order: &DirectiveOrder,
         matchers: &HashMap<String, Matcher>,
+        twins: &mut Twins,
         element: &HandlerElement,
         file_index: usize,
     ) -> Self {
         let rank = order.rank(handler_directive_name(&element.handler));
-        Self::new(rank, matchers, element.matcher.as_ref(), file_index)
+        Self::new(rank, matchers, twins, element.matcher.as_ref(), file_index)
     }
 
     /// 🧺 The key for the site's matcher-less pipeline, which sorts after
@@ -116,6 +158,7 @@ impl RouteOrderKey {
             rank: pipeline_rank,
             path_length: Reverse(None),
             unmatched: true,
+            twin_anchor: usize::MAX,
             wildcard: false,
             file_index: usize::MAX,
         }
@@ -152,6 +195,7 @@ impl RouteOrderKey {
     fn new(
         rank: usize,
         matchers: &HashMap<String, Matcher>,
+        twins: &mut Twins,
         matcher: Option<&Matcher>,
         file_index: usize,
     ) -> Self {
@@ -160,6 +204,7 @@ impl RouteOrderKey {
             rank,
             path_length: Reverse(pattern.map(|pattern| trim_wildcard(pattern).len())),
             unmatched: matcher.is_none(),
+            twin_anchor: twins.anchor(rank, pattern, file_index),
             wildcard: pattern.is_some_and(|pattern| pattern.ends_with('*')),
             file_index,
         }
@@ -409,5 +454,68 @@ mod tests {
         assert_eq!(bodies(&written(b, a)), ["b", "a"]);
         assert_eq!(answer(&written(a, b), "/a/bx"), "a");
         assert_eq!(answer(&written(b, a), "/a/bx"), "b");
+    }
+
+    #[test]
+    fn equal_length_prefix_and_middle_wildcard_keep_file_order() {
+        // 📏 Issue #230: `/abb*` and `/a*b` both trim to four characters and
+        // both match `/abb`. The middle `*` used to count as exact and jump
+        // ahead; now whichever is written first answers.
+        for (first, second) in [("/abb*", "/a*b"), ("/a*b", "/abb*")] {
+            let source =
+                format!("example.com {{\nrespond {first} first\nrespond {second} second\n}}");
+            assert_eq!(paths(&source), [first, second]);
+            assert_eq!(answer(&source, "/abb"), "first");
+        }
+    }
+
+    #[test]
+    fn different_equal_length_exact_and_prefix_paths_keep_file_order() {
+        // 📏 Exact-before-wildcard is a rule between twins only; `/xyz` is
+        // not a twin of `/abb*`, so it stays second.
+        let source = "example.com {\nrespond /abb* first\nrespond /xyz second\n}";
+        assert_eq!(paths(source), ["/abb*", "/xyz"]);
+    }
+
+    #[test]
+    fn twins_sit_where_the_first_of_them_was_written() {
+        // 👯 `/foo` and `/foo*` are twins, so all four sit at the slot of
+        // the first `/foo*`, exact ones first; the unrelated `/bar` keeps
+        // its place after them, and each pair keeps its own file order.
+        let source = concat!(
+            "example.com {\n",
+            "respond /foo* prefix-first\n",
+            "respond /bar unrelated\n",
+            "respond /foo* prefix-second\n",
+            "respond /FOO exact-first\n",
+            "respond /foo exact-second\n",
+            "}",
+        );
+        assert_eq!(
+            bodies(source),
+            [
+                "exact-first",
+                "exact-second",
+                "prefix-first",
+                "prefix-second",
+                "unrelated"
+            ]
+        );
+    }
+
+    #[test]
+    fn twin_grouping_breaks_the_file_order_cycle() {
+        // 🔁 File order wants `/abb*` < `/a*b` < `/abb`; the twin rule
+        // wants `/abb` < `/abb*`. Grouping the twins at the first one's
+        // slot gives one answer whatever order the sort visits them in.
+        let source = concat!(
+            "example.com {\n",
+            "respond /abb* glob\n",
+            "respond /a*b middle\n",
+            "respond /abb exact\n",
+            "}",
+        );
+        assert_eq!(paths(source), ["/abb", "/abb*", "/a*b"]);
+        assert_eq!(answer(source, "/abb"), "exact");
     }
 }

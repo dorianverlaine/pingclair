@@ -33,6 +33,9 @@ Most configurations keep working unchanged. These are the changes most
 likely to alter what an existing configuration does; each links to its entry
 below, which ends with what to write instead.
 
+- **A middle `*` no longer jumps ahead of an equal-length sibling.** Put the
+  intended winner first when equal-length patterns overlap.
+  → [Equal-length route patterns keep file order](#-equal-length-route-patterns-keep-file-order)
 - **Braces in route paths are literal.** Use `path_regexp` for captures.
   → [Route braces stay literal](#-route-braces-stay-literal)
 - **Host validation and HTTP/1 parser decisions now follow Go.**
@@ -391,6 +394,22 @@ missing config read. Replace the old metric names in dashboards, recording
 rules, and alerts with the names above; histogram `_bucket`, `_sum`, and
 `_count` series follow the renamed family. The old names are no longer exported.
 The names do not imply that Pingclair exports Caddy's complete label schema.
+
+### 📏 Equal-length route patterns keep file order
+
+A route path with a `*` in the middle used to count as an exact path when two
+routes of the same directive tied on length, so it jumped ahead (#230). With
+`respond /abb* "first"` written before `respond /a*b "second"`, both patterns
+match `/abb` and both are four characters once the trailing `*` is dropped,
+yet `second` answered. Now `first` does: two different patterns of equal
+length keep file order. "Exact before wildcard" applies only between twins,
+patterns equal once the trailing `*` is dropped (`/foo` and `/foo*`), and the
+twins sit together where the first of them was written. Site routes, `handle`
+blocks and scoped middleware all sort this way.
+
+**Upgrade:** Where two equal-length patterns overlap, write the one that
+should answer first, or list them in a `route` block to fix the order
+explicitly.
 
 ### 🧭 Route braces stay literal
 

@@ -41,7 +41,7 @@
 //! the route only answers requests that already matched it.
 
 use super::order::DirectiveOrder;
-use super::route_order::{RouteOrderKey, sort_path};
+use super::route_order::{RouteOrderKey, Twins, sort_path};
 use super::sites::handler_has_terminal;
 use crate::parser::ast::{Handler, HandlerElement, Matcher, RouteArm};
 use std::collections::HashMap;
@@ -71,6 +71,9 @@ pub(super) fn compose_site_routes(
     // 🧭 Each scoped line keeps its route key too, because it stays a route
     // of its own as well as a step in front of others (see below).
     let mut scoped: Vec<(RouteOrderKey, Step)> = Vec::new();
+    // 👯 Step keys rank by the middleware's own directive, so their twins
+    // are tracked apart from the route keys the caller built.
+    let mut twins = Twins::default();
     for (file_index, (arm, route_key)) in keyed.into_iter().enumerate() {
         if handler_has_terminal(&arm.handler) {
             routes.push((arm, route_key));
@@ -80,7 +83,7 @@ pub(super) fn compose_site_routes(
             matcher: arm.matcher,
             handler: arm.handler,
         };
-        let key = RouteOrderKey::for_element(order, matchers, &element, file_index);
+        let key = RouteOrderKey::for_element(order, matchers, &mut twins, &element, file_index);
         scoped.push((route_key, Step { key, element }));
     }
 
@@ -225,7 +228,9 @@ fn unmatched_step(
         matcher: None,
         handler: handler.clone(),
     };
-    let key = RouteOrderKey::for_element(order, matchers, &element, index);
+    // 👯 A step without a matcher has no pattern and so no twins; an empty
+    // map does not allocate.
+    let key = RouteOrderKey::for_element(order, matchers, &mut Twins::default(), &element, index);
     Step { key, element }
 }
 

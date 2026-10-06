@@ -104,6 +104,10 @@ mod route_order;
 #[path = "integration/route_braces.rs"]
 mod route_braces;
 
+// 📏 Equal-length wildcard patterns retain file order at both DSL scopes.
+#[path = "integration/route_ties.rs"]
+mod route_ties;
+
 // 🔤 Route paths ignore letter case, exact and prefix as well as wildcard.
 #[path = "integration/route_path_case.rs"]
 mod route_path_case;
