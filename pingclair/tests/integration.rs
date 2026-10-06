@@ -58,6 +58,13 @@ mod addressed_servers;
 #[path = "integration/static_validators.rs"]
 mod static_validators;
 
+// 📜 One test per RFC requirement, plus the parity gaps that are not RFC
+// requirements but were measured against Caddy and nginx. A requirement the
+// current build does not meet is `#[ignore]`d with its issue number, so the
+// ignored set *is* the outstanding list — `--run-ignored all` runs them.
+#[path = "integration/rfc_conformance.rs"]
+mod rfc_conformance;
+
 // 🏷️ `If-Match`, `If-None-Match` and their date forms on `file_server`.
 #[path = "integration/preconditions.rs"]
 mod preconditions;

@@ -35,6 +35,10 @@ clippy:
 test *args:
     cargo +{{ rust }} nextest run --locked --no-fail-fast --no-tests pass --profile ci {{ args }}
 
+# 📜 Run the RFC conformance set, ignored requirements included.
+conformance:
+    cargo +{{ rust }} nextest run --locked -p pingclair --test integration -E 'test(/rfc_conformance/)' --run-ignored all --no-fail-fast
+
 # 🧹 Fail on unused Cargo dependencies.
 shear:
     cargo +{{ rust }} shear --deny-warnings
