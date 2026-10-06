@@ -207,40 +207,86 @@ impl CompiledClientAuth {
 /// mutual TLS on it enforces SNI-against-Host at the HTTP layer. Without that,
 /// a client would send the harmless name in the handshake and the protected one
 /// in the `Host` header.
+///
+/// 🎯 Every site on the listener gets a row, including the sites that ask for
+/// nothing. "No client certificate here" is a statement a site makes, and it
+/// has to outrank a wildcard exactly as a more specific certificate does:
+/// `public.example.com` with no `client_auth` must not inherit the demand that
+/// `*.example.com` makes. A table holding only the demanding sites cannot say
+/// that, because a missing exact row falls through to the wildcard.
 #[derive(Debug, Default)]
 pub struct ClientAuthTable {
-    /// 🏷️ Sites named outright. The common case, and a hash lookup.
-    exact: HashMap<Box<str>, Arc<CompiledClientAuth>>,
+    /// 🏷️ Sites named outright. The common case, and a hash lookup. `None`
+    /// is a site that configured no client authentication.
+    exact: HashMap<Box<str>, Option<Arc<CompiledClientAuth>>>,
 
     /// 🃏 `*.example.com`, stored as the `.example.com` it has to end with.
     /// A `Vec` because a listener has a handful of these at most, and a linear
     /// walk over a handful beats any structure that has to be built first.
-    wildcards: Vec<(Box<str>, Arc<CompiledClientAuth>)>,
+    wildcards: Vec<(Box<str>, Option<Arc<CompiledClientAuth>>)>,
 
     /// 🕳️ The catch-all site's policy, used when nothing else matches — which
     /// includes the client that sent no SNI at all.
     fallback: Option<Arc<CompiledClientAuth>>,
+
+    /// 🪪 Whether any row demands anything. A field rather than a scan because
+    /// the HTTP layer asks on every request, and the answer was settled when
+    /// the table was built.
+    enforcing: bool,
 }
 
 impl ClientAuthTable {
     /// 🏗️ Records one site's policy under every name it answers to.
     pub fn insert(&mut self, names: &[&str], policy: Arc<CompiledClientAuth>) {
+        self.enforcing = true;
+        self.record(names, Some(&policy));
+    }
+
+    /// 🔓 Records a site that asks its clients for no certificate.
+    ///
+    /// This is the row that lets an exact name outrank a demanding wildcard.
+    /// It never replaces a demand already recorded under the same name: if two
+    /// sites ever claim one name, the stricter one wins.
+    pub fn insert_without_client_auth(&mut self, names: &[&str]) {
+        self.record(names, None);
+    }
+
+    /// 🗂️ Files one site's answer under each of its names.
+    ///
+    /// 🛡️ Only a demand overwrites an existing row, so the order sites are
+    /// recorded in can never relax a name. An open catch-all records nothing,
+    /// because an empty fallback already means "nothing demanded".
+    fn record(&mut self, names: &[&str], policy: Option<&Arc<CompiledClientAuth>>) {
+        let merge = |row: &mut Option<Arc<CompiledClientAuth>>| {
+            if let Some(policy) = policy {
+                *row = Some(Arc::clone(policy));
+            }
+        };
         if names.is_empty() {
-            self.fallback = Some(policy);
+            merge(&mut self.fallback);
             return;
         }
         for name in names {
             match *name {
-                "_" | "*" => self.fallback = Some(Arc::clone(&policy)),
-                name if name.starts_with(':') => self.fallback = Some(Arc::clone(&policy)),
+                "_" | "*" => merge(&mut self.fallback),
+                name if name.starts_with(':') => merge(&mut self.fallback),
                 name => match name.strip_prefix('*') {
-                    Some(suffix) if suffix.starts_with('.') => self
-                        .wildcards
-                        .push((suffix.to_ascii_lowercase().into(), Arc::clone(&policy))),
-                    _ => {
-                        self.exact
-                            .insert(name.to_ascii_lowercase().into(), Arc::clone(&policy));
+                    Some(suffix) if suffix.starts_with('.') => {
+                        let suffix = suffix.to_ascii_lowercase();
+                        match self
+                            .wildcards
+                            .iter_mut()
+                            .find(|(known, _)| **known == *suffix)
+                        {
+                            Some((_, row)) => merge(row),
+                            None => self.wildcards.push((suffix.into(), policy.cloned())),
+                        }
                     }
+                    _ => merge(
+                        self.exact
+                            .entry(name.to_ascii_lowercase().into())
+                            .or_default(),
+                    ),
                 },
             }
         }
@@ -250,7 +296,8 @@ impl ClientAuthTable {
     ///
     /// Exact names win over wildcards, and a wildcard covers exactly one label
     /// — `*.example.com` answers for `a.example.com` and not `a.b.example.com`,
-    /// matching how upstream matches an SNI.
+    /// matching how upstream matches an SNI. The most specific matching site
+    /// decides, including when what it decides is "nothing is required".
     pub fn policy_for(&self, sni: &str) -> Option<&Arc<CompiledClientAuth>> {
         // 🛡️ `secure.example.` and `secure.example` are one DNS name, and the
         // certificate lookup and routing both treat them as one. This lookup
@@ -270,14 +317,14 @@ impl ClientAuthTable {
                 sni
             };
             if let Some(policy) = self.exact.get(name) {
-                return Some(policy);
+                return policy.as_ref();
             }
             for (suffix, policy) in &self.wildcards {
                 if let Some(label) = name.strip_suffix(suffix.as_ref())
                     && !label.is_empty()
                     && !label.contains('.')
                 {
-                    return Some(policy);
+                    return policy.as_ref();
                 }
             }
         }
@@ -286,7 +333,7 @@ impl ClientAuthTable {
 
     /// 🕳️ Reports whether this listener asks anything of any client.
     pub fn is_empty(&self) -> bool {
-        self.exact.is_empty() && self.wildcards.is_empty() && self.fallback.is_none()
+        !self.enforcing
     }
 }
 
@@ -1226,5 +1273,63 @@ mod tests {
             assert!(table.policy_for(name).is_some(), "{name} lost its policy");
         }
         assert!(table.policy_for("secure.example..").is_none());
+    }
+
+    // MARK: - Which site's policy a name gets
+
+    fn request_policy() -> Arc<CompiledClientAuth> {
+        Arc::new(
+            CompiledClientAuth::compile(&ClientAuthConfig {
+                mode: ClientAuthMode::Request,
+                ..Default::default()
+            })
+            .expect("compiles"),
+        )
+    }
+
+    /// 🎯 The most specific site decides, even when it decides "nothing"
+    /// (#259): an exact site without `client_auth` must not inherit the demand
+    /// of a wildcard or catch-all that shares its listener.
+    #[test]
+    fn an_open_site_outranks_a_demanding_wildcard_and_catch_all() {
+        let wildcard = request_policy();
+        let catch_all = request_policy();
+        let mut table = ClientAuthTable::default();
+        table.insert(&["*.sandbox.test"], Arc::clone(&wildcard));
+        table.insert(&[":443"], Arc::clone(&catch_all));
+        table.insert_without_client_auth(&["public.sandbox.test", "*.open.test"]);
+
+        let chosen = |sni: &str| table.policy_for(sni).map(Arc::as_ptr);
+        assert_eq!(chosen("public.sandbox.test"), None);
+        assert_eq!(chosen("PUBLIC.sandbox.test"), None);
+        assert_eq!(chosen("a.open.test"), None);
+        assert_eq!(chosen("other.sandbox.test"), Some(Arc::as_ptr(&wildcard)));
+        assert_eq!(chosen("elsewhere.test"), Some(Arc::as_ptr(&catch_all)));
+        assert!(!table.is_empty(), "the listener still demands certificates");
+    }
+
+    /// 🛡️ Recording order must never relax a name: an open row cannot replace
+    /// a demand, and a table of open rows alone demands nothing.
+    #[test]
+    fn an_open_row_never_replaces_a_demand() {
+        let policy = request_policy();
+        let mut table = ClientAuthTable::default();
+        table.insert(&["shared.test", "*.shared.test"], Arc::clone(&policy));
+        table.insert_without_client_auth(&["shared.test", "*.shared.test", "_"]);
+        assert_eq!(
+            table.policy_for("shared.test").map(Arc::as_ptr),
+            Some(Arc::as_ptr(&policy))
+        );
+        assert_eq!(
+            table.policy_for("a.shared.test").map(Arc::as_ptr),
+            Some(Arc::as_ptr(&policy))
+        );
+
+        let mut open = ClientAuthTable::default();
+        open.insert_without_client_auth(&["only.test", "*.only.test"]);
+        assert!(
+            open.is_empty(),
+            "open rows alone must not enable SNI-Host enforcement"
+        );
     }
 }

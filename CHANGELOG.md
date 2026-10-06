@@ -42,6 +42,24 @@ escape literal backslashes, so a request such as `//sub?x=1` receives
 `Location: /sub/?x=1` instead of a reference to another host. Rewrites that
 change the filename and `disable_canonical_uris` retain their existing behavior.
 
+### 🪪 An exact site's `client_auth` outranks a wildcard
+
+A wildcard site with `tls { client_auth … }`, such as `*.example.test`, used
+to impose its demand on a different site on the same port that has an exact
+name, such as `public.example.test`, and configured no `client_auth` at all:
+every visitor to the exact site was asked for a client certificate, and one
+signed by the wildcard's CA was accepted (#259). The handshake now picks the
+client-certificate policy of the most specific site for the name the client
+sent, exactly as it already picks the certificate, on HTTP/1.1, HTTP/2 and
+HTTP/3. A site without `client_auth` is that statement too: "no client
+certificate here". The listener still requires the handshake name and the
+`Host` (or `:authority`) to agree, so the open name cannot be used to reach a
+name only the wildcard covers.
+
+📦 **Upgrade:** An exact site that shares a port with a wildcard `client_auth`
+site no longer asks its clients for a certificate. If it relied on the
+wildcard's demand, give it its own `client_auth` block.
+
 ### ⚠️ Before you upgrade
 
 Most configurations keep working unchanged. These are the changes most
@@ -262,6 +280,9 @@ below, which ends with what to write instead.
   matcher.** `handle *.php { … }` used to compile into a block that answered
   every request; write `handle @php { … }` with `@php path *.php`.
   → [A block directive takes `*`, a `/path` or `@name`](#-a-block-directive-takes--a-path-or-name)
+- **An exact site no longer inherits a wildcard's `client_auth`.** A site
+  that relied on it needs its own `client_auth` block.
+  → [An exact site's `client_auth` outranks a wildcard](#-an-exact-sites-client_auth-outranks-a-wildcard)
 
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under

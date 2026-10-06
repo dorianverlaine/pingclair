@@ -150,6 +150,9 @@ impl PreparedListenerPolicy {
             }
 
             let Some(config) = server.tls.as_ref().and_then(|tls| tls.client_auth.as_ref()) else {
+                // 🔓 Recorded rather than skipped, so this site's own name
+                // outranks a demanding wildcard on the same listener (#259).
+                client_auth.insert_without_client_auth(&names);
                 continue;
             };
             let compiled = Arc::new(CompiledClientAuth::compile(config).map_err(|problem| {

@@ -32,6 +32,10 @@ readonly run_dir="$(mktemp -d "${TMPDIR:-/tmp}/pingclair-h3-clientauth.XXXXXX")"
 # 🏷️ Two names, one listener. That shape is the whole point; see the header.
 readonly secure_name="secure.h3.local"
 readonly open_name="open.h3.local"
+# 🃏 A third site, `*.h3.local`, also demands a certificate and would cover
+# both names above. It is here for #259: the open site's own name has to
+# outrank the wildcard, including when what it says is "no certificate".
+readonly wild_name="wild.h3.local"
 pingclair_pid=""
 passed=0
 failed=0
@@ -156,6 +160,16 @@ https://${open_name}:${port} {
 	tls ${run_dir}/server.crt ${run_dir}/server.key
 	respond "open ok" 200
 }
+
+https://*.h3.local:${port} {
+	tls internal {
+		client_auth {
+			mode require_and_verify
+			trusted_ca_cert_file ${run_dir}/ca.crt
+		}
+	}
+	respond "wild ok" 200
+}
 EOF
 
 PINGCLAIR_TLS_STORE="${run_dir}/store" "${binary}" run "${run_dir}/Pingclairfile" \
@@ -189,6 +203,7 @@ done
 resolve_args=(
     --resolve "${secure_name}:${port}:127.0.0.1"
     --resolve "${open_name}:${port}:127.0.0.1"
+    --resolve "${wild_name}:${port}:127.0.0.1"
 )
 
 # 🧪 One case. `expected` is the status code, or `refused` when the handshake
@@ -234,9 +249,20 @@ for proto in --http1.1 --http3-only; do
 done
 
 log ""
-log "🔎 The site that never asked for one still answers without a certificate"
+log "🔎 The site that never asked for one still answers without a certificate,"
+log "     even though a demanding wildcard on this listener covers its name"
 for proto in --http1.1 --http3-only; do
     check "${proto}" 200 "${proto}" "https://${open_name}:${port}/"
+done
+
+# 🔐 `-k` because the wildcard site uses `tls internal`, whose root this run
+# never trusts; the certificate under test here is the client's, not ours.
+log ""
+log "🔎 The wildcard keeps its demand for the names only it covers"
+for proto in --http1.1 --http3-only; do
+    check "${proto}" refused -k "${proto}" "https://${wild_name}:${port}/"
+    check "${proto} with a trusted certificate" 200 -k "${client_cert[@]}" "${proto}" \
+        "https://${wild_name}:${port}/"
 done
 
 log ""
@@ -244,6 +270,8 @@ log "🔎 🛡️ Naming the unprotected site in the handshake and the protected
 log "     in the request is refused with 421 — the reason this check exists"
 for proto in --http1.1 --http2 --http3-only; do
     check "${proto}" 421 "${proto}" -H "Host: ${secure_name}" "https://${open_name}:${port}/"
+    check "${proto} to the wildcard" 421 "${proto}" -H "Host: ${wild_name}" \
+        "https://${open_name}:${port}/"
 done
 
 log ""

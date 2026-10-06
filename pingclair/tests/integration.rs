@@ -15425,3 +15425,7 @@ mod cache_age;
 // 🛡️ `bind` restricts a site with an explicit address to its interface.
 #[path = "integration/site_bind.rs"]
 mod site_bind;
+
+// 🎯 An explicit site's name outranks a wildcard's `client_auth` (#259).
+#[path = "integration/client_auth_precedence.rs"]
+mod client_auth_precedence;
