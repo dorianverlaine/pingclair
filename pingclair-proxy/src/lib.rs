@@ -25,6 +25,7 @@ pub mod dns;
 pub mod drain;
 pub mod dynamic_upstream;
 pub mod encoding;
+mod error_routes;
 mod fastcgi;
 mod h3_header_deadline;
 mod header_limits;

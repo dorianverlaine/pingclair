@@ -15378,3 +15378,9 @@ mod encoded_path_guard;
 // an answer already under way may take.
 #[path = "integration/retry_duration.rs"]
 mod retry_duration;
+
+// MARK: - Error routes
+
+// 🚨 A `handle_errors` route serves its own page with the error's status.
+#[path = "integration/error_routes.rs"]
+mod error_routes;

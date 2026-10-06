@@ -100,6 +100,10 @@ mod encoded_path_guard;
 #[path = "h3_end_to_end/retry_duration.rs"]
 mod retry_duration;
 
+// 🚨 `handle_errors` pages, served from the error route's own file server.
+#[path = "h3_end_to_end/error_routes.rs"]
+mod error_routes;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {

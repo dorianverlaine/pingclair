@@ -255,6 +255,9 @@ pub struct RequestContext {
     /// 🚫 Whether the request is already inside an error route; a second
     /// raised error then responds directly instead of recursing forever.
     pub handling_error: bool,
+    /// 🚨 The error route running and the status it answers, while one runs.
+    /// A `file_server` reads it to serve the route's own page with that status.
+    pub(crate) error_scope: Option<crate::error_routes::ErrorScope>,
     /// 🚫 Whether a `log_skip` middleware excluded this request from access
     /// logging.
     pub log_skip: bool,
@@ -345,6 +348,7 @@ impl Default for RequestContext {
             response_takeover_complete: false,
             orig_uri: http::Uri::default(),
             handling_error: false,
+            error_scope: None,
             log_skip: false,
             request_deadline: None,
             long_connection: false,
@@ -1042,9 +1046,9 @@ pub struct ProxyState {
     pub config: Arc<ServerConfig>,
     /// Route matcher
     pub router: Arc<Router>,
-    /// 🚨 Precompiled per-element matchers for each error route, parallel to
+    /// 🚨 Each error route's pipeline, matchers and file server, parallel to
     /// `config.error_routes`.
-    pub error_route_precompiles: Vec<MatcherPrecompile>,
+    pub(crate) error_routes: Arc<[crate::error_routes::PreparedErrorRoute]>,
     /// 🧰 Precompiled matchers for site-level `vars` rules, parallel to
     /// `config.vars_routes`; `None` means the rule has no matcher.
     pub vars_precompiles: Vec<Option<CompiledMatcher>>,
@@ -1547,11 +1551,6 @@ impl ProxyState {
         Self::new_with_previous(config, None)
     }
 
-    /// 🚨 Returns one error route's precompiled matcher tree.
-    pub fn compiled_error_route(&self, index: usize) -> Option<&MatcherPrecompile> {
-        self.error_route_precompiles.get(index)
-    }
-
     /// ♻️ Rebuilds configuration while retaining compatible breaker state.
     fn new_with_previous(config: ServerConfig, previous: Option<&ProxyState>) -> Self {
         // ⚡ Configuration decides whether these request variables can ever be
@@ -1563,11 +1562,7 @@ impl ProxyState {
             encoded.windows(PREFIX.len()).any(|window| window == PREFIX)
         });
         let router = Router::new(config.routes.clone());
-        let error_route_precompiles = config
-            .error_routes
-            .iter()
-            .map(|route| pingclair_core::server::precompile_handler_list(&route.handlers))
-            .collect();
+        let error_routes = crate::error_routes::prepare(&config);
         let vars_precompiles = config
             .vars_routes
             .iter()
@@ -1843,39 +1838,11 @@ impl ProxyState {
             health_checkers.push(None);
 
             // File server (possibly nested inside a handle/route block)
-            if let Some(HandlerConfig::FileServer {
-                root,
-                index,
-                browse,
-                browse_limit,
-                compress,
-                precompressed,
-                hide,
-                status,
-                pass_thru: _,
-                canonical_uris,
-                etag_file_extensions,
-            }) = find_file_server_config(&route.handler)
-            {
-                let fs_config = pingclair_static::FileServerConfig::from_handler(
-                    root,
-                    index,
-                    *browse,
-                    *browse_limit,
-                    *compress,
-                    precompressed,
-                    hide,
-                    *status,
-                    *canonical_uris,
-                    etag_file_extensions,
-                )
-                .with_site_encode(&config);
-
-                file_servers.push(Some(Arc::new(pingclair_static::FileServer::new(fs_config))));
+            let file_server = build_file_server(&route.handler, &config);
+            if file_server.is_some() {
                 tracing::info!("📁 Initialized file server for route {}", route.path);
-            } else {
-                file_servers.push(None);
             }
+            file_servers.push(file_server);
 
             // Check for rate limit config
             if let Some(rl_config) = find_rate_limit_config(&route.handler, &route.path) {
@@ -1997,7 +1964,7 @@ impl ProxyState {
             ),
             config: Arc::new(config),
             router: Arc::new(router),
-            error_route_precompiles,
+            error_routes,
             vars_precompiles,
             load_balancers,
             dynamic_dials,
@@ -4694,12 +4661,22 @@ impl PingclairProxy {
             if !route.matches(status) {
                 continue;
             }
-            let precompile = state.compiled_error_route(index);
-            let handlers = HandlerConfig::Pipeline {
-                handlers: route.handlers.clone(),
+            let Some(prepared) = state.error_routes.get(index) else {
+                continue;
             };
+            ctx.error_scope = Some(crate::error_routes::ErrorScope {
+                route: index,
+                status,
+            });
             if self
-                .handle_config(session, ctx, &handlers, &path, route_index, precompile)
+                .handle_config(
+                    session,
+                    ctx,
+                    &prepared.pipeline,
+                    &path,
+                    route_index,
+                    Some(&prepared.precompile),
+                )
                 .await?
             {
                 // 🚫 A handler inside the error route raised again (a
@@ -4986,17 +4963,26 @@ impl PingclairProxy {
                 Ok(true)
             }
             HandlerConfig::FileServer { pass_thru, .. } => {
-                let maybe_file_server = {
-                    ctx.state.as_ref().and_then(|state| {
-                        state.file_servers.get(route_index).and_then(|f| f.clone())
-                    })
-                };
+                // 🚨 Inside an error route the file server is that route's
+                // own, and the page goes out with the error's status.
+                let error_scope = ctx.error_scope;
+                let maybe_file_server = ctx.state.as_ref().and_then(|state| match error_scope {
+                    Some(scope) => state
+                        .error_routes
+                        .get(scope.route)
+                        .and_then(|route| route.file_server.clone()),
+                    None => state.file_servers.get(route_index).and_then(|f| f.clone()),
+                });
+                let status_for = |own: u16| error_scope.map_or(own, |scope| scope.status);
 
                 if let Some(file_server) = maybe_file_server {
                     // 🏷️ The method and header fields go over whole:
                     // pingclair-static reads `Range`, `If-Range`, and the
                     // four preconditions from them itself, the same way for
-                    // both transports.
+                    // both transports. An error page is read plainly instead;
+                    // see `error_page_method`. The encode policy sees the
+                    // status that actually goes out, which for an error page
+                    // is the error's.
                     let encode_policy = |status, headers: &mut http::HeaderMap| {
                         ctx.state.as_ref().is_some_and(|state| {
                             crate::static_encode::apply_policy(
@@ -5004,15 +4990,22 @@ impl PingclairProxy {
                                 state,
                                 &ctx.request_id_value,
                                 ctx.request_scheme == "https",
-                                status,
+                                status_for(status),
                                 headers,
                             )
                         })
                     };
-                    let request = pingclair_static::FileRequest::new(
-                        &session.req_header().method,
-                        &session.req_header().headers,
-                    )
+                    let no_fields = http::HeaderMap::new();
+                    let request = match error_scope {
+                        Some(_) => pingclair_static::FileRequest::new(
+                            crate::error_routes::error_page_method(&session.req_header().method),
+                            &no_fields,
+                        ),
+                        None => pingclair_static::FileRequest::new(
+                            &session.req_header().method,
+                            &session.req_header().headers,
+                        ),
+                    }
                     .with_response_policy(&encode_policy);
                     let accept_encoding = session
                         .req_header()
@@ -5027,7 +5020,13 @@ impl PingclairProxy {
                     // 🔁 `ctx.orig_uri` is the request as it arrived, before
                     // any rewrite: the canonical redirect is decided against
                     // it and points back to it — see `serve_auto`.
-                    let original_path = ctx.orig_uri.path();
+                    //
+                    // 📄 An error page has no "as it arrived" path of its own:
+                    // it is wherever the error route rewrote to.
+                    let original_path = match error_scope {
+                        Some(_) => path,
+                        None => ctx.orig_uri.path(),
+                    };
                     match file_server
                         .serve_auto(path, original_path, request, accept_encoding)
                         .await
@@ -5104,9 +5103,12 @@ impl PingclairProxy {
                             // configured override such as a maintenance tree's 503.
                             // Hardcoding 200 would tell a range request it received
                             // the whole file.
-                            let mut header =
-                                Self::build_downstream_header(session, stream.status, Some(7))
-                                    .unwrap();
+                            let mut header = Self::build_downstream_header(
+                                session,
+                                status_for(stream.status),
+                                Some(7),
+                            )
+                            .unwrap();
                             header
                                 .insert_header("Content-Type", stream.content_type.clone())
                                 .unwrap();
@@ -5150,9 +5152,12 @@ impl PingclairProxy {
                             return Ok(true);
                         }
                         Ok(Some(pingclair_static::ServedResponse::Buffered(file))) => {
-                            let mut header =
-                                Self::build_downstream_header(session, file.status, Some(6))
-                                    .unwrap();
+                            let mut header = Self::build_downstream_header(
+                                session,
+                                status_for(file.status),
+                                Some(6),
+                            )
+                            .unwrap();
                             header
                                 .insert_header("Content-Type", file.content_type.clone())
                                 .unwrap();
@@ -9661,6 +9666,47 @@ fn go_layout_to_chrono(layout: &str) -> String {
         .replace("04", "%M")
         .replace("05", "%S")
         .replace('2', "%-d")
+}
+
+/// 📂 Builds the file server for the first `file_server` in a handler tree.
+///
+/// Off the request path: it runs once per route, and once per error route,
+/// when a configuration is loaded.
+pub(crate) fn build_file_server(
+    handler: &HandlerConfig,
+    site: &ServerConfig,
+) -> Option<Arc<pingclair_static::FileServer>> {
+    let Some(HandlerConfig::FileServer {
+        root,
+        index,
+        browse,
+        browse_limit,
+        compress,
+        precompressed,
+        hide,
+        status,
+        pass_thru: _,
+        canonical_uris,
+        etag_file_extensions,
+    }) = find_file_server_config(handler)
+    else {
+        return None;
+    };
+    Some(Arc::new(pingclair_static::FileServer::new(
+        pingclair_static::FileServerConfig::from_handler(
+            root,
+            index,
+            *browse,
+            *browse_limit,
+            *compress,
+            precompressed,
+            hide,
+            *status,
+            *canonical_uris,
+            etag_file_extensions,
+        )
+        .with_site_encode(site),
+    )))
 }
 
 /// Find the first `FileServer` config in a handler tree, recursing through

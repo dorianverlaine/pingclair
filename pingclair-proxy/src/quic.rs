@@ -2578,7 +2578,11 @@ enum H3Terminal {
     Templates {
         root: Option<String>,
     },
-    FileServer,
+    /// 📂 Serves a file; `error` names the error route and status when the
+    /// `file_server` sits inside `handle_errors`.
+    FileServer {
+        error: Option<crate::error_routes::ErrorScope>,
+    },
     ReverseProxy,
     /// 🧵 Streams a FastCGI exchange without coupling it to Pingora's HTTP session.
     FastCgi,
@@ -3325,12 +3329,11 @@ async fn plan_h3_handler_with_connector(
                     if !route.matches(*status) {
                         continue;
                     }
-                    let precompile = state.compiled_error_route(index);
-                    let handlers = HandlerConfig::Pipeline {
-                        handlers: route.handlers.clone(),
+                    let Some(prepared) = state.error_routes.get(index) else {
+                        continue;
                     };
                     let plan = plan_h3_handler_with_connector(
-                        &handlers,
+                        &prepared.pipeline,
                         state,
                         connector,
                         route_index,
@@ -3339,7 +3342,7 @@ async fn plan_h3_handler_with_connector(
                         response_policy,
                         verified_client_ip,
                         addresses,
-                        precompile,
+                        Some(&prepared.precompile),
                         true,
                         request_vars,
                         response_handlers,
@@ -3352,6 +3355,17 @@ async fn plan_h3_handler_with_connector(
                             body: body.clone(),
                             headers: BTreeMap::new(),
                         }),
+                        // 🚨 A `file_server` anywhere in the error route serves
+                        // that route's page, with the raised status — the
+                        // same choice the H1/H2 path makes from `error_scope`.
+                        H3Plan::Terminal(H3Terminal::FileServer { .. }) => {
+                            H3Plan::Terminal(H3Terminal::FileServer {
+                                error: Some(crate::error_routes::ErrorScope {
+                                    route: index,
+                                    status: *status,
+                                }),
+                            })
+                        }
                         completed => completed,
                     });
                 }
@@ -3403,7 +3417,9 @@ async fn plan_h3_handler_with_connector(
                 Ok(H3Plan::Continue)
             }
         }
-        HandlerConfig::FileServer { .. } => Ok(H3Plan::Terminal(H3Terminal::FileServer)),
+        HandlerConfig::FileServer { .. } => {
+            Ok(H3Plan::Terminal(H3Terminal::FileServer { error: None }))
+        }
         HandlerConfig::ReverseProxy(config) if config.fastcgi.is_some() => {
             Ok(H3Plan::Terminal(H3Terminal::FastCgi))
         }
@@ -4212,15 +4228,27 @@ async fn handle_request_inner(
             .await
         }
 
-        H3Terminal::FileServer => {
-            let maybe_fs = state.file_servers.get(route_index).and_then(|f| f.clone());
+        H3Terminal::FileServer { error } => {
+            // 🚨 Inside an error route the file server is that route's own,
+            // and the page goes out with the error's status, as on H1/H2.
+            let maybe_fs = match error {
+                Some(scope) => state
+                    .error_routes
+                    .get(scope.route)
+                    .and_then(|route| route.file_server.clone()),
+                None => state.file_servers.get(route_index).and_then(|f| f.clone()),
+            };
             let Some(fs) = maybe_fs else {
                 return Err((503, "File Server Unavailable"));
             };
+            let status_for = |own: u16| error.map_or(own, |scope| scope.status);
 
             // 🏷️ The method and header fields go over whole, exactly as on
             // H1/H2; pingclair-static reads `Range`, `If-Range`, and the four
-            // preconditions from them itself.
+            // preconditions from them itself. An error page is read plainly
+            // instead; see `error_page_method`. The encode policy sees the
+            // status that actually goes out, which for an error page is the
+            // error's.
             let encode_policy = |status, headers: &mut http::HeaderMap| {
                 http::HeaderValue::from_str(request_id).is_ok_and(|request_id| {
                     crate::static_encode::apply_policy(
@@ -4228,13 +4256,20 @@ async fn handle_request_inner(
                         &state,
                         &request_id,
                         true,
-                        status,
+                        status_for(status),
                         headers,
                     )
                 })
             };
-            let request = pingclair_static::FileRequest::new(&header.method, &header.headers)
-                .with_response_policy(&encode_policy);
+            let no_fields = http::HeaderMap::new();
+            let request = match error {
+                Some(_) => pingclair_static::FileRequest::new(
+                    crate::error_routes::error_page_method(&header.method),
+                    &no_fields,
+                ),
+                None => pingclair_static::FileRequest::new(&header.method, &header.headers),
+            }
+            .with_response_policy(&encode_policy);
             let accept_encoding = header
                 .headers
                 .get("accept-encoding")
@@ -4245,7 +4280,10 @@ async fn handle_request_inner(
             // the canonical redirect is decided against it and points back to
             // it, or a `try_files` that already produced the canonical form
             // would be redirected away from — see `serve_auto`.
-            let original_path = req.path.split('?').next().unwrap_or("/");
+            let original_path = match error {
+                Some(_) => effective_path,
+                None => req.path.split('?').next().unwrap_or("/"),
+            };
             match fs
                 .serve_auto(effective_path, original_path, request, accept_encoding)
                 .await
@@ -4374,7 +4412,7 @@ async fn handle_request_inner(
                     if let Some(etag) = &stream.etag {
                         hdrs.insert("etag", etag.clone());
                     }
-                    let stream_status = stream.status;
+                    let stream_status = status_for(stream.status);
                     send_h3_local_response(
                         resp_tx,
                         stream_id,
@@ -4428,7 +4466,7 @@ async fn handle_request_inner(
                         &verified_client_ip_text,
                         &request_vars,
                         response_handlers.as_deref(),
-                        file.status,
+                        status_for(file.status),
                         hdrs,
                         H3LocalBody::Bytes(file.content),
                         response_policy,

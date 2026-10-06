@@ -122,6 +122,9 @@ below, which ends with what to write instead.
   → [Run and validate accept configuration flags](#run-and-validate-accept-configuration-flags)
 - **Validation now rejects unusable TLS material.** Fix malformed or mismatched manual pairs before deployment.
   → [Validate loads manual TLS material](#validate-loads-manual-tls-material)
+- **`handle_errors` pages render.** An error route ending in `file_server`
+  serves its page with the error's status instead of the error text.
+  → [`handle_errors` serves its own pages](#-handle_errors-serves-its-own-pages)
 - **Routes are chosen in directive order**, not by the most specific path.
   A `redir`, `route` or `handle` catch-all can now answer requests that a more
   specific `respond` used to take.
@@ -509,7 +512,7 @@ schema, and an explicit adapter overrides the filename extension.
 keys through the same loader as startup, without starting listeners (#218).
 Upgrade note: replace malformed PEM files or mismatched keys before validation.
 
-### 🚨 `handle_errors` takes its own `root`
+### 🚨 `handle_errors` serves its own pages
 
 `root * /srv/errors` inside a `handle_errors` block was refused at load as a
 directive that "is not supported inside a route or handle block"; it is now
@@ -518,8 +521,18 @@ an error route without one serves from the site's `root`. As upstream, the
 `root` line may sit anywhere in the block, and a matcher-scoped
 `root @name …` is refused there for the same reason it is at site level.
 
-**Upgrade:** Nothing to change. A configuration that kept its error pages
-under the site root to work around the refusal keeps working.
+A `file_server` inside `handle_errors` now serves from that error route's
+own configuration (#208). It used to be looked up in the slot of the route
+that raised the error, so `rewrite * /{err.status_code}.html` followed by
+`file_server` never rendered: HTTP/1.1 and HTTP/2 sent the bare error text,
+and HTTP/3 answered `503 File Server Unavailable`. The page goes out with the
+raised status, as Caddy's does, and is read as a plain `GET`: the failed
+request's `Range` and validators belong to the resource that failed, so they
+can no longer turn an error into a `206` or a `304`.
+
+**Upgrade:** Nothing to change for a configuration that already worked. One
+whose error route ends in `file_server` now answers with the page it names
+instead of the error text, with the error's status rather than `200`.
 
 ### 🚫 Non-goals for 0.2.0
 
