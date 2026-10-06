@@ -209,6 +209,61 @@ pub(crate) fn explicit_http_names(
         .collect()
 }
 
+/// 🔌 Serves each specific address through the wildcard socket on its port,
+/// when there is one (#246).
+///
+/// Startup and every reload call this before deriving a single listener, so
+/// both derivations below see one address per port. The automatic HTTPS
+/// companion counts as a wildcard on the HTTP port: it is not in
+/// `config.servers`, but it is a socket, and a `127.0.0.1:80` site beside it
+/// would collide with it exactly as with a configured one.
+///
+/// Borrowed when nothing folds, which is every configuration without a shared
+/// port; this runs on the load path only.
+pub(crate) fn fold_shared_ports(
+    config: &pingclair_core::config::PingclairConfig,
+    automatic_http_available: bool,
+) -> Result<
+    std::borrow::Cow<'_, pingclair_core::config::PingclairConfig>,
+    pingclair_core::config::SharedPortConflict,
+> {
+    let http_port = config.global.http_port;
+    let https_port = config.global.https_port;
+    let explicit_http_names = explicit_http_names(config);
+    let companion_exists = automatic_http_available
+        && config.servers.iter().any(|server| {
+            automatic_http_companion(
+                server,
+                config.global.auto_https.clone(),
+                &server.listen_addresses(http_port, https_port),
+                &explicit_http_names,
+                http_port,
+                https_port,
+            )
+            .is_some()
+        });
+    let runtime_wildcards: Vec<String> = companion_exists
+        .then(|| format!("[::]:{http_port}"))
+        .into_iter()
+        .collect();
+
+    let fold = pingclair_core::config::SharedPortFold::plan(config, &runtime_wildcards)?;
+    if fold.folded().is_empty() {
+        return Ok(std::borrow::Cow::Borrowed(config));
+    }
+    for folded in fold.folded() {
+        tracing::info!(
+            specific = %folded.specific,
+            wildcard = %folded.wildcard,
+            "🔌 Serving a specific address through the wildcard listener on its port; \
+             its sites are still matched by Host"
+        );
+    }
+    let mut folded = config.clone();
+    fold.apply(&mut folded);
+    Ok(std::borrow::Cow::Owned(folded))
+}
+
 /// 🧭 Maps every server (and its automatic HTTP companion) to the concrete
 /// bind addresses it serves, exactly like the startup listener derivation.
 ///

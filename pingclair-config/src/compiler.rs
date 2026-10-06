@@ -1203,6 +1203,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
     validate_proxy_protocol_listeners(config)?;
     validate_listener_options(config)?;
     validate_plaintext_listeners(config)?;
+    crate::shared_ports::validate_shared_ports(config)?;
     validate_cache_ceiling_agrees(config)?;
     validate_log_channels_exist(config)?;
 
@@ -2615,7 +2616,7 @@ fn validate_listener_options(config: &PingclairConfig) -> CompileResult<()> {
 ///   socket and can only have one answer;
 /// - requiring the header with no `trusted_proxies`, which would reject every
 ///   connection because no peer can ever be authorised to send one.
-fn validate_proxy_protocol_listeners(config: &PingclairConfig) -> CompileResult<()> {
+pub(crate) fn validate_proxy_protocol_listeners(config: &PingclairConfig) -> CompileResult<()> {
     // 📌 Addresses are compared *normalized*: `:8443` and `[::]:8443` are one
     // socket, and a site that named no `listen` still listens on the derived
     // port. Comparing the raw strings made both answers "not the same listener",
@@ -2674,7 +2675,7 @@ fn validate_proxy_protocol_listeners(config: &PingclairConfig) -> CompileResult<
 ///
 /// A shared socket has one transport policy. Accepting disagreement here would
 /// make server order decide whether the same bytes are parsed as HTTP or TLS.
-fn validate_plaintext_listeners(config: &PingclairConfig) -> CompileResult<()> {
+pub(crate) fn validate_plaintext_listeners(config: &PingclairConfig) -> CompileResult<()> {
     let mut policies: HashMap<String, bool> = HashMap::new();
 
     for server in &config.servers {

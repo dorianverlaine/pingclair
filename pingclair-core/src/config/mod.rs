@@ -6,9 +6,11 @@
 mod ip_ranges;
 mod loader;
 pub mod secret;
+mod shared_ports;
 mod types;
 
 pub use ip_ranges::{InvalidIpRange, IpRanges};
 pub use loader::ConfigLoader;
 pub use secret::SecretString;
+pub use shared_ports::{FoldedListener, SharedPortConflict, SharedPortFold};
 pub use types::*;

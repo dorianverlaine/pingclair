@@ -45,6 +45,9 @@ below, which ends with what to write instead.
 - **HTTP/1.1 without Host now closes after its 400 response.**
   → [Short HTTP requests answer and close](#-short-http-requests-answer-and-close)
 
+- **A specific address and a wildcard on one port share one listener.** A
+  `bind`-restricted site beside a wildcard site on the same port is refused.
+  → [One port, one listener](#-a-specific-address-and-a-wildcard-on-one-port-share-one-listener)
 - **FastCGI HEAD and download limits apply on H1/H2.** Expect no HEAD body and
   budget download time according to configured rate limits.
   → [FastCGI body policy](#-fastcgi-bodies-honor-head-and-download-pacing)
@@ -261,6 +264,29 @@ HTTP/1.0 without Host receives an HTTP/1.0 200 response and closes.
 
 📌 Upgrade note: monitoring clients may omit Host only with HTTP/1.0. Send
 a Host field with HTTP/1.1 and open a fresh connection after a rejection.
+
+### 🔌 A specific address and a wildcard on one port share one listener
+
+`http://127.0.0.1:8080` and `http://example.test:8080` in one configuration
+used to become two sockets, `127.0.0.1:8080` and `[::]:8080`, each carrying
+only its own site. Linux binds only one of the two, so which site answered on
+`127.0.0.1:8080` depended on which socket the kernel took first; macOS kept
+both, and each answered only for its own site (#246). Now a specific address
+that shares its port with a wildcard is served through the wildcard socket at
+startup and on every reload, for TCP and HTTP/3 alike, and sites are still told
+apart by `Host`, as Caddy does. An IP-literal site that is alone on its port
+still binds only its own address. Each fold is logged when the configuration
+loads.
+
+📦 **Upgrade:** Configurations need no change unless the port now carries
+conflicting socket policy, which is refused at load: a site restricted by
+`bind` (or `default_bind`) beside a wildcard site on the same port, a plaintext
+site beside a TLS site, PROXY protocol on only one of them, or a
+`servers <address>` block for the folded address. Bind every site on that port
+to the same addresses, move one of them to another port, or address the
+`servers` block to the wildcard. A literal site that shares a port with a
+wildcard site is reachable on every interface by a client that sends its
+`Host`; give it a port of its own if it must stay on loopback.
 
 ### 🤐 FastCGI bodies honor HEAD and download pacing
 

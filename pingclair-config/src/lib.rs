@@ -28,6 +28,7 @@ pub mod adapter;
 pub mod compiler;
 pub mod parser;
 mod retired_placeholders;
+mod shared_ports;
 
 pub use parser::{
     Ast, CompileError as AnalyzeError, LexError, ParseError, ResolvedVariable, SemanticAnalyzer,

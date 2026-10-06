@@ -28,7 +28,7 @@
 //! `crate::fd_budget`, because neither is only a startup concern.
 
 use crate::certs::{eager_issuance_domains, h3_excluded_domains};
-use crate::listen::can_bind_automatic_http_port;
+use crate::listen::{can_bind_automatic_http_port, fold_shared_ports};
 use crate::runtime_listeners::{
     RuntimeListeners, RuntimePublisherInputs, prepare_listener_policies,
 };
@@ -180,6 +180,16 @@ pub(crate) fn run_server_with_adapter(
         != pingclair_core::config::AutoHttpsMode::Off
         && config.servers.iter().any(|server| server.tls.is_some())
         && can_bind_automatic_http_port(config.global.http_port);
+    // 🔌 One port, one socket: a specific address that shares its port with a
+    // wildcard is served through the wildcard from here on, so every listener
+    // below — TCP, TLS, PROXY protocol, and HTTP/3's UDP socket — is derived
+    // from one address per port (#246). The Admin API keeps the document the
+    // operator wrote, as it does after a reload.
+    let active_document = serde_json::to_value(&config)
+        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+    let config = fold_shared_ports(&config, automatic_http_available)
+        .map_err(|conflict| anyhow::anyhow!("🚫 {conflict}"))?
+        .into_owned();
     let prepared_listener_policies = prepare_listener_policies(&config, automatic_http_available)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let listener_security_by_address: HashMap<String, Arc<PublishedListenerPolicy>> =
@@ -320,10 +330,9 @@ pub(crate) fn run_server_with_adapter(
         .map(|admin| admin.listen.clone())
         .unwrap_or_else(|| "localhost:2019".to_string());
     let admin_listener_available = config.admin.as_ref().is_some_and(|admin| admin.enabled);
-    // 📦 Admin publishes this document with its access policy so a read keeps
-    // one complete generation even when a reload changes the running config.
-    let active_document = serde_json::to_value(config.clone())
-        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+    // 📦 Admin publishes the written document (captured before the shared
+    // port fold) with its access policy, so a read keeps one complete
+    // generation even when a reload changes the running config.
     let admin_policy = Arc::new(pingclair_api::AdminPolicy::new(
         admin_listen,
         config.admin.as_ref(),

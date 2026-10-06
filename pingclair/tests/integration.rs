@@ -15384,3 +15384,7 @@ mod retry_duration;
 // 🚨 A `handle_errors` route serves its own page with the error's status.
 #[path = "integration/error_routes.rs"]
 mod error_routes;
+
+// 🔌 An IP-literal site and a hostname site on one port share one socket.
+#[path = "integration/shared_port_sites.rs"]
+mod shared_port_sites;
