@@ -59,4 +59,15 @@ jobs:
       - name: Run the HTTP/3 functional matrix
         run: just h3
 
+      - name: Install the Go H3 client toolchain
+        if: ${{ !cancelled() }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # 🧰 v7.0.0
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: scripts/h3-go/go.sum
+
+      - name: Run the Go HTTP/3 behavioral matrix
+        if: ${{ !cancelled() }}
+        run: just h3-go-test
+
       - uses: ./.github/actions/check-clean-worktree
