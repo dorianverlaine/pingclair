@@ -319,7 +319,7 @@ impl FileServer {
         if self.config.status.is_none()
             && let Some(answer) = self
                 .evaluate_preconditions(&request, &file_path, file_size, &meta, accept_encoding)
-                .await
+                .await?
         {
             return Ok(Some(answer));
         }
@@ -388,6 +388,61 @@ impl FileServer {
             }
         }
 
+        // 🗜️ Prefer disk sidecars before cached live compression, matching Caddy.
+        // 🌊 A large sidecar holds encoded bytes on disk and can stream directly.
+        if !self.config.precompressed.is_empty()
+            && content_range.is_none()
+            && let Some((sidecar, sidecar_metadata, encoding)) =
+                self.try_precompressed(&file_path, accept_encoding).await
+        {
+            let sidecar_len = sidecar_metadata.len();
+            let sidecar_meta = self.file_meta(&sidecar, &sidecar_metadata)?;
+            let sidecar_etag = sidecar_meta.etags.for_sidecar(encoding);
+            tracing::debug!(
+                "✅ Using pre-compressed file: {} ({}, {} bytes)",
+                file_path.display(),
+                encoding,
+                sidecar_len
+            );
+            // 🌊 A sidecar's bytes on disk *are* the response body, so a large
+            // one never needed to be in memory. Reading it whole — which this
+            // used to do unconditionally — made a 500 MB `.br` a 500 MB
+            // allocation on the path that exists to avoid exactly that.
+            if sidecar_len > Self::STREAMING_THRESHOLD {
+                let window = super::stream::StreamWindow {
+                    start: 0,
+                    length: Some(sidecar_len),
+                    status,
+                    content_range: None,
+                    content_encoding: HeaderValue::from_str(encoding).ok(),
+                };
+                let mut stream =
+                    Self::open_stream_window(self, sidecar, &sidecar_metadata, window)?;
+                // 🏷️ MIME and modification time describe the resource; the tag identifies sidecar bytes.
+                stream.content_type = meta.content_type.clone();
+                stream.last_modified = meta.last_modified.clone();
+                stream.etag = Some(sidecar_etag.clone());
+                stream.path = file_path;
+                return Ok(Some(ServedResponse::Stream(stream)));
+            }
+            let Some(precompressed_content) = Self::read_precompressed(&sidecar) else {
+                return Ok(None);
+            };
+            let precompressed_len = precompressed_content.len() as u64;
+            return Ok(Some(ServedResponse::Buffered(ServedFile {
+                content: precompressed_content.into(),
+                content_type: meta.content_type.clone(),
+                content_length: HeaderValue::from(precompressed_len),
+                path: file_path,
+                status,
+                content_range,
+                last_modified: meta.last_modified.clone(),
+                etag: Some(sidecar_etag.clone()),
+                content_encoding: Some(encoding.to_string()),
+                vary_accept_encoding: self.config.varies_by_accept_encoding(),
+            })));
+        }
+
         // Cache-key ingredients. Only full-file (200, non-range) responses
         // with compression enabled are cacheable; the negotiated encoding and
         // the file mtime (so an edit invalidates the stale entry) form the key.
@@ -439,64 +494,6 @@ impl FileServer {
                     vary_accept_encoding: self.config.varies_by_accept_encoding(),
                 })));
             }
-        }
-
-        // Check for pre-compressed files first (much faster than on-the-fly
-        // compression). Only for complete (non-range) requests. This runs
-        // before the raw read because it doesn't need the uncompressed body
-        // — when a .br/.gz/.zst variant exists we skip buffering the full
-        // file entirely.
-        if !self.config.precompressed.is_empty()
-            && content_range.is_none()
-            && let Some((sidecar, sidecar_metadata, encoding)) =
-                self.try_precompressed(&file_path, accept_encoding).await
-        {
-            let sidecar_len = sidecar_metadata.len();
-            tracing::debug!(
-                "✅ Using pre-compressed file: {} ({}, {} bytes)",
-                file_path.display(),
-                encoding,
-                sidecar_len
-            );
-            // 🌊 A sidecar's bytes on disk *are* the response body, so a large
-            // one never needed to be in memory. Reading it whole — which this
-            // used to do unconditionally — made a 500 MB `.br` a 500 MB
-            // allocation on the path that exists to avoid exactly that.
-            if sidecar_len > Self::STREAMING_THRESHOLD {
-                let window = super::stream::StreamWindow {
-                    start: 0,
-                    length: Some(sidecar_len),
-                    status,
-                    content_range: None,
-                    content_encoding: HeaderValue::from_str(encoding).ok(),
-                };
-                let mut stream =
-                    Self::open_stream_window(self, sidecar, &sidecar_metadata, window)?;
-                // 🏷️ The content type and validators describe the *resource*,
-                // which is the uncompressed file the client asked for — not the
-                // sidecar, whose own MIME type would be `application/gzip`.
-                stream.content_type = meta.content_type.clone();
-                stream.last_modified = meta.last_modified.clone();
-                stream.etag = Some(meta.etags.for_coding(Some(encoding)).clone());
-                stream.path = file_path;
-                return Ok(Some(ServedResponse::Stream(stream)));
-            }
-            let Some(precompressed_content) = Self::read_precompressed(&sidecar) else {
-                return Ok(None);
-            };
-            let precompressed_len = precompressed_content.len() as u64;
-            return Ok(Some(ServedResponse::Buffered(ServedFile {
-                content: precompressed_content.into(),
-                content_type: meta.content_type.clone(),
-                content_length: HeaderValue::from(precompressed_len),
-                path: file_path,
-                status,
-                content_range,
-                last_modified: meta.last_modified.clone(),
-                etag: Some(meta.etags.for_coding(Some(encoding)).clone()),
-                content_encoding: Some(encoding.to_string()),
-                vary_accept_encoding: self.config.varies_by_accept_encoding(),
-            })));
         }
 
         // 🌊 Streaming branch: any large response that is not being compressed

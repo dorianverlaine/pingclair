@@ -79,11 +79,13 @@ async fn test_file_server_etag_differs_per_content_coding() {
     assert_eq!(identity.1, None);
     assert_eq!(gzip.1.as_deref(), Some("gzip"));
     assert!(!identity.0.starts_with("W/"), "the tag must stay strong");
-    assert_eq!(
-        gzip.0,
-        format!("{}-gzip-5\"", identity.0.trim_end_matches('"')),
-        "the gzip body gets its own strong tag"
+    // 🗜️ A disk sidecar carries its own tag, never the live encoder's `-gzip-<level>` one.
+    assert!(
+        !gzip.0.ends_with("-gzip-5\""),
+        "a sidecar must not claim the live encoder's tag: {}",
+        gzip.0
     );
+    assert_ne!(gzip.0, identity.0, "each representation needs its own tag");
 }
 
 /// 🕰️ Two same-size edits inside one second must not share a tag. With a

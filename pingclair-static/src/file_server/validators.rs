@@ -27,7 +27,8 @@ use http::HeaderValue;
 /// 🏷️ One strong entity tag per representation of a file.
 ///
 /// 🗜️ Encoded tags include coding and, for gzip, quality inside the quotes:
-/// `"1f-17a…"` becomes `"1f-17a…-gzip-5"`. Built once per file
+/// `"1f-17a…"` becomes `"1f-17a…-gzip-5"`; a precompressed sidecar's tags are
+/// derived from the sidecar's own metadata as `"…-sidecar-gzip"`. Built once per file
 /// identity; a request only picks one and clones it, which is a reference
 /// count increment.
 pub(super) struct EntityTags {
@@ -35,6 +36,9 @@ pub(super) struct EntityTags {
     br: HeaderValue,
     zstd: HeaderValue,
     gzip: HeaderValue,
+    sidecar_br: HeaderValue,
+    sidecar_zstd: HeaderValue,
+    sidecar_gzip: HeaderValue,
 }
 
 impl EntityTags {
@@ -62,6 +66,12 @@ impl EntityTags {
             br: Self::coded(&identity, "br"),
             zstd: Self::coded(&identity, "zstd"),
             gzip: Self::coded(&identity, &format!("gzip-{gzip_level}")),
+            // 🏷️ Disk sidecars and live encoders can produce different bytes from
+            // equal metadata. A sidecar's bytes do not depend on the configured
+            // gzip quality, so its tag carries no level.
+            sidecar_br: Self::coded(&identity, "sidecar-br"),
+            sidecar_zstd: Self::coded(&identity, "sidecar-zstd"),
+            sidecar_gzip: Self::coded(&identity, "sidecar-gzip"),
             identity: Self::header(identity),
         }
     }
@@ -94,6 +104,15 @@ impl EntityTags {
             Some("zstd") => &self.zstd,
             Some("gzip") => &self.gzip,
             Some(_) => &self.identity,
+        }
+    }
+    /// 🏷️ Selects a disk representation's tag, derived from its own metadata.
+    pub(super) fn for_sidecar(&self, coding: &str) -> &HeaderValue {
+        match coding {
+            "br" => &self.sidecar_br,
+            "zstd" => &self.sidecar_zstd,
+            "gzip" => &self.sidecar_gzip,
+            _ => &self.identity,
         }
     }
 }

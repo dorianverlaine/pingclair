@@ -131,19 +131,18 @@ impl FileServer {
         file_size: u64,
         meta: &FileMeta,
         accept_encoding: Option<&str>,
-    ) -> Option<ServedResponse> {
+    ) -> pingclair_core::error::Result<Option<ServedResponse>> {
         // 🕳️ The overwhelmingly common case: nothing to evaluate.
         if !request.has_preconditions() {
-            return None;
+            return Ok(None);
         }
-        let coding = if request.compares_entity_tags() {
-            self.selected_coding(request, file_path, file_size, meta, accept_encoding)
-                .await
+        let etag = if request.compares_entity_tags() {
+            self.selected_etag(request, file_path, file_size, meta, accept_encoding)
+                .await?
         } else {
-            None
+            meta.etags.for_coding(None).clone()
         };
-        let etag = meta.etags.for_coding(coding);
-        match evaluate(request, etag, meta.modified) {
+        Ok(match evaluate(request, &etag, meta.modified) {
             Precondition::Proceed => None,
             Precondition::NotModified => Some(ServedResponse::NotModified(NotModified {
                 etag: etag.clone(),
@@ -151,13 +150,11 @@ impl FileServer {
                 vary_accept_encoding: self.config.varies_by_accept_encoding(),
             })),
             Precondition::Failed => Some(ServedResponse::PreconditionFailed),
-        }
+        })
     }
 
-    /// 🗜️ The content coding of the body this request would receive, which
-    /// decides the tag its conditions are compared with: each coding has its
-    /// own strong tag, and a cache revalidating its gzip copy must be matched
-    /// against the gzip tag, not the identity one.
+    /// 🏷️ Conditions compare against the selected body's validator, including
+    /// disk sidecars whose metadata can change independently of the source.
     ///
     /// Mirrors the order `serve_auto` serves in: a range that will be honoured
     /// is always identity, then a precompressed sidecar, then on-the-fly
@@ -165,14 +162,14 @@ impl FileServer {
     /// makes again when the answer is 200. It only runs for a request that
     /// sent a tag condition, and the usual outcome there is a 304 that reads
     /// no body at all, so the extra `stat` buys skipping the whole read.
-    async fn selected_coding(
+    async fn selected_etag(
         &self,
         request: &FileRequest<'_>,
         file_path: &Path,
         file_size: u64,
         meta: &FileMeta,
         accept_encoding: Option<&str>,
-    ) -> Option<&'static str> {
+    ) -> pingclair_core::error::Result<HeaderValue> {
         if let Some(range) = request.range()
             && validators::if_range_holds(
                 request.if_range(),
@@ -186,19 +183,26 @@ impl FileServer {
                 RangeDecision::Satisfied { .. }
             )
         {
-            return None;
+            return Ok(meta.etags.for_coding(None).clone());
         }
         if !self.config.precompressed.is_empty()
-            && let Some((_, _, encoding)) = self.try_precompressed(file_path, accept_encoding).await
+            && let Some((sidecar, metadata, encoding)) =
+                self.try_precompressed(file_path, accept_encoding).await
         {
-            return Some(encoding);
+            return Ok(self
+                .file_meta(&sidecar, &metadata)?
+                .etags
+                .for_sidecar(encoding)
+                .clone());
         }
-        if self.would_compress(file_size, accept_encoding)
+        let coding = if self.would_compress(file_size, accept_encoding)
             && self.matches_file_encode(self.config.status.unwrap_or(200), meta, request)
         {
-            return self.negotiate_encoding(accept_encoding);
-        }
-        None
+            self.negotiate_encoding(accept_encoding)
+        } else {
+            None
+        };
+        Ok(meta.etags.for_coding(coding).clone())
     }
 }
 

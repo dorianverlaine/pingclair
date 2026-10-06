@@ -43,6 +43,8 @@ below, which ends with what to write instead.
 
 - **Static ranges stream when compression is enabled.**
   → [Static ranges stream when compression is enabled](#static-ranges-stream-when-compression-is-enabled)
+- **Precompressed sidecars have independent validators.**
+  → [Precompressed sidecars have independent validators](#precompressed-sidecars-have-independent-validators)
 
 - **A middle `*` no longer jumps ahead of an equal-length sibling.** Put the
   intended winner first when equal-length patterns overlap.
@@ -244,6 +246,12 @@ known defect that ships is under
 Large ranges on compressible static files now stream in bounded chunks while retaining identity encoding and the correct partial-response headers.
 
 **Upgrade:** No configuration change is needed; concurrent large range requests no longer allocate the complete range.
+
+### Precompressed sidecars have independent validators
+
+Precompressed files use their own size and modification time for ETags, with tags distinct from live compression. Sidecars take precedence over cached live-encoded bodies, and conditional requests use the selected sidecar tag.
+
+**Upgrade:** Sidecar ETags change once; clients revalidate their encoded copies. Replacing only a sidecar now invalidates that copy.
 
 ### 🚫 HTTP parser decisions follow Go
 

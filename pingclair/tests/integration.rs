@@ -15409,3 +15409,6 @@ mod shared_port_sites;
 
 #[path = "integration/static_range_streaming.rs"]
 mod static_range_streaming;
+
+#[path = "integration/static_sidecar_identity.rs"]
+mod static_sidecar_identity;
