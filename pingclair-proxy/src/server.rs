@@ -250,6 +250,10 @@ pub struct RequestContext {
     pub response_decision_error: Option<u16>,
     /// 🌊 Whether response interception fully wrote and framed the downstream body.
     pub response_takeover_complete: bool,
+    /// 🔌 Whether Pingora's upstream loop has started, so a failure from here on
+    /// ends with Pingora closing the client connection whatever
+    /// `fail_to_proxy` asks for.
+    pub upstream_attempted: bool,
     /// 🧭 The request URI before any rewrite, for `{http.request.orig_uri.*}`.
     pub orig_uri: http::Uri,
     /// 🚫 Whether the request is already inside an error route; a second
@@ -346,6 +350,7 @@ impl Default for RequestContext {
             intercepted_body_emitted: false,
             response_decision_error: None,
             response_takeover_complete: false,
+            upstream_attempted: false,
             orig_uri: http::Uri::default(),
             handling_error: false,
             error_scope: None,
@@ -7766,6 +7771,7 @@ impl ProxyHttp for PingclairProxy {
     where
         Self::CTX: Send + Sync,
     {
+        ctx.upstream_attempted = true;
         let route_index = if let Some(index) = ctx.route_index {
             index
         } else {
@@ -8822,6 +8828,17 @@ impl ProxyHttp for PingclairProxy {
         if matches!(e.esource(), ErrorSource::Downstream) {
             // 🔌 Broken request framing cannot be reused. Set this before
             // writing the error so its header advertises the closure too.
+            session.as_mut().set_keepalive(None);
+        } else if ctx.upstream_attempted {
+            // 🔌 A failure inside Pingora's upstream loop (no peer, refused
+            // connect, upstream timeout) reaches here from `process_request`,
+            // which closes the client connection with the upstream's reuse
+            // flag and ignores `can_reuse_downstream` below (pingora-proxy
+            // 0.9.0, `process_request` → `finish(session, ctx, server_reuse,
+            // ..)`). The 502 used to say `Connection: keep-alive` anyway, so a
+            // client that reused the socket had its next request reset.
+            // nginx keeps this connection open; that needs Pingora to honour
+            // the flag on this path, so the honest answer is to say `close`.
             session.as_mut().set_keepalive(None);
         }
 

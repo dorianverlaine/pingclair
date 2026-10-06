@@ -155,3 +155,39 @@ async fn test_forwarded_upstream_502_carries_no_proxy_status() {
     assert_eq!(reply.status(), 502);
     assert_eq!(reply.headers().get("proxy-status"), None);
 }
+
+/// 🔌 A 502 written after the upstream loop failed says the connection is
+/// closing, because Pingora closes it on this path whatever the hook asks.
+///
+/// Before the fix the response said `Connection: keep-alive`; a client that
+/// believed it and sent its next request on the same socket got a reset.
+/// That is what made `test_502_for_a_backend_marked_down_carries_proxy_status`
+/// fail on Linux CI with `Connection reset by peer`.
+#[tokio::test]
+async fn test_502_from_the_upstream_loop_announces_connection_close() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut server = TestServer::new_pingclairfile(&proxy_site(refused_address(), ""));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let mut stream = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read_to_end(&mut response),
+    )
+    .await;
+    let head = String::from_utf8_lossy(&response).to_ascii_lowercase();
+    let head = head.split("\r\n\r\n").next().unwrap_or_default().to_owned();
+    assert!(
+        read.is_ok() && head.starts_with("http/1.1 502") && head.contains("\r\nconnection: close"),
+        "closed in time: {}, head: {head}",
+        read.is_ok()
+    );
+}
