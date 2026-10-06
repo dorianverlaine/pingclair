@@ -35,10 +35,16 @@ fn proxy_site(upstream: SocketAddr, transport: &str) -> String {
     )
 }
 
-/// 🔌 An address nothing listens on: bound once for a free port, then closed.
+/// 🔌 An address nothing listens on.
+///
+/// Port 1 sits below every system's dynamic range, so no fixture in a
+/// parallel run is ever handed it. The first version bound an ephemeral port
+/// and closed it again, which left the number free: under a full run another
+/// fixture took it, the proxy reached a live server, and the 502 these tests
+/// expect never came. Holding a bound socket that never listens does not
+/// work either, because macOS drops the connect instead of refusing it.
 fn refused_address() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+    SocketAddr::from(([127, 0, 0, 1], 1))
 }
 
 /// ⌛ An origin that accepts connections and never answers them.
