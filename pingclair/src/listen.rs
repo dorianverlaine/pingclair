@@ -209,27 +209,30 @@ pub(crate) fn explicit_http_names(
         .collect()
 }
 
-/// 🔌 Serves each specific address through the wildcard socket on its port,
-/// when there is one (#246).
+/// 🔌 Puts every site on its `bind` host, then serves each specific address
+/// through the wildcard socket on its port, when there is one (#246).
 ///
 /// Startup and every reload call this before deriving a single listener, so
-/// both derivations below see one address per port. The automatic HTTPS
+/// both derivations below see the sockets that will exist, one address per
+/// port. 🛡️ The bind step matters for a JSON document, which never passed
+/// through the compiler that applies it to a Pingclairfile. The automatic HTTPS
 /// companion counts as a wildcard on the HTTP port: it is not in
 /// `config.servers`, but it is a socket, and a `127.0.0.1:80` site beside it
 /// would collide with it exactly as with a configured one.
 ///
 /// Borrowed when nothing folds, which is every configuration without a shared
 /// port; this runs on the load path only.
-pub(crate) fn fold_shared_ports(
+pub(crate) fn bind_and_fold_listeners(
     config: &pingclair_core::config::PingclairConfig,
     automatic_http_available: bool,
 ) -> Result<
     std::borrow::Cow<'_, pingclair_core::config::PingclairConfig>,
     pingclair_core::config::SharedPortConflict,
 > {
+    let config = pingclair_core::config::bind_listeners(config);
     let http_port = config.global.http_port;
     let https_port = config.global.https_port;
-    let explicit_http_names = explicit_http_names(config);
+    let explicit_http_names = explicit_http_names(&config);
     let companion_exists = automatic_http_available
         && config.servers.iter().any(|server| {
             automatic_http_companion(
@@ -247,9 +250,9 @@ pub(crate) fn fold_shared_ports(
         .into_iter()
         .collect();
 
-    let fold = pingclair_core::config::SharedPortFold::plan(config, &runtime_wildcards)?;
+    let fold = pingclair_core::config::SharedPortFold::plan(&config, &runtime_wildcards)?;
     if fold.folded().is_empty() {
-        return Ok(std::borrow::Cow::Borrowed(config));
+        return Ok(config);
     }
     for folded in fold.folded() {
         tracing::info!(
@@ -259,7 +262,7 @@ pub(crate) fn fold_shared_ports(
              its sites are still matched by Host"
         );
     }
-    let mut folded = config.clone();
+    let mut folded = config.into_owned();
     fold.apply(&mut folded);
     Ok(std::borrow::Cow::Owned(folded))
 }
@@ -279,25 +282,9 @@ pub(crate) fn servers_by_bind_address(
     let explicit_http_names = explicit_http_names(config);
     let mut by_port: HashMap<String, Vec<pingclair_core::config::ServerConfig>> = HashMap::new();
     for server in &config.servers {
-        let addrs: Vec<String> = if server.listen.is_empty() {
-            let host = server
-                .bind
-                .as_deref()
-                .filter(|host| !host.is_empty())
-                .unwrap_or("[::]");
-            let port = if server.tls.is_some() {
-                https_port
-            } else {
-                http_port
-            };
-            vec![format!("{host}:{port}")]
-        } else {
-            server
-                .listen
-                .iter()
-                .map(|addr| normalize_listen_addr(addr))
-                .collect()
-        };
+        // 📌 The one derivation `validate_config` also uses; a private copy
+        // here once pasted an IPv6 `bind` host without its brackets.
+        let addrs = server.listen_addresses(http_port, https_port);
         for addr in &addrs {
             by_port
                 .entry(addr.clone())

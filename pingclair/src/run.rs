@@ -28,7 +28,7 @@
 //! `crate::fd_budget`, because neither is only a startup concern.
 
 use crate::certs::{eager_issuance_domains, h3_excluded_domains};
-use crate::listen::{can_bind_automatic_http_port, fold_shared_ports};
+use crate::listen::{bind_and_fold_listeners, can_bind_automatic_http_port};
 use crate::runtime_listeners::{
     RuntimeListeners, RuntimePublisherInputs, prepare_listener_policies,
 };
@@ -181,14 +181,15 @@ pub(crate) fn run_server_with_adapter(
         != pingclair_core::config::AutoHttpsMode::Off
         && config.servers.iter().any(|server| server.tls.is_some())
         && can_bind_automatic_http_port(config.global.http_port);
-    // 🔌 One port, one socket: a specific address that shares its port with a
-    // wildcard is served through the wildcard from here on, so every listener
+    // 🔌 Every site sits on its `bind` host, and one port is one socket: a
+    // specific address that shares its port with a wildcard is served through
+    // the wildcard from here on, so every listener
     // below — TCP, TLS, PROXY protocol, and HTTP/3's UDP socket — is derived
     // from one address per port (#246). The Admin API keeps the document the
     // operator wrote, as it does after a reload.
     let active_document = serde_json::to_value(&config)
         .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
-    let config = fold_shared_ports(&config, automatic_http_available)
+    let config = bind_and_fold_listeners(&config, automatic_http_available)
         .map_err(|conflict| anyhow::anyhow!("🚫 {conflict}"))?
         .into_owned();
     let prepared_listener_policies = prepare_listener_policies(&config, automatic_http_available)

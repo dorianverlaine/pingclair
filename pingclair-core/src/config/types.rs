@@ -598,8 +598,9 @@ pub struct ServerConfig {
     pub names: Vec<String>,
 
     /// 📍 Optional interface to bind the site's listener to (`bind` directive).
-    /// When the site has no explicit `listen`, the runtime uses this as the
-    /// host for the automatically derived 443/80 address.
+    /// 🛡️ It replaces the host of every `listen` entry (see
+    /// [`ServerConfig::apply_bind`]), and when the site has no explicit
+    /// `listen` it is the host of the automatically derived 443/80 address.
     #[serde(default)]
     pub bind: Option<String>,
 
@@ -3171,11 +3172,13 @@ impl ServerConfig {
     /// configuration.
     pub fn listen_addresses(&self, http_port: u16, https_port: u16) -> Vec<String> {
         if self.listen.is_empty() {
+            // 🌐 Bracketed, so `bind ::1` derives `[::1]:443` rather than the
+            // portless IPv6 address `::1:443`.
             let host = self
                 .bind
                 .as_deref()
-                .filter(|host| !host.is_empty())
-                .unwrap_or("[::]");
+                .and_then(super::bind::bind_socket_host)
+                .unwrap_or_else(|| "[::]".to_string());
             let port = if self.tls.is_some() {
                 https_port
             } else {

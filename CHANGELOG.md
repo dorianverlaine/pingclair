@@ -74,6 +74,9 @@ below, which ends with what to write instead.
 - **A specific address and a wildcard on one port share one listener.** A
   `bind`-restricted site beside a wildcard site on the same port is refused.
   → [One port, one listener](#-a-specific-address-and-a-wildcard-on-one-port-share-one-listener)
+- **`bind` now applies to a site with an explicit address or port.** Such a
+  site listens only on its `bind` host; address a `servers` block to that host.
+  → [`bind` applies to every listener](#-bind-applies-to-every-listener-of-a-site)
 - **FastCGI HEAD and download limits apply on H1/H2.** Expect no HEAD body and
   budget download time according to configured rate limits.
   → [FastCGI body policy](#-fastcgi-bodies-honor-head-and-download-pacing)
@@ -348,6 +351,23 @@ to the same addresses, move one of them to another port, or address the
 `servers` block to the wildcard. A literal site that shares a port with a
 wildcard site is reachable on every interface by a client that sends its
 `Host`; give it a port of its own if it must stay on loopback.
+
+### 📍 `bind` applies to every listener of a site
+
+`bind` used to be read only for a site without an address of its own, so
+`http://example.test:8080 { bind 127.0.0.1 }` listened on `[::]:8080`, every
+interface, instead of the loopback address it named. `bind` now replaces the
+host of every listener the site declares, at load time, for TCP, TLS and
+HTTP/3 alike, and `adapt` shows the resulting addresses, as Caddy does. An
+IPv6 bind host is bracketed (`bind ::1` listens on `[::1]:443`, where it used
+to produce the unbindable `::1:443`).
+
+📦 **Upgrade:** A site with both an explicit port and `bind` is no longer
+reachable on other interfaces; that was the intent of writing `bind`. A
+`servers <address>` block meant for such a site must name the bound address
+(`servers 127.0.0.1:8080`), not the wildcard. A bound site beside a wildcard
+site on the same port is refused, as it already was for a site without an
+explicit port.
 
 ### 🤐 FastCGI bodies honor HEAD and download pacing
 

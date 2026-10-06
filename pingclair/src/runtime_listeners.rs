@@ -22,7 +22,7 @@ mod bootstrap;
 pub(crate) use bootstrap::BootstrapRuntime;
 
 use crate::listen::{
-    fold_shared_ports, normalize_listen_addr, server_requires_tls, servers_by_bind_address,
+    bind_and_fold_listeners, normalize_listen_addr, server_requires_tls, servers_by_bind_address,
 };
 use parking_lot::{Mutex, RwLock};
 use pingclair_api::{AdminPolicy, PreparedAdminPolicy};
@@ -420,7 +420,7 @@ impl ConfigPublisher for RuntimeListeners {
         // 🔌 The Admin document keeps the addresses the operator wrote; every
         // listener derivation from here on sees one address per port, exactly
         // as startup did (#246).
-        let folded = fold_shared_ports(config, self.automatic_http_available)
+        let folded = bind_and_fold_listeners(config, self.automatic_http_available)
             .map_err(|conflict| ConfigApplyError::invalid(conflict.to_string()))?;
         let config: &PingclairConfig = &folded;
         let next = prepare_listener_policies(config, self.automatic_http_available)?;

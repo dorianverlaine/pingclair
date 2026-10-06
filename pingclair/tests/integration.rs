@@ -15421,3 +15421,7 @@ mod cache_budget_reload;
 
 #[path = "integration/cache_age.rs"]
 mod cache_age;
+
+// 🛡️ `bind` restricts a site with an explicit address to its interface.
+#[path = "integration/site_bind.rs"]
+mod site_bind;

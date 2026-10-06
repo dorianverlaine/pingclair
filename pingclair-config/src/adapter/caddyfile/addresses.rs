@@ -452,4 +452,30 @@ mod address_semantics_tests {
             "bind names an interface, not a listener"
         );
     }
+
+    /// 🛡️ `bind` governs the interface of an explicit address too: the site
+    /// below is loopback-only, not reachable on every interface.
+    #[test]
+    fn bind_moves_an_explicit_address_onto_its_interface() {
+        let server = first_server("http://x.test:8080 {\n    bind 127.0.0.1\n}");
+        assert_eq!(
+            (server.listen, server.plaintext_listen),
+            (
+                vec!["127.0.0.1:8080".to_string()],
+                vec!["127.0.0.1:8080".to_string()]
+            )
+        );
+    }
+
+    /// 🌐 An IPv6 bind host is bracketed before the port is appended.
+    #[test]
+    fn an_ipv6_bind_host_is_bracketed() {
+        let explicit = first_server("http://x.test:8080 {\n    bind ::1\n}");
+        assert_eq!(explicit.listen, vec!["[::1]:8080".to_string()]);
+        let derived = first_server("x.test {\n    bind ::1\n    tls internal\n}");
+        assert_eq!(
+            derived.listen_addresses(80, 443),
+            vec!["[::1]:443".to_string()]
+        );
+    }
 }

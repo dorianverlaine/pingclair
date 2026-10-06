@@ -108,9 +108,10 @@ impl SharedPortFold {
                 let Some(wildcard) = covering_wildcard(&address, &wildcards) else {
                     continue;
                 };
-                // 🛡️ A derived address with no `listen` of its own came from
-                // `bind` (or `default_bind`); see the module comment.
-                if server.listen.is_empty() {
+                // 🛡️ Any address of a site with `bind` (or `default_bind`)
+                // was put there by the bind, explicit port or not; see the
+                // module comment.
+                if server.bind.as_deref().is_some_and(|bind| !bind.is_empty()) {
                     return Err(SharedPortConflict(format!(
                         "site {} is restricted to {address} by `bind`, but port {} also has the \
                          wildcard listener {wildcard}; one port is one socket, so the site would \

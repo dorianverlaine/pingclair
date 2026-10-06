@@ -47,6 +47,16 @@ mod tests {
         assert!(error.to_string().contains("[::]:8443"), "{error}");
     }
 
+    /// 🛡️ A `bind` with an explicit port is still a restriction: folding it
+    /// into the neighbouring wildcard would expose it on every interface.
+    #[test]
+    fn a_bound_explicit_address_beside_a_wildcard_is_refused() {
+        let source = "http://internal.test:8080 {\n    bind 127.0.0.1\n    respond \"internal\"\n}\n\
+                      http://public.test:8080 {\n    respond \"public\"\n}\n";
+        let error = crate::compile(source).expect_err("one socket cannot be both");
+        assert!(error.to_string().contains("`bind`"), "{error}");
+    }
+
     /// 🔌 #246: the hostname and literal sites validate together.
     #[test]
     fn a_literal_and_a_hostname_on_one_port_validate() {

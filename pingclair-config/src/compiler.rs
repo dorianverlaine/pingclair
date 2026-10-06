@@ -75,6 +75,10 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
         {
             server_config.bind = Some(first.clone());
         }
+        // 🛡️ `bind` names the interface for every listener of the site,
+        // explicit address or not. Applied here, before anything below reads
+        // the addresses, so `adapt` shows the sockets that will exist.
+        server_config.apply_bind();
         // 🧢 `servers { listener_wrappers { proxy_protocol } }` applies to every
         // listener of every server, so the flat list is built here — the same
         // place `default_bind` above is applied, and for the same reason: this
@@ -1205,10 +1209,14 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
         });
     }
 
-    validate_proxy_protocol_listeners(config)?;
-    validate_listener_options(config)?;
-    validate_plaintext_listeners(config)?;
-    crate::shared_ports::validate_shared_ports(config)?;
+    // 📍 The listener rules judge the sockets that will exist, which for a
+    // JSON document with `bind` are not yet the addresses it spells: two sites
+    // can only disagree about one socket once their `bind` has put them on it.
+    let bound = pingclair_core::config::bind_listeners(config);
+    validate_proxy_protocol_listeners(&bound)?;
+    validate_listener_options(&bound)?;
+    validate_plaintext_listeners(&bound)?;
+    crate::shared_ports::validate_shared_ports(&bound)?;
     validate_cache_ceiling_agrees(config)?;
     validate_log_channels_exist(config)?;
 
