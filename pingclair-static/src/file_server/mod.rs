@@ -39,6 +39,9 @@ mod budget;
 #[cfg(test)]
 mod budget_tests;
 mod cache;
+mod canonical;
+#[cfg(test)]
+mod canonical_tests;
 mod encode;
 mod listing;
 mod preconditions;

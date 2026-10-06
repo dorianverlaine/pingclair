@@ -4332,7 +4332,7 @@ async fn handle_request_inner(
                     // would be redirected away from — see `serve_auto`.
                     let original_path = match error {
                         Some(_) => effective_path,
-                        None => req.path.split('?').next().unwrap_or("/"),
+                        None => req.path.as_str(),
                     };
                     match fs
                         .serve_auto(effective_path, original_path, request, accept_encoding)

@@ -37,6 +37,7 @@ production deployment.
   overload queues.
 - **Static files and FastCGI** — Serve files with conditional and range
   requests, apply gzip or Zstandard compression, and run PHP through FastCGI.
+  Canonical file and directory redirects preserve queries and stay on the same origin.
 - **Fail-closed configuration** — Validate policy before publication and keep
   the last-known-good configuration when a reload cannot be applied safely.
 - **Operational visibility** — Export Prometheus metrics and structured access
