@@ -25,7 +25,10 @@ use pingora_proxy::{ProxyHttp, Session};
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::key::{CacheKey, HashBinary};
 
-use pingora_cache::eviction::{EvictionManager, simple_lru};
+use crate::cache_budget::CACHE_EVICTION;
+use pingora_cache::eviction::EvictionManager;
+#[cfg(test)]
+use pingora_cache::eviction::simple_lru;
 use pingora_cache::lock::{CacheKeyLockImpl, CacheLock};
 use pingora_cache::predictor::Predictor;
 use pingora_cache::{CacheMeta, MemCache, NoCacheReason, RespCacheable, filters};
@@ -5416,47 +5419,15 @@ impl PingclairProxy {
 
 // MARK: - Response cache
 
-/// 🗄️ The process-wide in-memory response store.
-///
-/// Pingora wants a `&'static` storage handle because a cached body outlives the
-/// request that admitted it. One store is leaked at first use rather than being
-/// rebuilt per reload, so a configuration change does not silently discard
-/// every entry the previous configuration had warmed.
-///
-/// ⚠️ Memory-only, and currently **unbounded**: there is no eviction and no
-/// size ceiling yet. A route that enables `cache` can therefore grow the
-/// process without limit, which is why caching is off unless asked for and
-/// why it is not yet documented as a feature.
-fn response_cache_storage() -> &'static MemCache {
-    static STORAGE: OnceLock<&'static MemCache> = OnceLock::new();
-    STORAGE.get_or_init(|| Box::leak(Box::new(MemCache::new())))
+/// 🗄️ The memory store survives reloads alongside its resizable eviction manager.
+pub(crate) fn response_cache_storage() -> &'static MemCache {
+    static STORAGE: OnceLock<MemCache> = OnceLock::new();
+    STORAGE.get_or_init(MemCache::new)
 }
 
-/// 📏 Bounds the shared cache, evicting least-recently-used entries once the
-/// stored bytes reach the configured ceiling.
-///
-/// The ceiling is fixed at first use, for the same reason the store is: the
-/// manager owns the accounting for entries admitted under earlier
-/// configurations, so rebuilding it on reload would either lose that accounting
-/// or throw away a warm cache. A reload that changes `max_size` therefore does
-/// not take effect until restart — stated plainly here because the alternative
-/// is an operator raising the limit and quietly not getting it.
-///
-/// ⚠️ Until this existed the store had no ceiling at all: a route with `cache`
-/// enabled grew the process until the box ran out of memory. That is why
-/// caching stayed undocumented.
-/// 📏 The one eviction manager, published so metrics and the purge endpoint can
-/// read the same accounting the request path writes.
-static CACHE_EVICTION: OnceLock<&'static simple_lru::Manager> = OnceLock::new();
-
-fn response_cache_eviction(limit_bytes: usize) -> &'static simple_lru::Manager {
-    CACHE_EVICTION.get_or_init(|| {
-        // 📊 Export the ceiling once, at the moment it becomes real. A limit
-        // that is only in a config file cannot be compared against the size
-        // gauge on the same dashboard.
-        metrics::CACHE_LIMIT_BYTES.set(limit_bytes as i64);
-        Box::leak(Box::new(simple_lru::Manager::new(limit_bytes)))
-    })
+/// 🧮 Applies the complete document's process-wide cache ceiling at publication.
+pub fn configure_response_cache(servers: &[ServerConfig]) {
+    crate::cache_budget::configure(servers);
 }
 
 /// 🔑 Where a route's consistent-hash key is read from.
@@ -5533,10 +5504,8 @@ fn affinity_cookie<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a s
 
 /// 🗄️ A read-only snapshot of the shared response store, for the admin API.
 ///
-/// `configured` is false before any route with caching has served a request:
-/// the store and its ceiling are built on first use, so until then there is
-/// genuinely nothing to report. Saying so beats reporting zeroes, which read
-/// like an empty cache rather than an absent one.
+/// 🧮 The complete configuration establishes the ceiling before traffic.
+/// A reload that removes caching leaves the retained manager at a zero limit.
 #[derive(Debug, serde::Serialize)]
 pub struct CacheStatus {
     pub configured: bool,
@@ -5550,9 +5519,9 @@ pub struct CacheStatus {
 pub fn cache_status() -> CacheStatus {
     match CACHE_EVICTION.get() {
         Some(eviction) => CacheStatus {
-            configured: true,
+            configured: eviction.weight_limit() > 0,
             size_bytes: eviction.total_size(),
-            limit_bytes: metrics::CACHE_LIMIT_BYTES.get().max(0) as usize,
+            limit_bytes: eviction.weight_limit(),
             entries: eviction.total_items(),
             evicted_bytes_total: eviction.evicted_size(),
         },
@@ -6259,9 +6228,12 @@ impl ProxyHttp for PingclairProxy {
         ctx.cache_scope = Some(cache_scope);
         ctx.cache_upstream = cache_upstream;
 
+        let Some(eviction) = CACHE_EVICTION.get() else {
+            return Ok(());
+        };
         session.cache.enable(
             response_cache_storage(),
-            Some(response_cache_eviction(cache_max_size_bytes)),
+            Some(eviction),
             Some(response_cache_predictor()),
             Some(response_cache_lock()),
             None,
@@ -6279,7 +6251,9 @@ impl ProxyHttp for PingclairProxy {
         //
         // ⚠️ Must come after `enable`: the setter panics while the cache is
         // still in the `Disabled` phase.
-        session.cache.set_max_file_size_bytes(cache_max_size_bytes);
+        session
+            .cache
+            .set_max_file_size_bytes(cache_max_size_bytes.min(eviction.weight_limit()));
         ctx.cache_size_tracked = true;
         Ok(())
     }

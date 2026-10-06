@@ -485,6 +485,7 @@ impl ConfigPublisher for RuntimeListeners {
         };
         drop(current);
 
+        pingclair_proxy::server::configure_response_cache(&config.servers);
         // 📦 Every reader keeps its published generation while the next is installed.
         if let (Some(table), Some(prepared)) = (&self.h3_cert_table, prepared_h3_certs) {
             table.publish_manual_update(prepared);

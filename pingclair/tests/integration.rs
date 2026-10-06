@@ -15415,3 +15415,6 @@ mod static_sidecar_identity;
 
 #[path = "integration/cache_streaming_routes.rs"]
 mod cache_streaming_routes;
+
+#[path = "integration/cache_budget_reload.rs"]
+mod cache_budget_reload;

@@ -49,6 +49,8 @@ below, which ends with what to write instead.
   → [Empty static bodies have a shared entry ceiling](#empty-static-bodies-have-a-shared-entry-ceiling)
 - **Immediate-flush routes bypass the response cache.**
   → [Immediate-flush routes bypass the response cache](#immediate-flush-routes-bypass-the-response-cache)
+- **Response cache budgets apply at load and reload.**
+  → [Response cache budgets apply at load and reload](#response-cache-budgets-apply-at-load-and-reload)
 
 - **A middle `*` no longer jumps ahead of an equal-length sibling.** Put the
   intended winner first when equal-length patterns overlap.
@@ -268,6 +270,12 @@ Static body caches share a 16,384-entry ceiling in addition to their existing by
 Routes with `flush_interval -1` bypass response-cache admission using state computed when configuration loads. The existing SSE content-type safeguard remains in effect.
 
 **Upgrade:** Remove reliance on cached responses from immediate-flush routes; use a separate ordinary route if caching is desired.
+
+### Response cache budgets apply at load and reload
+
+The process-wide response-cache ceiling is configured before traffic and resized on reload. Shrinking it evicts retained entries immediately; removing caching drains the store. The existing requirement that caching routes agree on `max_size` remains.
+
+**Upgrade:** Use the same `max_size` on every caching route. Reloads now apply a changed ceiling without a restart.
 
 ### 🚫 HTTP parser decisions follow Go
 

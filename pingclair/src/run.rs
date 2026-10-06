@@ -82,6 +82,7 @@ pub(crate) fn run_server_with_adapter(
     // Caddy. Deciding it here, once, is what lets request paths skip metric
     // work with a single atomic load instead of consulting the configuration.
     pingclair_proxy::metrics::configure(config.global.metrics);
+    pingclair_proxy::server::configure_response_cache(&config.servers);
 
     // 📡 OTLP push is parsed so a configuration written elsewhere still loads
     // and still says what it meant, but nothing here exports it. Refusing beats
