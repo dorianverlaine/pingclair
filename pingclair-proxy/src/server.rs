@@ -3909,15 +3909,9 @@ impl PingclairProxy {
                 .write_response_header(Box::new(response), false)
                 .await?;
             while let Ok(Some(chunk)) = stream.read_chunk() {
-                if session
-                    .write_response_body(Some(Bytes::from(chunk)), false)
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
+                Self::write_local_body(session, ctx, Bytes::from(chunk), false).await?;
             }
-            session.write_response_body(None, true).await?;
+            Self::write_local_body(session, ctx, Bytes::new(), true).await?;
             return Ok(true);
         }
 
@@ -3929,11 +3923,9 @@ impl PingclairProxy {
                 .write_response_header(Box::new(response), false)
                 .await?;
             if !replacement.body.is_empty() {
-                session
-                    .write_response_body(Some(Bytes::from(replacement.body)), false)
-                    .await?;
+                Self::write_local_body(session, ctx, Bytes::from(replacement.body), false).await?;
             }
-            session.write_response_body(None, true).await?;
+            Self::write_local_body(session, ctx, Bytes::new(), true).await?;
             return Ok(true);
         }
 
@@ -3960,7 +3952,7 @@ impl PingclairProxy {
             };
             match read {
                 Ok(Some(chunk)) => {
-                    if let Err(error) = session.write_response_body(Some(chunk), false).await {
+                    if let Err(error) = Self::write_local_body(session, ctx, chunk, false).await {
                         exchange.abort().await;
                         return Err(error);
                     }
@@ -3969,7 +3961,7 @@ impl PingclairProxy {
                     // 📤 End of stream releases whatever is still held.
                     if let Some(held) = response_buffer.as_mut().and_then(|buffer| buffer.finish())
                     {
-                        session.write_response_body(Some(held), false).await?;
+                        Self::write_local_body(session, ctx, held, false).await?;
                     }
                     break;
                 }
@@ -3980,7 +3972,7 @@ impl PingclairProxy {
                 }
             }
         }
-        session.write_response_body(None, true).await?;
+        Self::write_local_body(session, ctx, Bytes::new(), true).await?;
         let stderr = exchange.take_stderr();
         if !stderr.is_empty() {
             let text = String::from_utf8_lossy(&stderr);

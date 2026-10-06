@@ -33,6 +33,9 @@ Most configurations keep working unchanged. These are the changes most
 likely to alter what an existing configuration does; each links to its entry
 below, which ends with what to write instead.
 
+- **FastCGI HEAD and download limits apply on H1/H2.** Expect no HEAD body and
+  budget download time according to configured rate limits.
+  → [FastCGI body policy](#-fastcgi-bodies-honor-head-and-download-pacing)
 - **Oversized FastCGI parameters return 431.** Reduce the header or environment
   value so each encoded parameter fits in one FastCGI record.
   → [FastCGI parameter limits](#-oversized-fastcgi-parameters-return-431)
@@ -193,6 +196,17 @@ below, which ends with what to write instead.
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
 [Known defect — WebSocket upgrades under load](#-known-defect--websocket-upgrades-under-load).
+
+### 🤐 FastCGI bodies honor HEAD and download pacing
+
+H1/H2 FastCGI responses now use the local response-body policy, matching H3.
+HEAD responses keep their metadata without sending content, and download rate
+limits apply to streamed, buffered, intercepted-file, and replacement bodies.
+The same path also enforces whole-request deadlines and response byte accounting.
+
+📦 **Upgrade:** Configurations need no change. A configured
+`download_bytes_per_sec` now slows FastCGI responses too; allow enough time in
+client deadlines and whole-request timeouts for the configured download budget.
 
 ### 🧾 Oversized FastCGI parameters return 431
 

@@ -168,6 +168,10 @@ mod fastcgi_truncation;
 #[path = "integration/fastcgi_params.rs"]
 mod fastcgi_params;
 
+// 🤐 FastCGI bodies share the local content and pacing policy.
+#[path = "integration/fastcgi_policy.rs"]
+mod fastcgi_policy;
+
 // 🚫 What a locally raised error status says about itself.
 #[path = "integration/error_responses.rs"]
 mod error_responses;
