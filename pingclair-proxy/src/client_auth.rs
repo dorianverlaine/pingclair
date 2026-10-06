@@ -252,6 +252,13 @@ impl ClientAuthTable {
     /// — `*.example.com` answers for `a.example.com` and not `a.b.example.com`,
     /// matching how upstream matches an SNI.
     pub fn policy_for(&self, sni: &str) -> Option<&Arc<CompiledClientAuth>> {
+        // 🛡️ `secure.example.` and `secure.example` are one DNS name, and the
+        // certificate lookup and routing both treat them as one. This lookup
+        // did not: the HTTP/3 handshake passed the SNI through unchanged, so a
+        // client that added the trailing dot got the protected site's
+        // certificate, reached the protected site, and was never asked for a
+        // client certificate. Canonicalizing here covers both transports.
+        let sni = sni.strip_suffix('.').unwrap_or(sni);
         if !sni.is_empty() {
             // 🏷️ SNI is case-insensitive, and almost always already lowercase;
             // only the rare mixed-case name pays for a copy.
@@ -1195,5 +1202,29 @@ mod tests {
             !admits(&trust, &under_server, &stack_of(&server_pem)),
             "an intermediate restricted to serverAuth was allowed to issue a client identity"
         );
+    }
+
+    /// 🛡️ A trailing dot names the same host, so it must select the same
+    /// policy; without that, `secure.example.` skipped mutual TLS on HTTP/3.
+    #[test]
+    fn a_trailing_dot_selects_the_same_policy() {
+        let policy = Arc::new(
+            CompiledClientAuth::compile(&ClientAuthConfig {
+                mode: ClientAuthMode::Require,
+                ..Default::default()
+            })
+            .expect("compiles"),
+        );
+        let mut table = ClientAuthTable::default();
+        table.insert(&["secure.example", "*.wild.example"], policy);
+        for name in [
+            "secure.example",
+            "secure.example.",
+            "SECURE.EXAMPLE.",
+            "a.wild.example.",
+        ] {
+            assert!(table.policy_for(name).is_some(), "{name} lost its policy");
+        }
+        assert!(table.policy_for("secure.example..").is_none());
     }
 }
