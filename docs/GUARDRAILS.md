@@ -4,9 +4,11 @@
 > recorded here is a hole somebody already fell into, not theoretical advice —
 > every single rule has one real failure standing behind it.
 >
-> This file is only an index. The content is split by subsystem into four
+> This file is only an index. The content is split by subsystem into five
 > documents; read the one or two that touch what you are changing. Split on
 > 2026-08-05, moved across verbatim — not one rule was reworded or dropped.
+> `guardrails/logging.md` was added on 2026-10-06, when it turned out that the
+> measured cost of access logging lived only in commit bodies.
 
 | Document | Covers |
 | --- | --- |
@@ -14,6 +16,7 @@
 | [`guardrails/config.md`](guardrails/config.md) | **Which layer validation belongs in** (a rule that lives in the adapter is a rule the Admin API walks straight past), failing closed on settings that cannot be honoured, the secure defaults that are configuration rules (`#[serde(untagged)]` recursion, masking secrets), defects in the measuring tools themselves, and why "it compiled" is not "it compiled correctly" |
 | [`guardrails/tls.md`](guardrails/tls.md) | Dependencies and linking (one BoringSSL for the whole tree, what `[patch.crates-io]` does to the audit) and the trust-material secure defaults (certificates, downgrade switches, forwarded-header forgery) |
 | [`guardrails/proxy.md`](guardrails/proxy.md) | Why HTTP/3 is pinned to quiche/BoringSSL, the architecture and correctness rules for `quic.rs`, and streaming and memory |
+| [`guardrails/logging.md`](guardrails/logging.md) | Where the cost of a log record actually is (the formatter, not the sink), the invariants in the writer and the formatter that each stand behind a measured regression, the list of things that must never be done to the logging path, and how to measure a logging change so it cannot be mistaken for a win |
 
 - What to work on next → [GitHub issues](https://github.com/dorianverlaine/pingclair/issues)
 - Newly found problems that should not be fixed right now → an issue, using the
