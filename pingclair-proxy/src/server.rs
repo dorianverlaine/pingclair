@@ -4042,8 +4042,13 @@ impl PingclairProxy {
         // DATA would hold its `respond` route forever; the error maps to 408
         // like HTTP/1's. See `h2_body_pause`.
         let h2_pause = Self::h2_body_pause(session, ctx);
+        // 📥 This error came from reading the client, even when Pingora's
+        // chunk parser leaves its source unset. Handler and upstream
+        // failures must keep their own classification.
         while let Some(bytes) =
-            crate::body_timeout::read_within(h2_pause, session.read_request_body()).await?
+            crate::body_timeout::read_within(h2_pause, session.read_request_body())
+                .await
+                .map_err(pingora_core::Error::into_down)?
         {
             Self::enforce_request_body_chunk(session, ctx, bytes.len()).await?;
         }
@@ -8784,6 +8789,12 @@ impl ProxyHttp for PingclairProxy {
                 error_code: ctx.response_status,
                 can_reuse_downstream: true,
             };
+        }
+
+        if matches!(e.esource(), ErrorSource::Downstream) {
+            // 🔌 Broken request framing cannot be reused. Set this before
+            // writing the error so its header advertises the closure too.
+            session.as_mut().set_keepalive(None);
         }
 
         // 💥 Count upstream and internal failures as *attempts*, which is a

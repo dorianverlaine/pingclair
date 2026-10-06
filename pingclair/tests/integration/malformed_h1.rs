@@ -72,3 +72,21 @@ async fn test_raw_space_in_request_target_is_refused_and_closed() {
     assert_eq!((status, body), (200, b"ok".to_vec()));
     server.stop();
 }
+
+#[tokio::test]
+async fn test_malformed_chunked_body_is_a_client_error_and_closed() {
+    let mut server = TestServer::new_pingclairfile(site());
+    assert!(server.wait_until_ready().await, "server failed to start");
+    for body in [
+        b"zz\r\nhello\r\n0\r\n\r\n".as_slice(),
+        b"5\nhello\n0\n\n".as_slice(),
+    ] {
+        let mut request =
+            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        request.extend_from_slice(body);
+        let (status, head, body) = closed_exchange(&server, &request).await;
+        assert_eq!((status, body), (400, b"400 Bad Request".to_vec()), "{head}");
+        assert!(head.contains("\r\nconnection: close"), "{head}");
+    }
+    server.stop();
+}

@@ -33,6 +33,9 @@ Most configurations keep working unchanged. These are the changes most
 likely to alter what an existing configuration does; each links to its entry
 below, which ends with what to write instead.
 
+- **Malformed chunked request bodies now receive 400 and close instead of 500.**
+  → [Malformed chunked bodies are client errors](#-malformed-chunked-bodies-are-client-errors)
+
 - **Raw spaces and controls in HTTP/1 request targets now receive 400 and close.**
   → [Raw request targets reject whitespace](#-raw-request-targets-reject-whitespace)
 
@@ -209,6 +212,16 @@ below, which ends with what to write instead.
 The full list of breaking changes is under [Breaking](#️-breaking); the one
 known defect that ships is under
 [Known defect — WebSocket upgrades under load](#-known-defect--websocket-upgrades-under-load).
+
+### 🚫 Malformed chunked bodies are client errors
+
+Local body reads classify chunk-framing failures as downstream errors. The
+error response advertises closure and the connection cannot be reused.
+
+📌 Upgrade note: clients must fix the chunk size and CRLF framing, then open
+a new connection. Pingclair reads local-handler bodies to enforce streaming
+limits, so a framing failure is 400; Caddy may preserve a handler response
+when its handler does not read that body.
 
 ### 🚫 Raw request targets reject whitespace
 
