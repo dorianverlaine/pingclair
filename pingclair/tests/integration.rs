@@ -9507,6 +9507,76 @@ async fn test_early_hints_reach_the_client_before_the_final_response() {
     upstream_task.await.unwrap();
 }
 
+/// 💡 The same `103` must reach an HTTP/2 client before the final response.
+///
+/// `pingora-core 0.9.0`'s H2 downstream writer drops every informational
+/// response: `write_response_header` returns early with the comment that
+/// `send_response()` can only be called once, which predates `h2`'s
+/// `SendResponse::send_informational` — present in the `h2 0.4.19` this tree
+/// resolves. Ignored until the dependency forwards it; the H1 half passes
+/// above, and HTTP/3 skips interim responses by design (#116, #207).
+#[tokio::test]
+#[ignore = "pingora-core 0.9.0's H2 server ignores 1xx; h2 0.4.19 has send_informational"]
+async fn test_early_hints_reach_an_h2_client_before_the_final_response() {
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        stream
+            .write_all(
+                b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload; as=style\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+
+    let mut server = TestServer::new(&protocol_proxy_config(upstream_address));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let downstream = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    let (mut client, connection) = h2::client::handshake(downstream).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(format!("http://{}/hints", server.address(0)))
+        .body(())
+        .unwrap();
+    let (mut response, _) = client.send_request(request, true).unwrap();
+
+    // 💡 `h2` delivers interim responses beside the final one; asking for one
+    // is the only way a test can see whether this hop sent it.
+    let interim = tokio::time::timeout(
+        Duration::from_secs(2),
+        std::future::poll_fn(|cx| response.poll_informational(cx)),
+    )
+    .await
+    .expect("an informational response must arrive before the final one")
+    .expect("the informational stream ended without a response");
+    let interim = interim.expect("the informational response must be well formed");
+    assert_eq!(interim.status(), http::StatusCode::EARLY_HINTS);
+    assert_eq!(
+        interim.headers().get(http::header::LINK).unwrap(),
+        "</style.css>; rel=preload; as=style"
+    );
+
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    connection_task.abort();
+    let _ = connection_task.await;
+    upstream_task.await.unwrap();
+}
+
 #[tokio::test]
 async fn test_declared_request_trailers_fail_clearly_without_an_upstream_exchange() {
     use tokio::io::AsyncWriteExt;

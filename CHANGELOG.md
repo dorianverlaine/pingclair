@@ -2753,6 +2753,12 @@ reproduction; the workaround, where there is one, is in the issue.
   block answers from the store over HTTP/1.1 and HTTP/2, and reaches the origin
   over HTTP/3. The documentation's `cache` page states it, an in-process H3
   test pins it, and wiring the cache in is a 0.3 feature (#205, #297).
+- **An upstream `103 Early Hints` reaches only HTTP/1.1 clients**: the HTTP/2
+  path drops interim responses inside `pingora-core 0.9.0` (its H2 writer
+  returns early with a comment that predates `h2`'s
+  `SendResponse::send_informational`), and the HTTP/3 path skips them by design
+  (#116, #207). The H1 half is pinned by an integration test, and the H2 half
+  by an ignored one that is ready to enable when the dependency forwards it.
 - **HTTP/3 transport-parameter checks** fail 18 of 77 h3spec cases; the fix
   belongs in the QUIC library (#282).
 - **A wildcard site's manual certificate** is not served for the names it
