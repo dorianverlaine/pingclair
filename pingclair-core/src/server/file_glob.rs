@@ -35,9 +35,25 @@
 //! The root is literal: metacharacters in a configured `root` are not
 //! expanded. A `..` component is refused rather than followed. `**` does not
 //! descend through symbolic links, so a link pointing at an ancestor cannot
-//! turn one request into an endless walk. Expansion stops at `limit` results.
+//! turn one request into an endless walk. Expansion stops at `limit` results,
+//! and the walk that looks for them may examine at most
+//! [`MAX_VISITED_ENTRIES`] directory entries: a result limit alone does not
+//! bound the work, because a directory is read in full before the first match
+//! can stop anything.
 
 use std::path::{Path, PathBuf};
+
+/// 🛡️ Directory entries one expansion may examine while looking for matches.
+///
+/// 📌 The result limit stopped the caller from receiving more candidates, not
+/// the walk from doing more work: a directory holding a hundred thousand
+/// entries was read and sorted in full before the first match could stop
+/// anything, and `**` walked a whole tree for a pattern that matched nothing
+/// (#240). This budget follows the walk itself and stops it wherever the work
+/// happens. It is far above any plausible configuration, so reaching it means
+/// the pattern was pointed somewhere it should not have been — the same
+/// reading the result limit already has.
+const MAX_VISITED_ENTRIES: usize = 16 * 1024;
 
 /// 🔍 Expands `pattern`, a cleaned URI-style path, below `root`.
 ///
@@ -56,9 +72,40 @@ pub(super) fn expand(root: &Path, pattern: &str, limit: usize) -> Vec<PathBuf> {
     {
         return Vec::new();
     }
-    let mut found = Vec::new();
-    walk(root.to_path_buf(), &components, limit, &mut found);
-    found
+    let mut walk = Walk {
+        limit,
+        visited: 0,
+        budget: MAX_VISITED_ENTRIES,
+        found: Vec::new(),
+    };
+    walk_components(root.to_path_buf(), &components, &mut walk);
+    walk.found
+}
+
+/// 🚶 One expansion's state: what it has found, and what it may still spend.
+struct Walk {
+    /// 🎯 The result ceiling the caller asked for.
+    limit: usize,
+    /// 📂 Directory entries examined so far.
+    visited: usize,
+    /// 🛡️ How many may be examined in total.
+    budget: usize,
+    /// 🗂️ The matches, in walk order.
+    found: Vec<PathBuf>,
+}
+
+impl Walk {
+    /// 🎯 Whether the caller already has as many matches as it asked for.
+    fn full(&self) -> bool {
+        self.found.len() >= self.limit
+    }
+
+    /// 🛡️ Whether no more directory entries may be read. A name already
+    /// collected is still followed: this budget bounds the reading, and the
+    /// result limit bounds what following those names can produce.
+    fn spent(&self) -> bool {
+        self.visited >= self.budget
+    }
 }
 
 /// 🙈 One glob compiled to match a single path component by its bytes.
@@ -88,61 +135,69 @@ impl ComponentGlob {
     }
 }
 
-/// 🚶 Matches `rest` below `base`, depth first, appending hits to `found`.
-fn walk(base: PathBuf, rest: &[&str], limit: usize, found: &mut Vec<PathBuf>) {
-    if found.len() >= limit {
+/// 🚶 Matches `rest` below `base`, depth first, appending hits to the walk.
+fn walk_components(base: PathBuf, rest: &[&str], walk: &mut Walk) {
+    if walk.full() {
         return;
     }
     let Some((component, after)) = rest.split_first() else {
         // 📏 A literal tail was joined without asking the filesystem, so the
         // existence check happens once, here, for the whole path.
         if base.metadata().is_ok() {
-            found.push(base);
+            walk.found.push(base);
         }
         return;
     };
     if *component == "**" {
-        walk_recursive(base, after, limit, found);
+        walk_recursive(base, after, walk);
         return;
     }
     if !has_meta(component) {
         // 🍃 A literal component costs a join, not a directory read.
-        walk(base.join(component), after, limit, found);
+        walk_components(base.join(component), after, &mut *walk);
         return;
     }
     // 📌 `expand` refused a malformed component before the walk began.
     let Some(glob) = Glob::compile(component) else {
         return;
     };
-    for name in matching_entries(&base, &glob) {
-        walk(base.join(name), after, limit, found);
-        if found.len() >= limit {
+    for name in matching_entries(&base, &glob, walk) {
+        walk_components(base.join(name), after, &mut *walk);
+        if walk.full() {
             return;
         }
     }
 }
 
 /// 🌲 `**`: tries the rest of the pattern here, then in every subdirectory.
-fn walk_recursive(base: PathBuf, rest: &[&str], limit: usize, found: &mut Vec<PathBuf>) {
-    walk(base.clone(), rest, limit, found);
-    for name in sorted_entries(&base, |entry| {
-        // 🛡️ `DirEntry::file_type` does not follow symbolic links, so a link
-        // back to an ancestor is never descended into.
-        entry.file_type().is_ok_and(|kind| kind.is_dir())
-    }) {
-        if found.len() >= limit {
+fn walk_recursive(base: PathBuf, rest: &[&str], walk: &mut Walk) {
+    walk_components(base.clone(), rest, walk);
+    for name in sorted_entries(
+        &base,
+        |entry| {
+            // 🛡️ `DirEntry::file_type` does not follow symbolic links, so a link
+            // back to an ancestor is never descended into.
+            entry.file_type().is_ok_and(|kind| kind.is_dir())
+        },
+        walk,
+    ) {
+        if walk.full() {
             return;
         }
-        walk_recursive(base.join(name), rest, limit, found);
+        walk_recursive(base.join(name), rest, &mut *walk);
     }
 }
 
 /// 📂 The names in `dir` that match one pattern component, in byte order.
-fn matching_entries(dir: &Path, glob: &Glob) -> Vec<std::ffi::OsString> {
-    sorted_entries(dir, |entry| {
-        crate::percent::path_bytes(Path::new(&entry.file_name()))
-            .is_some_and(|name| glob.matches(name))
-    })
+fn matching_entries(dir: &Path, glob: &Glob, walk: &mut Walk) -> Vec<std::ffi::OsString> {
+    sorted_entries(
+        dir,
+        |entry| {
+            crate::percent::path_bytes(Path::new(&entry.file_name()))
+                .is_some_and(|name| glob.matches(name))
+        },
+        walk,
+    )
 }
 
 /// 📂 The entries of `dir` that `keep` accepts, sorted by name.
@@ -150,18 +205,28 @@ fn matching_entries(dir: &Path, glob: &Glob) -> Vec<std::ffi::OsString> {
 /// 📌 Sorted because `first_exist` takes the first match, and the order a
 /// directory happens to return its entries in is not something a
 /// configuration should depend on. The `glob` crate sorted the same way.
+///
+/// 🛡️ Reading stops at the walk's remaining budget, and the names collected
+/// before that are still sorted, so a directory too large to read in full
+/// answers in the order its first entries would have anyway (#240).
 fn sorted_entries(
     dir: &Path,
     keep: impl Fn(&std::fs::DirEntry) -> bool,
+    walk: &mut Walk,
 ) -> Vec<std::ffi::OsString> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut names: Vec<_> = entries
-        .flatten()
-        .filter(|entry| keep(entry))
-        .map(|entry| entry.file_name())
-        .collect();
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        if walk.spent() {
+            break;
+        }
+        walk.visited += 1;
+        if keep(&entry) {
+            names.push(entry.file_name());
+        }
+    }
     names.sort_unstable();
     names
 }
@@ -401,6 +466,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a[bc"), "").unwrap();
         assert!(expand(dir.path(), "/a[bc", 8).is_empty());
+    }
+
+    /// 🛡️ The walk stops at its visited budget, not only at the result limit.
+    ///
+    /// Before this budget existed, one `read_dir` was read and sorted in full
+    /// before the result limit could stop anything, and `**` walked whole
+    /// trees for patterns that matched nothing (#240). The budget is tiny here
+    /// so the test observes the stop without creating 16,384 files.
+    #[test]
+    fn the_walk_stops_at_its_visited_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..64 {
+            std::fs::write(dir.path().join(format!("f{index:02}.js")), "").unwrap();
+        }
+        let mut walk = Walk {
+            limit: 8,
+            visited: 0,
+            budget: 4,
+            found: Vec::new(),
+        };
+        walk_components(dir.path().to_path_buf(), &["*.js"], &mut walk);
+        assert_eq!(walk.visited, 4, "the walk must stop at its budget");
+        assert_eq!(
+            walk.found.len(),
+            4,
+            "every entry examined matched; the budget is what stopped it"
+        );
     }
 
     /// 🌲 `**` reaches nested matches in byte order, never climbs with `..`,

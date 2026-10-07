@@ -27,6 +27,17 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🛡️ A glob expansion is bounded by the entries it reads
+
+A `file` matcher's glob — `try_files /cache/*` — read and sorted a directory in
+full before its 1,024-result ceiling could stop anything, and `**` walked a
+whole tree for a pattern that matched nothing, so the work one request could
+ask for was bounded by the filesystem rather than by the configuration (#240).
+The walk now examines at most 16,384 directory entries per evaluation: far
+above any plausible configuration, and far below a directory that would make
+one request expensive. Names already collected are still followed, so a
+truncated read costs matches at the end of a directory, not the ones it found.
+
 ### 🧮 The static caches are sized from the machine
 
 The file server's caches had fixed ceilings — 64 MiB of compressed bodies,
