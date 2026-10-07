@@ -386,12 +386,30 @@ impl HttpModule for ResponseEncodingModule {
         stream_chunk(&mut self.encoder, body, end_of_stream).map_err(abandon)
     }
 
+    /// 🧹 Writes the coding's trailer when trailer fields end the body.
+    ///
+    /// An HTTP/2 origin may end its response with trailing HEADERS, announced
+    /// or not, and Pingora makes that task the end of the message instead of
+    /// sending `Done` — this filter is the last hook that runs before the
+    /// writer closes the body. Without it the client held compressed DATA with
+    /// no gzip trailer and could not decode a byte of it (#225).
+    ///
+    /// 🧾 Pingora writes the returned bytes as the final body chunk and drops
+    /// the trailer fields with it. A field that cannot share that chunk is the
+    /// price of a body the client can decode, and the alternative is a message
+    /// that no client can read at all. Responses without an installed encoder
+    /// return `None` and keep their trailers untouched.
+    fn response_trailer_filter(
+        &mut self,
+        _trailers: &mut Option<Box<http::HeaderMap>>,
+    ) -> pingora_core::Result<Option<Bytes>> {
+        self.finish()
+    }
+
     /// 🧹 Writes the coding's trailer for bodies that end with `Done` rather
     /// than with a chunk flagged as the last one.
     fn response_done_filter(&mut self) -> pingora_core::Result<Option<Bytes>> {
-        let mut tail = None;
-        stream_chunk(&mut self.encoder, &mut tail, true).map_err(abandon)?;
-        Ok(tail)
+        self.finish()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -400,6 +418,19 @@ impl HttpModule for ResponseEncodingModule {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+}
+
+impl ResponseEncodingModule {
+    /// 🏁 Finalizes the coding and returns its trailing bytes, if any.
+    ///
+    /// Both end-of-body tasks funnel through here: the coder is taken out of
+    /// the slot, so whichever task arrives first finalizes once and a later
+    /// one writes nothing.
+    fn finish(&mut self) -> pingora_core::Result<Option<Bytes>> {
+        let mut tail = None;
+        stream_chunk(&mut self.encoder, &mut tail, true).map_err(abandon)?;
+        Ok(tail)
     }
 }
 

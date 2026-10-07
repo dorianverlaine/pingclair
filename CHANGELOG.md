@@ -27,6 +27,17 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🗜️ A compressed response stays decodable when trailers end it
+
+An HTTP/2 origin can end a response with trailing HEADERS, announced or not,
+and Pingora writes that task as the end of the message instead of the `Done`
+task the response encoder used to wait for. The gzip or zstd trailer was never
+written, so the client held compressed bytes it could not decode and the whole
+response was lost (#225). The encoder now finalizes on the trailer task as
+well. Trailer fields cannot share the final body chunk through this
+dependency's hook, so a compressed response drops them: the body decodes,
+while the same response without `encode` keeps its trailers.
+
 ### 🧵 `php_fastcgi` measures a body that did not declare its length
 
 A request to a `php_fastcgi` route was answered `411 Length Required` whenever
@@ -2606,8 +2617,6 @@ Found before the release and deliberately left for the next version, because
 none of them widens what a configuration exposes. Each has an open issue with a
 reproduction; the workaround, where there is one, is in the issue.
 
-- **Proxy compression may end a gzip body early** when an HTTP/2 upstream sends
-  trailers it did not announce (#225).
 - **After an upgrade, a client that half-closes ends the tunnel**, and bytes the
   backend still had to send are lost (#274). The dependency's upgrade loop
   ends the whole exchange when the request side finishes, and it offers an
