@@ -1669,6 +1669,25 @@ pub(crate) fn connection_named_fields(headers: &HeaderMap) -> Vec<Box<str>> {
         .collect()
 }
 
+/// 🛡️ Whether a field name carries an underscore.
+///
+/// Such a name aliases its hyphenated form in every CGI/FastCGI environment —
+/// `x_probe` and `x-probe` both become `HTTP_X_PROBE` — so a client could
+/// inject the identity headers `forward_auth copy_headers` is supposed to own.
+/// The policy is one drop, before anything routes, on every transport (#269).
+pub(crate) fn underscore_named(name: &[u8]) -> bool {
+    name.contains(&b'_')
+}
+
+/// 🛡️ The names in `headers` that [`underscore_named`] refuses.
+pub(crate) fn underscore_named_fields(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .keys()
+        .filter(|name| underscore_named(name.as_str().as_bytes()))
+        .map(|name| name.as_str().to_string())
+        .collect()
+}
+
 /// ✂️ The value with its leading and trailing SP/HTAB removed.
 ///
 /// RFC 9110 §5.5 makes that whitespace `OWS`: allowed around a field value and
@@ -3254,6 +3273,28 @@ mod outbound_filter_tests {
                 "{raw:?} must trim to {expected:?}"
             );
         }
+    }
+
+    /// 🛡️ The underscore rule is one rule: the names the H1/H2 filter drops
+    /// are the names the H3 parser drops (#269).
+    #[test]
+    fn underscore_named_fields_are_the_ones_the_filter_drops() {
+        for (name, dropped) in [
+            ("x_probe", true),
+            ("X_Probe", true),
+            ("_leading", true),
+            ("x-probe", false),
+            ("xprobe", false),
+        ] {
+            assert_eq!(underscore_named(name.as_bytes()), dropped, "{name}");
+        }
+
+        let headers = client_headers(&[
+            ("x_probe", "present"),
+            ("x-probe", "present"),
+            ("content-type", "text/plain"),
+        ]);
+        assert_eq!(underscore_named_fields(&headers), vec!["x_probe"]);
     }
 
     /// 🔗 A field named by `Connection` is dropped, whatever it is called.

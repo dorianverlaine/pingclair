@@ -6687,13 +6687,17 @@ impl ProxyHttp for PingclairProxy {
         // identity headers `forward_auth copy_headers` is supposed to own.
         // Drop underscore-named headers before anything routes on them,
         // matching Caddy's default.
-        let underscore_headers: Vec<String> = session
-            .req_header()
-            .headers
-            .keys()
-            .filter(|name| name.as_str().contains('_'))
-            .map(|name| name.as_str().to_string())
-            .collect();
+        let underscore_headers =
+            crate::http_policy::underscore_named_fields(&session.req_header().headers);
+        if !underscore_headers.is_empty() {
+            // 👁️ The drop used to be invisible at every log level, which is
+            // what made "the field is simply gone" a support-ticket mystery
+            // (#269).
+            tracing::debug!(
+                fields = ?underscore_headers,
+                "🚫 Dropped underscore-named request fields before routing"
+            );
+        }
         for name in underscore_headers {
             session.req_header_mut().remove_header(name.as_str());
         }

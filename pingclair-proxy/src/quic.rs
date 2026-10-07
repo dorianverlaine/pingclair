@@ -730,6 +730,18 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
             b"te" if !h.value().trim_ascii().eq_ignore_ascii_case(b"trailers") => return None,
             _ => {}
         }
+        // 🛡️ An underscore aliases the hyphenated spelling in every CGI
+        // environment (`x_probe` and `x-probe` both become `HTTP_X_PROBE`),
+        // which is the injection the H1/H2 filter refuses before routing.
+        // Same policy, applied at the same point, or one configuration routes
+        // two ways (#269).
+        if crate::http_policy::underscore_named(name) {
+            tracing::debug!(
+                field = %String::from_utf8_lossy(name),
+                "🚫 Dropped an underscore-named request field"
+            );
+            continue;
+        }
         headers.push((
             String::from_utf8_lossy(name).into_owned(),
             String::from_utf8_lossy(h.value()).into_owned(),
@@ -7469,6 +7481,27 @@ mod tests {
         assert_eq!(
             req.headers,
             vec![("content-type".to_string(), "text/plain".to_string())]
+        );
+    }
+
+    /// 🛡️ An underscore-named field is dropped before routing, exactly like
+    /// the H1/H2 filter drops it; the hyphenated spelling beside it survives,
+    /// which is what makes the two transports agree (#269).
+    #[test]
+    fn parse_h3_request_drops_underscore_named_fields() {
+        let list = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"example.com"),
+            quiche::h3::Header::new(b":path", b"/"),
+            quiche::h3::Header::new(b"x_probe", b"present"),
+            quiche::h3::Header::new(b"x-probe", b"present"),
+        ];
+        let req = parse_h3_request(&list).unwrap();
+        assert_eq!(
+            req.headers,
+            vec![("x-probe".to_string(), "present".to_string())],
+            "the underscore spelling is dropped, the hyphenated one kept"
         );
     }
 
