@@ -5,6 +5,7 @@
 //!
 //! Provides metrics collection for requests, errors, and latency.
 
+use parking_lot::Mutex;
 use prometheus::{
     Encoder, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
     TextEncoder,
@@ -578,6 +579,39 @@ pub static UPSTREAM_HEALTHY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("metric can be created")
 });
 
+/// 🩺 The upstream labels this gauge has published, so a reload can retire the
+/// series of an upstream the configuration no longer contains.
+///
+/// The Prometheus client keeps every child series it has ever created, so
+/// without this registry there is no way to enumerate what to remove — and a
+/// removed upstream kept reporting `1` forever (#251).
+static UPSTREAM_HEALTH_LABELS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// 🩺 Publishes one upstream's health, remembering the label for retirement.
+pub fn set_upstream_healthy(upstream: &str, healthy: bool) {
+    UPSTREAM_HEALTH_LABELS.lock().insert(upstream.to_string());
+    UPSTREAM_HEALTHY
+        .with_label_values(&[upstream])
+        .set(if healthy { 1 } else { 0 });
+}
+
+/// 🧹 Removes the health series of every upstream absent from `keep`.
+///
+/// Called after a configuration publication with the addresses the new
+/// generation can actually dial. A label that stays would name a backend this
+/// process no longer speaks to, and report its last value as current.
+pub fn retain_upstream_health(keep: &HashSet<String>) {
+    let mut labels = UPSTREAM_HEALTH_LABELS.lock();
+    labels.retain(|label| {
+        if keep.contains(label) {
+            return true;
+        }
+        let _ = UPSTREAM_HEALTHY.remove_label_values(&[label]);
+        false
+    });
+}
+
 // MARK: - Initialization
 
 /// 📊 Applies the configuration's `metrics` switch, at startup and on reload.
@@ -830,6 +864,33 @@ mod host_label_tests {
 #[cfg(test)]
 mod cardinality_tests {
     use super::*;
+
+    /// 🧹 A label the keep-set no longer names leaves the exposition, and the
+    /// one it does name stays.
+    #[test]
+    fn retain_upstream_health_drops_retired_labels() {
+        use prometheus::core::Collector;
+
+        set_upstream_healthy("127.0.0.1:18001", true);
+        set_upstream_healthy("127.0.0.1:18002", true);
+        retain_upstream_health(&HashSet::from(["127.0.0.1:18001".to_string()]));
+
+        let families = UPSTREAM_HEALTHY.collect();
+        let labels: Vec<String> = families
+            .iter()
+            .flat_map(|family| family.get_metric().iter())
+            .flat_map(|metric| metric.get_label().iter())
+            .map(|label| label.value().to_string())
+            .collect();
+        assert!(
+            labels.iter().any(|label| label == "127.0.0.1:18001"),
+            "the surviving label stays: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == "127.0.0.1:18002"),
+            "the retired label leaves: {labels:?}"
+        );
+    }
 
     /// 🛡️ **The property that makes a client-controlled label safe.**
     ///

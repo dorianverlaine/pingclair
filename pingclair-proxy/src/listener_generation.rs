@@ -53,7 +53,11 @@ impl RouteTable {
     }
 
     /// 🏠 Iterates every site on the listener, the catch-all included.
-    pub(crate) fn states(&self) -> impl Iterator<Item = &Arc<ProxyState>> {
+    ///
+    /// Public because the reload path reads each site's load balancers to
+    /// retire `/metrics` health series the new generation no longer contains
+    /// (#251).
+    pub fn states(&self) -> impl Iterator<Item = &Arc<ProxyState>> {
         self.hosts.values().chain(self.default.iter())
     }
 }

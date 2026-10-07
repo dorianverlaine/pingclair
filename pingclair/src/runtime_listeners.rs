@@ -462,6 +462,7 @@ impl ConfigPublisher for RuntimeListeners {
             Vec::new()
         };
 
+        let mut live_upstreams: HashSet<String> = HashSet::new();
         let targets = {
             let proxies = self.port_proxies.read();
             let mut targets = Vec::with_capacity(next.len());
@@ -482,6 +483,20 @@ impl ConfigPublisher for RuntimeListeners {
                 // published, so the slow part of a reload runs while traffic
                 // keeps using the current generation.
                 let routes = Arc::new(proxy.prepare_routes(policy.servers.clone()));
+                // 🩺 The addresses the new generation can actually dial. A
+                // resolved hostname's metric label is its address, not the
+                // name the operator wrote, so this has to come from the built
+                // pools — the config alone cannot answer it (#251).
+                for state in routes.states() {
+                    for load_balancer in state.load_balancers.iter().flatten() {
+                        live_upstreams.extend(
+                            load_balancer
+                                .backend_addresses()
+                                .iter()
+                                .map(ToString::to_string),
+                        );
+                    }
+                }
                 targets.push((address.clone(), Arc::clone(&policy.client_auth), routes));
             }
             targets
@@ -525,6 +540,10 @@ impl ConfigPublisher for RuntimeListeners {
                 .iter()
                 .flat_map(|server| server.names.iter().map(String::as_str)),
         );
+        // 🧹 Retire the health series of every upstream this generation no
+        // longer contains; the client keeps old children forever otherwise
+        // (#251).
+        pingclair_proxy::metrics::retain_upstream_health(&live_upstreams);
         pingclair_proxy::metrics::CONFIG_VERSION.inc();
         *self.current.write() = ActiveRuntimeConfig {
             config: config.clone(),

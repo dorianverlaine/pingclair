@@ -19,6 +19,9 @@ mod admin_etag;
 #[path = "integration/admin_reload.rs"]
 mod admin_reload;
 
+#[path = "integration/metrics_reload.rs"]
+mod metrics_reload;
+
 #[path = "integration/admin_compat.rs"]
 mod admin_compat;
 #[path = "integration/encode.rs"]

@@ -321,9 +321,7 @@ impl LeastConnTracker {
                     continue;
                 };
                 let healthy = addr.is_none_or(|inet| self.health.is_up(&inet));
-                crate::metrics::UPSTREAM_HEALTHY
-                    .with_label_values(&[&backend.addr.to_string()])
-                    .set(if healthy { 1 } else { 0 });
+                crate::metrics::set_upstream_healthy(&backend.addr.to_string(), healthy);
             }
         }
 
