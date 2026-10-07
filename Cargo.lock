@@ -2623,7 +2623,9 @@ dependencies = [
 name = "pingclair-l4"
 version = "0.0.0"
 dependencies = [
+ "pingclair-core",
  "proptest",
+ "rustls",
  "tokio",
 ]
 
