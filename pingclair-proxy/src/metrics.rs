@@ -7,8 +7,7 @@
 
 use parking_lot::Mutex;
 use prometheus::{
-    Encoder, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder,
+    Encoder, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -343,17 +342,10 @@ pub static CACHE_EVICTED_BYTES_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
 
 /// 🪵 Access-log lines dropped because the writer could not keep up.
 ///
-/// The only signal that a gap exists. A bounded queue turns "the disk is slow"
-/// into "some lines are missing" rather than "the proxy stopped"; this counter
-/// is what stops the second outcome from being silent. Any non-zero value means
-/// the log is incomplete for that period — alert on the rate, not the total.
-pub static ACCESS_LOG_DROPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
-    IntCounter::new(
-        "pingclair_access_log_dropped_total",
-        "Access log lines dropped because the writer queue was full",
-    )
-    .expect("metric can be created")
-});
+/// 📌 Defined by [`pingclair_runtime::access_log`], which owns the writers,
+/// and registered here so the series stays on one `/metrics` endpoint whatever
+/// transport produced the record.
+pub use pingclair_runtime::access_log::ACCESS_LOG_DROPPED_TOTAL;
 
 /// ⏱️ Time spent waiting on the upstream, separately from total request time.
 ///

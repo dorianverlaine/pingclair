@@ -114,7 +114,7 @@ pub(crate) fn run_server_with_adapter(
     // reference to one. Registration is idempotent, so a reload that keeps a
     // channel keeps its writer thread and its queue rather than spawning a
     // second writer onto the same file.
-    pingclair_proxy::access_log::register_channels(&config.logging.channels);
+    pingclair_runtime::access_log::register_channels(&config.logging.channels);
 
     // 🔢 The startup configuration is version 1. The number itself is
     // meaningless; two instances behind one balancer reporting *different*

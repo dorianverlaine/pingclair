@@ -1,0 +1,27 @@
+[package]
+name = "pingclair-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Runtime services every transport shares: access logging and log redaction"
+
+[dependencies]
+pingclair-core = { path = "../pingclair-core" }
+chrono = "0.4"
+crossbeam-queue = "0.3"
+flate2 = "1.0"
+http.workspace = true
+pingora-core.workspace = true
+prometheus.workspace = true
+tracing.workspace = true
+zstd = "0.13"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

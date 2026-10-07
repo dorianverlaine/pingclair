@@ -16,6 +16,7 @@ path = "src/main.rs"
 pingclair-core = { path = "../pingclair-core" }
 pingclair-config = { path = "../pingclair-config" }
 pingclair-proxy = { path = "../pingclair-proxy" }
+pingclair-runtime = { path = "../pingclair-runtime" }
 pingclair-static = { path = "../pingclair-static" }
 pingclair-tls = { path = "../pingclair-tls" }
 pingclair-api = { path = "../pingclair-api" }

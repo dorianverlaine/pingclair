@@ -679,7 +679,7 @@ pub struct ProxyState {
     /// unconditionally. They are one list now because the question a request
     /// asks is not "which kind of logger is this" but "does this host belong
     /// here", and that is answered once, at configuration time.
-    log_targets: crate::access_log::LogTargets,
+    log_targets: pingclair_runtime::access_log::LogTargets,
     /// 🔐 The built-in `Strict-Transport-Security` value, rendered once.
     pub(crate) strict_transport: crate::http_policy::StrictTransport,
 }
@@ -687,7 +687,7 @@ pub struct ProxyState {
 impl ProxyState {
     /// 🪵 The access-log destinations this server can reach, for the HTTP/3
     /// path, which builds its record outside this module.
-    pub(crate) fn log_targets(&self) -> &crate::access_log::LogTargets {
+    pub(crate) fn log_targets(&self) -> &pingclair_runtime::access_log::LogTargets {
         &self.log_targets
     }
 
@@ -1444,14 +1444,14 @@ impl ProxyState {
         // channel subscribing to the site's log source with
         // `include http.log.access.<name>`. Only the first used to resolve, so
         // the second passed validation and then received nothing.
-        let mut log_channels: Vec<Arc<crate::access_log::AccessLogger>> = Vec::new();
+        let mut log_channels: Vec<Arc<pingclair_runtime::access_log::AccessLogger>> = Vec::new();
         for name in &config.log_channels {
-            if let Some(logger) = crate::access_log::channel_logger(name) {
+            if let Some(logger) = pingclair_runtime::access_log::channel_logger(name) {
                 log_channels.push(logger);
             }
-            for subscriber in
-                crate::access_log::channels_admitting(&format!("http.log.access.{name}"))
-            {
+            for subscriber in pingclair_runtime::access_log::channels_admitting(&format!(
+                "http.log.access.{name}"
+            )) {
                 // 🚫 A channel named directly and subscribing by namespace is
                 // still one destination; two entries would double every line.
                 if !log_channels
@@ -1466,10 +1466,12 @@ impl ProxyState {
         // 🏠 A named logger's `hostnames` decides which requests reach it. The
         // list travels with the logger so `LogTargets` can resolve it once,
         // here, instead of the request path re-reading configuration.
-        let mut named_targets: Vec<(Vec<String>, Arc<crate::access_log::AccessLogger>)> =
-            Vec::new();
+        let mut named_targets: Vec<(
+            Vec<String>,
+            Arc<pingclair_runtime::access_log::AccessLogger>,
+        )> = Vec::new();
         for named in &config.named_logs {
-            match crate::access_log::AccessLogger::from_config(Some(&named.config)) {
+            match pingclair_runtime::access_log::AccessLogger::from_config(Some(&named.config)) {
                 Ok(Some(logger)) => {
                     let logger = Arc::new(logger);
                     named_targets.push((named.config.hostnames.clone(), logger.clone()));
@@ -1486,23 +1488,25 @@ impl ProxyState {
             }
         }
 
-        let access_logger = match crate::access_log::AccessLogger::from_config(config.log.as_ref())
-        {
-            Ok(logger) => logger.map(Arc::new),
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    server = config.name.as_deref().unwrap_or("<default>"),
-                    "❌ Could not open configured access log; falling back to tracing output"
-                );
-                None
-            }
-        };
+        let access_logger =
+            match pingclair_runtime::access_log::AccessLogger::from_config(config.log.as_ref()) {
+                Ok(logger) => logger.map(Arc::new),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        server = config.name.as_deref().unwrap_or("<default>"),
+                        "❌ Could not open configured access log; falling back to tracing output"
+                    );
+                    None
+                }
+            };
 
         // 🪵 The server's own `log` block and any global channels are not
         // host-restricted; only named loggers carry `hostnames`.
-        let mut target_entries: Vec<(Vec<String>, Arc<crate::access_log::AccessLogger>)> =
-            Vec::new();
+        let mut target_entries: Vec<(
+            Vec<String>,
+            Arc<pingclair_runtime::access_log::AccessLogger>,
+        )> = Vec::new();
         if let Some(logger) = &access_logger {
             target_entries.push((Vec::new(), logger.clone()));
         }
@@ -1510,7 +1514,7 @@ impl ProxyState {
             target_entries.push((Vec::new(), channel.clone()));
         }
         target_entries.extend(named_targets);
-        let log_targets = crate::access_log::LogTargets::new(target_entries);
+        let log_targets = pingclair_runtime::access_log::LogTargets::new(target_entries);
         let strict_transport = crate::http_policy::StrictTransport::from_security(&config.security);
         let cache_scopes = Arc::new(crate::cache_key::route_scopes(&config, |route| {
             find_reverse_proxy_config(&route.handler).is_some_and(|proxy| proxy.cache.is_some())
@@ -2150,8 +2154,10 @@ impl PingclairProxy {
             let mut next = RouteTable {
                 hosts: current.hosts.clone(),
                 default: current.default.clone(),
+                access_logging: current.access_logging,
             };
             Self::register_site(&mut next, current, config.clone());
+            next.refresh_access_logging();
             next
         });
     }
@@ -2229,6 +2235,7 @@ impl PingclairProxy {
         for config in servers {
             Self::register_site(&mut next, previous, config);
         }
+        next.refresh_access_logging();
         next
     }
 
@@ -2245,6 +2252,7 @@ impl PingclairProxy {
         self.listener_policy.replace_routes(|_| RouteTable {
             hosts: next.hosts.clone(),
             default: next.default.clone(),
+            access_logging: next.access_logging,
         });
         tracing::info!("♻️ Configuration reloaded successfully");
     }
@@ -9058,7 +9066,7 @@ impl ProxyHttp for PingclairProxy {
                 let upstream = ctx
                     .upstream
                     .as_ref()
-                    .map(|value| crate::access_log::LogUpstream::Address(&value.addr));
+                    .map(|value| pingclair_runtime::access_log::LogUpstream::Address(&value.addr));
                 let route = ctx
                     .route_index
                     .and_then(|index| state.config.routes.get(index))
@@ -9072,19 +9080,19 @@ impl ProxyHttp for PingclairProxy {
                     .uri
                     .path_and_query()
                     .map_or_else(|| req_header.uri.path(), |value| value.as_str());
-                let logged_path = crate::redaction::redact_target(target);
+                let logged_path = pingclair_runtime::redaction::redact_target(target);
                 // 🙈 Referer carries the *previous* page's URL, so it can leak a
                 // token this request never contained.
-                let redacted_referer = crate::redaction::redact_referer(referer);
+                let redacted_referer = pingclair_runtime::redaction::redact_referer(referer);
 
                 // 🏷️ The entry lends each destination the original maps. Each
                 // logger narrows and masks them while writing its own final buffer,
                 // avoiding dozens of temporary strings per request.
                 let logged_request_headers =
-                    crate::access_log::LogHeaders::new(&req_header.headers);
-                let logged_response_headers = session
-                    .response_written()
-                    .map(|response| crate::access_log::LogHeaders::new(&response.headers));
+                    pingclair_runtime::access_log::LogHeaders::new(&req_header.headers);
+                let logged_response_headers = session.response_written().map(|response| {
+                    pingclair_runtime::access_log::LogHeaders::new(&response.headers)
+                });
                 // 🔐 `digest` carries the handshake result; a plaintext listener
                 // simply has none, which is why both fields are optional rather
                 // than empty strings.
@@ -9098,7 +9106,7 @@ impl ProxyHttp for PingclairProxy {
                     (None, None)
                 };
 
-                let entry = crate::access_log::AccessEntry {
+                let entry = pingclair_runtime::access_log::AccessEntry {
                     request_headers: Some(logged_request_headers),
                     response_headers: logged_response_headers,
                     tls_version,
@@ -9107,7 +9115,7 @@ impl ProxyHttp for PingclairProxy {
                     // finished: a five-second request logged at its end would
                     // otherwise sit in a shipper's timeline beside requests that
                     // arrived after it.
-                    started_unix: crate::access_log::unix_started_at(ctx.start_time),
+                    started_unix: pingclair_runtime::access_log::unix_started_at(ctx.start_time),
                     request_id: ctx.request_id(),
                     method,
                     host,
@@ -9145,6 +9153,20 @@ impl ProxyHttp for PingclairProxy {
                 }
                 return;
             }
+        }
+
+        // 🚫 Nothing on this listener asked for access logging, so this request
+        // gets no record. Caddy's `ServerLogConfig` is per server: one site's
+        // `log` enables records for the whole listener, and a server whose
+        // sites never mention `log` writes none at all — which is what the
+        // documented "Default: no access log" means (#213). The fallback below
+        // is therefore kept only for a listener that logs, where an unmapped
+        // `Host` belongs to Caddy's default access logger.
+        //
+        // ⚡ One bit read: whether this listener logs was decided when its route
+        // table was published, so the request path does not walk the sites.
+        if !self.request_generation(ctx).routes().has_access_logging() {
+            return;
         }
 
         // Structured access log

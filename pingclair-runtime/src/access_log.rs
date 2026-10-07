@@ -43,13 +43,32 @@ use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use crate::metrics;
 use crossbeam_queue::ArrayQueue;
+use prometheus::IntCounter;
+use std::sync::LazyLock;
 
 mod writer;
 pub use writer::flush_all;
 
 use pingclair_core::config::{LogConfig, LogFormat, LogOutput, LogRotation};
+
+/// 🪵 Access-log lines dropped because the writer could not keep up.
+///
+/// The only signal that a gap exists. A bounded queue turns "the disk is slow"
+/// into "some lines are missing" rather than "the proxy stopped"; this counter
+/// is what stops the second outcome from being silent. Any non-zero value means
+/// the log is incomplete for that period — alert on the rate, not the total.
+///
+/// 📌 Owned by this crate because the writers are: the metrics registry in
+/// `pingclair-proxy` registers this collector, so the series an operator
+/// scrapes does not move when a second transport starts logging through here.
+pub static ACCESS_LOG_DROPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "pingclair_access_log_dropped_total",
+        "Access log lines dropped because the writer queue was full",
+    )
+    .expect("metric can be created")
+});
 
 /// 🖊️ Where a formatted access line is written.
 ///
@@ -1124,7 +1143,7 @@ impl LogWriter {
                 };
                 self.recycle_buffer(line);
                 self.dropped.fetch_add(1, Ordering::Relaxed);
-                metrics::ACCESS_LOG_DROPPED_TOTAL.inc();
+                ACCESS_LOG_DROPPED_TOTAL.inc();
             }
         }
     }

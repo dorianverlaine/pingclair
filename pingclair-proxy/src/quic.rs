@@ -3772,8 +3772,8 @@ async fn handle_request(
 
 /// 🧾 Writes one HTTP/3 access record to the destinations this host selects.
 ///
-/// The record is built from the same [`crate::access_log::AccessEntry`] the
-/// H1/H2 path uses and goes through the same [`crate::access_log::LogTargets`],
+/// The record is built from the same [`pingclair_runtime::access_log::AccessEntry`] the
+/// H1/H2 path uses and goes through the same [`pingclair_runtime::access_log::LogTargets`],
 /// so `hostnames` and the record's shape cannot drift between transports —
 /// which is the failure mode this project keeps hitting whenever the two
 /// transports grow their own answer to the same question.
@@ -3798,7 +3798,7 @@ fn write_h3_access_log(
     // 🙈 The target can carry a credential in its query string, and `Referer`
     // carries the *previous* page's URL, so it can leak a token this request
     // never contained. Both go through the same redaction the H1/H2 record uses.
-    let logged_path = crate::redaction::redact_target(&req.path);
+    let logged_path = pingclair_runtime::redaction::redact_target(&req.path);
     let header = |wanted: &str| {
         req.headers
             .iter()
@@ -3806,17 +3806,17 @@ fn write_h3_access_log(
             .map(|(_, value)| value.to_str().unwrap_or(""))
             .unwrap_or("")
     };
-    let redacted_referer = crate::redaction::redact_referer(header("referer"));
+    let redacted_referer = pingclair_runtime::redaction::redact_referer(header("referer"));
     let route = matched_route
         .and_then(|index| state.config.routes.get(index))
         .map(|route| route.path.as_str());
 
-    let entry = crate::access_log::AccessEntry {
+    let entry = pingclair_runtime::access_log::AccessEntry {
         // 🕰️ Both transports derive `ts` the same way from their own start
         // `Instant`, so the H3 record and the H1/H2 record place a request at the
         // same moment. A timestamp produced only on one of them would be the
         // parity gap this field exists to close.
-        started_unix: crate::access_log::unix_started_at(request_started),
+        started_unix: pingclair_runtime::access_log::unix_started_at(request_started),
         request_id,
         method: &req.method,
         host,

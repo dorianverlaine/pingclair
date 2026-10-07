@@ -28,9 +28,32 @@ use crate::server::ProxyState;
 pub struct RouteTable {
     pub(crate) hosts: HashMap<String, Arc<ProxyState>>,
     pub(crate) default: Option<Arc<ProxyState>>,
+    /// 📝 Whether any site on this listener configured an access log.
+    ///
+    /// Caddy's `ServerLogConfig` belongs to the server, not to one site: a
+    /// single site's `log` turns records on for the whole listener, and a
+    /// server whose sites never mention `log` writes none. The answer is
+    /// decided when the table is published (load and reload) rather than
+    /// derived per request, because it cannot change while a generation is
+    /// live (#213).
+    pub(crate) access_logging: bool,
 }
 
 impl RouteTable {
+    /// 📝 Whether this listener writes any access record at all.
+    pub(crate) fn has_access_logging(&self) -> bool {
+        self.access_logging
+    }
+
+    /// 🔁 Recomputes [`Self::has_access_logging`] from the sites present.
+    ///
+    /// Called once per load or reload, after the sites are registered — the
+    /// only moment the answer can change.
+    pub(crate) fn refresh_access_logging(&mut self) {
+        let any = self.states().any(|state| !state.log_targets().is_empty());
+        self.access_logging = any;
+    }
+
     /// 🧭 Resolves a host to the site that answers it.
     ///
     /// Resolution order: the exact name, then a one-label wildcard such as

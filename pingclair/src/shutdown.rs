@@ -198,7 +198,7 @@ pub(crate) async fn drain_then_exit(
 pub(crate) fn shutdown_and_exit() -> ! {
     // 🚿 Access records first, because the warning below travels through the
     // tracing queue and would not survive the drain that follows it.
-    if !pingclair_proxy::access_log::flush_all(Duration::from_millis(250)) {
+    if !pingclair_runtime::access_log::flush_all(Duration::from_millis(250)) {
         tracing::warn!("⚠️ Access log drain exceeded the shutdown budget");
     }
     // 🚿 Then the tracing queue itself — which is where the records about this

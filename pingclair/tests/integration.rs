@@ -10475,6 +10475,7 @@ async fn test_an_unmatched_host_is_logged_with_the_proxy_protocol_client() {
 
     let dir = tempfile::tempdir().unwrap();
     let process_log = dir.path().join("process.log");
+    let site_log = dir.path().join("site.log");
     let config = serde_json::json!({
         "global": {
             "http3": false,
@@ -10493,6 +10494,10 @@ async fn test_an_unmatched_host_is_logged_with_the_proxy_protocol_client() {
             "name": "known.test",
             "listen": ["127.0.0.1:0"],
             "proxy_protocol_listen": ["0"],
+            // 🪵 One site's `log` turns access records on for the whole
+            // listener, which is Caddy's `ServerLogConfig` and what makes the
+            // unmatched request below produce a record at all (#213).
+            "log": { "output": { "file": site_log.display().to_string() }, "format": "text" },
             "routes": [{
                 "path": "/",
                 "handler": { "type": "respond", "status": 200, "body": "known" }
@@ -10571,6 +10576,66 @@ async fn test_an_unmatched_host_is_logged_with_the_proxy_protocol_client() {
         record.contains("remote_ip=5.6.7.8"),
         "the access record must name the PROXY-protocol client, got: {record}"
     );
+    // 🎯 The site's own logger wrote the matched request's record, so the
+    // listener's logging is what put the unmatched record in the process log
+    // rather than a process-wide fallback that ignores the configuration.
+    let mut site_record = false;
+    for _ in 0..50 {
+        site_record = std::fs::read_to_string(&site_log)
+            .unwrap_or_default()
+            .contains(&known_host);
+        if site_record {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        site_record,
+        "the site's own log must carry the request to {known_host}"
+    );
+}
+
+/// 🚫 No `log` directive means no access record.
+///
+/// Caddy writes nothing until a site's `log` enables the server's access
+/// logging, and this server used to emit a process-wide record for every
+/// request whether or not anyone asked for one (#213). The fixtures that read
+/// a record back all configure logging; this one deliberately does not.
+#[tokio::test]
+async fn test_no_log_directive_writes_no_access_record() {
+    let mut server = TestServer::new_pingclairfile(
+        r#"
+        {
+            admin off
+        }
+
+        http://:__PINGCLAIR_TEST_PORT__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "quiet"
+        }
+        "#,
+    );
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+    for _ in 0..2 {
+        let response = client.get(server.url(0, "/")).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let _ = response.text().await.unwrap();
+    }
+    // 🕰️ The logging phase runs at the end of the request; give it a moment
+    // before reading the streams the process log goes to.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    server.stop();
+
+    for path in [&server.stdout_path, &server.stderr_path] {
+        let output = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            !output.contains("📝 Access") && !output.contains("❌ Access"),
+            "no access record may be written without a `log` directive: {}",
+            path.display()
+        );
+    }
 }
 
 #[tokio::test]

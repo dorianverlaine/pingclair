@@ -6,6 +6,7 @@ members = [
     "pingclair-core",
     "pingclair-proxy",
     "pingclair-static",
+    "pingclair-runtime",
     "pingclair-tls",
     "pingclair-config",
     "pingclair-api",

@@ -38,6 +38,17 @@ before any answer can be produced; the trusted-proxy policy is global and the
 PROXY-protocol tunnel registry is per listener, so none of it needed a site
 (#281).
 
+### 📝 No `log` directive now means no access record
+
+This server wrote an access record for every request through its process log
+whether or not the configuration asked for one, which contradicted this
+release's own documentation ("Default: no access log") and Caddy, where a
+server writes access records only once one of its sites declares `log`. The
+record is now written where the configuration puts it: a site's own `log`
+destinations, and the process log only for a listener that has access logging
+at all, which is where an unmapped `Host` belongs (#213). The answer costs one
+bit per request, decided when the listener's routes are published.
+
 ### 🚨 `handle_errors` is an ordinary route body
 
 A `handle_errors` block used to run its directives in the order they were

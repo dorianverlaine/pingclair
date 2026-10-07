@@ -2535,6 +2535,7 @@ dependencies = [
  "pingclair-config",
  "pingclair-core",
  "pingclair-proxy",
+ "pingclair-runtime",
  "pingclair-static",
  "pingclair-tls",
  "pingora",
@@ -2641,7 +2642,6 @@ dependencies = [
  "boring-sys",
  "bytes",
  "chrono",
- "crossbeam-queue",
  "flate2",
  "foreign-types",
  "futures",
@@ -2656,6 +2656,7 @@ dependencies = [
  "pingclair-config",
  "pingclair-core",
  "pingclair-fastcgi",
+ "pingclair-runtime",
  "pingclair-static",
  "pingclair-tls",
  "pingora-cache",
@@ -2673,6 +2674,23 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-quiche",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "pingclair-runtime"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "crossbeam-queue",
+ "flate2",
+ "http",
+ "pingclair-core",
+ "pingora-core",
+ "prometheus",
+ "serde_json",
+ "tempfile",
  "tracing",
  "zstd",
 ]
