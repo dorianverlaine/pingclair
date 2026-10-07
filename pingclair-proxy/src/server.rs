@@ -1731,6 +1731,22 @@ pub(crate) fn error_reason(status: u16) -> &'static str {
     }
 }
 
+/// 💬 The body this hop writes for a status it generated itself.
+///
+/// One shape for all three transports: the status, its reason phrase, and the
+/// detail when this hop has one to add — for a `431`, the field that was too
+/// large (RFC 6585 §5). Caddy's built-in bodies are empty; these are
+/// deliberately informative, because the alternative was a client that could
+/// not tell why it was refused, and the transports agreeing with each other
+/// matters more than agreeing with an empty body (#252, #253).
+pub(crate) fn builtin_error_body(status: u16, detail: Option<&str>) -> String {
+    let reason = error_reason(status);
+    match detail {
+        Some(detail) if !detail.is_empty() => format!("{status} {reason}: {detail}"),
+        _ => format!("{status} {reason}"),
+    }
+}
+
 // MARK: - Server Implementation
 
 /// 🔄 Where the automatic HTTP→HTTPS redirect sends a request whose `Host`
@@ -4280,20 +4296,11 @@ impl PingclairProxy {
             Self::write_local_body(session, ctx, Bytes::from(content), true).await?;
             return Ok(());
         }
-        let body = Self::builtin_error_body(ctx, status);
+        // 📌 `error_detail` is taken, not read: it belongs to the one response
+        // that answers the failure it describes.
+        let detail = ctx.error_detail.take();
+        let body = builtin_error_body(status, detail.as_deref());
         Self::write_simple_response(session, ctx, status, &body).await
-    }
-
-    /// 💬 The built-in body for `status`, carrying this hop's detail if any.
-    ///
-    /// 📌 `error_detail` is taken, not read: it belongs to the one response
-    /// that answers the failure it describes.
-    fn builtin_error_body(ctx: &mut RequestContext, status: u16) -> String {
-        let reason = error_reason(status);
-        match ctx.error_detail.take() {
-            Some(detail) => format!("{status} {reason}: {detail}"),
-            None => format!("{status} {reason}"),
-        }
     }
 
     /// 🚨 Writes the default response for a raised error status.
@@ -7181,12 +7188,13 @@ impl ProxyHttp for PingclairProxy {
                     self.handle_raised_error(session, ctx, 413).await?;
                     return Ok(true);
                 }
-                let mut header = pingora_http::ResponseHeader::build(413, Some(4)).unwrap();
-                header.insert_header("Connection", "close").unwrap();
-                Self::apply_local_response_headers(&mut header, ctx)?;
-                session
-                    .write_response_header(Box::new(header), true)
-                    .await?;
+                // 🧾 The built-in refusal is the same sentence H1-chunked, H2
+                // and H3 write: a body on three of the four paths and none on
+                // the fourth was the drift #252 names. The connection still
+                // closes, because the body was never read.
+                session.as_mut().set_keepalive(None);
+                let body = builtin_error_body(413, None);
+                Self::write_simple_response(session, ctx, 413, &body).await?;
                 return Ok(true);
             }
         }

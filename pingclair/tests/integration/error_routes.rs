@@ -283,6 +283,77 @@ async fn test_handle_errors_answers_proxy_and_body_size_errors() {
     );
 }
 
+/// 🧾 A body over the limit is refused with one sentence on every framing.
+///
+/// The 413's body used to depend on the framing a client chose — nothing for a
+/// declared length, `413 Request Entity Too Large` for a chunked upload, and a
+/// body without the status line at all on HTTP/3 (#252).
+#[tokio::test]
+async fn test_a_body_over_the_limit_is_refused_with_one_sentence() {
+    let mut server = TestServer::new_pingclairfile(
+        r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle /upload {
+                request_body {
+                    max_size 10
+                }
+                respond "accepted"
+            }
+        }
+        "#,
+    );
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let address = server.address(0);
+    let expected = "413 Request Entity Too Large".to_string();
+
+    // 📏 A declared length over the limit is refused before the body is read.
+    let (declared_status, declared_body) = raw_exchange(
+        address,
+        &format!(
+            "POST /upload HTTP/1.1\r\nHost: {address}\r\nContent-Length: 100\r\n\
+             Connection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!((declared_status, declared_body), (413, expected.clone()));
+
+    // 🌊 A chunked body trips the same limit while it streams.
+    let chunk = "x".repeat(100);
+    let (streamed_status, streamed_body) = raw_exchange(
+        address,
+        &format!(
+            "POST /upload HTTP/1.1\r\nHost: {address}\r\nTransfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n{:X}\r\n{chunk}\r\n0\r\n\r\n",
+            chunk.len()
+        ),
+    )
+    .await;
+    assert_eq!((streamed_status, streamed_body), (413, expected.clone()));
+
+    // 🔀 The same request over HTTP/2 carries the same sentence.
+    let h2 = reqwest::Client::builder()
+        .no_proxy()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let response = h2
+        .post(server.url(0, "/upload"))
+        .body("x".repeat(100))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 413);
+    assert_eq!(response.text().await.unwrap(), expected);
+    server.stop();
+}
+
 /// 🔌 Writes one raw HTTP/1.1 request and returns the status and body of the
 /// connection-closing response.
 async fn raw_exchange(address: std::net::SocketAddr, request: &str) -> (u16, String) {

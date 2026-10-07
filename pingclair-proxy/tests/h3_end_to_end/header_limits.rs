@@ -195,7 +195,8 @@ async fn h3_oversized_header_fails_only_its_own_stream_and_names_the_field() {
         vec![
             (
                 431,
-                "Request Header Fields Too Large: the x-big field alone exceeds the header size limit"
+                "431 Request Header Fields Too Large: the x-big field alone exceeds the header size \
+                 limit"
                     .to_string()
             ),
             (200, "admitted".to_string()),

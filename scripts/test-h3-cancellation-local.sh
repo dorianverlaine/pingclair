@@ -268,7 +268,7 @@ request_trailer_status="$("${curl_bin}" --noproxy '*' --http3-only -ksS \
     -w '%{http_code}' \
     "https://${host_name}:${h3_port}/ready")"
 if [[ "${request_trailer_status}" != "501" ]] \
-    || ! grep -Fq 'Request Trailers Not Supported' "${run_dir}/request-trailer.out"; then
+    || ! grep -Fq '501 Not Implemented' "${run_dir}/request-trailer.out"; then
     log "❌ Declared H3 request trailers did not fail clearly with 501."
     exit 1
 fi

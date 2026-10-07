@@ -3712,7 +3712,7 @@ async fn handle_request(
                     &resp_tx,
                     stream_id,
                     status,
-                    msg,
+                    None,
                     error_state.as_deref(),
                     &response_policy,
                     &request_id,
@@ -3931,21 +3931,15 @@ async fn handle_request_inner(
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.len())),
         ) {
-            // 🔎 RFC 6585 §5: name the one field at fault. The sentence is
-            // built only here, on the rejection path, and sent directly
-            // because the shared error type carries static text only. A
-            // refusal before routing never enters `handle_errors` on any
-            // transport (#288); `send_error_response` still applies a
-            // configured `error_page 431`, exactly as H1/H2 do.
-            let message = breach.detail().map_or_else(
-                || "Request Header Fields Too Large".to_string(),
-                |detail| format!("Request Header Fields Too Large: {detail}"),
-            );
+            // 🔎 RFC 6585 §5: name the one field at fault. A refusal before
+            // routing never enters `handle_errors` on any transport (#288);
+            // `send_error_response` still applies a configured
+            // `error_page 431`, exactly as H1/H2 do.
             send_error_response(
                 resp_tx,
                 stream_id,
                 431,
-                &message,
+                breach.detail().as_deref(),
                 Some(&state),
                 response_policy,
                 request_id,
@@ -4621,6 +4615,15 @@ async fn handle_request_inner(
                             Err((404, "Not Found"))
                         }
                         Ok(None) => {
+                            // 🧾 The built-in 404 is the same sentence H1/H2
+                            // write from `serve_error_page`; an empty body here
+                            // was the one place the transports disagreed about
+                            // a missing file (#253).
+                            let mut hdrs = http::HeaderMap::new();
+                            hdrs.insert(
+                                "content-type",
+                                http::HeaderValue::from_static("text/plain"),
+                            );
                             send_h3_local_response(
                                 resp_tx,
                                 stream_id,
@@ -4631,8 +4634,10 @@ async fn handle_request_inner(
                                 &request_vars,
                                 response_handlers.as_deref(),
                                 404,
-                                http::HeaderMap::new(),
-                                H3LocalBody::Bytes(Bytes::new()),
+                                hdrs,
+                                H3LocalBody::Bytes(Bytes::from(crate::server::builtin_error_body(
+                                    404, None,
+                                ))),
                                 response_policy,
                                 request_id,
                                 request_deadline,
@@ -7367,15 +7372,20 @@ async fn send_error_response(
     resp_tx: &ResponseSink,
     stream_id: u64,
     status: u16,
-    msg: &str,
+    detail: Option<&str>,
     state: Option<&ProxyState>,
     policy: &ResponseHeaderPolicy,
     request_id: &str,
 ) {
+    // 💬 The same sentence H1/H2 write for a status this hop generated —
+    // "413 Request Entity Too Large", plus a detail when there is one, like the
+    // field a 431 names (#252, #253). The handler's own phrase goes to the
+    // access log, not into the client's body.
+    let text = crate::server::builtin_error_body(status, detail);
     let (body, content_type) = state
         .and_then(|state| state.read_error_page(status))
         .map_or_else(
-            || (Bytes::copy_from_slice(msg.as_bytes()), "text/plain"),
+            || (Bytes::from(text), "text/plain"),
             |(page, content_type)| (Bytes::from(page), content_type),
         );
     let mut headers = vec![

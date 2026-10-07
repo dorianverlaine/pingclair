@@ -27,6 +27,20 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🧾 The built-in error body is one sentence on every transport
+
+One refusal had four bodies: a missing static file answered `404 Not Found` on
+HTTP/1.1 and HTTP/2 and an empty `404` on HTTP/3, while a body over
+`request_body max_size` answered nothing at all for a declared length on
+H1/H2, `413 Request Entity Too Large` when the same H1 request streamed, and
+the bare `Request Entity Too Large` on H3 (#252, #253). All three transports
+now write one sentence from one place: the status, its reason phrase, and the
+detail when this hop has one — the field a `431` names, per RFC 6585 §5.
+Caddy's built-in bodies are empty; this is a deliberate divergence, recorded
+here, because the alternative was a client that could not tell what was
+refused. A configured `error_page <status>` still supplies the body, and
+`handle_errors` still answers everything a handler raised.
+
 ### 🧾 An oversized header block is refused before routing on every transport
 
 A request whose header block exceeded `limits { max_header_bytes }` was

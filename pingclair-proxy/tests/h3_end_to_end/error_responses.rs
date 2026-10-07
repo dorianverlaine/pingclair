@@ -26,7 +26,9 @@ async fn spawn_h3_site(source: &str) -> SocketAddr {
 
 /// 🚦 A rate-limit rejection over HTTP/3 has a body and keeps `Retry-After`.
 ///
-/// Before the fix it was a lone `:status 429` header block.
+/// Before the fix it was a lone `:status 429` header block. The body is the
+/// same sentence HTTP/1.1 and HTTP/2 write — status, reason, and any detail —
+/// so the transports cannot drift apart again (#252).
 #[tokio::test]
 async fn h3_rate_limit_rejection_carries_a_body() {
     let server = spawn_h3_site(
@@ -46,7 +48,7 @@ async fn h3_rate_limit_rejection_carries_a_body() {
             field(&rejected, "retry-after").is_some(),
             rejected.body.as_slice(),
         ),
-        (429, Some("text/plain"), true, &b"Too Many Requests"[..]),
+        (429, Some("text/plain"), true, &b"429 Too Many Requests"[..]),
         "headers: {:?}",
         rejected.headers
     );
