@@ -506,8 +506,22 @@ fn verify_basic_auth_pair(user: &str, password: &str, credentials: &[BasicAuthCr
 }
 
 /// Build the `WWW-Authenticate` challenge value for a 401 response.
+///
+/// 🛡️ The realm is a `quoted-string` (RFC 7617 §2 defines `realm-value` that
+/// way, and RFC 9110 §5.6.4 sends the parameter there), so a `"` or `\` in it
+/// has to be sent as a `quoted-pair`. Interpolating the configured text
+/// unchanged turned `He said "hi" ok` into three glued quoted-strings: a
+/// strict parser refused the challenge and a lenient one truncated the realm
+/// at the first inner quote (#268).
 pub fn basic_auth_challenge(realm: &str) -> String {
-    format!("Basic realm=\"{realm}\"")
+    let mut escaped = String::with_capacity(realm.len());
+    for character in realm.chars() {
+        if character == '"' || character == '\\' {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    format!("Basic realm=\"{escaped}\"")
 }
 
 /// ⏱️ Compares equal-length byte strings without content-dependent early exits.
@@ -828,6 +842,23 @@ mod tests {
         assert_eq!(
             basic_auth_challenge("Restricted"),
             "Basic realm=\"Restricted\""
+        );
+    }
+
+    /// 🛡️ A quote or backslash in the realm is sent as a `quoted-pair`.
+    ///
+    /// The realm is a `quoted-string`, so `He said "hi"` written verbatim is
+    /// three glued quoted-strings — a protocol error strict parsers refuse and
+    /// lenient ones truncate at the first inner quote (#268).
+    #[test]
+    fn test_basic_auth_challenge_escapes_the_realm() {
+        assert_eq!(
+            basic_auth_challenge("He said \"hi\" ok"),
+            "Basic realm=\"He said \\\"hi\\\" ok\""
+        );
+        assert_eq!(
+            basic_auth_challenge("back\\slash"),
+            "Basic realm=\"back\\\\slash\""
         );
     }
 }

@@ -27,6 +27,16 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🛡️ A `basic_auth` realm is escaped as a quoted-string
+
+A realm containing a double quote was interpolated into the challenge
+verbatim, so `WWW-Authenticate: Basic realm="He said "hi" ok"` was three glued
+quoted-strings: a strict parser refused the challenge and a lenient one
+truncated the realm at the first inner quote (RFC 7617 §2 makes the value a
+`quoted-string`, whose `"` and `\` travel as `quoted-pair`s). The shared
+challenge builder now escapes both, so the bytes on the wire are one
+well-formed quoted-string on HTTP/1.1, HTTP/2 and HTTP/3 (#268).
+
 ### 🧾 An HTTP/3 request field is validated as bytes, not repaired
 
 A field whose name was not a token was dropped with `from_utf8_lossy`, and its
