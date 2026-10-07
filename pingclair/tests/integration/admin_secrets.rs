@@ -72,33 +72,54 @@ async fn test_admin_config_reads_mask_secrets() {
         "no secret anywhere in the export: {whole}"
     );
 
-    // 🚫 Posting the export back unchanged would make `[redacted]` the admin
-    // key. It is refused, and the real key keeps working.
+    // ♻️ Posting the export back, with one ordinary field edited, is the
+    // supported read-modify-write cycle: each placeholder keeps the running
+    // secret instead of installing itself as one.
+    let mut edited = document.clone();
+    edited["debug"] = serde_json::json!(true);
     let reload = client
         .post(server.admin_url("/load"))
         .bearer_auth(KEY)
-        .json(&document)
+        .json(&edited)
         .send()
         .await
         .unwrap();
-    let refused = (
-        reload.status().is_client_error(),
-        reload.text().await.unwrap(),
-    );
-    assert!(refused.0, "a masked export must be refused: {}", refused.1);
-    assert!(
-        refused.1.contains("redacted"),
-        "the refusal says why: {}",
-        refused.1
-    );
-    let still_guarded = client
+    let (status, body) = (reload.status(), reload.text().await.unwrap());
+    assert_eq!(status, reqwest::StatusCode::OK, "round trip: {body}");
+
+    // 🔐 The real admin key survived the round trip; the placeholder did not
+    // become one.
+    let real_key_still_works = client
         .get(server.admin_url("/config"))
         .bearer_auth(KEY)
         .send()
         .await
         .unwrap()
         .status();
-    assert_eq!(still_guarded, reqwest::StatusCode::OK);
+    assert_eq!(real_key_still_works, reqwest::StatusCode::OK);
+    let placeholder_is_not_a_key = client
+        .get(server.admin_url("/config"))
+        .bearer_auth("[redacted]")
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(placeholder_is_not_a_key, reqwest::StatusCode::UNAUTHORIZED);
+
+    // 🙈 And the DNS token is still masked, not replaced by the placeholder.
+    let after = client
+        .get(server.admin_url("/config"))
+        .bearer_auth(KEY)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !after.contains(TOKEN) && after.contains("[redacted]"),
+        "the export stays masked after the round trip: {after}"
+    );
 }
 
 /// 🙈 Credentials written into header and environment directives are masked
@@ -148,20 +169,81 @@ async fn test_admin_config_reads_mask_configured_credentials() {
         "credentials masked, ordinary values kept: {whole}"
     );
 
-    let document: serde_json::Value = serde_json::from_str(&whole).unwrap();
+    let mut document: serde_json::Value = serde_json::from_str(&whole).unwrap();
+    document["debug"] = serde_json::json!(true);
     let reload = client
         .post(server.admin_url("/load"))
         .json(&document)
         .send()
         .await
         .unwrap();
-    let refused = (
-        reload.status().is_client_error(),
-        reload.text().await.unwrap(),
+    let (status, body) = (reload.status(), reload.text().await.unwrap());
+    assert_eq!(status, reqwest::StatusCode::OK, "round trip: {body}");
+
+    let after = client
+        .get(server.admin_url("/config"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            after.contains("upstream-credential"),
+            after.contains("upstream-api-key"),
+            after.contains("visible-value"),
+        ),
+        (false, false, true),
+        "credentials stay masked after the round trip: {after}"
     );
+}
+
+/// 🚫 Restoration never invents a secret: a placeholder the running document
+/// cannot answer is still refused, so the literal `[redacted]` can never be
+/// installed as a credential.
+#[tokio::test]
+async fn test_a_placeholder_without_a_running_secret_is_refused() {
+    let mut server = TestServer::new_pingclairfile(
+        r#"
+        {
+            admin __PINGCLAIR_TEST_ADMIN_LISTEN__
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            respond "ok"
+        }
+        "#,
+    );
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+    let document = client
+        .get(server.admin_url("/config"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+
+    let mut edited = document;
+    edited["global"]["dns"] = serde_json::json!({
+        "name": "cloudflare",
+        "arguments": ["[redacted]"]
+    });
+    let reload = client
+        .post(server.admin_url("/load"))
+        .json(&edited)
+        .send()
+        .await
+        .unwrap();
+    let (status, body) = (reload.status(), reload.text().await.unwrap());
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
     assert!(
-        refused.0 && refused.1.contains("redacted"),
-        "a masked credential must be refused: {}",
-        refused.1
+        body.contains("redacted"),
+        "the refusal names the placeholder: {body}"
     );
 }

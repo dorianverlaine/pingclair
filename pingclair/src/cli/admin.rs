@@ -30,6 +30,8 @@ pub(crate) fn parse_header_pair(raw: &str) -> Result<(String, String), String> {
 ///
 /// The production binary has no HTTP client dependency; a tiny request is
 /// enough for these two commands and keeps the dependency tree unchanged.
+/// The second half of the returned pair is the response *body* — the part
+/// that names a failure — not the raw response including its status line.
 pub(crate) fn admin_request(
     method: &str,
     path: &str,
@@ -61,7 +63,21 @@ pub(crate) fn admin_request(
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
         .unwrap_or(0);
-    Ok((status, response))
+    Ok((status, response_body(&response)))
+}
+
+/// 🧾 The part of a raw HTTP response that follows the header block.
+///
+/// Callers print this when a request fails, because the status line only says
+/// *that* something went wrong. The body is where the server names the reason
+/// — a masked secret, a matcher it could not read — and it used to be dropped
+/// on the floor here, which is how a 400 became `HTTP/1.1 400 Bad Request`.
+fn response_body(response: &str) -> String {
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or("")
+        .to_string()
 }
 
 /// 🔐 Installs or removes the internal CA root from the system trust store.
@@ -151,5 +167,20 @@ pub(crate) fn trust_internal_ca(trust: bool) -> anyhow::Result<()> {
     {
         let _ = (trust, root);
         anyhow::bail!("❌ System trust management is only supported on macOS and Linux");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::response_body;
+
+    /// 🧾 The body, not the status line, is what a caller can act on.
+    #[test]
+    fn test_response_body_is_what_follows_the_header_block() {
+        let response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nInvalid config: a \
+             tagged matcher";
+        assert_eq!(response_body(response), "Invalid config: a tagged matcher");
+        // A response that never finished its headers has no body to print.
+        assert_eq!(response_body("HTTP/1.1 400 Bad Request\r\n"), "");
     }
 }
