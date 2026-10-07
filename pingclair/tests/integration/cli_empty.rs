@@ -242,6 +242,12 @@ async fn cli_stdin_startup_survives_reload_signals() {
     notify.set_nonblocking(true).unwrap();
     let port = super::free_port();
     let token = uuid::Uuid::new_v4().to_string();
+    // 📓 The child's log is kept, not discarded: this test failed once on a
+    // loaded postmerge shard with "terminated on -HUP" and nothing else, and a
+    // panic that cannot say why is a flake nobody can fix (#184's first
+    // lesson). It is read only when the child dies unexpectedly.
+    let log_path = dir.path().join("stdin-startup.log");
+    let log = std::fs::File::create(&log_path).unwrap();
     let mut child = ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_pingclair"))
             .args(["run", "-c", "-"])
@@ -249,7 +255,7 @@ async fn cli_stdin_startup_survives_reload_signals() {
             .env("NOTIFY_SOCKET", &socket)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(log))
             .spawn()
             .unwrap(),
     );
@@ -288,7 +294,8 @@ async fn cli_stdin_startup_survives_reload_signals() {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         assert!(
             child.0.try_wait().unwrap().is_none(),
-            "stdin startup terminated on {signal}"
+            "stdin startup terminated on {signal}:\n{}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
         );
         assert_eq!(
             client
