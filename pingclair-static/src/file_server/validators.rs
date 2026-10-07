@@ -27,7 +27,7 @@ use http::HeaderValue;
 /// 🏷️ One strong entity tag per representation of a file.
 ///
 /// 🗜️ Encoded tags include coding and, for gzip, quality inside the quotes:
-/// `"1f-17a…"` becomes `"1f-17a…-gzip-5"`; a precompressed sidecar's tags are
+/// `"ai-v"` becomes `"ai-v-gzip-5"`; a precompressed sidecar's tags are
 /// derived from the sidecar's own metadata as `"…-sidecar-gzip"`. Built once per file
 /// identity; a request only picks one and clones it, which is a reference
 /// count increment.
@@ -46,12 +46,19 @@ impl EntityTags {
     /// Derives the tags from a file's size and nanosecond mtime, or from a
     /// sidecar-supplied tag when the site keeps one.
     ///
+    /// 🔤 The derived spelling is Caddy's: `"<base36(mtime_ns)>-<base36(size)>"`
+    /// (`calculateEtag`, `modules/caddyhttp/fileserver/staticfiles.go`, v2.11.7).
+    /// A site moved between the two servers keeps the validators its clients
+    /// and CDN already hold, so the move does not invalidate every stored copy
+    /// at once (#158). Caddy before 2.11.7 wrote the same two numbers without
+    /// the hyphen, which is a one-time revalidation for those deployments.
+    ///
     /// Nanoseconds rather than seconds because the second is exactly the
     /// window in which a deploy can write a file twice; the content caches in
     /// this module already key on nanoseconds for the same reason.
     ///
     /// 🛡️ Every tag built here is a valid header value by construction: the
-    /// derived one is quotes around hex digits and a hyphen, and a sidecar one
+    /// derived one is quotes around base36 digits and a hyphen, and a sidecar one
     /// has passed [`SidecarTag::parse`]. Appending `-br` and friends inside
     /// the quotes keeps both properties, which is why the conversions below
     /// cannot fail.
@@ -61,7 +68,10 @@ impl EntityTags {
         sidecar: Option<SidecarTag>,
         gzip_level: u32,
     ) -> Self {
-        let identity = sidecar.map_or_else(|| format!("\"{size:x}-{mtime_ns:x}\""), |tag| tag.0);
+        let identity = sidecar.map_or_else(
+            || format!("\"{}-{}\"", base36(mtime_ns), base36(u128::from(size))),
+            |tag| tag.0,
+        );
         Self {
             br: Self::coded(&identity, "br"),
             zstd: Self::coded(&identity, "zstd"),
@@ -115,6 +125,22 @@ impl EntityTags {
             _ => &self.identity,
         }
     }
+}
+
+/// 🔤 Renders a number in lowercase base36 — Go's `strconv.FormatInt(value, 36)`,
+/// which is what Caddy's file server formats its validator with.
+fn base36(mut value: u128) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut digits = Vec::with_capacity(13);
+    loop {
+        digits.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+        if value == 0 {
+            break;
+        }
+    }
+    digits.reverse();
+    String::from_utf8(digits).expect("base36 digits are ASCII")
 }
 
 // MARK: - Sidecar tags
@@ -240,12 +266,26 @@ mod tests {
         assert_eq!(
             all,
             [
-                "\"1f-17a\"",
-                "\"1f-17a-br\"",
-                "\"1f-17a-zstd\"",
-                "\"1f-17a-gzip-5\""
+                "\"ai-v\"",
+                "\"ai-v-br\"",
+                "\"ai-v-zstd\"",
+                "\"ai-v-gzip-5\""
             ]
         );
+    }
+
+    /// 🏷️ The derived tag is Caddy's spelling, so a site moved between the two
+    /// servers keeps the validators every client and CDN already stored.
+    ///
+    /// The expected value is written the way Go computes it
+    /// (`strconv.FormatInt(value, 36)`, `calculateEtag` in
+    /// `modules/caddyhttp/fileserver/staticfiles.go` at v2.11.7): mtime in
+    /// nanoseconds first, then the size, separated by a hyphen. Caddy before
+    /// 2.11.7 wrote the same digits with no separator.
+    #[test]
+    fn the_derived_tag_is_caddys_base36_pair() {
+        let tags = EntityTags::derive(7200, 1_700_000_000_000_000_000, None, 5);
+        assert_eq!(tags.for_coding(None), "\"cwyvpelgpse8-5k0\"");
     }
 
     /// 🕰️ Two writes inside the same second must not share a tag.
@@ -265,13 +305,13 @@ mod tests {
         let first = EntityTags::derive(0x1f, 1_700_000_000_000_000_000, None, 5);
         let next_nanosecond = EntityTags::derive(0x1f, 1_700_000_000_000_000_001, None, 5);
         assert_eq!(
-            first.for_coding(None).to_str().unwrap().split('-').next(),
+            first.for_coding(None).to_str().unwrap().split('-').nth(1),
             next_nanosecond
                 .for_coding(None)
                 .to_str()
                 .unwrap()
                 .split('-')
-                .next(),
+                .nth(1),
             "the size half is the same, so only the time half can distinguish these"
         );
         assert_ne!(

@@ -88,6 +88,32 @@ async fn test_file_server_etag_differs_per_content_coding() {
     assert_ne!(gzip.0, identity.0, "each representation needs its own tag");
 }
 
+/// 🏷️ The validator is Caddy's spelling for the same file.
+///
+/// Caddy derives a static file's tag as
+/// `"<base36(mtime_ns)>-<base36(size)>"` (`calculateEtag`,
+/// `modules/caddyhttp/fileserver/staticfiles.go`, v2.11.7). A site moved
+/// between the two servers therefore keeps the validators its browsers and CDN
+/// already stored, instead of re-downloading every file on the day of the
+/// switch (#158).
+#[tokio::test]
+async fn test_file_server_etag_is_caddys_base36_pair() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("gzip.txt");
+    std::fs::write(&path, "x".repeat(7200)).unwrap();
+    // 🕰️ A whole second, because the digit string below is what Caddy prints
+    // for this exact pair: 1_700_000_000 s in nanoseconds is `cwyvpelgpse8`,
+    // and 7200 bytes is `5k0`.
+    set_mtime(&path, UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+    let mut server = sidecar_site(root.path().to_str().unwrap());
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let etag = etag_of(&server, "/gzip.txt", "identity").await.0;
+    server.stop();
+
+    assert_eq!(etag, "\"cwyvpelgpse8-5k0\"");
+}
+
 /// 🕰️ Two same-size edits inside one second must not share a tag. With a
 /// whole-second mtime they did, and a client resuming a download would have
 /// spliced bytes from two different files together.

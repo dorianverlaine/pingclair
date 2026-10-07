@@ -38,6 +38,20 @@ before any answer can be produced; the trusted-proxy policy is global and the
 PROXY-protocol tunnel registry is per listener, so none of it needed a site
 (#281).
 
+### 🏷️ A static file's `ETag` is Caddy's, so a moved site keeps its validators
+
+The validator was a `<size hex>-<mtime hex>` pair where Caddy writes
+`"<mtime in base36>-<size in base36>"` (`calculateEtag`,
+`modules/caddyhttp/fileserver/staticfiles.go`, v2.11.7). The same unchanged
+file therefore had two different validators, and a site moved between the two
+servers invalidated every stored copy at once: every browser, CDN and reverse
+proxy re-downloaded the file, and every `If-None-Match` that would have
+answered `304` answered `200` instead. The derived tag now uses Caddy's
+spelling, so the stored validators survive the move (#158). Each
+representation still carries its own tag — a precompressed sidecar's ends
+`-sidecar-gzip`, a live-compressed body's `-gzip-<level>` — because their bytes
+differ, and a validators file beside the asset still wins.
+
 ### 🏷️ An upstream's `Server` field line reaches the client unchanged
 
 A proxied response used to carry `Server: Pingclair` where the origin had sent
