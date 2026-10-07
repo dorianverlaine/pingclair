@@ -10,7 +10,7 @@ pub mod secret;
 mod shared_ports;
 mod types;
 
-pub use bind::bind_listeners;
+pub use bind::{bind_listeners, bind_socket_host};
 pub use ip_ranges::{InvalidIpRange, IpRanges};
 pub use loader::ConfigLoader;
 pub use secret::SecretString;

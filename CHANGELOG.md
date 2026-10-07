@@ -27,6 +27,17 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🧩 Two sites on one port, one per interface, are two sites
+
+Two site blocks on the same port were refused as duplicates whenever their
+names matched, even when each block named a different `bind` interface — the
+configuration Caddy accepts since caddyserver/caddy#4635, and the natural way
+to answer IPv4 and IPv6 clients with different content. The interface a site
+binds is now part of its identity, normalized so `bind ::1` and `bind [::1]`
+are one interface: the same name on the same port and the same interface is
+still refused, and a `bind`-restricted site that shares its port with a
+wildcard listener is still refused with the message that explains why (#279).
+
 ### 🍪 Two `+Set-Cookie` lines in one `header` block are two cookies
 
 A block that added one field twice kept only the last value: the compiled shape

@@ -103,3 +103,60 @@ async fn test_bind_restricts_the_automatic_http_redirect_to_its_interface() {
         )
     );
 }
+
+/// 🧩 Two sites on one port, one per interface, are two sites.
+///
+/// The duplicate check compared `(name, listens)` alone, so both blocks below
+/// were refused with `Duplicate server name: _` even though they sit on
+/// different interfaces — the shape Caddy accepts since
+/// caddyserver/caddy#4635, where `bind` is part of what makes a site distinct
+/// (#279).
+#[tokio::test]
+async fn test_two_binds_on_one_port_serve_their_own_interface() {
+    let mut server = TestServer::new_pingclairfile(
+        r#"
+        {
+            admin off
+        }
+
+        http://:__PINGCLAIR_TEST_PORT__ {
+            bind 127.0.0.1
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "v4"
+        }
+
+        http://:__PINGCLAIR_TEST_PORT__ {
+            bind [::1]
+            respond "v6"
+        }
+        "#,
+    );
+    assert!(server.wait_until_ready().await, "server did not start");
+    let port = server.address(0).port();
+
+    // 🎯 Each socket answers its own site, and the other interface's site is
+    // not reachable through it even when the `Host` names it.
+    let mut seen = Vec::new();
+    for (url, host) in [
+        (format!("http://127.0.0.1:{port}/"), None),
+        (format!("http://[::1]:{port}/"), None),
+        (format!("http://127.0.0.1:{port}/"), Some("[::1]")),
+    ] {
+        let mut request = no_proxy_client().get(url);
+        if let Some(host) = host {
+            request = request.header(reqwest::header::HOST, host);
+        }
+        let response = request.send().await.unwrap();
+        seen.push((response.status().as_u16(), response.text().await.unwrap()));
+    }
+
+    assert_eq!(
+        seen,
+        vec![
+            (200, "v4".to_string()),
+            (200, "v6".to_string()),
+            (200, "v4".to_string()),
+        ]
+    );
+}
