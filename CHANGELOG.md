@@ -27,6 +27,19 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🗜️ A range over a precompressed sidecar ranges over the sidecar
+
+A client that accepted `gzip` and sent a `Range` was answered with the identity
+representation — identity bytes, identity `Content-Range`, identity `ETag` —
+while the same client's full request received the sidecar, because any parsed
+range skipped the precompressed branch entirely (#254). The sidecar *is* the
+representation the client negotiated, so its bytes are what a range applies
+to, which is what Caddy serves. `If-Range` and `If-None-Match` compare against
+the sidecar's own tag for that shape, and a range whose `If-Range` does not
+hold is ignored in favour of the whole sidecar. On-the-fly compression still
+never applies to a range response: a compressed stream cannot start at an
+arbitrary offset.
+
 ### 🏷️ A configured `ETag` is the validator, not just a label
 
 A site that set `ETag` with the `header` directive sent that tag to every

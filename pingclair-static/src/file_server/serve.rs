@@ -337,29 +337,63 @@ impl FileServer {
         let mut start = 0;
         let mut length = file_size;
 
+        // 🗜️ A precompressed sidecar the client accepts is the representation,
+        // so a range applies to *its* bytes: the coding the client negotiated
+        // and the offsets it asked for have to describe the same thing, and
+        // that is the representation Caddy ranges over (#254). On-the-fly
+        // compression is never a range target — a compressed stream cannot
+        // start at an arbitrary offset — so it stays out of this decision.
+        let range_sidecar = if range.is_some() && !self.config.precompressed.is_empty() {
+            self.try_precompressed(&file_path, accept_encoding).await
+        } else {
+            None
+        };
+        // 📏 What the range is parsed against, and the validator that decides
+        // whether it applies at all: the sidecar's tag when its bytes will be
+        // the body, the identity tag as the client was given it otherwise.
+        let (range_length, range_etag, range_last_modified, range_modified) = match &range_sidecar {
+            Some((sidecar, sidecar_metadata, encoding)) => {
+                let sidecar_meta = self.file_meta(sidecar, sidecar_metadata)?;
+                (
+                    sidecar_metadata.len(),
+                    self.declared_etag(
+                        &request,
+                        &meta,
+                        sidecar_meta.etags.for_sidecar(encoding).clone(),
+                    ),
+                    sidecar_meta.last_modified.clone(),
+                    sidecar_meta.modified,
+                )
+            }
+            None => (
+                file_size,
+                self.declared_etag(&request, &meta, meta.etags.for_coding(None).clone()),
+                meta.last_modified.clone(),
+                meta.modified,
+            ),
+        };
+
         //
         // 🏷️ `If-Range` is evaluated before the range is parsed: when the
         // client's copy is a different version of the file, its range is
-        // ignored and the whole current file goes out as 200. Honouring the
-        // range anyway would hand back bytes that splice onto nothing the
-        // client holds. A range response is never compressed, so the tag it is
-        // compared against is the identity one — as the client knows it, which
-        // is the configured `ETag` when the site set one (#265).
+        // ignored and the whole current representation goes out as 200.
+        // Honouring the range anyway would hand back bytes that splice onto
+        // nothing the client holds.
         if let Some(range) = range
             && validators::if_range_holds(
                 request.if_range(),
-                &self.declared_etag(&request, &meta, meta.etags.for_coding(None).clone()),
-                meta.last_modified.as_ref(),
-                meta.modified,
+                &range_etag,
+                range_last_modified.as_ref(),
+                range_modified,
                 SystemTime::now(),
             )
         {
-            match self.parse_range(range, file_size) {
+            match self.parse_range(range, range_length) {
                 RangeDecision::Satisfied { start: s, end: e } => {
                     start = s;
                     length = e - s + 1;
                     status = 206;
-                    content_range = Some(format!("bytes {s}-{e}/{file_size}"));
+                    content_range = Some(format!("bytes {s}-{e}/{range_length}"));
                 }
                 // 🚫 A range that cannot be satisfied is answered, not ignored:
                 // the `Content-Range` names the real length so a resuming
@@ -375,7 +409,7 @@ impl FileServer {
                         content_length: HeaderValue::from(body.len() as u64),
                         path: file_path,
                         status: 416,
-                        content_range: Some(format!("bytes */{file_size}")),
+                        content_range: Some(format!("bytes */{range_length}")),
                         // 📌 No validators: this response carries none of the
                         // entity, so `If-Range` and `If-None-Match` have
                         // nothing to decide about and Caddy sends neither.
@@ -389,32 +423,53 @@ impl FileServer {
             }
         }
 
-        // 🗜️ Prefer disk sidecars before cached live compression, matching Caddy.
-        // 🌊 A large sidecar holds encoded bytes on disk and can stream directly.
-        if !self.config.precompressed.is_empty()
-            && content_range.is_none()
-            && let Some((sidecar, sidecar_metadata, encoding)) =
+        // 🗜️ Prefer disk sidecars before cached live compression, matching
+        // Caddy. 🌊 A large sidecar holds encoded bytes on disk and can stream
+        // directly. A sidecar that a range selected is served here too, as the
+        // window the range asked for rather than as the whole representation
+        // (#254); one whose range was ignored or unsatisfiable is the full
+        // representation, exactly as it would be without a range.
+        let sidecar = match range_sidecar {
+            Some(found) => Some(found),
+            // A request without a range probes here, the way it always has.
+            // One whose range was satisfied over identity bytes must not
+            // switch representations.
+            None if range.is_none() && !self.config.precompressed.is_empty() => {
                 self.try_precompressed(&file_path, accept_encoding).await
-        {
+            }
+            None => None,
+        };
+        if let Some((sidecar, sidecar_metadata, encoding)) = sidecar {
             let sidecar_len = sidecar_metadata.len();
             let sidecar_meta = self.file_meta(&sidecar, &sidecar_metadata)?;
             let sidecar_etag = sidecar_meta.etags.for_sidecar(encoding);
+            // 🪟 A satisfied range selects a byte window of the sidecar's
+            // bytes; no applied range selects all of them.
+            let (window_start, window_length) = if content_range.is_some() {
+                (start, length)
+            } else {
+                (0, sidecar_len)
+            };
             tracing::debug!(
-                "✅ Using pre-compressed file: {} ({}, {} bytes)",
+                "✅ Using pre-compressed file: {} ({}, {} bytes, window {}+{})",
                 file_path.display(),
                 encoding,
-                sidecar_len
+                sidecar_len,
+                window_start,
+                window_length
             );
             // 🌊 A sidecar's bytes on disk *are* the response body, so a large
             // one never needed to be in memory. Reading it whole — which this
             // used to do unconditionally — made a 500 MB `.br` a 500 MB
             // allocation on the path that exists to avoid exactly that.
-            if sidecar_len > Self::STREAMING_THRESHOLD {
+            if window_length > Self::STREAMING_THRESHOLD {
                 let window = super::stream::StreamWindow {
-                    start: 0,
-                    length: Some(sidecar_len),
+                    start: window_start,
+                    length: Some(window_length),
                     status,
-                    content_range: None,
+                    content_range: content_range
+                        .as_deref()
+                        .and_then(|value| HeaderValue::from_str(value).ok()),
                     content_encoding: HeaderValue::from_str(encoding).ok(),
                 };
                 let mut stream =
@@ -429,11 +484,15 @@ impl FileServer {
             let Some(precompressed_content) = Self::read_precompressed(&sidecar) else {
                 return Ok(None);
             };
-            let precompressed_len = precompressed_content.len() as u64;
+            let Some(window_content) = precompressed_content
+                .get(window_start as usize..(window_start.saturating_add(window_length)) as usize)
+            else {
+                return Ok(None);
+            };
             return Ok(Some(ServedResponse::Buffered(ServedFile {
-                content: precompressed_content.into(),
+                content: Bytes::copy_from_slice(window_content),
                 content_type: meta.content_type.clone(),
-                content_length: HeaderValue::from(precompressed_len),
+                content_length: HeaderValue::from(window_length),
                 path: file_path,
                 status,
                 content_range,

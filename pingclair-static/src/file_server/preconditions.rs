@@ -191,12 +191,14 @@ impl FileServer {
     /// 🏷️ Conditions compare against the selected body's validator, including
     /// disk sidecars whose metadata can change independently of the source.
     ///
-    /// Mirrors the order `serve_auto` serves in: a range that will be honoured
-    /// is always identity, then a precompressed sidecar, then on-the-fly
-    /// compression. 📌 The sidecar probe repeats a `stat` that `serve_auto`
-    /// makes again when the answer is 200. It only runs for a request that
-    /// sent a tag condition, and the usual outcome there is a 304 that reads
-    /// no body at all, so the extra `stat` buys skipping the whole read.
+    /// Mirrors the order `serve_auto` serves in: a precompressed sidecar the
+    /// client accepts — the representation a range applies to as well (#254) —
+    /// then the identity file for a range that will be honoured, then
+    /// on-the-fly compression. 📌 The sidecar probe repeats a `stat` that
+    /// `serve_auto` makes again when the answer is 200. It only runs for a
+    /// request that sent a tag condition, and the usual outcome there is a 304
+    /// that reads no body at all, so the extra `stat` buys skipping the whole
+    /// read.
     async fn selected_etag(
         &self,
         request: &FileRequest<'_>,
@@ -205,9 +207,25 @@ impl FileServer {
         meta: &FileMeta,
         accept_encoding: Option<&str>,
     ) -> pingclair_core::error::Result<HeaderValue> {
+        // 🗜️ An accepted sidecar is the representation, with or without a
+        // range: its bytes on disk are what the client negotiated, so its tag
+        // is what a conditional request compares against.
+        if !self.config.precompressed.is_empty()
+            && let Some((sidecar, metadata, encoding)) =
+                self.try_precompressed(file_path, accept_encoding).await
+        {
+            let sidecar_meta = self.file_meta(&sidecar, &metadata)?;
+            return Ok(self.declared_etag(
+                request,
+                meta,
+                sidecar_meta.etags.for_sidecar(encoding).clone(),
+            ));
+        }
         // 🏷️ A range is judged against the identity representation's tag, and
         // the client knows it as the tag the response carried — the configured
-        // one when the site set `ETag` (#265).
+        // one when the site set `ETag` (#265). A range whose `If-Range` does not
+        // hold is ignored, so the full representation below may still be
+        // compressed on the fly.
         let identity_etag = self.declared_etag(request, meta, meta.etags.for_coding(None).clone());
         if let Some(range) = request.range()
             && validators::if_range_holds(
@@ -224,16 +242,6 @@ impl FileServer {
         {
             return Ok(identity_etag);
         }
-        if !self.config.precompressed.is_empty()
-            && let Some((sidecar, metadata, encoding)) =
-                self.try_precompressed(file_path, accept_encoding).await
-        {
-            return Ok(self
-                .file_meta(&sidecar, &metadata)?
-                .etags
-                .for_sidecar(encoding)
-                .clone());
-        }
         let coding = if self.would_compress(file_size, accept_encoding)
             && self.matches_file_encode(self.config.status.unwrap_or(200), meta, request)
         {
@@ -241,7 +249,7 @@ impl FileServer {
         } else {
             None
         };
-        Ok(meta.etags.for_coding(coding).clone())
+        Ok(self.declared_etag(request, meta, meta.etags.for_coding(coding).clone()))
     }
 }
 
