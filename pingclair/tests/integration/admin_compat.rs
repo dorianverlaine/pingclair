@@ -3,6 +3,55 @@
 
 use super::*;
 
+/// 📊 Every `admin.api.*` name the listing prints answers on this server, and
+/// the one it omits does not.
+///
+/// The listing's authority is the route match, and nothing derives one from
+/// the other — a migration checklist asked "do you expose `/pki/`?" and got
+/// "yes, something admin-shaped" from the inventory and a 404 from the
+/// endpoint. This is the tie: probe what is advertised, and probe what is
+/// deliberately not (#151).
+#[tokio::test]
+async fn every_listed_admin_api_module_answers_and_pki_does_not() {
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__modules", "sentinel"));
+    assert!(server.wait_until_ready().await);
+    let client = no_proxy_client();
+
+    for module in [
+        "admin.api.load",
+        "admin.api.metrics",
+        "admin.api.reverse_proxy",
+    ] {
+        let probe = match module {
+            // 🚪 The endpoint exists when it refuses a body it cannot apply.
+            "admin.api.load" => client.post(server.admin_url("/load")).send().await,
+            "admin.api.metrics" => client.get(server.admin_url("/metrics")).send().await,
+            "admin.api.reverse_proxy" => {
+                client
+                    .get(server.admin_url("/reverse_proxy/upstreams"))
+                    .send()
+                    .await
+            }
+            other => panic!("no probe for the advertised module {other}"),
+        }
+        .unwrap();
+        assert_ne!(
+            probe.status().as_u16(),
+            404,
+            "`{module}` is advertised by `list-modules` but its endpoint answers 404"
+        );
+    }
+
+    // 🚫 And the one name the listing withholds is genuinely absent.
+    let pki = client.get(server.admin_url("/pki/")).send().await.unwrap();
+    assert_eq!(
+        pki.status().as_u16(),
+        404,
+        "`admin.api.pki` is deliberately unlisted, so `/pki/` must not answer"
+    );
+}
+
 #[tokio::test]
 async fn missing_config_reads_return_null_and_support_creation() {
     let mut server = TestServer::new_pingclairfile(&admin_test_pingclairfile("/__null", "null"));
