@@ -27,6 +27,15 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🚨 `handle_errors` is an ordinary route body
+
+A `handle_errors` block used to run its directives in the order they were
+written, so a `respond` written above a `header` answered before the header
+ever applied, and a named matcher defined inside the block (`@name …`) was
+refused. The block is now built like any other route body: directives run in
+Caddy's directive order, and its matchers belong to its own scope, seeing the
+site's definitions without leaking its own back out (#245).
+
 ### 🧩 Two sites on one port, one per interface, are two sites
 
 Two site blocks on the same port were refused as duplicates whenever their

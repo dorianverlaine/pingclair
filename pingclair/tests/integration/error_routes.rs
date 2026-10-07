@@ -354,6 +354,54 @@ async fn test_a_body_over_the_limit_is_refused_with_one_sentence() {
     server.stop();
 }
 
+/// 🔢 Directives in `handle_errors` run in Caddy's order, not in file order.
+///
+/// The block used to run its directives in the order they were written, so a
+/// `respond` written first answered before a `header` written after it ever
+/// applied — the same block, a different site, depending on line order (#245).
+#[tokio::test]
+async fn test_handle_errors_applies_a_header_written_after_respond() {
+    let mut server = TestServer::new_pingclairfile(
+        r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle_errors {
+                respond "page" 503
+                header X-Error-Route ordered
+            }
+
+            handle /boom {
+                error "exploded" 503
+            }
+        }
+        "#,
+    );
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/boom"))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let header = response
+        .headers()
+        .get("x-error-route")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        (status, header, body),
+        (503, Some("ordered".to_string()), "page".to_string())
+    );
+}
+
 /// 🔌 Writes one raw HTTP/1.1 request and returns the status and body of the
 /// connection-closing response.
 async fn raw_exchange(address: std::net::SocketAddr, request: &str) -> (u16, String) {

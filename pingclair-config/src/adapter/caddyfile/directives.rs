@@ -723,7 +723,7 @@ pub(super) fn adapt_handle_path(
 /// Caddy's three scope rules live here: named matcher definitions are copied
 /// from the parent scope, additions stay local to this block, and nothing is
 /// written back to the parent.
-fn collect_subroute_elements(
+pub(super) fn collect_subroute_elements(
     block: &Block,
     parent_matchers: &HashMap<String, Matcher>,
     order: &DirectiveOrder,
