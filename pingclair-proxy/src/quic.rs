@@ -2778,7 +2778,9 @@ async fn h3_raise_status(
     response_policy: &mut ResponseHeaderPolicy,
     verified_client_ip: &str,
     addresses: RequestAddresses,
-    handling_error: bool,
+    // 🚨 The error route this plan is running inside, if any: it carries both
+    // the re-entry guard and the route's own compiled patterns (#245).
+    error_scope: Option<crate::error_routes::ErrorScope>,
     request_vars: &mut crate::http_policy::RequestVars,
     response_handlers: &mut Option<Vec<pingclair_core::config::ResponseHandlerConfig>>,
 ) -> Result<H3Plan, HandlerError> {
@@ -2797,7 +2799,7 @@ async fn h3_raise_status(
         verified_client_ip,
         addresses,
         None,
-        handling_error,
+        error_scope,
         request_vars,
         response_handlers,
         // 📥 An error route runs after the request body is finished with, so a
@@ -2823,7 +2825,8 @@ async fn plan_h3_handler_with_connector(
     verified_client_ip: &str,
     addresses: RequestAddresses,
     precompile: Option<&MatcherPrecompile>,
-    handling_error: bool,
+    // 🚨 The error route this plan is running inside, if any (#245).
+    error_scope: Option<crate::error_routes::ErrorScope>,
     request_vars: &mut crate::http_policy::RequestVars,
     response_handlers: &mut Option<Vec<pingclair_core::config::ResponseHandlerConfig>>,
     // 📥 What this request's `request_body` handlers decided, if any ran.
@@ -2857,7 +2860,7 @@ async fn plan_h3_handler_with_connector(
                             response_policy,
                             verified_client_ip,
                             addresses,
-                            handling_error,
+                            error_scope,
                             request_vars,
                             response_handlers,
                         )
@@ -2878,7 +2881,7 @@ async fn plan_h3_handler_with_connector(
                     verified_client_ip,
                     addresses,
                     element_precompile,
-                    handling_error,
+                    error_scope,
                     request_vars,
                     response_handlers,
                     body_plan,
@@ -2917,7 +2920,7 @@ async fn plan_h3_handler_with_connector(
                             response_policy,
                             verified_client_ip,
                             addresses,
-                            handling_error,
+                            error_scope,
                             request_vars,
                             response_handlers,
                         )
@@ -2940,7 +2943,7 @@ async fn plan_h3_handler_with_connector(
                     verified_client_ip,
                     addresses,
                     element_precompile,
-                    handling_error,
+                    error_scope,
                     request_vars,
                     response_handlers,
                     body_plan,
@@ -2984,7 +2987,7 @@ async fn plan_h3_handler_with_connector(
                             response_policy,
                             verified_client_ip,
                             addresses,
-                            handling_error,
+                            error_scope,
                             request_vars,
                             response_handlers,
                         )
@@ -3007,7 +3010,7 @@ async fn plan_h3_handler_with_connector(
                     verified_client_ip,
                     addresses,
                     element_precompile,
-                    handling_error,
+                    error_scope,
                     request_vars,
                     response_handlers,
                     body_plan,
@@ -3101,6 +3104,7 @@ async fn plan_h3_handler_with_connector(
                     crate::server::compiled_header_replacement(
                         state,
                         route_index,
+                        error_scope.map(|scope| scope.route),
                         replacement,
                         request_header,
                         Some(verified_client_ip),
@@ -3269,6 +3273,7 @@ async fn plan_h3_handler_with_connector(
             *effective_uri = state
                 .rewrite_request_uri(
                     route_index,
+                    error_scope.map(|scope| scope.route),
                     effective_uri,
                     resolved_prefix.as_deref(),
                     resolved_suffix.as_deref(),
@@ -3365,7 +3370,7 @@ async fn plan_h3_handler_with_connector(
             // same as on H1/H2 — an error page that names the status on one
             // transport and not the other is exactly the parity gap this crate
             // keeps having to close.
-            if !handling_error {
+            if error_scope.is_none() {
                 request_vars.set_error(*status, message.as_deref());
             }
             let raw = message.as_deref().unwrap_or_else(|| {
@@ -3381,7 +3386,7 @@ async fn plan_h3_handler_with_connector(
             );
             // 🚫 Inside an error route a second raise responds directly —
             // routing it again is the infinite recursion this guard stops.
-            if !handling_error {
+            if error_scope.is_none() {
                 for (index, route) in state.config.error_routes.iter().enumerate() {
                     if !route.matches(*status) {
                         continue;
@@ -3400,7 +3405,10 @@ async fn plan_h3_handler_with_connector(
                         verified_client_ip,
                         addresses,
                         Some(&prepared.precompile),
-                        true,
+                        Some(crate::error_routes::ErrorScope {
+                            route: index,
+                            status: *status,
+                        }),
                         request_vars,
                         response_handlers,
                         body_plan,
@@ -3537,7 +3545,7 @@ async fn plan_h3_handler_with_connector(
                         verified_client_ip,
                         addresses,
                         fallback_precompile,
-                        handling_error,
+                        error_scope,
                         request_vars,
                         response_handlers,
                         body_plan,
@@ -3567,7 +3575,8 @@ async fn plan_h3_handler(
     response_policy: &mut ResponseHeaderPolicy,
     verified_client_ip: &str,
     precompile: Option<&MatcherPrecompile>,
-    handling_error: bool,
+    // 🚨 The error route this plan is running inside, if any (#245).
+    error_scope: Option<crate::error_routes::ErrorScope>,
     request_vars: &mut crate::http_policy::RequestVars,
     response_handlers: &mut Option<Vec<pingclair_core::config::ResponseHandlerConfig>>,
     // 📥 What this request's `request_body` handlers decided, if any ran.
@@ -3592,7 +3601,7 @@ async fn plan_h3_handler(
             }
         },
         precompile,
-        handling_error,
+        error_scope,
         request_vars,
         response_handlers,
         body_plan,
@@ -4125,7 +4134,7 @@ async fn handle_request_inner(
                 response_policy,
                 &verified_client_ip_text,
                 addresses,
-                false,
+                None,
                 &mut request_vars,
                 &mut response_handlers,
             )
@@ -4143,7 +4152,7 @@ async fn handle_request_inner(
                 &verified_client_ip_text,
                 addresses,
                 route_precompile,
-                false,
+                None,
                 &mut request_vars,
                 &mut response_handlers,
                 &mut body_plan,
@@ -4764,7 +4773,7 @@ async fn handle_request_inner(
             response_policy,
             &verified_client_ip_text,
             addresses,
-            false,
+            None,
             &mut request_vars,
             &mut response_handlers,
         )
@@ -8868,7 +8877,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -8929,7 +8938,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -8971,7 +8980,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -9024,7 +9033,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -9139,7 +9148,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -9175,7 +9184,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -9224,7 +9233,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut registered,
             &mut RequestBodyPlan::default(),
@@ -9328,7 +9337,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -9368,7 +9377,7 @@ mod tests {
             &mut policy,
             "203.0.113.9",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -9423,7 +9432,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             precompile,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -9447,7 +9456,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             precompile,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),

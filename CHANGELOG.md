@@ -36,6 +36,12 @@ refused. The block is now built like any other route body: directives run in
 Caddy's directive order, and its matchers belong to its own scope, seeing the
 site's definitions without leaking its own back out (#245).
 
+The block's own regular expressions come with it. A `rewrite` or a `header`
+search-and-replace inside `handle_errors` used to look its pattern up in the
+table of the route that *raised* the error — a different route's
+configuration — so the rewrite failed with a `500` and the replacement quietly
+did nothing, on every transport.
+
 ### 🧩 Two sites on one port, one per interface, are two sites
 
 Two site blocks on the same port were refused as duplicates whenever their

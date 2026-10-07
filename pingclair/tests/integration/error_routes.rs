@@ -402,6 +402,97 @@ async fn test_handle_errors_applies_a_header_written_after_respond() {
     );
 }
 
+/// 🔤 A regex `rewrite` inside `handle_errors` resolves against the error
+/// route's own compiled patterns.
+///
+/// The lookup used to go to the table of the route that raised the error, so
+/// the pattern was missing and the rewrite failed exactly when the error page
+/// was being built (#245).
+#[tokio::test]
+async fn test_handle_errors_regex_rewrite_uses_its_own_table() {
+    let error_root = tempfile::tempdir().expect("error root");
+    std::fs::write(error_root.path().join("page.html"), "rewritten page").unwrap();
+    let mut server = TestServer::new_pingclairfile(&format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle_errors {{
+                root * {error_root}
+                rewrite "^/boom/(.*)$" "/$1"
+                file_server
+            }}
+
+            handle /boom/* {{
+                error "exploded" 503
+            }}
+        }}
+        "#,
+        error_root = error_root.path().display(),
+    ));
+    assert!(server.wait_until_ready().await, "server did not start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/boom/page.html"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        (response.status().as_u16(), response.text().await.unwrap()),
+        (503, "rewritten page".to_string())
+    );
+}
+
+/// 🔁 A `header` search-and-replace inside `handle_errors` resolves against the
+/// error route's own pattern table, like its `rewrite` does (#245).
+#[tokio::test]
+async fn test_handle_errors_header_replace_uses_its_own_table() {
+    let mut server = TestServer::new_pingclairfile(
+        r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle_errors {
+                header Content-Type "text/plain" "text/html"
+                respond "page" 503
+            }
+
+            handle /boom {
+                error "exploded" 503
+            }
+        }
+        "#,
+    );
+    assert!(server.wait_until_ready().await, "server did not start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/boom"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            response.status().as_u16(),
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+        ),
+        (503, Some("text/html; charset=utf-8".to_string()))
+    );
+}
+
 /// 🔌 Writes one raw HTTP/1.1 request and returns the status and body of the
 /// connection-closing response.
 async fn raw_exchange(address: std::net::SocketAddr, request: &str) -> (u16, String) {

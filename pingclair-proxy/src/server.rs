@@ -1645,14 +1645,6 @@ impl ProxyState {
     /// looked up here by the pattern text that named it. A request path is not
     /// a place to compile a regex: the answer can never differ from the one
     /// configuration already decided.
-    pub(crate) fn route_regex(&self, route_index: usize, pattern: &str) -> Option<&Regex> {
-        self.route_regexes
-            .get(route_index)
-            .and_then(|regexes| regexes.get(pattern).map(AsRef::as_ref))
-    }
-
-    /// ⚡ The same lookup, handing out a shared reference the response policy
-    /// can outlive this borrow with.
     ///
     /// A response header replacement is queued during handler dispatch and run
     /// when the response is written, which is later and elsewhere — so the
@@ -1669,6 +1661,7 @@ impl ProxyState {
     pub(crate) fn rewrite_request_uri(
         &self,
         route_index: usize,
+        error_route: Option<usize>,
         current: &str,
         strip_prefix: Option<&str>,
         strip_suffix: Option<&str>,
@@ -1676,11 +1669,20 @@ impl ProxyState {
         regex_pattern: Option<&str>,
         regex_replace: Option<&str>,
     ) -> Result<String, &'static str> {
+        // 🚨 While an error route runs, only that route's own table answers:
+        // the pattern belongs to the route body being run, and the table of
+        // the route that raised the error is a different configuration (#245).
         let compiled = if let Some(pattern) = regex_pattern {
-            Some(
-                self.route_regex(route_index, pattern)
+            Some(match error_route {
+                Some(index) => self
+                    .error_routes
+                    .get(index)
+                    .and_then(|route| route.regexes.get(pattern).cloned())
                     .ok_or("invalid rewrite regex in active configuration")?,
-            )
+                None => self
+                    .route_regex_arc(route_index, pattern)
+                    .ok_or("invalid rewrite regex in active configuration")?,
+            })
         } else {
             None
         };
@@ -1689,7 +1691,7 @@ impl ProxyState {
             strip_prefix,
             strip_suffix,
             replace,
-            compiled,
+            compiled.as_deref(),
             regex_replace,
         ))
     }
@@ -4108,6 +4110,7 @@ impl PingclairProxy {
                 compiled_header_replacement(
                     state,
                     route_index,
+                    ctx.error_scope.map(|scope| scope.route),
                     replacement,
                     header,
                     verified_client_ip.as_deref(),
@@ -4251,6 +4254,7 @@ impl PingclairProxy {
             })?
             .rewrite_request_uri(
                 route_index,
+                ctx.error_scope.map(|scope| scope.route),
                 current,
                 rule.strip_prefix,
                 rule.strip_suffix,
@@ -5157,6 +5161,7 @@ impl PingclairProxy {
                         compiled_header_replacement(
                             state,
                             route_index,
+                            ctx.error_scope.map(|scope| scope.route),
                             entry,
                             session.req_header(),
                             verified_client_ip.as_deref(),
@@ -9427,9 +9432,13 @@ fn collect_request_body_timeouts(handler: &HandlerConfig) -> RouteBodyTimeouts {
 ///
 /// Returns `None` when the pattern is missing or does not compile, having said
 /// so — a replacement that cannot run must not silently rewrite nothing.
+// 🚨 One argument past the lint's limit: the lookup needs both the route whose
+// table it reads and, while an error route runs, which error route (#245).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compiled_header_replacement(
     state: &ProxyState,
     route_index: usize,
+    error_route: Option<usize>,
     entry: &pingclair_core::config::HeaderReplacement,
     request_header: &pingora_http::RequestHeader,
     verified_client_ip: Option<&str>,
@@ -9450,7 +9459,17 @@ pub(crate) fn compiled_header_replacement(
     };
 
     if !entry.search_regexp.contains('{') {
-        return match state.route_regex_arc(route_index, &entry.search_regexp) {
+        // 🚨 While an error route runs, its own table answers: the header
+        // operation belongs to the route body being run, and the table of the
+        // route that raised the error is a different configuration (#245).
+        let compiled = match error_route {
+            Some(index) => state
+                .error_routes
+                .get(index)
+                .and_then(|route| route.regexes.get(&entry.search_regexp).cloned()),
+            None => state.route_regex_arc(route_index, &entry.search_regexp),
+        };
+        return match compiled {
             Some(pattern) => Some((pattern, replacement)),
             None => {
                 tracing::warn!(
@@ -9482,7 +9501,10 @@ pub(crate) fn compiled_header_replacement(
     }
 }
 
-fn collect_route_regexes(handler: &HandlerConfig, regexes: &mut HashMap<String, Arc<Regex>>) {
+pub(crate) fn collect_route_regexes(
+    handler: &HandlerConfig,
+    regexes: &mut HashMap<String, Arc<Regex>>,
+) {
     match handler {
         HandlerConfig::Rewrite {
             regex: Some(pattern),
