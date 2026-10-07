@@ -266,8 +266,12 @@ async fn test_header_block_keeps_every_set_cookie() {
 /// ✅ `header X v` produces one field line, even when the origin sent its own.
 ///
 /// This is the recorded decision from pingclair#272: Caddy keeps both values,
-/// this server replaces, and the verb says what it does. The test exists so the
-/// choice is visible to whoever next reads the compatibility note.
+/// this server replaces, and the verb says what it does. nginx keeps both too
+/// (`ngx_http_add_header`, `ngx_http_headers_filter_module.c:568`, pushes onto
+/// the response without touching the upstream's), and replacing a field there
+/// takes `proxy_hide_header` plus `add_header` — so the difference is kept on
+/// purpose rather than by accident. The test exists so the choice is visible to
+/// whoever next reads the compatibility note.
 #[tokio::test]
 async fn test_header_set_yields_one_field_line() {
     let upstream = ScriptedUpstream::start(
