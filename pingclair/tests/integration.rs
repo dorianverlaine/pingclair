@@ -14946,6 +14946,76 @@ async fn test_browse_listing_hides_and_escapes() {
     );
 }
 
+/// 🚫 A browse listing answers the same methods a file does.
+///
+/// The listing is this server's representation of the directory, and the file
+/// server serves representations to `GET` and `HEAD` only. The browse branch
+/// returned before that check, so a `POST` received a `200` listing — a
+/// success for a method this route does not support (#242). The refusal owes
+/// the client the `Allow` a `405` carries.
+#[tokio::test]
+async fn test_browse_listing_refuses_non_retrieval_methods() {
+    let docroot = tempfile::tempdir().unwrap();
+    std::fs::create_dir(docroot.path().join("d")).unwrap();
+    std::fs::write(docroot.path().join("d/inside.txt"), "public").unwrap();
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            file_server {{
+                root {root}
+                browse
+            }}
+        }}
+    "#,
+        root = docroot.path().display()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let refused = client
+        .post(server.url(0, "/d/"))
+        .send()
+        .await
+        .expect("request");
+    let status = refused.status().as_u16();
+    let allow = refused
+        .headers()
+        .get("allow")
+        .map(|value| value.to_str().unwrap().to_string());
+    assert_eq!(status, 405, "a listing is not served to POST");
+    assert_eq!(allow.as_deref(), Some("GET, HEAD"));
+
+    // 🎯 The listing itself is untouched, and a `HEAD` still describes it.
+    let listing = client.get(server.url(0, "/d/")).send().await.unwrap();
+    assert_eq!(listing.status(), 200);
+    assert!(
+        listing.text().await.unwrap().contains("inside.txt"),
+        "the browse listing must still work"
+    );
+    let head = client.head(server.url(0, "/d/")).send().await.unwrap();
+    assert_eq!(head.status(), 200);
+    assert!(head.headers().get("content-length").is_some());
+
+    // 🫥 A path that does not exist is still 404, not 405: the method check
+    // runs once the path is known to exist.
+    let missing = client
+        .post(server.url(0, "/missing/"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(missing.status(), 404);
+    server.stop();
+}
+
 /// 🧾 One raw HTTP/1 GET, headers and body, for request lines no client library
 /// will send verbatim.
 async fn raw_get(address: SocketAddr, target: &str) -> String {

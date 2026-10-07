@@ -256,6 +256,13 @@ impl FileServer {
             // If still a directory (no index found)
             if !index_found {
                 if self.config.browse {
+                    // 🚫 A listing is a representation of the directory, and it
+                    // is served to the same methods a file is: `GET` and
+                    // `HEAD`. The check below runs after this branch, so a
+                    // `POST` used to be answered with a listing (#242).
+                    if !request.is_retrieval() {
+                        return Ok(Some(ServedResponse::MethodNotAllowed));
+                    }
                     let listing = self.generate_listing(&file_path, path).await?;
                     // Compress listing if enabled
                     let (content, encoding) = if self

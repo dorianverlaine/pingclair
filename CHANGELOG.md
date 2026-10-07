@@ -27,6 +27,14 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🚫 A directory listing answers `GET` and `HEAD` only
+
+With `browse` on and no index file, a `POST` to the directory received the
+`200` listing: the browse branch returned before the method check that
+answers `405` for a file. A listing is this server's representation of the
+directory, so it is served to the same methods a file is, and the refusal
+carries `Allow: GET, HEAD` (#242). A path that does not exist is still `404`.
+
 ### 📏 A `HEAD` describes the response its `GET` would receive
 
 With `encode` configured, a `HEAD` forwarded the origin's identity fields while
