@@ -1330,8 +1330,16 @@ impl<'de> Deserialize<'de> for Matcher {
             },
             File {
                 try_files: Vec<String>,
+                // 📂 These three mirror the real `Matcher::File` fields that
+                // serialize as absent when unset (`Option::is_none` /
+                // `Vec::is_empty`), so the reader must default them. Without
+                // this, the document a `php_fastcgi` compile produces cannot
+                // be read back: `/load` refused it as "a tagged matcher".
+                #[serde(default)]
                 root: Option<String>,
+                #[serde(default)]
                 try_policy: Option<String>,
+                #[serde(default)]
                 split_path: Vec<String>,
             },
             And(Box<Matcher>, Box<Matcher>),
@@ -2210,6 +2218,22 @@ pub struct ReverseProxyConfig {
     /// 🩺 Active upstream health-check configuration.
     #[serde(default)]
     pub health_check: Option<Box<HealthCheckConfig>>,
+
+    /// 🩹 Passive health: how many backend-implicating failures within
+    /// [`Self::fail_duration_ms`] mark an upstream down before it is skipped.
+    /// Caddy's `max_fails`, which must be at least one; `None` keeps this
+    /// proxy's default of one — the same "first failure removes it" rule a
+    /// refused connection already follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fails: Option<u32>,
+
+    /// 🩹 Passive health: how long a failure is remembered and how long the
+    /// backend stays out once `max_fails` is reached. Caddy's `fail_duration`;
+    /// `None` keeps this proxy's default (ten seconds, the cooldown connect
+    /// failures already used), and `Some(0)` is Caddy's "do not remember
+    /// failures" — passive health off for this route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_duration_ms: Option<u64>,
 
     /// Headers to add to upstream request
     #[serde(default)]
@@ -3892,6 +3916,17 @@ mod tests {
                 root: Some("/srv/www".into()),
                 try_policy: Some("first_exist_fallback".into()),
                 split_path: vec![".php".into()],
+            },
+            // 📂 What a compiled `php_fastcgi` route actually holds: the
+            // optional fields are absent, and the serializer omits them, so
+            // the reader must accept the sparse shape too. Before this case
+            // existed the test only proved the maximal shape, which is the
+            // one shape an Admin `/load` round trip never produces.
+            Matcher::File {
+                try_files: vec!["{path}".into(), "index.php".into()],
+                root: None,
+                try_policy: None,
+                split_path: Vec::new(),
             },
         ] {
             assert_eq!(round_trip(&matcher), matcher, "{matcher:?}");

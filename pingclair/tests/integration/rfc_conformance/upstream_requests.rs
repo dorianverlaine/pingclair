@@ -21,7 +21,6 @@ use std::time::Duration;
 /// the raw target (SigV4, S3-style names, raw-path ACLs) sees a URL nobody
 /// requested.
 #[tokio::test]
-#[ignore = "pingclair#275 — `/a//b` reaches the upstream as `/a/b`"]
 async fn test_forwarded_path_keeps_interior_empty_segments() {
     let upstream = ScriptedUpstream::start(
         vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()],
@@ -61,7 +60,6 @@ async fn test_forwarded_path_keeps_interior_empty_segments() {
 /// exactly the one behind a port-qualified vhost — where a probe with a bare
 /// hostname 404s and the pool is retired while the application is healthy.
 #[tokio::test]
-#[ignore = "pingclair#271 — the probe sends `Host: 127.0.0.1` with no port"]
 async fn test_health_probe_host_carries_the_authority() {
     let upstream = ScriptedUpstream::start(
         vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()],

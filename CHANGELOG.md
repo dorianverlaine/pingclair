@@ -950,8 +950,26 @@ handshake timeout (ten seconds for curl). The installed unit adds nothing to
 the gap: it has no `ExecStop=` (the repository lint now refuses one) and
 keeps systemd's own stop timeout as a backstop.
 
+🔐 Ownership of the running configuration moves with the first change made
+through the Admin API: `/load` and the traversal writes claim it inside the
+publication lock, and a `SIGUSR1` that arrives afterwards is refused instead
+of letting the file on disk overwrite an API key rotation that just
+succeeded. Send further changes through the Admin API, or restart the process
+to hand ownership back to the file.
+
 📌 Upgrading: apply configuration changes with `reload`, and keep
 `grace_period` short where restarts must be brief. (#210)
+
+### 🔻 Passive health counts failures after the connection
+
+A backend that accepted the connection and then failed mid-response — a
+truncated body, a reset before the response ended, a malformed response —
+kept receiving traffic forever, because only connect failures fed the
+passive health mark. Response-phase failures now count the same way, and
+Caddy's `max_fails` and `fail_duration` are honoured instead of refused
+(`fail_duration 0` keeps Caddy's "do not remember failures"). The default is
+one failure and a ten-second window, the rule a refused connection already
+followed (#262).
 
 ### 🔌 An HTTP/3 request cut by a stop ends at `grace_period`, not at an idle timeout
 
@@ -2595,8 +2613,6 @@ reproduction; the workaround, where there is one, is in the issue.
   backend still had to send are lost (#274).
 - **An upstream that fails before its first body byte** leaves an HTTP/2 client
   with a stream reset rather than a `502` (#249).
-- **A backend that truncates every response stays in rotation**; `max_fails`
-  and `fail_duration` are not implemented yet (#262).
 - **A configured `ETag` header is advertised but not used for revalidation**
   (#265).
 - **An empty path segment (`/a//b`) is collapsed** before forwarding (#275).

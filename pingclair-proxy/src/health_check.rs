@@ -216,11 +216,20 @@ impl HealthChecker {
         {
             peer.sni = sni.to_string();
         }
+        // 🏷️ Each backend's own name is an authority too: the port comes from
+        // the address this probe is about to dial (#271).
+        let backend_authority = backend_name.map(|name| {
+            crate::upstream::authority(
+                name,
+                &target.addr,
+                target.ext.get::<crate::upstream::Scheme>().copied(),
+            )
+        });
         if let Some(host) = self
             .config
             .host_override
             .as_deref()
-            .or(backend_name)
+            .or(backend_authority.as_deref())
             .filter(|name| *name != self.config.host)
         {
             request.insert_header("Host", host)?;
@@ -430,8 +439,10 @@ mod tests {
         checker.check(&target).await.expect("probe succeeds");
         let request = host_rx.await.unwrap().to_ascii_lowercase();
         assert!(
-            request.contains("\r\nhost: second.internal\r\n"),
-            "the probe must carry the backend's own name, not the template's:\n{request}"
+            // 🏷️ The backend's own name *and its port*, because a probe's Host
+            // is the authority it dialled (#271).
+            request.contains(&format!("\r\nhost: second.internal:{}\r\n", address.port())),
+            "the probe must carry the backend's own authority, not the template's:\n{request}"
         );
         origin.await.unwrap();
     }

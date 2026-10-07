@@ -5242,6 +5242,11 @@ async fn fastcgi_upstream(
             headers.append(name, value);
         }
     }
+    // 🧹 Fields the origin named in its own `Connection` are scoped to that
+    // hop: RFC 9110 §7.6.1 makes forwarding one a MUST NOT (#263).
+    for name in crate::http_policy::connection_named_fields(&headers) {
+        headers.remove(name.as_ref());
+    }
     let mut effective_response_policy = response_policy.clone();
     effective_response_policy.merge_proxy_response_ops(
         &proxy_config.headers_down,

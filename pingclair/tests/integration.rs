@@ -19,6 +19,9 @@ mod admin_etag;
 #[path = "integration/admin_reload.rs"]
 mod admin_reload;
 
+#[path = "integration/metrics_reload.rs"]
+mod metrics_reload;
+
 #[path = "integration/admin_compat.rs"]
 mod admin_compat;
 #[path = "integration/encode.rs"]
@@ -14766,6 +14769,10 @@ async fn test_browse_listing_hides_and_escapes() {
     // tag is gone by the time anything is reflected. Nothing decodes `%3C`
     // either. Both of those would have to change for this to be markup, and the
     // assertion says which page came back so a future change shows up here.
+    //
+    // 📂 The trailing `..` leaves the slash that replaced it (RFC 3986 §5.2.4
+    // step 2C removes the last segment, step 2E then moves the `/`), which
+    // nginx's parser also lands on, so the listing is the one for `/d/`.
     let encoded = raw_get(
         server.address(0),
         "/d/%3Cscript%3Ealert(1)%3C%2Fscript%3E/..",
@@ -14773,7 +14780,7 @@ async fn test_browse_listing_hides_and_escapes() {
     .await;
     assert!(encoded.starts_with("HTTP/1.1 200"), "{encoded}");
     assert!(
-        encoded.contains("<title>Index of /d</title>"),
+        encoded.contains("<title>Index of /d/</title>"),
         "the reflected path must be the normalised one: {encoded}"
     );
 

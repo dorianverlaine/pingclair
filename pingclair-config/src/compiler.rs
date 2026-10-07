@@ -3119,6 +3119,8 @@ fn compile_handler(
                         slow_start_ms: health.slow_start_ms,
                     })
                 }),
+                max_fails: proxy.max_fails,
+                fail_duration_ms: proxy.fail_duration_ms,
                 headers_up: BTreeMap::new(),
                 headers_up_remove: Vec::new(),
                 headers_down: BTreeMap::new(),

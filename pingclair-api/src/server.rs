@@ -435,8 +435,10 @@ async fn handle_request_inner(
             //
             // 🙈 Secrets are masked: the repository rule is that admin dumps
             // never carry them, and this one would otherwise hand out the very
-            // key that guards it. A masked export therefore cannot be POSTed
-            // back as-is; `/load` refuses the placeholder by name.
+            // key that guards it. A masked export can still be POSTed back:
+            // `/load` restores each placeholder from the running document at
+            // the same secret position, so an edit beside the secrets does not
+            // require re-typing them.
             let masked = crate::redaction::redacted(document);
             Ok(config_response(path, &masked))
         }
@@ -594,26 +596,40 @@ async fn handle_request_inner(
                     }
                 }
             } else {
-                match serde_json::from_slice(&body_bytes) {
+                // 🚫 A Caddy document is the one rejection worth naming.
+                // Handing the whole body to `PingclairConfig` makes serde
+                // report the first key it did not expect — `apps` — and
+                // the caller reads "unknown field" as a typo in a
+                // document they copied from a working Caddy install. It
+                // is not a typo; the two shapes are different, and the
+                // message should say which one this endpoint takes.
+                let describe_error = |error: &serde_json::Error| {
+                    if looks_like_caddy_document(&body_bytes) {
+                        "this admin API takes pingclair's own configuration JSON, \
+                         not Caddy's: `apps` is Caddy's top level. POST a Caddyfile \
+                         instead (Content-Type: text/caddyfile), or send the document \
+                         GET /config/ returns."
+                            .to_string()
+                    } else {
+                        format!("Invalid config: {error}")
+                    }
+                };
+                let value: Value = match serde_json::from_slice(&body_bytes) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Ok(response(StatusCode::BAD_REQUEST, &describe_error(&error)));
+                    }
+                };
+                // ♻️ A masked export is restored from the running document
+                // before it is parsed: `validate_config` refuses a masked
+                // secret by design, and this is the document that holds the
+                // real one. `commit_document` restores again for the
+                // traversal writes, which build their document differently.
+                let restored = crate::redaction::restore_placeholders(&value, document);
+                match serde_json::from_value::<PingclairConfig>(restored) {
                     Ok(config) => config,
                     Err(error) => {
-                        // 🚫 A Caddy document is the one rejection worth naming.
-                        // Handing the whole body to `PingclairConfig` makes serde
-                        // report the first key it did not expect — `apps` — and
-                        // the caller reads "unknown field" as a typo in a
-                        // document they copied from a working Caddy install. It
-                        // is not a typo; the two shapes are different, and the
-                        // message should say which one this endpoint takes.
-                        let message = if looks_like_caddy_document(&body_bytes) {
-                            "this admin API takes pingclair's own configuration JSON, \
-                             not Caddy's: `apps` is Caddy's top level. POST a Caddyfile \
-                             instead (Content-Type: text/caddyfile), or send the document \
-                             GET /config/ returns."
-                                .to_string()
-                        } else {
-                            format!("Invalid config: {error}")
-                        };
-                        return Ok(response(StatusCode::BAD_REQUEST, &message));
+                        return Ok(response(StatusCode::BAD_REQUEST, &describe_error(&error)));
                     }
                 }
             };
@@ -629,7 +645,7 @@ async fn handle_request_inner(
             // restart-required until TCP, QUIC, and TLS can be rebuilt as one
             // transaction.
             let value = serde_json::to_value(&config).unwrap_or_default();
-            match commit_document(&value, publisher, access_policy.revision, None) {
+            match commit_document(&value, document, publisher, access_policy.revision, None) {
                 Ok(()) => {
                     if let Some(path) = autosave {
                         autosave_document(&state.policy.snapshot().document, path);
@@ -845,6 +861,7 @@ async fn apply_full_document(
     }
     match commit_document(
         &value,
+        ctx.document,
         ctx.publisher,
         ctx.authorized_revision,
         ctx.if_match.as_deref(),
@@ -1042,6 +1059,7 @@ async fn apply_segments(
         )),
         Ok(()) => match commit_document(
             &next,
+            ctx.document,
             ctx.publisher,
             ctx.authorized_revision,
             ctx.if_match.as_deref(),
@@ -1085,24 +1103,31 @@ fn autosave_document(document: &Value, path: &Path) {
 /// after publishing only a subset of security policy.
 fn commit_document(
     next: &Value,
+    running: &Value,
     publisher: Option<&dyn pingclair_proxy::server::ConfigPublisher>,
     expected_admin_revision: u64,
     if_match: Option<&str>,
 ) -> Result<(), (StatusCode, String)> {
-    // 🙈 A masked read replaced each secret with a placeholder. Loading that
-    // placeholder would install it — as a header credential, or as the admin
-    // key itself — so it is refused with the reason, before anything else.
-    if crate::redaction::carries_placeholder(next) {
+    // ♻️ A masked read replaced each secret with a placeholder; posting the
+    // export back is how an operator edits everything around it. Every
+    // placeholder takes the running document's value at the same secret
+    // position first, so the real secret survives the round trip. Loading a
+    // remaining placeholder would install it — as a header credential, or as
+    // the admin key itself — so what restoration cannot answer is refused with
+    // the reason, before anything else.
+    let restored = crate::redaction::restore_placeholders(next, running);
+    if crate::redaction::carries_placeholder(&restored) {
         return Err((
             StatusCode::BAD_REQUEST,
             format!(
-                "Invalid config: a secret is the placeholder `{}` from a masked /config read; \
-                 put the real value back before loading this document",
+                "Invalid config: a secret position holds the placeholder `{}`, and the running \
+                 document has no secret there to keep; put the real value in before loading \
+                 this document",
                 pingclair_core::config::SecretString::REDACTED
             ),
         ));
     }
-    let config: PingclairConfig = serde_json::from_value(next.clone())
+    let config: PingclairConfig = serde_json::from_value(restored.clone())
         .map_err(|error| (StatusCode::BAD_REQUEST, format!("Invalid config: {error}")))?;
     if let Err(error) = pingclair_config::compiler::validate_config(&config) {
         return Err((StatusCode::BAD_REQUEST, format!("Invalid config: {error}")));
@@ -1114,7 +1139,7 @@ fn commit_document(
         ))
     })?;
     publisher
-        .publish_config(&config, Some(expected_admin_revision), Some(next))
+        .publish_config(&config, Some(expected_admin_revision), Some(&restored))
         .map(|_| ())
         .map_err(|error| {
             // 🛡️ The publisher checks the revision under its publication lock,

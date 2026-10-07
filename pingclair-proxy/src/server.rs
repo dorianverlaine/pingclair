@@ -1266,12 +1266,20 @@ impl ProxyState {
                             tls_policy,
                         ) {
                             Ok(peer_template) => {
-                                let host = hc_config.host.clone().unwrap_or_else(|| {
-                                    upstream
-                                        .ext
-                                        .get::<HostName>()
-                                        .map(|host| host.0.clone())
-                                        .unwrap_or_else(|| upstream.addr.to_string())
+                                // 🏷️ The probe's Host is the authority it
+                                // dialled, port included when it is not the
+                                // scheme's default; the operator's explicit
+                                // `health_host` still wins.
+                                let host = hc_config.host.clone().unwrap_or_else(|| match upstream
+                                    .ext
+                                    .get::<HostName>()
+                                {
+                                    Some(name) => crate::upstream::authority(
+                                        &name.0,
+                                        &upstream.addr,
+                                        upstream.ext.get::<Scheme>().copied(),
+                                    ),
+                                    None => upstream.addr.to_string(),
                                 });
                                 load_balancer.set_health_check(
                                     crate::health_check::HealthCheckConfig {
@@ -2480,12 +2488,55 @@ impl PingclairProxy {
         route_index: usize,
         address: &SocketAddr,
     ) {
+        self.mark_upstream(state, route_index, address, false);
+    }
+
+    /// 🩹 The same, for a failure *after* the connection was made. The last
+    /// selectable backend is kept in rotation: a response-phase failure is
+    /// ambiguous, and taking the only backend out turns a flaky origin into
+    /// an outage until the window expires (#262).
+    pub(crate) fn mark_upstream_response_failure(
+        &self,
+        state: &ProxyState,
+        route_index: usize,
+        address: &SocketAddr,
+    ) {
+        self.mark_upstream(state, route_index, address, true);
+    }
+
+    fn mark_upstream(
+        &self,
+        state: &ProxyState,
+        route_index: usize,
+        address: &SocketAddr,
+        response_phase: bool,
+    ) {
         if let Some(load_balancer) = state
             .load_balancers
             .get(route_index)
             .and_then(|load_balancer| load_balancer.as_ref())
         {
-            load_balancer.mark_unhealthy(address);
+            // 🩹 The route's passive policy: Caddy's `max_fails` and
+            // `fail_duration` when written down, this proxy's own default
+            // (one failure, ten seconds) when not.
+            let policy = self
+                .get_proxy_config(state, route_index)
+                .map(|config| crate::load_balancer::PassiveHealth {
+                    max_fails: config.max_fails.unwrap_or(1),
+                    // 🤔 `None` keeps the default cooldown; `Some(0)` is
+                    // Caddy's "do not remember failures" — passive health off.
+                    window: match config.fail_duration_ms {
+                        None => Some(crate::FAIL_COOLDOWN),
+                        Some(0) => None,
+                        Some(millis) => Some(std::time::Duration::from_millis(millis)),
+                    },
+                })
+                .unwrap_or_default();
+            if response_phase {
+                load_balancer.mark_response_failure(address, policy);
+            } else {
+                load_balancer.mark_failure(address, policy);
+            }
         }
     }
 
@@ -6645,12 +6696,13 @@ impl ProxyHttp for PingclairProxy {
 
         // 🧭 Resolve `.` and `..` before anything routes on the path, so this
         // proxy and the origin agree on which resource was asked for. nginx and
-        // Caddy both do this, and the policy that matters is the one attached to
-        // the resolved path.
+        // Caddy both do this — and both leave interior empty segments alone,
+        // which this does too — and the policy that matters is the one attached
+        // to the resolved path.
         //
         // ⚠️ Only the path-and-query is rewritten, never the whole URI. An H2
-        // request target is absolute (`https://host/path`), and folding its
-        // `//` as if it were a duplicate separator would corrupt the authority.
+        // request target is absolute (`https://host/path`), and rewriting it
+        // wholesale would corrupt the authority.
         {
             let path_and_query = session
                 .req_header()
@@ -7876,6 +7928,11 @@ impl ProxyHttp for PingclairProxy {
                 crate::cache_age::RevalidationHeaders::from_response(upstream_response),
             );
         }
+        // 🧹 Fields the origin named in its own `Connection` are scoped to that
+        // hop: RFC 9110 §7.6.1 makes forwarding one a MUST NOT (#263).
+        for name in crate::http_policy::connection_named_fields(&upstream_response.headers) {
+            upstream_response.remove_header(name.as_ref());
+        }
         if upstream_response.headers.contains_key("trailer") {
             tracing::warn!(
                 "🚫 Rejecting an upstream response that requires unsupported trailer forwarding"
@@ -8380,6 +8437,22 @@ impl ProxyHttp for PingclairProxy {
         // 🏷️ The same memory as in `fail_to_connect`, for a failure after
         // the connection was made.
         ctx.proxy_error = Some(crate::proxy_status::ProxyError::from_upstream_error(&e));
+        // 🩹 A failure after the connection was made is the backend's too, when
+        // the error names the response side: a truncated body, a reset
+        // mid-response, a malformed response. A downstream abort or an internal
+        // fault is not, and evicting a backend for one impatient client would
+        // turn that into an outage (#262).
+        if crate::upstream_failure::classify_response_error(&e).implicates_backend()
+            && let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) = peer.address()
+            && let (Some(state), Some(route_index)) = (ctx.state.as_ref(), ctx.route_index)
+        {
+            tracing::warn!(
+                error_type = ?e.etype(),
+                cause = %e,
+                "🔻 Marking upstream {address} down after response-phase failure"
+            );
+            self.mark_upstream_response_failure(state, route_index, address);
+        }
         let elapsed = ctx.start_time.elapsed();
         log_at_level!(
             failure_severity(&e),

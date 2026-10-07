@@ -432,13 +432,10 @@ async fn test_undeclared_request_trailer_is_not_silently_dropped() {
 ///
 /// No RFC clause covers load-balancer health, so this is the repository's own
 /// fail-closed rule plus Caddy/nginx parity: nginx ejects after `max_fails`
-/// within `fail_timeout`, Caddy lets the operator configure `max_fails` and
-/// `fail_duration`, and here the directives are refused at load — which makes the
-/// default behaviour the only behaviour, and a permanently failing backend the
-/// operator cannot retire. The check asks for the modest version: after a first
-/// failure, stop sending it new traffic.
+/// within `fail_timeout`, and Caddy lets the operator configure `max_fails`
+/// and `fail_duration` — both of which are honoured now. The check asks for
+/// the modest version: after a first failure, stop sending it new traffic.
 #[tokio::test]
-#[ignore = "pingclair#262 — a truncating backend is chosen forever"]
 async fn test_a_truncating_backend_stops_receiving_traffic() {
     let truncating = ScriptedUpstream::start(
         vec![

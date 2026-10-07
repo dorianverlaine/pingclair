@@ -1374,6 +1374,53 @@ mod fail_closed_tests {
         }
     }
 
+    /// 🚫 Two `path_regexp` directives in one matcher block are refused, and
+    /// the refusal names the block and shows the alternative.
+    ///
+    /// Caddy's JSON matcher holds one pattern, so upstream keeps the last one
+    /// silently (caddyserver/caddy#5028 asked for a loud answer); this proxy
+    /// used to AND them, so a block that reads as "either path" matched
+    /// nothing at all. Neither reading is what the block says.
+    #[test]
+    fn test_a_second_path_regexp_in_one_block_is_refused() {
+        let message = compile_err(
+            "example.com {\n    @and {\n        path_regexp ^/a\n        path_regexp b$\n    }\n    respond @and \"matched\"\n}",
+        );
+        assert!(
+            message.contains("path_regexp") && message.contains("@and"),
+            "the refusal names the directive and the block: {message}"
+        );
+        assert!(
+            message.contains('|'),
+            "the refusal shows the alternative: {message}"
+        );
+
+        // 🔤 One pattern that says "either" is what compiles.
+        crate::compile(
+            "example.com {\n    @either path_regexp ^/a|b$\n    respond @either \"matched\"\n}",
+        )
+        .expect("one alternation pattern is the supported spelling");
+    }
+
+    /// 🚫 The same rule covers `header_regexp` for one field, while two
+    /// different fields still AND — that is the reading Caddy's JSON map gives
+    /// them.
+    #[test]
+    fn test_repeated_header_regexp_for_one_field_is_refused() {
+        let message = compile_err(
+            "example.com {\n    @both {\n        header_regexp X-Env ^prod$\n        header_regexp X-Env ^staging$\n    }\n    respond @both \"matched\"\n}",
+        );
+        assert!(
+            message.contains("header_regexp") && message.contains("X-Env"),
+            "the refusal names the field: {message}"
+        );
+
+        crate::compile(
+            "example.com {\n    @both {\n        header_regexp X-Env ^prod$\n        header_regexp X-Tier ^gold$\n    }\n    respond @both \"matched\"\n}",
+        )
+        .expect("different fields still AND");
+    }
+
     /// 🩺 Health checking spelled flat, which is how the format spells it.
     #[test]
     fn flat_health_options_configure_the_health_check() {
@@ -1408,6 +1455,41 @@ mod fail_closed_tests {
             }
             other => panic!("expected a proxy handler, got {other:?}"),
         }
+    }
+
+    /// 🩹 `max_fails` and `fail_duration` configure passive health instead of
+    /// being refused. `fail_duration 0` keeps Caddy's meaning — failures are
+    /// not remembered — and `max_fails` keeps its `>= 1` bound.
+    #[test]
+    fn passive_health_options_are_configured_not_refused() {
+        let config = crate::compile(
+            "example.com {\n    reverse_proxy 127.0.0.1:9000 {\n        max_fails 3\n        fail_duration 30s\n    }\n}",
+        )
+        .expect("passive health options compile");
+        match &config.servers[0].routes[0].handler {
+            pingclair_core::config::HandlerConfig::ReverseProxy(proxy) => {
+                assert_eq!(proxy.max_fails, Some(3));
+                assert_eq!(proxy.fail_duration_ms, Some(30_000));
+            }
+            other => panic!("expected a proxy handler, got {other:?}"),
+        }
+
+        let off = crate::compile(
+            "example.com {\n    reverse_proxy 127.0.0.1:9000 {\n        fail_duration 0\n    }\n}",
+        )
+        .expect("`fail_duration 0` is Caddy's \"do not remember failures\"");
+        match &off.servers[0].routes[0].handler {
+            pingclair_core::config::HandlerConfig::ReverseProxy(proxy) => {
+                assert_eq!(proxy.fail_duration_ms, Some(0));
+            }
+            other => panic!("expected a proxy handler, got {other:?}"),
+        }
+
+        // 🔢 Zero failures before marking down is not a number Caddy accepts,
+        // and it would make `max_fails` mean "never mark down".
+        compile_err(
+            "example.com {\n    reverse_proxy 127.0.0.1:9000 {\n        max_fails 0\n    }\n}",
+        );
     }
 
     /// 🧭 `dynamic a` and `dynamic srv` compile into their DNS source, with

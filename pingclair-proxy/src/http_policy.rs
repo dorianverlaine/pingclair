@@ -1653,6 +1653,22 @@ impl<'a> OutboundRequestFilter<'a> {
     }
 }
 
+/// 🔎 The fields a message's own `Connection` named.
+///
+/// RFC 9110 §7.6.1 requires an intermediary to remove every field listed in
+/// `Connection` before forwarding it, and the list lives in the very field
+/// being read — so it is collected first. `close`, `keep-alive` and `upgrade`
+/// are skipped by [`OutboundRequestFilter`], the same rule the request
+/// direction uses, because they name connection options rather than fields
+/// (#263). Returned as owned names so the caller may remove them while holding
+/// the very header map they came from.
+pub(crate) fn connection_named_fields(headers: &HeaderMap) -> Vec<Box<str>> {
+    OutboundRequestFilter::for_client(headers)
+        .connection_tokens()
+        .map(Box::from)
+        .collect()
+}
+
 /// 🧪 The one header matrix every sink is tested against.
 ///
 /// Lives beside the filter rather than in a test module because four different
@@ -1997,9 +2013,13 @@ pub fn request_host_is_valid(raw: &[u8]) -> bool {
 /// remaining escapes are decoded at that boundary instead; see the static file
 /// server's `resolve_path`.
 ///
-/// `..` can never climb above the root; empty segments collapse, so `//a`
-/// becomes `/a`. Returns `None` when the path is already normal, so the common
-/// request pays for a scan and no allocation.
+/// `..` can never climb above the root. A *leading* run of slashes collapses to
+/// one (`//a` becomes `/a`, which is what Caddy and nginx do), while empty
+/// segments inside or at the end of the path survive: RFC 3986 §3.3 makes the
+/// empty string a segment, and §5.2.4 removes dot segments only. Collapsing an
+/// interior `//` would rewrite a target an upstream may have signed (#275).
+/// Returns `None` when the path is already normal, so the common request pays
+/// for a scan and no allocation.
 pub(crate) fn normalize_request_path(path: &str) -> Option<String> {
     // 🧾 The query comes off first, before anything is decoded or resolved. It
     // is not a path, and normalizing it like one is wrong: `decode_encoded_dots`
@@ -2027,29 +2047,14 @@ pub(crate) fn normalize_request_path(path: &str) -> Option<String> {
         return None;
     }
 
-    let raw_path = source;
-    let mut resolved: Vec<&str> = Vec::new();
-    for segment in raw_path.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                // 🧱 The root is the floor; `/../x` is `/x`, never an escape.
-                resolved.pop();
-            }
-            other => resolved.push(other),
-        }
-    }
-
-    let mut out = String::with_capacity(raw_path.len());
-    for segment in &resolved {
-        out.push('/');
-        out.push_str(segment);
+    let mut out = remove_dot_segments(source);
+    // 🧼 Only a leading run collapses. Interior and trailing empty segments
+    // are part of the target the client wrote, so they leave unchanged.
+    let leading = out.len() - out.trim_start_matches('/').len();
+    if leading > 1 {
+        out.replace_range(..leading, "/");
     }
     if out.is_empty() {
-        out.push('/');
-    }
-    // 🏁 A trailing slash is meaningful to origins, so it survives.
-    if raw_path.len() > 1 && raw_path.ends_with('/') && !out.ends_with('/') {
         out.push('/');
     }
     if let Some(query) = query {
@@ -2058,6 +2063,70 @@ pub(crate) fn normalize_request_path(path: &str) -> Option<String> {
     }
 
     (out != path).then_some(out)
+}
+
+/// 🧼 RFC 3986 §5.2.4 `remove_dot_segments`, verbatim.
+///
+/// 📚 Currency checked on 2026-10-07: RFC 3986 is still Internet Standard 66,
+/// updated only by RFC 7320 / RFC 8820 (URI design and ownership, not path
+/// syntax), and none of the eighteen open errata changes this algorithm — 4547
+/// and 4789 (held for document update) touch §5.4.2's examples and §5.2.3's
+/// merge condition, not §5.2.4.
+///
+/// The four rules that matter here: `.` segments disappear, `..` removes the
+/// last segment of the output (which may be empty — that is what makes
+/// `/a//../b` become `/a/b` rather than `/b`), a leading `..` is absorbed by
+/// the root, and everything else — including an empty segment — moves to the
+/// output untouched. The caller collapses a leading run of slashes afterwards.
+fn remove_dot_segments(path: &str) -> String {
+    let mut input = path;
+    let mut out = String::with_capacity(path.len());
+    while !input.is_empty() {
+        if let Some(rest) = input
+            .strip_prefix("../")
+            .or_else(|| input.strip_prefix("./"))
+        {
+            input = rest;
+        } else if input.starts_with("/./") {
+            // Replace the `/./` prefix with `/`.
+            input = &input[2..];
+        } else if input == "/." {
+            input = "/";
+        } else if input.starts_with("/../") {
+            // Replace the `/../` prefix with `/` and drop the last segment.
+            input = &input[3..];
+            remove_last_segment(&mut out);
+        } else if input == "/.." {
+            input = "/";
+            remove_last_segment(&mut out);
+        } else if input == "." || input == ".." {
+            input = "";
+        } else {
+            // Move the first path segment, with its leading `/` when it has
+            // one, up to (but not including) the next `/`.
+            let end = match input.strip_prefix('/') {
+                Some(rest) => match rest.find('/') {
+                    Some(index) => index + 1,
+                    None => input.len(),
+                },
+                None => match input.find('/') {
+                    Some(index) => index,
+                    None => input.len(),
+                },
+            };
+            out.push_str(&input[..end]);
+            input = &input[end..];
+        }
+    }
+    out
+}
+
+/// ✂️ Removes the last segment from the output buffer, with its `/`.
+fn remove_last_segment(out: &mut String) {
+    match out.rfind('/') {
+        Some(index) => out.truncate(index),
+        None => out.clear(),
+    }
 }
 
 /// 🔤 Decodes escapes whose byte is unreserved, leaving every other escape alone.
@@ -2282,8 +2351,16 @@ mod tests {
             ("/api/%2E%2E/admin/x", "/admin/x"),
             ("/admin/./x", "/admin/x"),
             ("//admin/x", "/admin/x"),
+            ("///a//b", "/a//b"),
+            // 🔁 `..` removes the last segment, and an empty segment is one:
+            // `/a//../b` loses the empty segment, not the `a`.
+            ("/a//../b", "/a/b"),
             ("/a/b/../../c", "/c"),
-            ("/a/b/..", "/a"),
+            // 🔁 A trailing `..` leaves the slash that replaces it: RFC 3986
+            // §5.2.4 step 2C removes the last segment, and step 2E then moves
+            // the `/` that remains. nginx's complex-URI parser lands on the
+            // same string (`u -= 4`, back to the previous `/`, `u++`).
+            ("/a/b/..", "/a/"),
         ] {
             assert_eq!(
                 normalize_request_path(input).as_deref(),
@@ -2291,6 +2368,24 @@ mod tests {
                 "{input:?} must normalize to {expected:?}"
             );
         }
+    }
+
+    /// 🧼 An interior or trailing empty segment is a segment, so a path that
+    /// holds one is already normal and the normalizer says so by changing
+    /// nothing — the request the upstream receives is the one the client
+    /// signed (#275).
+    #[test]
+    fn interior_empty_segments_survive_normalization() {
+        for path in ["/a//b", "/a//b/", "/a//b//", "/"] {
+            assert_eq!(
+                normalize_request_path(path),
+                None,
+                "{path:?} must not be rewritten"
+            );
+        }
+        // The root absorbs a leading climb, and the leading run collapses,
+        // while the interior empty segment that follows survives.
+        assert_eq!(normalize_request_path("/..//a").as_deref(), Some("/a"));
     }
 
     #[test]
