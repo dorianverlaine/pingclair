@@ -122,6 +122,63 @@ async fn test_handle_errors_file_server_serves_the_error_page() {
     }
 }
 
+/// 🧾 A header block over the limit is refused before error routing.
+///
+/// `handle_errors` answers for a site's handlers, and a request refused before
+/// routing never reached one — Caddy refuses an oversized header block before
+/// any handler runs. The site's page replaced the one sentence naming the
+/// field that was too large, which is the client's entire diagnosis, and
+/// HTTP/3 already answered with the plain refusal (#288).
+#[tokio::test]
+async fn test_an_oversized_header_block_never_reaches_the_error_route() {
+    let site = error_page_site("limits {\n    max_header_bytes 8192\n}\n");
+    let mut server = TestServer::new_pingclairfile(&site.config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let big = "x".repeat(9_000);
+    for http2 in [false, true] {
+        let builder = reqwest::Client::builder().no_proxy();
+        let client = if http2 {
+            builder.http2_prior_knowledge()
+        } else {
+            builder.http1_only()
+        }
+        .build()
+        .unwrap();
+        let response = client
+            .get(server.url(0, "/present.txt"))
+            .header("X-Big", &big)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, 431, "http2={http2}");
+        assert!(
+            body.contains("x-big"),
+            "http2={http2}: the refusal must name the field: {body}"
+        );
+        assert!(
+            !body.contains("page for"),
+            "http2={http2}: the site's page must not replace the refusal: {body}"
+        );
+    }
+
+    // 🎯 Control: an error the handler chain produced still reaches the route,
+    // so this refuses one shape rather than turning error routing off.
+    let missing = no_proxy_client()
+        .get(server.url(0, "/missing.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+    assert!(
+        missing.text().await.unwrap().contains("page for 404"),
+        "a handler's error must keep reaching the error route"
+    );
+    server.stop();
+}
+
 /// 🚨 Errors the server produces itself, not only the ones a handler raises,
 /// reach `handle_errors`: a proxy that cannot reach its upstream (502), and a
 /// body over its limit (413), whether it declared its length or streamed past

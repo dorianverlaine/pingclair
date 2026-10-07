@@ -3913,6 +3913,46 @@ async fn handle_request_inner(
             }
             return Err((404, "No Matching Virtual Host"));
         };
+        // 🧾 The selected virtual host's decoded field bounds are enforced
+        // here, before any matcher runs, exactly where H1/H2 enforces them
+        // (`early_request_filter`). An oversized section is then refused on
+        // its own terms instead of as a 404 from a path it never got to
+        // match, and site variables and matchers never run on headers that
+        // were already refused (#229).
+        //
+        // 📌 quiche was given a looser section limit (`QuicServer::run`), so
+        // an oversized section reaches this check and is refused on this
+        // stream alone, instead of quiche closing the connection with
+        // H3_EXCESSIVE_LOAD and failing every other request on it.
+        if let Some(breach) = crate::header_limits::check(
+            &state.config.limits,
+            req.headers.len(),
+            req.headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.len())),
+        ) {
+            // 🔎 RFC 6585 §5: name the one field at fault. The sentence is
+            // built only here, on the rejection path, and sent directly
+            // because the shared error type carries static text only. A
+            // refusal before routing never enters `handle_errors` on any
+            // transport (#288); `send_error_response` still applies a
+            // configured `error_page 431`, exactly as H1/H2 do.
+            let message = breach.detail().map_or_else(
+                || "Request Header Fields Too Large".to_string(),
+                |detail| format!("Request Header Fields Too Large: {detail}"),
+            );
+            send_error_response(
+                resp_tx,
+                stream_id,
+                431,
+                &message,
+                Some(&state),
+                response_policy,
+                request_id,
+            )
+            .await;
+            return Ok(());
+        }
         for (index, rule) in state.config.vars_routes.iter().enumerate() {
             let compiled = state.vars_precompiles.get(index).and_then(Option::as_ref);
             let matches = match compiled {
@@ -3987,39 +4027,6 @@ async fn handle_request_inner(
         .get(route_index)
         .ok_or((500, "Missing Route Handler"))?
         .handler;
-
-    // 🧾 Applies the selected virtual host's decoded H3 field bounds.
-    //
-    // 📌 quiche was given a looser section limit (`QuicServer::run`), so an
-    // oversized section reaches this check and is refused on this stream
-    // alone, instead of quiche closing the connection with H3_EXCESSIVE_LOAD
-    // and failing every other request on it.
-    if let Some(breach) = crate::header_limits::check(
-        &state.config.limits,
-        req.headers.len(),
-        req.headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.len())),
-    ) {
-        let Some(detail) = breach.detail() else {
-            return Err((431, "Request Header Fields Too Large"));
-        };
-        // 🔎 RFC 6585 §5: name the one field at fault. The sentence is built
-        // only here, on the rejection path, and sent directly because the
-        // shared error type carries static text only.
-        let message = format!("Request Header Fields Too Large: {detail}");
-        send_error_response(
-            resp_tx,
-            stream_id,
-            431,
-            &message,
-            Some(&state),
-            response_policy,
-            request_id,
-        )
-        .await;
-        return Ok(());
-    }
 
     // 🚫 Rejects advertised request trailers before a handler can consume an incomplete message.
     if header.headers.contains_key("trailer") {

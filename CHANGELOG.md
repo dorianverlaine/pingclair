@@ -27,6 +27,19 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🧾 An oversized header block is refused before routing on every transport
+
+A request whose header block exceeded `limits { max_header_bytes }` was
+answered differently by each transport. On HTTP/1.1 and HTTP/2 the site's
+`handle_errors` rendered the 431, so its page replaced the one sentence naming
+the field that was too large; on HTTP/3 the check ran after route resolution,
+so the same request to a path that matched no route was answered `404` and
+site variables and matchers ran on headers that should already have been
+refused (#288, #229). All three transports now enforce the limit before any
+matcher runs, answer the refusal directly rather than through `handle_errors`,
+and name the field when one field alone is at fault. A configured
+`error_page 431` still supplies the body, as it already did.
+
 ### 🃏 A manual wildcard certificate serves the names beneath it
 
 A site written `https://*.sandbox.test { tls cert.pem key.pem }` refused a

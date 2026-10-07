@@ -239,6 +239,14 @@ pub struct RequestContext {
     /// `error_page` is configured — for a 431, which field was too large.
     /// Unlike `error_message` it never replaces the operator's page.
     pub error_detail: Option<std::borrow::Cow<'static, str>>,
+    /// 🚫 This request was refused before any route could run.
+    ///
+    /// `handle_errors` routes and `error_page` files exist so a site can answer
+    /// for its handlers; a request refused before routing never reached one,
+    /// and its refusal carries the detail that says what was wrong (#288).
+    /// HTTP/3 already answers these directly, so this is also the shape all
+    /// three transports share.
+    pub refused_before_routing: bool,
     /// 🏷️ Why the latest upstream attempt failed. Recorded by
     /// `fail_to_connect` and `error_while_proxy`, cleared once an attempt
     /// connects, and settled by `fail_to_proxy`; only the error page that
@@ -355,6 +363,7 @@ impl Default for RequestContext {
             error_status: None,
             error_message: None,
             error_detail: None,
+            refused_before_routing: false,
             proxy_error: None,
             request_vars: crate::http_policy::RequestVars::default(),
             intercept_handlers: Vec::new(),
@@ -4271,12 +4280,20 @@ impl PingclairProxy {
             Self::write_local_body(session, ctx, Bytes::from(content), true).await?;
             return Ok(());
         }
+        let body = Self::builtin_error_body(ctx, status);
+        Self::write_simple_response(session, ctx, status, &body).await
+    }
+
+    /// 💬 The built-in body for `status`, carrying this hop's detail if any.
+    ///
+    /// 📌 `error_detail` is taken, not read: it belongs to the one response
+    /// that answers the failure it describes.
+    fn builtin_error_body(ctx: &mut RequestContext, status: u16) -> String {
         let reason = error_reason(status);
-        let body = match ctx.error_detail.take() {
+        match ctx.error_detail.take() {
             Some(detail) => format!("{status} {reason}: {detail}"),
             None => format!("{status} {reason}"),
-        };
-        Self::write_simple_response(session, ctx, status, &body).await
+        }
     }
 
     /// 🚨 Writes the default response for a raised error status.
@@ -6335,6 +6352,7 @@ impl ProxyHttp for PingclairProxy {
         ctx.state = Some(state);
         if breach.is_some() {
             ctx.error_detail = detail;
+            ctx.refused_before_routing = true;
             session.as_mut().set_keepalive(None);
             return pingora_core::Error::e_explain(
                 pingora_core::ErrorType::HTTPStatus(431),
@@ -8829,6 +8847,16 @@ impl ProxyHttp for PingclairProxy {
             // wrap itself recursively.
             ctx.intercept_handlers.clear();
             self.handle_raised_error(session, ctx, status).await.is_ok()
+        } else if ctx.refused_before_routing && code > 0 {
+            // 🚫 A refusal this hop made before any route could run — an
+            // oversized header block, today — never reaches `handle_errors`:
+            // that exists so a site can answer for its handlers, and this
+            // request never reached one. A configured `error_page` for the
+            // status still applies, and without one the built-in body keeps
+            // the detail that names what was wrong, which is the client's
+            // whole diagnosis (#288). HTTP/3 answers through the same two
+            // steps, so the three transports agree.
+            self.serve_error_page(session, ctx, code).await.is_ok()
         } else if code > 0
             && !ctx.handling_error
             && ctx
