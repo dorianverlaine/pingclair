@@ -120,6 +120,10 @@ mod uri_placeholders;
 #[path = "h3_end_to_end/body_length.rs"]
 mod body_length;
 
+// 🧊 HTTP/3 does not use the response cache, which the docs state.
+#[path = "h3_end_to_end/cache_parity.rs"]
+mod cache_parity;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {

@@ -2749,6 +2749,10 @@ reproduction; the workaround, where there is one, is in the issue.
   backend still had to send are lost (#274). The dependency's upgrade loop
   ends the whole exchange when the request side finishes, and it offers an
   embedder no hook to keep the other direction open.
+- **The HTTP/3 path does not use the response cache**: a route with a `cache`
+  block answers from the store over HTTP/1.1 and HTTP/2, and reaches the origin
+  over HTTP/3. The documentation's `cache` page states it, an in-process H3
+  test pins it, and wiring the cache in is a 0.3 feature (#205, #297).
 - **HTTP/3 transport-parameter checks** fail 18 of 77 h3spec cases; the fix
   belongs in the QUIC library (#282).
 - **A wildcard site's manual certificate** is not served for the names it
