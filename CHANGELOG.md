@@ -943,6 +943,13 @@ handshake timeout (ten seconds for curl). The installed unit adds nothing to
 the gap: it has no `ExecStop=` (the repository lint now refuses one) and
 keeps systemd's own stop timeout as a backstop.
 
+🔐 Ownership of the running configuration moves with the first change made
+through the Admin API: `/load` and the traversal writes claim it inside the
+publication lock, and a `SIGUSR1` that arrives afterwards is refused instead
+of letting the file on disk overwrite an API key rotation that just
+succeeded. Send further changes through the Admin API, or restart the process
+to hand ownership back to the file.
+
 📌 Upgrading: apply configuration changes with `reload`, and keep
 `grace_period` short where restarts must be brief. (#210)
 

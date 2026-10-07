@@ -90,6 +90,13 @@ Linux; a long download or event stream holds it open until it finishes or
 the new process instead of being refused. Restart for what a reload cannot
 do, such as moving a listener to another address or upgrading the binary.
 
+🧩 Ownership of the running configuration moves with the first configuration
+change made through the Admin API's `/load`: while the process is still
+serving the file it started with, `SIGUSR1` reloads that file; after an API
+load the file may no longer describe what is running, so `SIGUSR1` reloads
+are ignored until the process restarts. Keep changing the configuration
+through the Admin API, or restart to hand ownership back to the file.
+
 See the [installation guide](https://pingclair.com/start/install/) for Docker,
 service management, verification, removal, and troubleshooting.
 
