@@ -2606,23 +2606,14 @@ Found before the release and deliberately left for the next version, because
 none of them widens what a configuration exposes. Each has an open issue with a
 reproduction; the workaround, where there is one, is in the issue.
 
-- **HTTP/1.1 holds a response that declares its length until the body ends**, so
-  an event stream sent with `Content-Length` arrives in one piece at the end
-  (#247). Streams sent chunked, and every HTTP/2 and HTTP/3 response, are not
-  affected.
 - **Proxy compression may end a gzip body early** when an HTTP/2 upstream sends
   trailers it did not announce (#225).
-- **An upstream response that announces `Trailer` is answered `502`** (#273).
-- **An HTTP/1.0 client can receive chunked framing** from a proxied route whose
-  upstream sends no length (#277).
 - **After an upgrade, a client that half-closes ends the tunnel**, and bytes the
-  backend still had to send are lost (#274).
-- **An upstream that fails before its first body byte** leaves an HTTP/2 client
-  with a stream reset rather than a `502` (#249).
+  backend still had to send are lost (#274). The dependency's upgrade loop
+  ends the whole exchange when the request side finishes, and it offers an
+  embedder no hook to keep the other direction open.
 - **A configured `ETag` header is advertised but not used for revalidation**
   (#265).
-- **An empty path segment (`/a//b`) is collapsed** before forwarding (#275).
-- **`php_fastcgi` answers `411`** to a chunked or bodyless request (#248).
 - **HTTP/3 transport-parameter checks** fail 18 of 77 h3spec cases; the fix
   belongs in the QUIC library (#282).
 - **A wildcard site's manual certificate** is not served for the names it
