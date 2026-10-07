@@ -6177,10 +6177,14 @@ fn resolve_single_placeholder(
         "path" | "http.request.uri.path" => req.uri.path().to_string(),
         _ => {
             // 🚧 Still missing: {dir}, {file}, {file.*}, {re.*}, {env.*},
-            // {http.vars.*}, {err.*}. An unknown name resolves to the empty
-            // string rather than being echoed back, which is what the format
-            // does — printing `{nonsense}` into a response body would turn a
-            // typo into content.
+            // {http.vars.*}, {err.*}.
+            //
+            // 🧭 An unknown name is left exactly as written, which is what
+            // Caddy's replacer does: a body carrying literal braces — JSON,
+            // JavaScript, documentation — survives, and a `header_down` value
+            // such as `{some.unknown.thing}` stays readable as a debugging
+            // tool. Erasing it was the only answer that silently changed
+            // content the operator wrote (#260).
             //
             // 🤡 This list used to name `{scheme}` and `{method}` too, six and
             // eleven lines above where both are handled. On 2026-08-07 a survey
@@ -6189,7 +6193,7 @@ fn resolve_single_placeholder(
             // for features that already existed. A comment that outlives what
             // it describes does not announce itself; it just gets believed.
             tracing::debug!("⚠️ Unresolved Caddy placeholder: {{{}}}", name);
-            String::new()
+            format!("{{{name}}}")
         }
     }
 }

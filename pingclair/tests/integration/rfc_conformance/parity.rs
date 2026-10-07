@@ -21,7 +21,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Replacing the unknown name with nothing is the one answer that silently
 /// changes content the operator wrote.
 #[tokio::test]
-#[ignore = "pingclair#260 — the unknown placeholder is replaced with nothing"]
 async fn test_unknown_placeholder_is_preserved() {
     let mut server = TestServer::new_pingclairfile(&site(r#"respond "open {brace} close""#));
     assert!(server.wait_until_ready().await, "server failed to start");
@@ -49,7 +48,6 @@ async fn test_unknown_placeholder_is_preserved() {
 /// `gzip_static` serves the identity file for ranges — but it has to be a choice,
 /// which is what this test records.
 #[tokio::test]
-#[ignore = "pingclair#254 — the identity representation is served instead"]
 async fn test_precompressed_range_uses_the_compressed_representation() {
     use std::io::Write;
 

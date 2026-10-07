@@ -27,6 +27,15 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🧭 An unknown `{placeholder}` stays exactly as written
+
+A name the replacer did not know was replaced with nothing, so a body carrying
+literal braces — JSON, JavaScript, documentation — lost them, and a
+`header_down` value such as `{some.unknown.thing}` emptied out. Caddy's
+replacer leaves an unknown name verbatim, which is what makes such a value
+usable as a debugging tool; the resolver now does the same, while a known
+placeholder that is merely unset still resolves to the empty string (#260).
+
 ### 🛡️ A `basic_auth` realm is escaped as a quoted-string
 
 A realm containing a double quote was interpolated into the challenge
