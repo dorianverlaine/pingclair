@@ -27,6 +27,18 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 📏 A `HEAD` describes the response its `GET` would receive
+
+With `encode` configured, a `HEAD` forwarded the origin's identity fields while
+the matching `GET` received compressed bytes — a client that sized its
+download from the `HEAD` was told the identity length and then read a shorter,
+encoded body (#264). A `HEAD` now announces the negotiated coding, drops the
+identity `Content-Length` (the compressed length is only known once the body
+has been produced, and RFC 9110 §8.6 makes the field the content's length),
+and carries the same weakened validator as the `GET`. Caddy 2.11.7 announces
+the coding too but reports the length of a gzip stream over an *empty* body,
+which describes neither representation; this release omits the field instead.
+
 ### 🗜️ A range over a precompressed sidecar ranges over the sidecar
 
 A client that accepted `gzip` and sent a `Range` was answered with the identity

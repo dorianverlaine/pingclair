@@ -6509,39 +6509,46 @@ async fn reverse_proxy_upstream(
     }
     apply_h3_response_policy(&mut hdrs, &effective_policy, request_id, Some(state));
     // 🗜️ Final headers decide encoding, so outer policy cannot restore a strong validator.
-    let mut encoder = if crate::response_encoding::request_allows_encoding(&client_header.headers)
-        && intercept_file.is_none()
-        && intercept_replacement.is_none()
-        && !immediate_stream
-    {
-        let accepted = client_header
-            .headers
-            .get("accept-encoding")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("");
-        crate::encoding::negotiate(accepted, &state.config.encodings)
-            .filter(|_| {
-                crate::response_encoding::eligible_h3(
-                    &state.config,
-                    &state.encode_policy,
-                    &client_header.method,
-                    &hdrs,
-                )
+    // 🤐 A `HEAD` describes the response its `GET` would receive and has no
+    // body: the same decision runs, and the encoder it builds is dropped
+    // instead of installed (#264).
+    let bodiless = client_header.method == http::Method::HEAD;
+    let encode_decision =
+        if crate::response_encoding::request_allows_encoding(&client_header.headers)
+            && intercept_file.is_none()
+            && intercept_replacement.is_none()
+            && !immediate_stream
+        {
+            let accepted = client_header
+                .headers
+                .get("accept-encoding")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            crate::encoding::negotiate(accepted, &state.config.encodings).filter(|_| {
+                crate::response_encoding::eligible_h3(&state.config, &state.encode_policy, &hdrs)
             })
-            .and_then(|encoding| {
-                crate::encoding::ResponseEncoder::at_gzip_level(
-                    encoding,
-                    state.config.encode.gzip_level,
-                )
-                .map_err(|error| tracing::warn!("⚠️ Could not initialize H3 encoder: {error}"))
-                .ok()
-            })
-    } else {
-        None
-    };
-    let reencoded = encoder.is_some();
-    if let Some(encoder) = &encoder {
-        crate::response_encoding::reencode_h3_headers(&mut hdrs, encoder.token());
+        } else {
+            None
+        };
+    let mut encoder = None;
+    let mut coding = None;
+    if let Some(encoding) = encode_decision {
+        match crate::encoding::ResponseEncoder::at_gzip_level(
+            encoding,
+            state.config.encode.gzip_level,
+        ) {
+            Ok(built) => {
+                coding = Some(built.token());
+                if !bodiless {
+                    encoder = Some(built);
+                }
+            }
+            Err(error) => tracing::warn!("⚠️ Could not initialize H3 encoder: {error}"),
+        }
+    }
+    let reencoded = coding.is_some();
+    if let Some(coding) = coding {
+        crate::response_encoding::reencode_h3_headers(&mut hdrs, coding);
     }
 
     let mut download_pacer = limits.download_bytes_per_sec.map(StreamPacer::new);

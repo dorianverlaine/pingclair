@@ -8331,48 +8331,63 @@ impl ProxyHttp for PingclairProxy {
             && crate::response_encoding::eligible(
                 &state.config,
                 &state.encode_policy,
-                &session.req_header().method,
                 upstream_response,
             )
             && !ctx.streaming_response
             && ctx.intercepted_response.is_none()
         {
-            match ResponseEncoder::at_gzip_level(encoding, state.config.encode.gzip_level) {
-                Ok(encoder) => {
-                    // 🛡️ Headers are only rewritten once the encoder is
-                    // in place. Announcing a coding that nothing then
-                    // applies would hand the client a body it cannot
-                    // decode.
-                    let token = encoder.token();
-                    if !crate::response_encoding::install(
-                        &mut session.downstream_modules_ctx,
-                        encoder,
-                    ) {
-                        return Ok(());
+            // 🤐 A `HEAD` describes the response its `GET` would receive but
+            // has no body, so the header rewrite below is the whole answer and
+            // no encoder is installed (#264).
+            let encodes_body = crate::response_encoding::encodes_a_body(
+                &session.req_header().method,
+                upstream_response,
+            );
+            let token = encoding.token();
+            let ready = if encodes_body {
+                match ResponseEncoder::at_gzip_level(encoding, state.config.encode.gzip_level) {
+                    Ok(encoder) => {
+                        // 🛡️ Headers are only rewritten once the encoder is
+                        // in place. Announcing a coding that nothing then
+                        // applies would hand the client a body it cannot
+                        // decode.
+                        if !crate::response_encoding::install(
+                            &mut session.downstream_modules_ctx,
+                            encoder,
+                        ) {
+                            return Ok(());
+                        }
+                        true
                     }
-                    upstream_response.insert_header("Content-Encoding", token)?;
-                    let _ = upstream_response.remove_header("Content-Length");
-                    crate::response_encoding::drop_integrity_fields(upstream_response);
-                    crate::response_encoding::weaken_etag(upstream_response)?;
-                    // 🌊 With Content-Length gone, HTTP/1.1 needs explicit
-                    // chunked framing. Pingora only adds it before this
-                    // filter runs, and has already promised keep-alive,
-                    // so leaving it out ends the body by closing a
-                    // connection the client was told would stay open.
-                    // HTTP/1.0 has no chunked coding and closes anyway;
-                    // Pingora's H2 writer strips the field itself.
-                    if session.req_header().version == http::Version::HTTP_11 {
-                        upstream_response.insert_header("Transfer-Encoding", "chunked")?;
+                    Err(e) => {
+                        tracing::warn!(
+                            "⚠️ Could not initialize {} encoder, serving identity: {}",
+                            encoding.token(),
+                            e
+                        );
+                        false
                     }
-                    crate::response_encoding::vary_on_accept_encoding(upstream_response)?;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "⚠️ Could not initialize {} encoder, serving identity: {}",
-                        encoding.token(),
-                        e
-                    );
+            } else {
+                true
+            };
+            if ready {
+                upstream_response.insert_header("Content-Encoding", token)?;
+                let _ = upstream_response.remove_header("Content-Length");
+                crate::response_encoding::drop_integrity_fields(upstream_response);
+                crate::response_encoding::weaken_etag(upstream_response)?;
+                // 🌊 With Content-Length gone, HTTP/1.1 needs explicit
+                // chunked framing. Pingora only adds it before this
+                // filter runs, and has already promised keep-alive,
+                // so leaving it out ends the body by closing a
+                // connection the client was told would stay open.
+                // HTTP/1.0 has no chunked coding and closes anyway;
+                // Pingora's H2 writer strips the field itself. A `HEAD`
+                // has no body to frame, so it needs none of this.
+                if encodes_body && session.req_header().version == http::Version::HTTP_11 {
+                    upstream_response.insert_header("Transfer-Encoding", "chunked")?;
                 }
+                crate::response_encoding::vary_on_accept_encoding(upstream_response)?;
             }
         }
 
