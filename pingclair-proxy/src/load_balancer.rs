@@ -31,7 +31,7 @@ use pingora_load_balancing::selection::consistent::KetamaHashing;
 use pingora_load_balancing::selection::{BackendIter, BackendSelection};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -151,6 +151,41 @@ pub enum Strategy {
 /// silently un-fail a backend that is still refusing connections.
 struct BackendHealth {
     down_until: HashMap<SocketAddr, Arc<AtomicU64>>,
+    /// 🩹 Failures inside the current policy window, per address. Counted
+    /// per window rather than forever, so a backend that fails once an hour
+    /// is not retired by accumulation.
+    failures: HashMap<SocketAddr, Arc<FailureWindow>>,
+}
+
+/// 🩹 One address's failure count inside the window that started with its
+/// most recent failure.
+#[derive(Default)]
+struct FailureWindow {
+    count: AtomicU32,
+    last_ms: AtomicU64,
+}
+
+/// 🩹 The passive-health policy one route applies to its backends.
+///
+/// Caddy spells the two knobs `max_fails` and `fail_duration`; the defaults
+/// here are this proxy's own (one failure, ten-second window and cooldown),
+/// which is what connect failures have always used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PassiveHealth {
+    /// Failures within [`Self::window`] before the backend is marked down.
+    pub max_fails: u32,
+    /// How long a failure is remembered and how long the mark lasts. `None`
+    /// turns passive marking off, which is Caddy's `fail_duration 0`.
+    pub window: Option<Duration>,
+}
+
+impl Default for PassiveHealth {
+    fn default() -> Self {
+        Self {
+            max_fails: 1,
+            window: Some(FAIL_COOLDOWN),
+        }
+    }
 }
 
 impl BackendHealth {
@@ -161,16 +196,24 @@ impl BackendHealth {
         previous: Option<&BackendHealth>,
         addrs: impl IntoIterator<Item = SocketAddr>,
     ) -> Self {
-        let down_until = addrs
-            .into_iter()
-            .map(|addr| {
-                let slot = previous
-                    .and_then(|health| health.down_until.get(&addr).cloned())
-                    .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
-                (addr, slot)
-            })
-            .collect();
-        Self { down_until }
+        let mut down_until = HashMap::new();
+        let mut failures = HashMap::new();
+        for addr in addrs {
+            let down = previous
+                .and_then(|health| health.down_until.get(&addr).cloned())
+                .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+            // 🩹 The failure count survives a refresh for the same reason the
+            // down mark does: re-resolution must not un-fail a bad backend.
+            let window = previous
+                .and_then(|health| health.failures.get(&addr).cloned())
+                .unwrap_or_default();
+            down_until.insert(addr, down);
+            failures.insert(addr, window);
+        }
+        Self {
+            down_until,
+            failures,
+        }
     }
 
     /// Mark a backend down for `cooldown`. `fetch_max` so a later failure
@@ -182,8 +225,33 @@ impl BackendHealth {
         }
     }
 
-    fn mark_down(&self, addr: &SocketAddr) {
-        self.mark_down_for(addr, FAIL_COOLDOWN);
+    /// 🩹 Records one backend-implicating failure under `policy`.
+    ///
+    /// A failure older than the window starts a new count. Reaching
+    /// `max_fails` marks the backend down for the window's length and clears
+    /// the count, so the next window starts from zero. `None` means Caddy's
+    /// `fail_duration 0`: failures are not remembered at all.
+    fn mark_failure(&self, addr: &SocketAddr, policy: PassiveHealth) {
+        let Some(window) = policy.window else {
+            return;
+        };
+        let Some(slot) = self.failures.get(addr) else {
+            return;
+        };
+        let now = now_millis();
+        let count = if now.saturating_sub(slot.last_ms.load(Ordering::Relaxed))
+            > window.as_millis() as u64
+        {
+            1
+        } else {
+            slot.count.load(Ordering::Relaxed).saturating_add(1)
+        };
+        slot.count.store(count, Ordering::Relaxed);
+        slot.last_ms.store(now, Ordering::Relaxed);
+        if count >= policy.max_fails.max(1) {
+            self.mark_down_for(addr, window);
+            slot.count.store(0, Ordering::Relaxed);
+        }
     }
 
     /// A backend is up when its down-until mark is absent or in the past.
@@ -980,14 +1048,67 @@ impl LoadBalancer {
         self.next_health_check_ms.store(0, Ordering::Release);
     }
 
-    /// Mark a backend as down (passive health check). Called from
-    /// `ProxyHttp::fail_to_connect` when a connection attempt to the
+    /// 🩹 Records one backend-implicating failure under `policy`.
+    ///
+    /// Called from `ProxyHttp::fail_to_connect` and `error_while_proxy`; once
+    /// the policy's failure count is reached, `select` skips the backend for
+    /// the policy's window.
+    pub fn mark_failure(&self, addr: &SocketAddr, policy: PassiveHealth) {
+        self.pool.load().health.mark_failure(addr, policy);
+        if let Some(backup) = &self.backup {
+            backup.mark_failure(addr, policy);
+        }
+    }
+
+    /// 🩹 Records one failure that happened **after** the connection was made,
+    /// unless this is the only selectable backend left.
+    ///
+    /// A connect failure is unambiguous — nothing will succeed on that
+    /// address — but a response-phase failure is not: the backend was
+    /// answering a moment ago, and taking the last one out turns a flaky
+    /// origin into a total outage for exactly the policy window. With an
+    /// alternative still up, the failing backend leaves rotation.
+    pub fn mark_response_failure(&self, addr: &SocketAddr, policy: PassiveHealth) {
+        if self.is_last_selectable() {
+            tracing::warn!(
+                upstream = %addr,
+                "🌊 The only selectable backend failed after the connection was made; \
+                 kept in rotation so the route can still answer"
+            );
+            return;
+        }
+        self.mark_failure(addr, policy);
+    }
+
+    /// 🩹 True when at most one backend across the primary and backup pools is
+    /// still selectable, so marking anything down would empty the route.
+    fn is_last_selectable(&self) -> bool {
+        fn up_count(tracked: &Mutex<Vec<TrackedUpstream>>, health: &BackendHealth) -> usize {
+            tracked
+                .lock()
+                .iter()
+                .filter_map(|entry| entry.backend.as_ref())
+                .filter_map(inet_address)
+                .filter(|inet| health.is_up(inet))
+                .count()
+        }
+
+        let mut up = 0usize;
+        up += up_count(&self.tracked, &self.pool.load().health);
+        if up > 1 {
+            return false;
+        }
+        if let Some(backup) = &self.backup {
+            up += up_count(&backup.tracked, &backup.pool.load().health);
+        }
+        up <= 1
+    }
+
+    /// Mark a backend as down immediately, under the default policy. Called
+    /// from `ProxyHttp::fail_to_connect` when a connection attempt to the
     /// backend fails; `select` then skips it for [`FAIL_COOLDOWN`].
     pub fn mark_unhealthy(&self, addr: &SocketAddr) {
-        self.pool.load().health.mark_down(addr);
-        if let Some(backup) = &self.backup {
-            backup.mark_unhealthy(addr);
-        }
+        self.mark_failure(addr, PassiveHealth::default());
     }
 
     /// Configures the health checker for this load balancer.
@@ -1856,6 +1977,68 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(lb.select(None).unwrap().addr.to_string(), "127.0.0.1:8002");
         }
+    }
+
+    /// 🩹 `max_fails` counts failures within the window: one failure leaves a
+    /// backend selectable, the second retires it, and an expired window starts
+    /// a new count instead of accumulating forever.
+    #[test]
+    fn passive_health_counts_failures_within_its_window() {
+        let lb = LoadBalancer::new(
+            vec![
+                Upstream::new("127.0.0.1:8151").unwrap(),
+                Upstream::new("127.0.0.1:8152").unwrap(),
+            ],
+            Strategy::RoundRobin,
+        );
+        let policy = PassiveHealth {
+            max_fails: 2,
+            window: Some(Duration::from_millis(40)),
+        };
+
+        lb.mark_failure(&addr("127.0.0.1:8151"), policy);
+        let mut seen_first = false;
+        for _ in 0..4 {
+            seen_first |= lb.select(None).unwrap().addr.to_string() == "127.0.0.1:8151";
+        }
+        assert!(
+            seen_first,
+            "one failure must not retire a backend under max_fails 2"
+        );
+
+        lb.mark_failure(&addr("127.0.0.1:8151"), policy);
+        for _ in 0..4 {
+            assert_eq!(lb.select(None).unwrap().addr.to_string(), "127.0.0.1:8152");
+        }
+
+        // ⏲️ The window is both the memory and the cooldown.
+        std::thread::sleep(Duration::from_millis(60));
+        let mut seen_again = false;
+        for _ in 0..4 {
+            seen_again |= lb.select(None).unwrap().addr.to_string() == "127.0.0.1:8151";
+        }
+        assert!(seen_again, "the cooldown must expire");
+
+        // 🚫 `window: None` is Caddy's `fail_duration 0`: nothing is remembered.
+        let off = LoadBalancer::new(
+            vec![
+                Upstream::new("127.0.0.1:8153").unwrap(),
+                Upstream::new("127.0.0.1:8154").unwrap(),
+            ],
+            Strategy::RoundRobin,
+        );
+        off.mark_failure(
+            &addr("127.0.0.1:8153"),
+            PassiveHealth {
+                max_fails: 1,
+                window: None,
+            },
+        );
+        let mut seen_off = false;
+        for _ in 0..4 {
+            seen_off |= off.select(None).unwrap().addr.to_string() == "127.0.0.1:8153";
+        }
+        assert!(seen_off, "a disabled window must not retire anything");
     }
 
     #[test]

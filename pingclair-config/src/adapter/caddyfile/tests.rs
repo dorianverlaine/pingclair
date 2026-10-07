@@ -1457,6 +1457,41 @@ mod fail_closed_tests {
         }
     }
 
+    /// 🩹 `max_fails` and `fail_duration` configure passive health instead of
+    /// being refused. `fail_duration 0` keeps Caddy's meaning — failures are
+    /// not remembered — and `max_fails` keeps its `>= 1` bound.
+    #[test]
+    fn passive_health_options_are_configured_not_refused() {
+        let config = crate::compile(
+            "example.com {\n    reverse_proxy 127.0.0.1:9000 {\n        max_fails 3\n        fail_duration 30s\n    }\n}",
+        )
+        .expect("passive health options compile");
+        match &config.servers[0].routes[0].handler {
+            pingclair_core::config::HandlerConfig::ReverseProxy(proxy) => {
+                assert_eq!(proxy.max_fails, Some(3));
+                assert_eq!(proxy.fail_duration_ms, Some(30_000));
+            }
+            other => panic!("expected a proxy handler, got {other:?}"),
+        }
+
+        let off = crate::compile(
+            "example.com {\n    reverse_proxy 127.0.0.1:9000 {\n        fail_duration 0\n    }\n}",
+        )
+        .expect("`fail_duration 0` is Caddy's \"do not remember failures\"");
+        match &off.servers[0].routes[0].handler {
+            pingclair_core::config::HandlerConfig::ReverseProxy(proxy) => {
+                assert_eq!(proxy.fail_duration_ms, Some(0));
+            }
+            other => panic!("expected a proxy handler, got {other:?}"),
+        }
+
+        // 🔢 Zero failures before marking down is not a number Caddy accepts,
+        // and it would make `max_fails` mean "never mark down".
+        compile_err(
+            "example.com {\n    reverse_proxy 127.0.0.1:9000 {\n        max_fails 0\n    }\n}",
+        );
+    }
+
     /// 🧭 `dynamic a` and `dynamic srv` compile into their DNS source, with
     /// every block option preserved for the runtime refresher.
     #[test]

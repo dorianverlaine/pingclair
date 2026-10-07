@@ -474,6 +474,32 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                 "lb_retry_match" => {
                     apply_retry_match(&mut proxy.retry, &sub)?;
                 }
+                // 🩹 Passive health. `max_fails` counts failures *within*
+                // `fail_duration`, so the window is what makes the count
+                // mean anything; without it the proxy's default window
+                // applies (see `ReverseProxyConfig::fail_duration_ms`).
+                "max_fails" => {
+                    let value = parse_positive_u64(&sub)?;
+                    let value = u32::try_from(value).map_err(|_| {
+                        AdapterError::InvalidArgument(
+                            "max_fails".into(),
+                            format!("`{value}` is larger than this server can count"),
+                        )
+                    })?;
+                    proxy.max_fails = Some(value);
+                }
+                "fail_duration" => {
+                    let raw = expect_one_argument(&sub)?;
+                    // 🚫 `0` is Caddy's "do not remember failures": passive
+                    // health stays off for this route. Any other value is an
+                    // ordinary positive duration.
+                    let millis = if raw == "0" || raw == "0s" || raw == "0ms" {
+                        0
+                    } else {
+                        parse_required_duration(&sub)?
+                    };
+                    proxy.fail_duration_ms = Some(millis);
+                }
                 "replace_status" => {
                     proxy
                         .handle_response
@@ -1190,8 +1216,6 @@ fn is_known_proxy_option(name: &str) -> bool {
             | "health_upstream"
             | "health_request_body"
             | "health_follow_redirects"
-            | "max_fails"
-            | "fail_duration"
             | "unhealthy_request_count"
             | "unhealthy_status"
             | "unhealthy_latency"

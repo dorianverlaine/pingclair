@@ -151,6 +151,44 @@ pub fn classify_connect_error(error: &pingora_core::Error) -> FailureOrigin {
     }
 }
 
+/// Classifies a failure that happened **after** the connection to the
+/// upstream was established (`ProxyHttp::error_while_proxy`).
+///
+/// That hook fires only for errors on the established upstream connection
+/// (`pingora-proxy` 0.9.0, `proxy_trait.rs:577`), so the question is which
+/// error types are evidence about the backend:
+///
+/// - `ReadError`, `ReadTimedout`, and `ConnectionClosed` are the origin
+///   truncating or dropping a response it announced.
+/// - `WriteError` / `WriteTimedout` are the request side of the same
+///   connection: the origin went away while the request was being written.
+/// - `InvalidHTTPHeader`, `H1Error`, `H2Error`, and `InvalidH2` are the
+///   origin speaking a protocol it cannot speak.
+/// - Everything else — a downstream abort surfacing here, an internal
+///   fault, a status the retry policy turned into an error — says nothing
+///   about the backend, and blaming it would turn one impatient client into
+///   an outage.
+///
+/// Unlike [`classify_connect_error`], an unrecognised type stays `Local`: a
+/// connect attempt already told us something by the time it fails, while a
+/// response-phase error can originate on either side of the proxy.
+pub fn classify_response_error(error: &pingora_core::Error) -> FailureOrigin {
+    use pingora_core::ErrorType;
+
+    match deepest_error_type(error) {
+        ErrorType::ReadError
+        | ErrorType::ReadTimedout
+        | ErrorType::ConnectionClosed
+        | ErrorType::WriteError
+        | ErrorType::WriteTimedout
+        | ErrorType::InvalidHTTPHeader
+        | ErrorType::H1Error
+        | ErrorType::H2Error
+        | ErrorType::InvalidH2 => FailureOrigin::Remote,
+        _ => FailureOrigin::Local,
+    }
+}
+
 /// Classifies a raw dial failure, for the FastCGI path.
 ///
 /// FastCGI does not go through Pingora's connector — it dials the responder
@@ -459,5 +497,38 @@ mod tests {
             1,
             "one second admits exactly one line no matter how many threads race for it"
         );
+    }
+
+    /// 🩹 The response phase has two sides, and only the upstream's errors
+    /// belong in the backend's health record.
+    #[test]
+    fn response_phase_failures_are_classified_by_side() {
+        for etype in [
+            ErrorType::ReadError,
+            ErrorType::ReadTimedout,
+            ErrorType::ConnectionClosed,
+            ErrorType::WriteError,
+            ErrorType::WriteTimedout,
+            ErrorType::InvalidHTTPHeader,
+            ErrorType::H1Error,
+            ErrorType::H2Error,
+            ErrorType::InvalidH2,
+        ] {
+            let error = Error::explain(etype.clone(), "the origin misbehaved after connecting");
+            assert_eq!(
+                classify_response_error(&error),
+                FailureOrigin::Remote,
+                "{etype:?} is evidence about the origin"
+            );
+            assert!(classify_response_error(&error).implicates_backend());
+        }
+        for etype in [ErrorType::InternalError, ErrorType::UnknownError] {
+            let error = Error::explain(etype.clone(), "not evidence about the origin");
+            assert_eq!(
+                classify_response_error(&error),
+                FailureOrigin::Local,
+                "{etype:?} must not evict a backend"
+            );
+        }
     }
 }

@@ -855,6 +855,15 @@ pub struct ProxyConfig {
     /// 🩺 Active health-check policy for this upstream pool.
     pub health_check: Option<HealthCheckConfig>,
 
+    /// 🩹 Passive health: failures within `fail_duration_ms` before a backend
+    /// is marked down. Caddy's `max_fails`.
+    pub max_fails: Option<u32>,
+
+    /// 🩹 Passive health: how long a failure is remembered and how long the
+    /// backend stays out. Caddy's `fail_duration`; `Some(0)` is "do not
+    /// remember failures" — passive health off for this route.
+    pub fail_duration_ms: Option<u64>,
+
     /// Flush interval
     pub flush_interval: Option<FlushInterval>,
 
@@ -1356,6 +1365,8 @@ impl ProxyConfig {
             lb_policy: None,
             lb_hash_key: None,
             health_check: None,
+            max_fails: None,
+            fail_duration_ms: None,
             flush_interval: None,
             header_up: BTreeMap::new(),
             header_up_remove: Vec::new(),

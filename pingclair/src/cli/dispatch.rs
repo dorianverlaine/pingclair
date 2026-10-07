@@ -756,6 +756,8 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 cache: None,
                 load_balance: LoadBalanceConfig::default(),
                 health_check: None,
+                max_fails: None,
+                fail_duration_ms: None,
                 headers_up,
                 headers_down: headers_down.into_iter().collect(),
                 // 🚫 The one-liner has no `+Name`/`?Name`/`-Name` spelling and

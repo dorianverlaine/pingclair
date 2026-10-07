@@ -2215,6 +2215,22 @@ pub struct ReverseProxyConfig {
     #[serde(default)]
     pub health_check: Option<Box<HealthCheckConfig>>,
 
+    /// 🩹 Passive health: how many backend-implicating failures within
+    /// [`Self::fail_duration_ms`] mark an upstream down before it is skipped.
+    /// Caddy's `max_fails`, which must be at least one; `None` keeps this
+    /// proxy's default of one — the same "first failure removes it" rule a
+    /// refused connection already follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fails: Option<u32>,
+
+    /// 🩹 Passive health: how long a failure is remembered and how long the
+    /// backend stays out once `max_fails` is reached. Caddy's `fail_duration`;
+    /// `None` keeps this proxy's default (ten seconds, the cooldown connect
+    /// failures already used), and `Some(0)` is Caddy's "do not remember
+    /// failures" — passive health off for this route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_duration_ms: Option<u64>,
+
     /// Headers to add to upstream request
     #[serde(default)]
     pub headers_up: BTreeMap<String, String>,
