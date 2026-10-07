@@ -1833,6 +1833,12 @@ pub(super) fn adapt_abort_directive(d: &Directive) -> Result<Handler, AdapterErr
 /// [`data_args`] before this runs — upstream's handler parser likewise rejects
 /// every positional argument and lets the registration helper take the matcher
 /// token first. So anything still here is a genuine surplus argument.
+///
+/// 📌 `disable_openmetrics` is accepted and truthful: this build writes
+/// Prometheus text exposition (`text/plain; version=0.0.4; charset=utf-8`)
+/// whatever the client asks for, so the option describes what already happens.
+/// It is not a switch that turns anything off, and it must not become one
+/// without an OpenMetrics encoder behind it (#45).
 pub(super) fn adapt_metrics_directive(d: &Directive) -> Result<Handler, AdapterError> {
     let args = data_args(d);
     if !args.is_empty() {

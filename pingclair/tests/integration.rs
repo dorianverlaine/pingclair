@@ -5532,6 +5532,30 @@ async fn test_pingclairfile_metrics_directive_serves_the_scrape() {
         &body[..body.len().min(400)]
     );
 
+    // 🚫 No OpenMetrics negotiation: a scraper that asks for it is answered
+    // with the same Prometheus text and the same version, which is the format
+    // this build writes (#45). Emitting a body labelled OpenMetrics without
+    // the spec's `# EOF` and unit rules would be worse than not negotiating.
+    let openmetrics = client
+        .get(server.url(0, "/metrics"))
+        .header("Accept", "application/openmetrics-text; version=1.0.0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(openmetrics.status(), 200);
+    assert_eq!(
+        openmetrics
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; version=0.0.4; charset=utf-8"),
+        "the exposition format does not change with the Accept header"
+    );
+    assert!(
+        !openmetrics.text().await.unwrap().contains("# EOF"),
+        "an OpenMetrics body must not be claimed by a Prometheus content type"
+    );
+
     // 🚫 The path is a matcher, so nothing else on the site turned into a
     // scrape. Without this, `metrics /metrics` reading its argument as data
     // would answer every request with the exposition format and still pass

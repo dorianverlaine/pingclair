@@ -423,6 +423,10 @@ async fn handle_request_inner(
             ))
         }
         (&Method::GET, "/metrics") => {
+            // 📌 Prometheus text exposition, whatever the client asked for:
+            // this build writes no OpenMetrics body, so it advertises none
+            // (#45). `metrics { disable_openmetrics }` describes the same fact
+            // from the configuration side.
             let buffer = pingclair_proxy::metrics::gather();
             Ok(Response::builder()
                 .status(StatusCode::OK)
