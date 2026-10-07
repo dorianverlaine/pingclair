@@ -15,7 +15,7 @@
 //! therefore the outstanding list, and it shrinks one fix at a time:
 //!
 //! ```text
-//! cargo +1.98.1 nextest run -p pingclair --test integration --run-ignored all
+//! cargo +1.99.0 nextest run -p pingclair --test integration --run-ignored all
 //! ```
 
 #[path = "rfc_conformance/request_framing.rs"]

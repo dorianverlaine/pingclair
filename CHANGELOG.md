@@ -3015,8 +3015,8 @@ reproduction; the workaround, where there is one, is in the issue.
 
 ### 🔄 Changed
 
-- 🦀 **Building from source now requires Rust 1.98 instead of 1.97.** The
-  workspace's `rust-version` is 1.98 and CI pins 1.98.1, so the toolchain is the
+- 🦀 **Building from source now requires Rust 1.99 instead of 1.97.** The
+  workspace's `rust-version` is 1.99 and CI pins 1.99.0, so the toolchain is the
   same one the tests ran under. `cargo install` picks the toolchain up from the
   manifest; anyone on a pinned 1.97 needs `rustup update` first.
 

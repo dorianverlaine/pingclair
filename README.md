@@ -107,7 +107,7 @@ Building the current branch requires the repository's pinned Rust toolchain:
 ```bash
 git clone https://github.com/dorianverlaine/pingclair.git
 cd pingclair
-cargo +1.98.1 install --locked --path pingclair
+cargo +1.99.0 install --locked --path pingclair
 ```
 
 The source build needs a C/C++ toolchain, CMake, Clang, and the development

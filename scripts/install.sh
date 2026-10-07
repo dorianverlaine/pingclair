@@ -41,7 +41,7 @@ while [ $# -gt 0 ]; do
         -h|--help)
             echo "Usage: $0 [--main]"
             echo "  (default)  Install the latest stable release binary."
-            echo "  --main     Clone main and compile it locally (requires Rust 1.98+)."
+            echo "  --main     Clone main and compile it locally (requires Rust 1.99+)."
             exit 0
             ;;
         *)
@@ -108,13 +108,13 @@ if [ "$INSTALL_MODE" = "main" ]; then
     # 🧭 Local build of the latest main; `--locked` pins the resolved
     # versions the tests ran against.
     if ! command -v cargo >/dev/null 2>&1; then
-        echo -e "${RED}Error: --main builds from source and requires Rust 1.98 or newer.${NC}"
+        echo -e "${RED}Error: --main builds from source and requires Rust 1.99 or newer.${NC}"
         echo "Install Rust first (https://rustup.rs), or install a released binary"
         echo "by running this script with no flag."
         exit 1
     fi
     # 🎯 The required minor is named once. It used to be written twice — `-lt 97`
-    # in the test and `1.98` in the message — so the check passed a toolchain the
+    # in the test and `1.99` in the message — so the check passed a toolchain the
     # message promised to reject, and the build then failed deep inside
     # BoringSSL with nothing pointing back here.
     REQUIRED_RUST_MAJOR=1

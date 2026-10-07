@@ -91,7 +91,7 @@ impl Budget {
         // 🧮 The counter grants capacity, not access to data; cache publication
         // supplies synchronization, so relaxed ordering is sufficient here.
         self.used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(amount)
                     .filter(|total| *total <= self.limit)
             })
