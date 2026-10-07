@@ -8434,6 +8434,25 @@ impl ProxyHttp for PingclairProxy {
             }
         }
 
+        // 🌊 A lengthless HTTP/1.1 body needs chunked framing: pingora frames
+        // a response whose head declares neither `Content-Length` nor
+        // `Transfer-Encoding` as close-delimited, and a close-delimited body
+        // ends the connection. An origin's early close would then read as a
+        // complete message (#249), and the route would pay a fresh handshake
+        // for every request. This mirrors the rule local responses already
+        // follow, and it also covers an origin that answered close-delimited.
+        if session.req_header().version == http::Version::HTTP_11
+            && body_is_coming
+            && !upstream_response
+                .headers
+                .contains_key(http::header::CONTENT_LENGTH)
+            && !upstream_response
+                .headers
+                .contains_key(http::header::TRANSFER_ENCODING)
+        {
+            upstream_response.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
+        }
+
         // 🛡️ Applies the same security policy used by locally generated responses.
         if let Some(state) = &ctx.state {
             Self::apply_security_response_headers(upstream_response, state)?;

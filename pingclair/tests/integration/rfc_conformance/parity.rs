@@ -11,6 +11,7 @@
 //! says plainly which server it is measured against.
 
 use super::{ScriptedUpstream, TestServer, raw_http1, site};
+use crate::{no_proxy_client, read_until_marker};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -190,6 +191,108 @@ async fn test_truncated_upstream_answers_an_h2_client() {
             Err(error) => panic!("the client must not be left with a bare stream reset: {error}"),
         }
     }
+}
+
+/// 🧯 A truncated flushing route must not read as a complete HTTP/1.1
+/// response.
+///
+/// This is the same origin break the HTTP/2 test above pins: the origin
+/// declares 1 MiB, writes 256 KiB and hangs up. A route that asked for
+/// immediate flushing drops the length so each chunk leaves as it is written
+/// (#247), and a response whose head declares neither `Content-Length` nor
+/// `Transfer-Encoding` is delimited by the close — which turns the very break
+/// the client must notice into a clean end. Caddy relays the head it formed
+/// with chunked framing instead, so the missing terminating chunk stays
+/// visible.
+#[tokio::test]
+async fn test_truncated_flushing_response_is_not_a_clean_h1_end() {
+    let upstream = ScriptedUpstream::start(
+        vec![
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+              Content-Length: 1048576\r\n\r\n"
+                .to_vec(),
+            vec![b'x'; 256 * 1024],
+        ],
+        Duration::ZERO,
+    )
+    .await;
+    let mut server = TestServer::new_pingclairfile(&site(&format!(
+        "reverse_proxy 127.0.0.1:{} {{\n                flush_interval -1\n            }}",
+        upstream.address.port()
+    )));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let outcome = async {
+        let response = client.get(server.url(0, "/")).send().await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        Ok::<_, reqwest::Error>((status, body.len()))
+    }
+    .await;
+    server.stop();
+
+    match outcome {
+        // The break reached the client — a failed body read is the signal.
+        Err(_) => {}
+        Ok((status, bytes)) => panic!(
+            "the origin stopped 768 KiB short, yet the client read a complete \
+             response: {status} {bytes} bytes"
+        ),
+    }
+}
+
+/// 🔁 A flushing route keeps its HTTP/1.1 connection for the next request.
+///
+/// `flush_interval -1` drops the length so chunks leave as they are written
+/// (#247). A lengthless HTTP/1.1 response is close-delimited unless its head
+/// says chunked, and a close-delimited response ends the connection: without
+/// that framing every proxied response would pay a fresh TCP and TLS
+/// handshake. Caddy and nginx both frame it as chunked and keep the
+/// connection, and the second request on this one is the check.
+#[tokio::test]
+async fn test_flushing_route_keeps_its_h1_connection() {
+    let upstream = ScriptedUpstream::start(
+        vec![
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello"
+                .to_vec(),
+        ],
+        Duration::ZERO,
+    )
+    .await;
+    let mut server = TestServer::new_pingclairfile(&site(&format!(
+        "reverse_proxy 127.0.0.1:{} {{\n                flush_interval -1\n            }}",
+        upstream.address.port()
+    )));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let mut stream = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET /one HTTP/1.1\r\nHost: test\r\n\r\n")
+        .await
+        .unwrap();
+    let first = read_until_marker(&mut stream, b"hello", Duration::from_secs(5)).await;
+    stream
+        .write_all(b"GET /two HTTP/1.1\r\nHost: test\r\n\r\n")
+        .await
+        .unwrap();
+    let second = read_until_marker(&mut stream, b"hello", Duration::from_secs(5)).await;
+    server.stop();
+
+    let first_head = String::from_utf8_lossy(&first).to_ascii_lowercase();
+    assert!(
+        first_head.contains("transfer-encoding: chunked"),
+        "a lengthless HTTP/1.1 response must frame its body, not lean on the \
+         close: {first_head}"
+    );
+    assert!(
+        second
+            .windows(b"HTTP/1.1 200".len())
+            .any(|window| window == b"HTTP/1.1 200"),
+        "the second response must arrive on the same connection"
+    );
 }
 
 /// ⚖️ A zero weight means the upstream is not chosen.

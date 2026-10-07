@@ -27,6 +27,19 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🧾 An immediately-flushed response is chunked on HTTP/1.1, so a short body stays short
+
+Immediate flushing drops the declared length so every chunk leaves as it is
+written, and the response that followed leaned on the connection close to end
+the body. That was wrong twice. An origin which declared a megabyte, wrote a
+quarter of it and hung up reached the client as a complete `200` — the missing
+bytes were indistinguishable from the end of the message — and the connection
+could not be reused, so every request on the route paid a fresh TCP and TLS
+handshake. The response is now framed as chunked, the way Caddy and nginx
+frame a body whose length is not known in advance; a body the origin never
+finished is missing its terminating chunk, and the client reports that as an
+error (#304).
+
 ### 🛡️ Every answer is logged with the client the listener established
 
 A request that matched no site — and one refused before routing, for a bad
