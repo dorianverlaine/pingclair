@@ -151,7 +151,6 @@ async fn test_known_length_body_arrives_before_it_ends() {
 /// it already formed; a stream reset with no status at all leaves the client —
 /// and the operator reading the access log — with nothing to act on.
 #[tokio::test]
-#[ignore = "pingclair#249 — the H2 client receives a stream reset and no response"]
 async fn test_truncated_upstream_answers_an_h2_client() {
     let upstream = ScriptedUpstream::start(
         vec![

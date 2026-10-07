@@ -8726,16 +8726,33 @@ impl ProxyHttp for PingclairProxy {
             _ => None,
         };
         let served = if already_responded {
-            // 🔪 The original response is already on the wire, so an error
-            // page could only be spliced onto it: on H2 its header block is
-            // dropped and its body arrives as more DATA on the same stream,
-            // which then ends normally; on H1 it lands inside the first
-            // response's framing. Abandoning the message is the only honest
-            // signal left — RST_STREAM(INTERNAL_ERROR) on H2, a closed
-            // connection on H1 — and the access log keeps the status that
-            // actually went out.
-            session.downstream_session.shutdown().await;
-            false
+            // 🔪 An error page cannot be spliced onto a response that is
+            // already on the wire: on H2 its header block would be dropped and
+            // its body would arrive as more DATA on the same stream; on H1 it
+            // would land inside the first response's framing.
+            //
+            // 🔚 Whether the message may be *ended* instead depends on who
+            // broke it. An origin that closed mid-response already formed the
+            // status and headers the client is entitled to, so the relay ends
+            // where the origin did: with a declared `Content-Length` the short
+            // body is the evidence, exactly as Caddy passes along the head it
+            // formed (#249). A response this hop abandons — a deadline, a
+            // write failure, an internal fault — has no origin answer to
+            // relay, and the break must be the visible signal, so it keeps
+            // RST_STREAM(INTERNAL_ERROR) on H2 (#95). The same reset stays for
+            // an origin break without a declared length: a clean end of a
+            // chunked or close-delimited message would look complete.
+            let declared_length = session.response_written().is_some_and(|response| {
+                response.headers.contains_key(http::header::CONTENT_LENGTH)
+            });
+            let origin_broke_mid_response =
+                crate::upstream_failure::classify_response_error(e).implicates_backend();
+            if declared_length && origin_broke_mid_response {
+                session.write_response_body(None, true).await.is_ok()
+            } else {
+                session.downstream_session.shutdown().await;
+                false
+            }
         } else if let Some(status) = ctx.response_decision_error.take() {
             // 🚫 A response subroute owns the original upstream response once
             // it matches. Its raised status may enter error routing once, but
