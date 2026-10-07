@@ -31,13 +31,14 @@ makes startup, reload and shutdown fail closed and drop no request.
 
 A field whose name was not a token was dropped with `from_utf8_lossy`, and its
 value was rebuilt the same lossy way — so `x bad: value` silently left the
-request and a legal obs-text value such as `caf\xe9` reached the origin as the
-bytes of U+FFFD, while HTTP/1.1 and HTTP/2 refuse the first and forward the
-second verbatim (#236). Field names and values are now validated where the
-request is parsed: an invalid name or a value carrying NUL, CR or LF is a
-malformed request and resets the stream with `H3_MESSAGE_ERROR`, and obs-text
-is forwarded unchanged. The parsed header list carries `HeaderName` and
-`HeaderValue` end to end, so a repaired copy cannot come back by accident.
+request and a legal obs-text value — a byte as ordinary as Latin-1 `0xE9` —
+reached the origin as the bytes of U+FFFD, while HTTP/1.1 and HTTP/2 refuse the
+first and forward the second verbatim (#236). Field names and values are now
+validated where the request is parsed: an invalid name or a value carrying
+NUL, CR or LF is a malformed request and resets the stream with
+`H3_MESSAGE_ERROR`, and obs-text is forwarded unchanged. The parsed header list
+carries `HeaderName` and `HeaderValue` end to end, so a repaired copy cannot
+come back by accident.
 
 ### 📏 An HTTP/3 body that ends early is a protocol error, not a `400`
 
