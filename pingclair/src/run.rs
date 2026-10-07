@@ -83,6 +83,9 @@ pub(crate) fn run_server_with_adapter(
     // work with a single atomic load instead of consulting the configuration.
     pingclair_proxy::metrics::configure(config.global.metrics);
     pingclair_proxy::server::configure_response_cache(&config.servers);
+    // 🧮 The static-file caches are sized from this machine's memory before any
+    // file server exists to size itself from a constant (#33).
+    crate::memory_budget::install_cache_budgets();
 
     // 📡 OTLP push is parsed so a configuration written elsewhere still loads
     // and still says what it meant, but nothing here exports it. Refusing beats

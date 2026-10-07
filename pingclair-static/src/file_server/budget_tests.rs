@@ -18,17 +18,18 @@ fn key(name: &str) -> FileKey {
 fn assert_body_budget(compressed: bool) {
     let first = FileServer::new(FileServerConfig::default());
     let second = FileServer::new(FileServerConfig::default());
+    let budgets = super::budget::cache_budgets();
     let (first_cache, second_cache, limit) = if compressed {
         (
             &first.compress_cache,
             &second.compress_cache,
-            FileServer::COMPRESS_CACHE_BUDGET,
+            budgets.compressed_bytes,
         )
     } else {
         (
             &first.content_cache,
             &second.content_cache,
-            FileServer::CONTENT_CACHE_BUDGET,
+            budgets.content_bytes,
         )
     };
     let size = limit * 3 / 4;
@@ -81,7 +82,7 @@ fn metadata_budget_is_shared_and_readers_keep_their_slots() {
     std::fs::write(&path, b"test").unwrap();
     let metadata = std::fs::metadata(&path).unwrap();
     let mut readers = Vec::new();
-    for i in 0..FileServer::META_CACHE_CAP {
+    for i in 0..super::budget::cache_budgets().metadata_entries {
         readers.push(
             first
                 .file_meta(&dir.path().join(format!("{i}.txt")), &metadata)
@@ -103,6 +104,48 @@ fn metadata_budget_is_shared_and_readers_keep_their_slots() {
         &cached,
         &second.file_meta(&path, &metadata).unwrap()
     ));
+}
+
+/// 🧮 A machine's memory sizes the caches without ever growing them.
+#[test]
+fn cache_budgets_follow_the_machines_memory_up_to_the_ceilings() {
+    // 🫥 Nothing known: the values this server has always used.
+    assert_eq!(
+        CacheBudgets::for_available_memory(None),
+        CacheBudgets::DEFAULTS
+    );
+
+    // 💻 A laptop or small server: exactly the ceilings.
+    assert_eq!(
+        CacheBudgets::for_available_memory(Some(4 * 1024 * 1024 * 1024)),
+        CacheBudgets::DEFAULTS
+    );
+
+    // 📦 A large container: still the ceilings, never more.
+    assert_eq!(
+        CacheBudgets::for_available_memory(Some(64 * 1024 * 1024 * 1024)),
+        CacheBudgets::DEFAULTS
+    );
+
+    // 🧯 A 512 MiB container: a sixteenth of the ceilings.
+    assert_eq!(
+        CacheBudgets::for_available_memory(Some(512 * 1024 * 1024)),
+        CacheBudgets {
+            compressed_bytes: 8 * 1024 * 1024,
+            content_bytes: 2 * 1024 * 1024,
+            metadata_entries: 1024,
+        }
+    );
+
+    // 🪫 A tiny one still gets working caches, not zero.
+    assert_eq!(
+        CacheBudgets::for_available_memory(Some(64 * 1024 * 1024)),
+        CacheBudgets {
+            compressed_bytes: 4 * 1024 * 1024,
+            content_bytes: 1024 * 1024,
+            metadata_entries: 256,
+        }
+    );
 }
 
 #[test]

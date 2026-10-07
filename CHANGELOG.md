@@ -27,6 +27,18 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🧮 The static caches are sized from the machine
+
+The file server's caches had fixed ceilings — 64 MiB of compressed bodies,
+16 MiB of raw ones, 4,096 metadata entries — and the keepalive pools may
+reserve 512 idle descriptors per connector per worker. Those numbers are now
+what they always were *at most*: at startup the process sizes the caches from
+the memory it may actually use (a cgroup limit first, then the machine's
+available memory) and logs the values it chose, so a 512 MiB container keeps a
+sixteenth of what a 16 GiB host does instead of the same fixed block. The
+descriptor side already warned when the pools alone can exceed
+`RLIMIT_NOFILE`; both halves now belong to one sizing policy (#33).
+
 ### 🚫 A directory listing answers `GET` and `HEAD` only
 
 With `browse` on and no index file, a `POST` to the directory received the

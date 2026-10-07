@@ -48,6 +48,7 @@ mod header_deadline;
 mod listen;
 mod log_bridge;
 mod logging;
+mod memory_budget;
 mod paths;
 mod resource_guard;
 mod run;

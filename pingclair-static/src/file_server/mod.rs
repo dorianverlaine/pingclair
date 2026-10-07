@@ -36,6 +36,7 @@
 //! from formatting.
 
 mod budget;
+pub use budget::{CacheBudgets, configure_cache_budgets};
 #[cfg(test)]
 mod budget_tests;
 mod cache;
@@ -398,20 +399,15 @@ pub struct NotModified {
 }
 
 impl FileServer {
-    /// 🧮 Process-wide retained compressed-body limit; bodies allocate on demand.
-    const COMPRESS_CACHE_BUDGET: usize = 64 * 1024 * 1024;
-
-    /// 🧮 Process-wide retained small-file limit; eligibility stays unchanged.
-    const CONTENT_CACHE_BUDGET: usize = 16 * 1024 * 1024;
-
-    /// 🧮 Creates route-local caches backed by the process-wide admission budgets.
+    /// 🧮 Creates route-local caches backed by the process-wide admission
+    /// budgets, whose sizes come from [`CacheBudgets`] (#33).
     pub fn new(config: FileServerConfig) -> Self {
         static COMPRESSED: std::sync::LazyLock<Arc<Budget>> =
-            std::sync::LazyLock::new(|| Budget::new(FileServer::COMPRESS_CACHE_BUDGET));
+            std::sync::LazyLock::new(|| Budget::new(budget::cache_budgets().compressed_bytes));
         static CONTENT: std::sync::LazyLock<Arc<Budget>> =
-            std::sync::LazyLock::new(|| Budget::new(FileServer::CONTENT_CACHE_BUDGET));
+            std::sync::LazyLock::new(|| Budget::new(budget::cache_budgets().content_bytes));
         static METADATA: std::sync::LazyLock<Arc<Budget>> =
-            std::sync::LazyLock::new(|| Budget::new(FileServer::META_CACHE_CAP));
+            std::sync::LazyLock::new(|| Budget::new(budget::cache_budgets().metadata_entries));
         Self {
             encode_policy: pingclair_core::encoding::EncodePolicy::compile(
                 &config.encode,
