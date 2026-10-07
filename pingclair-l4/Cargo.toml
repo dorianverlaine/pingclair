@@ -1,0 +1,15 @@
+[package]
+name = "pingclair-l4"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Bounded TCP routing and TLS ClientHello classification"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
