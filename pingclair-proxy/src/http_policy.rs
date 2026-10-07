@@ -1653,6 +1653,22 @@ impl<'a> OutboundRequestFilter<'a> {
     }
 }
 
+/// 🔎 The fields a message's own `Connection` named.
+///
+/// RFC 9110 §7.6.1 requires an intermediary to remove every field listed in
+/// `Connection` before forwarding it, and the list lives in the very field
+/// being read — so it is collected first. `close`, `keep-alive` and `upgrade`
+/// are skipped by [`OutboundRequestFilter`], the same rule the request
+/// direction uses, because they name connection options rather than fields
+/// (#263). Returned as owned names so the caller may remove them while holding
+/// the very header map they came from.
+pub(crate) fn connection_named_fields(headers: &HeaderMap) -> Vec<Box<str>> {
+    OutboundRequestFilter::for_client(headers)
+        .connection_tokens()
+        .map(Box::from)
+        .collect()
+}
+
 /// 🧪 The one header matrix every sink is tested against.
 ///
 /// Lives beside the filter rather than in a test module because four different

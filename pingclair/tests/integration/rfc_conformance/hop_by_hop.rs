@@ -20,7 +20,6 @@ use std::time::Duration;
 /// half that changes per deployment and the half a cache or a smuggling chain
 /// can use.
 #[tokio::test]
-#[ignore = "pingclair#263 — the listed field is delivered on H1 and H2"]
 async fn test_connection_listed_field_is_not_forwarded() {
     let body = b"hello text body\n".repeat(400);
     let head = format!(

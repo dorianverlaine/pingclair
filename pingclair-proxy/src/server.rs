@@ -7928,6 +7928,11 @@ impl ProxyHttp for PingclairProxy {
                 crate::cache_age::RevalidationHeaders::from_response(upstream_response),
             );
         }
+        // 🧹 Fields the origin named in its own `Connection` are scoped to that
+        // hop: RFC 9110 §7.6.1 makes forwarding one a MUST NOT (#263).
+        for name in crate::http_policy::connection_named_fields(&upstream_response.headers) {
+            upstream_response.remove_header(name.as_ref());
+        }
         if upstream_response.headers.contains_key("trailer") {
             tracing::warn!(
                 "🚫 Rejecting an upstream response that requires unsupported trailer forwarding"
