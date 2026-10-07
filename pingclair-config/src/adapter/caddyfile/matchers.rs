@@ -226,6 +226,7 @@ pub(super) fn parse_matcher_definition(d: &Directive) -> Result<Matcher, Adapter
             ));
         }
 
+        refuse_duplicate_regexp_matchers(&d.name, &matchers)?;
         Ok(merge_matcher_set(matchers))
     } else {
         // Inline matcher: @api path /v1/*
@@ -276,6 +277,9 @@ pub(super) fn parse_matcher_definition(d: &Directive) -> Result<Matcher, Adapter
 /// the same name, query keys of the same name, remote-IP ranges) while
 /// different kinds are AND'ed. The old code AND'ed everything, which made
 /// `@foo { header Foo bar; header Foo baz }` impossible to satisfy.
+///
+/// ⚠️ The regexp matchers are the exception, and they are refused rather than
+/// merged — see [`refuse_duplicate_regexp_matchers`].
 pub(super) fn merge_matcher_set(matchers: Vec<Matcher>) -> Matcher {
     use std::collections::HashMap;
 
@@ -350,6 +354,51 @@ pub(super) fn merge_matcher_set(matchers: Vec<Matcher>) -> Matcher {
         combined = Matcher::And(Box::new(combined), Box::new(part));
     }
     combined
+}
+
+/// 🚫 Refuses a second `path_regexp`, or a second `header_regexp` for one
+/// field, inside a single matcher block.
+///
+/// Caddy's JSON matcher holds one pattern per target, so a repeated directive
+/// silently keeps the last one; this proxy used to AND them, which made a
+/// block that reads as "either path" match nothing at all. Neither reading is
+/// what the block says, and upstream asked for a loud answer
+/// (caddyserver/caddy#5028), so the block is refused with the alternative the
+/// operator can write instead: one pattern with `|` between the choices.
+fn refuse_duplicate_regexp_matchers(block: &str, matchers: &[Matcher]) -> Result<(), AdapterError> {
+    let mut path_regexps = 0usize;
+    let mut header_fields: Vec<&str> = Vec::new();
+    for matcher in matchers {
+        match matcher {
+            Matcher::PathRegexp { .. } => {
+                path_regexps += 1;
+                if path_regexps > 1 {
+                    return Err(AdapterError::InvalidArgument(
+                        "path_regexp".into(),
+                        format!(
+                            "`{block}` holds more than one path_regexp; Caddy keeps only the \
+                             last one and this proxy will not guess between them — combine \
+                             the alternatives into one pattern, for example `^/a|b$`"
+                        ),
+                    ));
+                }
+            }
+            Matcher::HeaderRegexp { field, .. } => {
+                if header_fields.contains(&field.as_str()) {
+                    return Err(AdapterError::InvalidArgument(
+                        "header_regexp".into(),
+                        format!(
+                            "`{block}` holds more than one header_regexp for field `{field}`; \
+                             combine the alternatives into one pattern"
+                        ),
+                    ));
+                }
+                header_fields.push(field);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// 🕳️ Maximum matcher nesting accepted from a Pingclairfile.
@@ -459,6 +508,7 @@ pub(super) fn parse_single_matcher_at(
                         "empty matcher block".into(),
                     ));
                 }
+                refuse_duplicate_regexp_matchers("not", &matchers)?;
                 let mut combined = matchers.remove(0);
                 for matcher in matchers {
                     combined = Matcher::And(Box::new(combined), Box::new(matcher));

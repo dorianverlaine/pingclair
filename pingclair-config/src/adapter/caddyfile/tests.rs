@@ -1374,6 +1374,53 @@ mod fail_closed_tests {
         }
     }
 
+    /// 🚫 Two `path_regexp` directives in one matcher block are refused, and
+    /// the refusal names the block and shows the alternative.
+    ///
+    /// Caddy's JSON matcher holds one pattern, so upstream keeps the last one
+    /// silently (caddyserver/caddy#5028 asked for a loud answer); this proxy
+    /// used to AND them, so a block that reads as "either path" matched
+    /// nothing at all. Neither reading is what the block says.
+    #[test]
+    fn test_a_second_path_regexp_in_one_block_is_refused() {
+        let message = compile_err(
+            "example.com {\n    @and {\n        path_regexp ^/a\n        path_regexp b$\n    }\n    respond @and \"matched\"\n}",
+        );
+        assert!(
+            message.contains("path_regexp") && message.contains("@and"),
+            "the refusal names the directive and the block: {message}"
+        );
+        assert!(
+            message.contains('|'),
+            "the refusal shows the alternative: {message}"
+        );
+
+        // 🔤 One pattern that says "either" is what compiles.
+        crate::compile(
+            "example.com {\n    @either path_regexp ^/a|b$\n    respond @either \"matched\"\n}",
+        )
+        .expect("one alternation pattern is the supported spelling");
+    }
+
+    /// 🚫 The same rule covers `header_regexp` for one field, while two
+    /// different fields still AND — that is the reading Caddy's JSON map gives
+    /// them.
+    #[test]
+    fn test_repeated_header_regexp_for_one_field_is_refused() {
+        let message = compile_err(
+            "example.com {\n    @both {\n        header_regexp X-Env ^prod$\n        header_regexp X-Env ^staging$\n    }\n    respond @both \"matched\"\n}",
+        );
+        assert!(
+            message.contains("header_regexp") && message.contains("X-Env"),
+            "the refusal names the field: {message}"
+        );
+
+        crate::compile(
+            "example.com {\n    @both {\n        header_regexp X-Env ^prod$\n        header_regexp X-Tier ^gold$\n    }\n    respond @both \"matched\"\n}",
+        )
+        .expect("different fields still AND");
+    }
+
     /// 🩺 Health checking spelled flat, which is how the format spells it.
     #[test]
     fn flat_health_options_configure_the_health_check() {
