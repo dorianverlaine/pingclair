@@ -12238,6 +12238,77 @@ fn read_fcgi_size(content: &[u8], offset: &mut usize) -> std::io::Result<usize> 
     }
 }
 
+/// 🧩 `header_down` reaches a FastCGI response, not only a proxied one.
+///
+/// FastCGI never enters `upstream_peer`, so its response carries its own call
+/// to the proxy response operations. That call existed while the DSL could not
+/// populate the map it read, which is how pingclair#24 read "the DSL cannot
+/// express `header_down`" for weeks: the field was wired and always empty.
+/// `php_fastcgi` passes unknown block options through to the `reverse_proxy`
+/// syntax, so this is the configuration an operator would write.
+#[tokio::test]
+async fn test_php_fastcgi_applies_header_down_to_the_response() {
+    let responder = MockFastCgi::start();
+    *responder.response.lock().unwrap() = b"Status: 200 OK\r\nContent-Type: text/plain\r\n\
+        X-Secret: origin-only\r\nX-Kept: from-cgi\r\n\r\nfastcgi body"
+        .to_vec();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("index.php"), "<?php // responder").unwrap();
+    let root = root.path().to_str().unwrap().replace("\\", "/");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            php_fastcgi 127.0.0.1:{fcgi_port} {{
+                header_down -X-Secret
+                header_down +X-Added added-by-proxy
+            }}
+        }}
+        "#,
+        fcgi_port = responder.port
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/index.php"))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let secret = response.headers().get("x-secret").is_some();
+    let added = response
+        .headers()
+        .get("x-added")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let kept = response
+        .headers()
+        .get("x-kept")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        (status, secret, added, kept, body),
+        (
+            200,
+            false,
+            Some("added-by-proxy".to_string()),
+            Some("from-cgi".to_string()),
+            "fastcgi body".to_string()
+        )
+    );
+}
+
 /// 🐘 The `php_fastcgi` shortcut really talks FastCGI to PHP-FPM.
 #[tokio::test]
 async fn test_php_fastcgi_proxies_to_a_fastcgi_responder() {
