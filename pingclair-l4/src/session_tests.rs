@@ -54,8 +54,11 @@ async fn a_real_rustls_hello_reaches_the_selected_origin_unchanged() {
         assert_eq!(got, expected);
         socket.write_all(b"origin").await.unwrap();
     });
-    let session =
-        tokio::spawn(async move { prepared.serve(stream, "127.0.0.1".parse().unwrap()).await });
+    let session = tokio::spawn(async move {
+        prepared
+            .serve(stream, "::ffff:127.0.0.1".parse().unwrap())
+            .await
+    });
     client.write_all(&wire).await.unwrap();
     client.shutdown().await.unwrap();
     let mut response = Vec::new();
@@ -135,13 +138,15 @@ async fn blocked_peers_are_refused_before_any_preread_or_dial() {
         &["127.0.0.0/8".into()],
     )
     .unwrap();
-    let (_client, stream) = duplex(8);
-    assert_eq!(
-        prepared
-            .serve(stream, "127.0.0.1".parse().unwrap())
-            .await
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::PermissionDenied
-    );
+    for peer in ["127.0.0.1", "::ffff:127.0.0.1"] {
+        let (_client, stream) = duplex(8);
+        assert_eq!(
+            prepared
+                .serve(stream, peer.parse().unwrap())
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
 }

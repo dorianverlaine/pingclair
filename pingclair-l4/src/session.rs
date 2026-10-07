@@ -19,7 +19,7 @@ struct Matcher {
 
 impl Matcher {
     fn matches(&self, hello: Option<&ClientHello<'_>>, peer: IpAddr) -> bool {
-        if !self.peers.as_strings().is_empty() && !self.peers.contains(peer) {
+        if !self.peers.as_strings().is_empty() && !contains_peer(&self.peers, peer) {
             return false;
         }
         match (&self.tls, hello) {
@@ -31,6 +31,12 @@ impl Matcher {
             }
         }
     }
+}
+
+// 🌐 Dual-stack sockets report IPv4 peers as IPv6-mapped addresses.
+fn contains_peer(ranges: &IpRanges, peer: IpAddr) -> bool {
+    let canonical = peer.to_canonical();
+    ranges.contains(peer) || (canonical != peer && ranges.contains(canonical))
 }
 
 struct Route {
@@ -114,7 +120,7 @@ impl PreparedListener {
         mut stream: S,
         peer: IpAddr,
     ) -> io::Result<()> {
-        if self.blocked.contains(peer) {
+        if contains_peer(&self.blocked, peer) {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         let mut prefix = Vec::new();
