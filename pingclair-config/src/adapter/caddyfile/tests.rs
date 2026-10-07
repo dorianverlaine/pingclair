@@ -2681,6 +2681,49 @@ mod fail_closed_tests {
         }
     }
 
+    /// 🚫 A bare `tls` names nothing, and Caddy refuses it; this server used to
+    /// accept it as "automatic HTTPS on", which meant a file Caddy rejects
+    /// would start here (#147).
+    #[test]
+    fn a_bare_site_tls_is_refused_with_the_spellings_that_work() {
+        let error = crate::compile("example.com {\n    tls\n    respond \"hi\"\n}")
+            .expect_err("a bare `tls` must not load");
+        let message = error.to_string();
+        for expected in [
+            "names nothing",
+            "tls internal",
+            "tls <cert_file> <key_file>",
+            "tls { … }",
+            "already gets automatic HTTPS",
+        ] {
+            assert!(
+                message.contains(expected),
+                "missing {expected:?} in: {message}"
+            );
+        }
+
+        // 📌 The spellings that do say something still load, so the refusal is
+        // about the empty form rather than about `tls` itself.
+        for accepted in [
+            "example.com {\n    tls internal\n    respond \"hi\"\n}",
+            "example.com {\n    tls off\n    respond \"hi\"\n}",
+        ] {
+            crate::compile(accepted)
+                .unwrap_or_else(|error| panic!("`{accepted}` must load: {error}"));
+        }
+
+        // 🚧 And a `tls` block option this build has not implemented is still
+        // refused by name, which is the other half of #147's `tls` row.
+        let unimplemented = crate::compile(
+            "example.com {\n    tls {\n        protocols tls1.3\n    }\n    respond \"hi\"\n}",
+        )
+        .expect_err("an unimplemented TLS option must not load");
+        assert!(
+            unimplemented.to_string().contains("protocols"),
+            "the refusal must name the option: {unimplemented}"
+        );
+    }
+
     /// 🧭 `private_ranges` is a keyword inside `static` rather than a module of
     /// its own, and it expands to Caddy's own six prefixes — `127.0.0.1/8` and
     /// `::1` included, because loopback counts as private upstream.

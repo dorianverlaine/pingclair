@@ -38,6 +38,16 @@ before any answer can be produced; the trusted-proxy policy is global and the
 PROXY-protocol tunnel registry is per listener, so none of it needed a site
 (#281).
 
+### 🚫 A bare `tls` is refused, as Caddy refuses it
+
+`example.com { tls }` — no argument, no block — used to load here as "turn
+automatic HTTPS on", while Caddy refuses it at parse time. That is the
+direction that matters: a file which is broken on the reference implementation
+started on this one, so it could not be checked there before being deployed
+here. The refusal names the spellings that do say something — `tls internal`,
+`tls <cert> <key>`, `tls <email>`, or a `tls { … }` block — and notes that a
+site address with a hostname already gets automatic HTTPS (#147).
+
 ### 🌐 `remote_ip private_ranges` and `client_ip private_ranges` load
 
 Caddy's single-word spelling for its own list of private, loopback and

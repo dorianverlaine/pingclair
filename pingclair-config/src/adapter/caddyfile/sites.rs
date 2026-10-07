@@ -412,6 +412,24 @@ pub(super) fn adapt_server(
                     }
                 },
                 "tls" => {
+                    // 🚫 A bare `tls` names nothing, and Caddy refuses it at
+                    // parse time ("wrong argument count or unexpected line
+                    // ending after 'tls'"). This server accepted it as "turn
+                    // automatic HTTPS on", which is the dangerous direction:
+                    // a file that Caddy refuses would start here and only
+                    // here, so it could never be checked on the reference
+                    // implementation first (#147). An address with a hostname
+                    // already gets automatic HTTPS without any `tls` line.
+                    if sub_d.args.is_empty() && sub_d.block.is_none() {
+                        return Err(AdapterError::InvalidArgument(
+                            "tls".into(),
+                            "a bare `tls` names nothing; write `tls internal` for a local \
+                             certificate, `tls <cert_file> <key_file>` for your own, `tls <email>` \
+                             for ACME, or a `tls { … }` block. A site address with a hostname \
+                             already gets automatic HTTPS"
+                                .into(),
+                        ));
+                    }
                     server.tls = Some(adapt_tls_directive(&sub_d)?);
                 }
                 "limits" => {
