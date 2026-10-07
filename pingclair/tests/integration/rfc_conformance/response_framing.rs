@@ -100,7 +100,6 @@ async fn test_proxied_body_length_matches_its_header() {
 /// HTTP/1.1 client that believes the announced length on a bodiless status waits
 /// for bytes that never arrive.
 #[tokio::test]
-#[ignore = "pingclair#270 — the proxied H1 path forwards the origin's Content-Length on a 204"]
 async fn test_proxied_204_carries_no_content_length() {
     let upstream = ScriptedUpstream::start(
         vec![b"HTTP/1.1 204 No Content\r\nContent-Length: 42\r\n\r\n".to_vec()],

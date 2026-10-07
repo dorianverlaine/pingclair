@@ -8141,6 +8141,18 @@ impl ProxyHttp for PingclairProxy {
         // with a stray space is a protocol error on H2/H3 (#256).
         crate::http_policy::trim_pingora_response_padding(upstream_response);
 
+        // 🚫 RFC 9110 §8.6: a 1xx or 204 response cannot carry a
+        // `Content-Length`. An origin that sends one made its mistake here;
+        // forwarding it would make it ours, and an HTTP/1.1 client that
+        // believes the announced length on a bodiless status waits for bytes
+        // that never arrive (#270). This is the last header hook before the
+        // response is written, and the one every transport passes through.
+        if !crate::http_policy::ResponseContent::for_status(upstream_response.status.as_u16())
+            .allows_content_length()
+        {
+            upstream_response.remove_header(&http::header::CONTENT_LENGTH);
+        }
+
         // 🛡️ Applies the same security policy used by locally generated responses.
         if let Some(state) = &ctx.state {
             Self::apply_security_response_headers(upstream_response, state)?;
