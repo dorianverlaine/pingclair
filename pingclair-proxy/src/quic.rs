@@ -5329,7 +5329,10 @@ async fn fastcgi_upstream(
             "⚠️ H3 FastCGI request body length mismatch"
         );
         exchange.abort().await;
-        return Err((400, "Bad Request"));
+        // 📏 RFC 9114 §4.1.2: a body that ends before its declared length is a
+        // malformed request, not an answer this hop gives (#237).
+        send_reset(resp_tx, stream_id, quiche::h3::WireErrorCode::MessageError).await;
+        return Ok(());
     }
     if let Some(held) = request_buffer.as_mut().and_then(|buffer| buffer.finish()) {
         exchange.send_body(&held).await.map_err(exchange_error)?;
@@ -6117,6 +6120,9 @@ async fn reverse_proxy_upstream(
             return Err((502, "Upstream Write Failed"));
         }
         // 📏 Rejects a body length mismatch before it can poison a reused connection.
+        // RFC 9114 §4.1.2 makes it a malformed request, so the client is told
+        // "you broke the protocol" with a stream reset rather than handed an
+        // application's `400` — the same signal the header path sends (#237).
         if let Some(content_length) = client_content_length
             && counted != content_length
         {
@@ -6126,7 +6132,8 @@ async fn reverse_proxy_upstream(
                 counted
             );
             session.shutdown().await;
-            return Err((400, "Bad Request"));
+            send_reset(resp_tx, stream_id, quiche::h3::WireErrorCode::MessageError).await;
+            return Ok(());
         }
 
         if let Err(error) = session.finish_request_body().await {

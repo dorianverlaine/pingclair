@@ -27,6 +27,16 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 📏 An HTTP/3 body that ends early is a protocol error, not a `400`
+
+A request declaring `Content-Length: 10` and sending five bytes was answered
+`400 Bad Request` on both the proxied and the FastCGI paths — an application's
+refusal, which reads to a client or intermediary exactly like a site that
+chose to say no. RFC 9114 §4.1.2 makes it a malformed request, so both paths
+now reset the stream with `H3_MESSAGE_ERROR`, the same signal the header
+framing path already sends (#237). On FastCGI the responder is aborted too, so
+PHP-FPM is never handed a truncated body with a full-length `CONTENT_LENGTH`.
+
 ### 🧾 The built-in error body is one sentence on every transport
 
 One refusal had four bodies: a missing static file answered `404 Not Found` on

@@ -116,6 +116,10 @@ mod error_routes;
 #[path = "h3_end_to_end/uri_placeholders.rs"]
 mod uri_placeholders;
 
+// 📏 A body that ends before its declared length is malformed.
+#[path = "h3_end_to_end/body_length.rs"]
+mod body_length;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {
