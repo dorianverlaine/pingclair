@@ -414,6 +414,40 @@ fn is_known_tls_option(name: &str) -> bool {
     RECOGNISED_TLS_OPTIONS.contains(&name)
 }
 
+/// 🧾 Whether `name` is an option that belongs inside `tls { … }`.
+///
+/// The site-level adapter needs this to explain a top-level `client_auth { … }`
+/// as a misplaced option rather than as a second site (#285). Both the options
+/// this crate implements and the ones it refuses belong here: the operator's
+/// mistake is the same either way.
+///
+/// 📌 Keep in step with the `match` in `parse_tls_directive` and with
+/// [`RECOGNISED_TLS_OPTIONS`]. A name missing from both falls back to the
+/// second-site message, which is merely less useful than this one.
+pub(super) fn is_tls_option(name: &str) -> bool {
+    SUPPORTED_TLS_OPTIONS.contains(&name) || is_known_tls_option(name)
+}
+
+/// 🧾 Every `tls { … }` option this crate implements.
+const SUPPORTED_TLS_OPTIONS: [&str; 16] = [
+    "cert",
+    "key",
+    "acme_email",
+    "email",
+    "auto",
+    "internal",
+    "http3",
+    "default_sni",
+    "client_auth",
+    "dns",
+    "resolvers",
+    "dns_ttl",
+    "propagation_delay",
+    "propagation_timeout",
+    "dns_challenge_override_domain",
+    "renewal_window_ratio",
+];
+
 /// 🚫 Every `tls { … }` option the format defines and this crate refuses.
 ///
 /// 📌 A table rather than a `matches!` keeps recognition explicit and makes the

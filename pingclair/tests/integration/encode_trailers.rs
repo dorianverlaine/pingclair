@@ -5,6 +5,94 @@
 
 use super::*;
 
+/// 🧾 A trailer task ends the body, so the encoder must be finalized there.
+///
+/// An HTTP/2 origin can end a response with trailing HEADERS, announced or
+/// not. Pingora then writes the trailer task as the end of the message instead
+/// of sending `Done`, which is the only task that used to finalize the coding —
+/// so the client received compressed DATA with no gzip trailer and could not
+/// decode a single byte of a perfectly good response. The body must decode;
+/// trailer fields that cannot share the final body chunk are dropped rather
+/// than left to break it (#225).
+#[tokio::test]
+async fn h2_origin_trailers_still_leave_a_decodable_gzip_body() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let text = "compressible text ".repeat(256);
+    let origin_text = text.clone();
+    let origin = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(socket).await.unwrap();
+        while let Some(request) = connection.accept().await {
+            let (_, mut respond) = request.unwrap();
+            // 📏 No `Content-Length`: the origin streams and then ends the
+            // message with trailer fields, which is exactly the shape an H2
+            // origin uses for gRPC and for checksum trailers.
+            let response = http::Response::builder()
+                .status(200)
+                .header("content-type", "text/plain")
+                .body(())
+                .unwrap();
+            let mut body = respond.send_response(response, false).unwrap();
+            body.send_data(bytes::Bytes::from(origin_text.clone()), false)
+                .unwrap();
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert(
+                "x-origin-trailer",
+                http::HeaderValue::from_static("after-the-body"),
+            );
+            body.send_trailers(trailers).unwrap();
+        }
+    });
+
+    let mut server = TestServer::new_pingclairfile(&format!(
+        r#"
+{{
+    admin off
+}}
+
+:__PINGCLAIR_TEST_PORT__ {{
+    @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+    respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+    encode gzip
+    reverse_proxy h2c://{address}
+}}
+"#
+    ));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let response = client
+        .get(server.url(0, "/text"))
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok()),
+        Some("gzip"),
+        "the test needs a compressed response"
+    );
+    let wire = response.bytes().await.unwrap();
+    server.stop();
+    origin.abort();
+
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(&wire[..])
+        .read_to_end(&mut decoded)
+        .expect("a compressed response that ends with trailers must stay decodable");
+    assert_eq!(decoded, text.as_bytes());
+}
+
 #[tokio::test]
 #[ignore = "requires an HTTP/3 curl; set PINGCLAIR_H3_CURL and run explicitly"]
 async fn h3_encoding_removes_only_identity_integrity_trailers() {

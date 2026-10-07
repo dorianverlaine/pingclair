@@ -3,6 +3,55 @@
 
 use super::*;
 
+/// 📊 Every `admin.api.*` name the listing prints answers on this server, and
+/// the one it omits does not.
+///
+/// The listing's authority is the route match, and nothing derives one from
+/// the other — a migration checklist asked "do you expose `/pki/`?" and got
+/// "yes, something admin-shaped" from the inventory and a 404 from the
+/// endpoint. This is the tie: probe what is advertised, and probe what is
+/// deliberately not (#151).
+#[tokio::test]
+async fn every_listed_admin_api_module_answers_and_pki_does_not() {
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__modules", "sentinel"));
+    assert!(server.wait_until_ready().await);
+    let client = no_proxy_client();
+
+    for module in [
+        "admin.api.load",
+        "admin.api.metrics",
+        "admin.api.reverse_proxy",
+    ] {
+        let probe = match module {
+            // 🚪 The endpoint exists when it refuses a body it cannot apply.
+            "admin.api.load" => client.post(server.admin_url("/load")).send().await,
+            "admin.api.metrics" => client.get(server.admin_url("/metrics")).send().await,
+            "admin.api.reverse_proxy" => {
+                client
+                    .get(server.admin_url("/reverse_proxy/upstreams"))
+                    .send()
+                    .await
+            }
+            other => panic!("no probe for the advertised module {other}"),
+        }
+        .unwrap();
+        assert_ne!(
+            probe.status().as_u16(),
+            404,
+            "`{module}` is advertised by `list-modules` but its endpoint answers 404"
+        );
+    }
+
+    // 🚫 And the one name the listing withholds is genuinely absent.
+    let pki = client.get(server.admin_url("/pki/")).send().await.unwrap();
+    assert_eq!(
+        pki.status().as_u16(),
+        404,
+        "`admin.api.pki` is deliberately unlisted, so `/pki/` must not answer"
+    );
+}
+
 #[tokio::test]
 async fn missing_config_reads_return_null_and_support_creation() {
     let mut server = TestServer::new_pingclairfile(&admin_test_pingclairfile("/__null", "null"));
@@ -55,6 +104,53 @@ async fn missing_config_reads_return_null_and_support_creation() {
         .to_owned();
     assert!(error.contains("/config/servers/0"), "{error}");
     assert!(!error.contains("top level"), "{error}");
+}
+
+/// 🧭 A Caddy document is refused by name, and the endpoints automation reads
+/// exist.
+///
+/// `{"apps":{}}` is the smallest possible Caddy configuration, and serde's own
+/// answer to it is `unknown field 'apps'` — which reads like a typo in a
+/// document copied from a working Caddy install. The endpoint says which
+/// schema it takes instead (#164). The upstream list is the other half: a
+/// health check that enumerates upstreams used to get a `404`, which is
+/// indistinguishable from a deployment that has none.
+#[tokio::test]
+async fn a_caddy_document_is_refused_by_name_and_upstreams_are_listed() {
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__compat", "sentinel"));
+    assert!(server.wait_until_ready().await);
+    let client = no_proxy_client();
+
+    // 🚫 Caddy's top level is named, and the message says what to send instead.
+    let refused = client
+        .post(server.admin_url("/load"))
+        .json(&serde_json::json!({ "apps": {} }))
+        .send()
+        .await
+        .unwrap();
+    let status = refused.status().as_u16();
+    let body = refused.text().await.unwrap();
+    assert_eq!(status, 400);
+    assert!(
+        body.contains("not Caddy's") && body.contains("Caddyfile"),
+        "the refusal must name the schema and the way out: {body}"
+    );
+
+    // 🧭 The endpoint a health check enumerates answers with a list, not a 404.
+    let upstreams = client
+        .get(server.admin_url("/reverse_proxy/upstreams"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upstreams.status().as_u16(), 200);
+    assert!(
+        upstreams
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+            .is_array()
+    );
 }
 
 #[tokio::test]

@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "pingclair",
     "pingclair-fastcgi",
@@ -7,6 +7,7 @@ members = [
     "pingclair-core",
     "pingclair-proxy",
     "pingclair-static",
+    "pingclair-runtime",
     "pingclair-tls",
     "pingclair-config",
     "pingclair-api",
@@ -19,10 +20,11 @@ exclude = [
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-authors = ["Dorian Verlaine <dorianverlaine@icloud.com>"]
+authors = ["Dorian Verlaine <dorian@pingclair.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/dorianverlaine/pingclair"
-rust-version = "1.98"
+homepage = "https://pingclair.com"
+rust-version = "1.99"
 
 [workspace.lints.rust]
 # 🛡️ The lint table exists so every crate can opt in through

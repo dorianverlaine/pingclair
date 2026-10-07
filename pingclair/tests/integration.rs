@@ -244,6 +244,10 @@ mod alt_svc_opt_out;
 #[path = "integration/two_name_sites.rs"]
 mod two_name_sites;
 
+// 🃏 A wildcard site's manual certificate serves the names it covers.
+#[path = "integration/wildcard_certificate.rs"]
+mod wildcard_certificate;
+
 // 🛡️ A malformed `blocked_ips` entry is refused at the Admin door.
 #[path = "integration/blocked_ips.rs"]
 mod blocked_ips;
@@ -318,6 +322,15 @@ const MAX_BIND_RACE_RESPAWNS: u32 = 3;
 /// 🚀 Printed by `pingclair run` once its admin and site listeners are bound
 /// (`pingclair/src/run.rs`); readiness probes wait for it.
 const STARTUP_BANNER: &str = "🚀 Pingclair running...";
+
+/// 🚦 How many 200 ms probes a readiness wait makes before giving up.
+///
+/// Twenty seconds, not ten: the documented reproduction runs six suites at
+/// once, and with another build sharing the machine a child can need longer
+/// than ten to bind and answer. A genuinely broken child still fails — the
+/// probe interval is unchanged, and a child that exits is caught on the first
+/// iteration after it does (#184).
+const READINESS_ATTEMPTS: usize = 100;
 
 /// 🔎 What one readiness wait ended with, before any respawn decision.
 enum Readiness {
@@ -697,6 +710,22 @@ impl TestServer {
     }
 
     async fn wait_until_ready_once(&mut self) -> Readiness {
+        // 📌 Defined here rather than at the top of the file so the reason it
+        // exists sits next to the readiness contract it strengthens.
+        async fn every_reserved_listener_accepts(addresses: &[SocketAddr]) -> bool {
+            for address in addresses {
+                let connected = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    tokio::net::TcpStream::connect(address),
+                )
+                .await;
+                if !matches!(connected, Ok(Ok(_))) {
+                    return false;
+                }
+            }
+            true
+        }
+
         let client = no_proxy_client();
         let url = self.url(0, &self.readiness_path);
         let admin_url = self
@@ -704,7 +733,7 @@ impl TestServer {
             .map(|address| format!("http://{address}/health"));
         let mut server_ready = false;
         let mut admin_ready = admin_url.is_none();
-        for _ in 0..50 {
+        for _ in 0..READINESS_ATTEMPTS {
             if let Some(status) = self.exit_status() {
                 eprintln!("❌ Server exited unexpectedly with status: {status}");
                 self.stop();
@@ -721,7 +750,14 @@ impl TestServer {
                 && response.status().is_success()
                 && let Ok(body) = response.text().await
             {
-                server_ready = body == self.readiness_token;
+                // 🚪 The token proves *this* child answers on the address the
+                // probe used. The other addresses the same server reserved
+                // must accept a connection too before a test uses them: the
+                // load-sensitive failures in #184 both connected to a second
+                // listener and were refused, with the token already matched on
+                // the first.
+                server_ready = body == self.readiness_token
+                    && every_reserved_listener_accepts(&self.server_addresses[0]).await;
             }
             // 🎯 Any completed request used to count as admin readiness, so a
             // 404 from a wrong or half-initialised listener read as ready and
@@ -778,7 +814,7 @@ impl TestServer {
         let admin_client = no_proxy_client();
         let mut tls_ready = false;
         let mut admin_ready = admin_url.is_none();
-        for _ in 0..50 {
+        for _ in 0..READINESS_ATTEMPTS {
             if let Some(status) = self.exit_status() {
                 eprintln!("❌ Server exited unexpectedly with status: {status}");
                 self.stop();
@@ -1041,6 +1077,20 @@ async fn proxy_protocol_request(
     path: &str,
     extra_headers: &[(&str, &str)],
 ) -> std::io::Result<Vec<u8>> {
+    let host = address.to_string();
+    proxy_protocol_request_to_host(address, source_ip, prefix, path, &host, extra_headers).await
+}
+
+/// 🧭 The same exchange with an explicit `Host`, for a request that must reach
+/// a named site or deliberately miss every one of them.
+async fn proxy_protocol_request_to_host(
+    address: SocketAddr,
+    source_ip: std::net::IpAddr,
+    prefix: &[u8],
+    path: &str,
+    host: &str,
+    extra_headers: &[(&str, &str)],
+) -> std::io::Result<Vec<u8>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let socket = match source_ip {
@@ -1050,7 +1100,7 @@ async fn proxy_protocol_request(
     socket.bind(SocketAddr::new(source_ip, 0))?;
     let mut stream = socket.connect(address).await?;
     let mut request = prefix.to_vec();
-    request.extend_from_slice(format!("GET {path} HTTP/1.1\r\nHost: {address}\r\n").as_bytes());
+    request.extend_from_slice(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n").as_bytes());
     for (name, value) in extra_headers {
         request.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
     }
@@ -5514,6 +5564,30 @@ async fn test_pingclairfile_metrics_directive_serves_the_scrape() {
         &body[..body.len().min(400)]
     );
 
+    // 🚫 No OpenMetrics negotiation: a scraper that asks for it is answered
+    // with the same Prometheus text and the same version, which is the format
+    // this build writes (#45). Emitting a body labelled OpenMetrics without
+    // the spec's `# EOF` and unit rules would be worse than not negotiating.
+    let openmetrics = client
+        .get(server.url(0, "/metrics"))
+        .header("Accept", "application/openmetrics-text; version=1.0.0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(openmetrics.status(), 200);
+    assert_eq!(
+        openmetrics
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; version=0.0.4; charset=utf-8"),
+        "the exposition format does not change with the Accept header"
+    );
+    assert!(
+        !openmetrics.text().await.unwrap().contains("# EOF"),
+        "an OpenMetrics body must not be claimed by a Prometheus content type"
+    );
+
     // 🚫 The path is a matcher, so nothing else on the site turned into a
     // scrape. Without this, `metrics /metrics` reading its argument as data
     // would answer every request with the exposition format and still pass
@@ -9503,6 +9577,76 @@ async fn test_early_hints_reach_the_client_before_the_final_response() {
     upstream_task.await.unwrap();
 }
 
+/// 💡 The same `103` must reach an HTTP/2 client before the final response.
+///
+/// `pingora-core 0.9.0`'s H2 downstream writer drops every informational
+/// response: `write_response_header` returns early with the comment that
+/// `send_response()` can only be called once, which predates `h2`'s
+/// `SendResponse::send_informational` — present in the `h2 0.4.19` this tree
+/// resolves. Ignored until the dependency forwards it; the H1 half passes
+/// above, and HTTP/3 skips interim responses by design (#116, #207).
+#[tokio::test]
+#[ignore = "pingora-core 0.9.0's H2 server ignores 1xx; h2 0.4.19 has send_informational"]
+async fn test_early_hints_reach_an_h2_client_before_the_final_response() {
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        stream
+            .write_all(
+                b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload; as=style\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+
+    let mut server = TestServer::new(&protocol_proxy_config(upstream_address));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let downstream = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    let (mut client, connection) = h2::client::handshake(downstream).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(format!("http://{}/hints", server.address(0)))
+        .body(())
+        .unwrap();
+    let (mut response, _) = client.send_request(request, true).unwrap();
+
+    // 💡 `h2` delivers interim responses beside the final one; asking for one
+    // is the only way a test can see whether this hop sent it.
+    let interim = tokio::time::timeout(
+        Duration::from_secs(2),
+        std::future::poll_fn(|cx| response.poll_informational(cx)),
+    )
+    .await
+    .expect("an informational response must arrive before the final one")
+    .expect("the informational stream ended without a response");
+    let interim = interim.expect("the informational response must be well formed");
+    assert_eq!(interim.status(), http::StatusCode::EARLY_HINTS);
+    assert_eq!(
+        interim.headers().get(http::header::LINK).unwrap(),
+        "</style.css>; rel=preload; as=style"
+    );
+
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    connection_task.abort();
+    let _ = connection_task.await;
+    upstream_task.await.unwrap();
+}
+
 #[tokio::test]
 async fn test_declared_request_trailers_fail_clearly_without_an_upstream_exchange() {
     use tokio::io::AsyncWriteExt;
@@ -9536,8 +9680,14 @@ async fn test_declared_request_trailers_fail_clearly_without_an_upstream_exchang
     );
 }
 
+/// 🧾 A declared upstream trailer is relayed, not turned into a gateway error.
+///
+/// RFC 9110 §15.6.3 reserves 502 for an invalid upstream response, and the
+/// trailer section is part of the chunked coding (RFC 9112 §7.1.2). An H1
+/// client drops trailer fields that cannot be forwarded; the status it sees
+/// stays the origin's own (#273).
 #[tokio::test]
-async fn test_upstream_response_trailers_fail_before_response_commit() {
+async fn test_upstream_response_trailers_are_relayed_not_a_gateway_error() {
     use tokio::io::AsyncWriteExt;
 
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9559,8 +9709,12 @@ async fn test_upstream_response_trailers_fail_before_response_commit() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 502);
-    assert_eq!(response.text().await.unwrap(), "502 Bad Gateway");
+    assert_eq!(
+        response.status(),
+        200,
+        "a declared trailer must not become a gateway error"
+    );
+    assert_eq!(response.text().await.unwrap(), "ok");
     upstream_task.await.unwrap();
 }
 
@@ -10360,6 +10514,184 @@ async fn test_proxy_protocol_and_forwarded_share_verified_identity() {
     .await
     .unwrap();
     assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+}
+
+/// 🛡️ A `Host` that matches no site is logged with the client the listener
+/// established, not with the ingress hop the PROXY-protocol header arrived
+/// from (#281).
+///
+/// The identity used to be resolved after routing, so every answer produced
+/// before a site matched — a refused `Host`, refused framing, or this
+/// unmatched one — fell back to the session peer. On a PROXY-protocol
+/// listener that peer is the local ingress hop, which turns the traffic an
+/// operator most wants to see into `127.0.0.1`.
+#[tokio::test]
+async fn test_an_unmatched_host_is_logged_with_the_proxy_protocol_client() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let process_log = dir.path().join("process.log");
+    let site_log = dir.path().join("site.log");
+    let config = serde_json::json!({
+        "global": {
+            "http3": false,
+            "trusted_proxies": ["127.0.0.1/32"]
+        },
+        // 🪵 The unmatched path has no site to read a `log` block from, so its
+        // record travels through the process log. Pointing that at a file is
+        // what makes the record readable while the child runs.
+        "logging": {
+            "default": {
+                "output": { "file": process_log.display().to_string() },
+                "format": "text"
+            }
+        },
+        "servers": [{
+            "name": "known.test",
+            "listen": ["127.0.0.1:0"],
+            "proxy_protocol_listen": ["0"],
+            // 🪵 One site's `log` turns access records on for the whole
+            // listener, which is Caddy's `ServerLogConfig` and what makes the
+            // unmatched request below produce a record at all (#213).
+            "log": { "output": { "file": site_log.display().to_string() }, "format": "text" },
+            "routes": [{
+                "path": "/",
+                "handler": { "type": "respond", "status": 200, "body": "known" }
+            }]
+        }]
+    })
+    .to_string();
+    let mut server = TestServer::new(&config);
+    let address = server.address(0);
+    let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let known_host = format!("known.test:{}", address.port());
+
+    // 🚦 Readiness needs the PROXY preamble *and* the site's own `Host`: the
+    // harness's default probe carries the socket address, which this fixture
+    // deliberately does not answer.
+    let mut ready = false;
+    for _ in 0..50 {
+        if server.exit_status().is_some() {
+            break;
+        }
+        let prefix = proxy_v1_prefix("127.0.0.1", address);
+        if let Ok(response) = proxy_protocol_request_to_host(
+            address,
+            loopback,
+            &prefix,
+            &server.readiness_path,
+            &known_host,
+            &[],
+        )
+        .await
+            && String::from_utf8_lossy(&response).contains(&server.readiness_token)
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !ready {
+        server.print_diagnostics();
+    }
+    assert!(ready, "PROXY protocol listener failed to start");
+
+    // 🌐 The scanner: a claimed client of 5.6.7.8, a `Host` no site claims.
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut request = proxy_v1_prefix("5.6.7.8", address);
+    request.extend_from_slice(b"GET / HTTP/1.1\r\nHost: unknown.test\r\nConnection: close\r\n\r\n");
+    stream.write_all(&request).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    assert!(
+        !response.is_empty(),
+        "the unmatched request must still be answered"
+    );
+
+    // 🕰️ The logging phase runs at the end of the request, so the record lands
+    // shortly after the connection closes.
+    let mut record = None;
+    for _ in 0..50 {
+        let output = std::fs::read_to_string(&process_log).unwrap_or_default();
+        if let Some(found) = output
+            .lines()
+            .find(|line| line.contains(r#"host="unknown.test""#))
+            .map(ToString::to_string)
+        {
+            record = Some(found);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let record = record.unwrap_or_else(|| {
+        server.print_diagnostics();
+        let log = std::fs::read_to_string(&process_log).unwrap_or_default();
+        panic!("the unmatched request must produce an access record; process log:\n{log}")
+    });
+    assert!(
+        record.contains("remote_ip=5.6.7.8"),
+        "the access record must name the PROXY-protocol client, got: {record}"
+    );
+    // 🎯 The site's own logger wrote the matched request's record, so the
+    // listener's logging is what put the unmatched record in the process log
+    // rather than a process-wide fallback that ignores the configuration.
+    let mut site_record = false;
+    for _ in 0..50 {
+        site_record = std::fs::read_to_string(&site_log)
+            .unwrap_or_default()
+            .contains(&known_host);
+        if site_record {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        site_record,
+        "the site's own log must carry the request to {known_host}"
+    );
+}
+
+/// 🚫 No `log` directive means no access record.
+///
+/// Caddy writes nothing until a site's `log` enables the server's access
+/// logging, and this server used to emit a process-wide record for every
+/// request whether or not anyone asked for one (#213). The fixtures that read
+/// a record back all configure logging; this one deliberately does not.
+#[tokio::test]
+async fn test_no_log_directive_writes_no_access_record() {
+    let mut server = TestServer::new_pingclairfile(
+        r#"
+        {
+            admin off
+        }
+
+        http://:__PINGCLAIR_TEST_PORT__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "quiet"
+        }
+        "#,
+    );
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+    for _ in 0..2 {
+        let response = client.get(server.url(0, "/")).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let _ = response.text().await.unwrap();
+    }
+    // 🕰️ The logging phase runs at the end of the request; give it a moment
+    // before reading the streams the process log goes to.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    server.stop();
+
+    for path in [&server.stdout_path, &server.stderr_path] {
+        let output = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            !output.contains("📝 Access") && !output.contains("❌ Access"),
+            "no access record may be written without a `log` directive: {}",
+            path.display()
+        );
+    }
 }
 
 #[tokio::test]
@@ -11962,6 +12294,77 @@ fn read_fcgi_size(content: &[u8], offset: &mut usize) -> std::io::Result<usize> 
     }
 }
 
+/// 🧩 `header_down` reaches a FastCGI response, not only a proxied one.
+///
+/// FastCGI never enters `upstream_peer`, so its response carries its own call
+/// to the proxy response operations. That call existed while the DSL could not
+/// populate the map it read, which is how pingclair#24 read "the DSL cannot
+/// express `header_down`" for weeks: the field was wired and always empty.
+/// `php_fastcgi` passes unknown block options through to the `reverse_proxy`
+/// syntax, so this is the configuration an operator would write.
+#[tokio::test]
+async fn test_php_fastcgi_applies_header_down_to_the_response() {
+    let responder = MockFastCgi::start();
+    *responder.response.lock().unwrap() = b"Status: 200 OK\r\nContent-Type: text/plain\r\n\
+        X-Secret: origin-only\r\nX-Kept: from-cgi\r\n\r\nfastcgi body"
+        .to_vec();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("index.php"), "<?php // responder").unwrap();
+    let root = root.path().to_str().unwrap().replace("\\", "/");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            php_fastcgi 127.0.0.1:{fcgi_port} {{
+                header_down -X-Secret
+                header_down +X-Added added-by-proxy
+            }}
+        }}
+        "#,
+        fcgi_port = responder.port
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/index.php"))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let secret = response.headers().get("x-secret").is_some();
+    let added = response
+        .headers()
+        .get("x-added")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let kept = response
+        .headers()
+        .get("x-kept")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        (status, secret, added, kept, body),
+        (
+            200,
+            false,
+            Some("added-by-proxy".to_string()),
+            Some("from-cgi".to_string()),
+            "fastcgi body".to_string()
+        )
+    );
+}
+
 /// 🐘 The `php_fastcgi` shortcut really talks FastCGI to PHP-FPM.
 #[tokio::test]
 async fn test_php_fastcgi_proxies_to_a_fastcgi_responder() {
@@ -12444,10 +12847,15 @@ async fn test_php_fastcgi_missing_response_page_enters_error_route_once() {
     assert_eq!(response.text().await.unwrap(), "missing-error-page");
 }
 
-/// 🚫 A body without Content-Length is refused with 411, exactly like
-/// Caddy's FastCGI client, because PHP-FPM needs the length before STDIN.
+/// 📏 A chunked body reaches FastCGI with the length this server measured.
+///
+/// PHP-FPM reads exactly `CONTENT_LENGTH` bytes from STDIN, so the number has
+/// to exist before the exchange opens — and chunked framing defines a length by
+/// construction, so the server only has to read it. Refusing the request
+/// invented a refusal the client did not earn; Caddy reached the same
+/// conclusion in 2.9.1 by buffering FastCGI request bodies (#248).
 #[tokio::test]
-async fn test_php_fastcgi_refuses_a_chunked_body() {
+async fn test_php_fastcgi_forwards_a_chunked_body() {
     let responder = MockFastCgi::start();
     let root = tempfile::tempdir().unwrap();
     let root = root.path().to_str().unwrap().replace("\\", "/");
@@ -12475,7 +12883,7 @@ async fn test_php_fastcgi_refuses_a_chunked_body() {
     let mut stream = tokio::net::TcpStream::connect(server.address(0))
         .await
         .unwrap();
-    let request = "POST /index.php HTTP/1.1\r\nHost: chunked\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    let request = "POST /index.php HTTP/1.1\r\nHost: chunked\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
     let _ = tokio::time::timeout(
@@ -12485,12 +12893,146 @@ async fn test_php_fastcgi_refuses_a_chunked_body() {
     .await;
     let text = String::from_utf8_lossy(&response);
     assert!(
-        text.starts_with("HTTP/1.1 411 "),
-        "a chunked FastCGI body must be refused with 411, got:\n{text}"
+        text.starts_with("HTTP/1.1 200 "),
+        "a chunked FastCGI body must reach the responder, got:\n{text}"
+    );
+    let requests = responder.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1, "the responder must receive the request");
+    assert_eq!(
+        requests[0].0.get("CONTENT_LENGTH").map(String::as_str),
+        Some("5"),
+        "the environment must carry the length this server measured"
+    );
+    assert_eq!(requests[0].1, b"hello".to_vec());
+}
+
+/// 📏 An H2 body with no `Content-Length` is measured before the exchange.
+///
+/// HTTP/2 frames a body with DATA, not a header: a request that never declares
+/// a length is ordinary traffic there, and the responder still needs
+/// `CONTENT_LENGTH` before its first STDIN byte (#248).
+#[tokio::test]
+async fn test_php_fastcgi_measures_an_h2_body_without_content_length() {
+    use bytes::Bytes;
+
+    let responder = MockFastCgi::start();
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().to_str().unwrap().replace("\\", "/");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            php_fastcgi 127.0.0.1:{fcgi_port}
+        }}
+        "#,
+        fcgi_port = responder.port
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let downstream = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    let (mut client, connection) = h2::client::handshake(downstream).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(format!("http://{}/index.php", server.address(0)))
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream
+        .send_data(Bytes::from_static(b"hello"), true)
+        .unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let mut body = response.into_body();
+    while let Some(chunk) = body.data().await {
+        chunk.unwrap();
+    }
+    connection_task.abort();
+    let _ = connection_task.await;
+
+    let requests = responder.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1, "the responder must receive the request");
+    assert_eq!(
+        requests[0].0.get("CONTENT_LENGTH").map(String::as_str),
+        Some("5"),
+        "the environment must carry the length this server measured"
+    );
+    assert_eq!(requests[0].1, b"hello".to_vec());
+}
+
+/// 🧱 A lengthless body past its buffering ceiling fails closed.
+///
+/// The length has to exist before the first STDIN byte, so a body that
+/// outgrows what this server will hold cannot reach php-fpm at all: streaming
+/// it would arrive there as `CONTENT_LENGTH: 0` with unknown bytes behind it,
+/// and php-fpm would read an empty body. The refusal is a 413 the client can
+/// act on — and it happens before an upstream slot is spent (#248).
+#[tokio::test]
+async fn test_php_fastcgi_refuses_a_lengthless_body_past_its_ceiling() {
+    let responder = MockFastCgi::start();
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().to_str().unwrap().replace("\\", "/");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            php_fastcgi 127.0.0.1:{fcgi_port} {{
+                request_buffers 1KiB
+            }}
+        }}
+        "#,
+        fcgi_port = responder.port
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let mut stream = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    let chunk = "x".repeat(2048);
+    let request = format!(
+        "POST /index.php HTTP/1.1\r\nHost: oversized\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+         800\r\n{chunk}\r\n0\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.starts_with("HTTP/1.1 413 "),
+        "a body past the measuring ceiling must be refused, got:\n{text}"
     );
     assert!(
         responder.requests.lock().unwrap().is_empty(),
-        "the responder must never see a body that was refused"
+        "the responder must never see a body this server could not measure"
     );
 }
 
@@ -14797,6 +15339,76 @@ async fn test_browse_listing_hides_and_escapes() {
     );
 }
 
+/// 🚫 A browse listing answers the same methods a file does.
+///
+/// The listing is this server's representation of the directory, and the file
+/// server serves representations to `GET` and `HEAD` only. The browse branch
+/// returned before that check, so a `POST` received a `200` listing — a
+/// success for a method this route does not support (#242). The refusal owes
+/// the client the `Allow` a `405` carries.
+#[tokio::test]
+async fn test_browse_listing_refuses_non_retrieval_methods() {
+    let docroot = tempfile::tempdir().unwrap();
+    std::fs::create_dir(docroot.path().join("d")).unwrap();
+    std::fs::write(docroot.path().join("d/inside.txt"), "public").unwrap();
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            file_server {{
+                root {root}
+                browse
+            }}
+        }}
+    "#,
+        root = docroot.path().display()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let refused = client
+        .post(server.url(0, "/d/"))
+        .send()
+        .await
+        .expect("request");
+    let status = refused.status().as_u16();
+    let allow = refused
+        .headers()
+        .get("allow")
+        .map(|value| value.to_str().unwrap().to_string());
+    assert_eq!(status, 405, "a listing is not served to POST");
+    assert_eq!(allow.as_deref(), Some("GET, HEAD"));
+
+    // 🎯 The listing itself is untouched, and a `HEAD` still describes it.
+    let listing = client.get(server.url(0, "/d/")).send().await.unwrap();
+    assert_eq!(listing.status(), 200);
+    assert!(
+        listing.text().await.unwrap().contains("inside.txt"),
+        "the browse listing must still work"
+    );
+    let head = client.head(server.url(0, "/d/")).send().await.unwrap();
+    assert_eq!(head.status(), 200);
+    assert!(head.headers().get("content-length").is_some());
+
+    // 🫥 A path that does not exist is still 404, not 405: the method check
+    // runs once the path is known to exist.
+    let missing = client
+        .post(server.url(0, "/missing/"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(missing.status(), 404);
+    server.stop();
+}
+
 /// 🧾 One raw HTTP/1 GET, headers and body, for request lines no client library
 /// will send verbatim.
 async fn raw_get(address: SocketAddr, target: &str) -> String {
@@ -15449,3 +16061,10 @@ mod client_auth_precedence;
 // 🧭 `uri strip_prefix`, `strip_suffix` and `path_regexp` resolve their operands.
 #[path = "integration/uri_placeholders.rs"]
 mod uri_placeholders;
+
+// MARK: - Caddy's shorthand placeholders
+
+// 🧩 `{header.X}`, `{labels.N}`, `{query.X}`, `{path.N}`, `{re.*}` and the
+// `*` matcher token, from Caddy's own corpus fixture (#135).
+#[path = "integration/shorthand_placeholders.rs"]
+mod shorthand_placeholders;

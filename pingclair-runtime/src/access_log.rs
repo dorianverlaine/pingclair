@@ -43,13 +43,32 @@ use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use crate::metrics;
 use crossbeam_queue::ArrayQueue;
+use prometheus::IntCounter;
+use std::sync::LazyLock;
 
 mod writer;
 pub use writer::flush_all;
 
 use pingclair_core::config::{LogConfig, LogFormat, LogOutput, LogRotation};
+
+/// 🪵 Access-log lines dropped because the writer could not keep up.
+///
+/// The only signal that a gap exists. A bounded queue turns "the disk is slow"
+/// into "some lines are missing" rather than "the proxy stopped"; this counter
+/// is what stops the second outcome from being silent. Any non-zero value means
+/// the log is incomplete for that period — alert on the rate, not the total.
+///
+/// 📌 Owned by this crate because the writers are: the metrics registry in
+/// `pingclair-proxy` registers this collector, so the series an operator
+/// scrapes does not move when a second transport starts logging through here.
+pub static ACCESS_LOG_DROPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "pingclair_access_log_dropped_total",
+        "Access log lines dropped because the writer queue was full",
+    )
+    .expect("metric can be created")
+});
 
 /// 🖊️ Where a formatted access line is written.
 ///
@@ -299,6 +318,35 @@ pub fn unix_started_at(started: std::time::Instant) -> f64 {
     (now - started.elapsed().as_secs_f64()).max(0.0)
 }
 
+/// 🔢 Milliseconds as a compact decimal: microsecond resolution, trailing
+/// zeros trimmed, so a whole millisecond still renders as `42` — byte for byte
+/// what the integer field used to produce — and a fast request renders as
+/// `0.045` rather than `0` (#160).
+///
+/// ⚡ Written straight into the caller's formatter: records are formatted on
+/// the thread that emits them, so a `String` per field per record would be two
+/// allocations on the request path for nothing.
+struct Millis(f64);
+
+impl fmt::Display for Millis {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // 🔬 Rounded to microseconds first, then re-split, so the digits come
+        // from integer arithmetic instead of a float's own spelling.
+        let micros = (self.0.max(0.0) * 1000.0).round() as u64;
+        let whole = micros / 1000;
+        let mut fraction = micros % 1000;
+        if fraction == 0 {
+            return write!(formatter, "{whole}");
+        }
+        let mut width = 3;
+        while fraction.is_multiple_of(10) {
+            fraction /= 10;
+            width -= 1;
+        }
+        write!(formatter, "{whole}.{fraction:0width$}")
+    }
+}
+
 /// 📋 One access-log record.
 ///
 /// Borrowed rather than owned so the hot path does not allocate a copy of
@@ -318,11 +366,17 @@ pub struct AccessEntry<'a> {
     pub path: &'a str,
     pub status: u16,
     pub bytes: u64,
-    /// Wall time from request start to response completion.
-    pub duration_ms: u128,
-    /// Time to first byte, when the response actually produced one. `None`
-    /// for responses that failed before any byte was written.
-    pub ttfb_ms: Option<u128>,
+    /// Wall time from request start to response completion, in milliseconds.
+    ///
+    /// 📌 Fractional: whole milliseconds cannot express a request faster than
+    /// one, so every fast server's average rendered as `0` and could not be
+    /// compared with the reference implementation's seconds-as-float (#160).
+    /// The unit stays in the name, which is the whole reason a pipeline that
+    /// renames `duration` by hand cannot silently compare the wrong scale.
+    pub duration_ms: f64,
+    /// Time to first byte in milliseconds, when the response actually produced
+    /// one. `None` for responses that failed before any byte was written.
+    pub ttfb_ms: Option<f64>,
     /// Client IP resolved through the trusted-proxy policy, not the raw
     /// socket peer — see `trusted_proxies`.
     pub client_ip: IpAddr,
@@ -1124,7 +1178,7 @@ impl LogWriter {
                 };
                 self.recycle_buffer(line);
                 self.dropped.fetch_add(1, Ordering::Relaxed);
-                metrics::ACCESS_LOG_DROPPED_TOTAL.inc();
+                ACCESS_LOG_DROPPED_TOTAL.inc();
             }
         }
     }
@@ -1319,9 +1373,9 @@ impl AccessLogger {
         str_field!("path", entry.path);
         raw_field!("status", entry.status);
         raw_field!("bytes", entry.bytes);
-        raw_field!("duration_ms", entry.duration_ms);
+        raw_field!("duration_ms", Millis(entry.duration_ms));
         if let Some(ttfb) = entry.ttfb_ms {
-            raw_field!("ttfb_ms", ttfb);
+            raw_field!("ttfb_ms", Millis(ttfb));
         }
         display_str_field!("client_ip", entry.client_ip);
         if let Some(route) = entry.route {
@@ -1406,12 +1460,12 @@ impl AccessLogger {
             let _ = write!(out, " {}", entry.bytes);
         }
         if self.included("duration_ms") {
-            let _ = write!(out, " {}ms", entry.duration_ms);
+            let _ = write!(out, " {}ms", Millis(entry.duration_ms));
         }
         if let Some(ttfb) = entry.ttfb_ms
             && self.included("ttfb_ms")
         {
-            let _ = write!(out, " ttfb={ttfb}ms");
+            let _ = write!(out, " ttfb={}ms", Millis(ttfb));
         }
         if let Some(route) = entry.route
             && self.included("route")
@@ -1565,8 +1619,8 @@ mod tests {
             path: "/api/users",
             status: 200,
             bytes: 1234,
-            duration_ms: 42,
-            ttfb_ms: Some(7),
+            duration_ms: 42.0,
+            ttfb_ms: Some(7.0),
             client_ip: "203.0.113.9".parse().unwrap(),
             route: Some("/api/*"),
             upstream: Some(LogUpstream::Text("10.0.0.2:8080")),
@@ -1867,6 +1921,53 @@ mod tests {
             .unwrap_or_else(|e| panic!("emitted invalid JSON: {e}\n{out}"));
         assert_eq!(parsed["status"], 200);
         assert_eq!(parsed["route"], "/api/*");
+    }
+
+    /// ⏱️ A sub-millisecond request keeps its duration.
+    ///
+    /// Whole milliseconds rendered every fast request as `0`, so an average or
+    /// a percentile computed from the file could not tell "fast" from
+    /// "instant" — and could not be compared with the reference
+    /// implementation's seconds-as-float (#160). Whole milliseconds keep the
+    /// exact bytes they always had.
+    #[test]
+    fn a_sub_millisecond_duration_survives_into_json_and_text() {
+        let mut e = entry();
+        e.duration_ms = 0.045;
+        e.ttfb_ms = Some(0.045);
+        let json = logger(LogFormat::Json, vec![]).format_json(&e);
+        assert!(json.contains("\"duration_ms\":0.045"), "{json}");
+        assert!(json.contains("\"ttfb_ms\":0.045"), "{json}");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["duration_ms"], 0.045);
+
+        let text = logger(LogFormat::Text, vec![]).format_text(&e);
+        assert!(text.contains(" 0.045ms"), "{text}");
+
+        // 📌 A whole millisecond is unchanged, so a pipeline that already
+        // parsed `"duration_ms":42` still does.
+        e.duration_ms = 42.0;
+        let json = logger(LogFormat::Json, vec![]).format_json(&e);
+        assert!(json.contains("\"duration_ms\":42,"), "{json}");
+    }
+
+    /// 🔢 The millisecond spelling, at the edges.
+    #[test]
+    fn millisecond_spelling_trims_only_trailing_zeros() {
+        let rendered = |value: f64| Millis(value).to_string();
+        assert_eq!(rendered(0.0), "0");
+        assert_eq!(rendered(0.045), "0.045");
+        assert_eq!(rendered(1.5), "1.5");
+        assert_eq!(rendered(42.0), "42");
+        assert_eq!(rendered(42.25), "42.25");
+        assert_eq!(rendered(1000.0), "1000");
+        // 🧮 Rounded to microseconds, which is the resolution the field
+        // promises; the fourth decimal cannot survive it.
+        assert_eq!(rendered(0.000_4), "0");
+        assert_eq!(rendered(0.000_6), "0.001");
+        // 🚫 A negative duration is not a thing a clock can produce, and the
+        // formatter refuses to print one.
+        assert_eq!(rendered(-1.0), "0");
     }
 
     /// 🕰️ A record says when its request started.

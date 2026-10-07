@@ -1182,7 +1182,11 @@ pub struct RedirectConfig {
 #[derive(Debug, Clone, Default)]
 pub struct HeadersConfig {
     pub set: BTreeMap<String, String>,
-    pub add: BTreeMap<String, String>,
+    /// 📋 Multi-valued: two `+Set-Cookie` lines in one block are two cookies,
+    /// and RFC 6265 §3 forbids folding them into one field line (#276). `set`
+    /// and `default_set` stay single-valued, which is the shape Caddy gives
+    /// them as well.
+    pub add: BTreeMap<String, Vec<String>>,
     pub remove: Vec<String>,
     /// 🔁 Regex search-and-replace over values already present.
     pub replace: Vec<pingclair_core::config::HeaderReplacement>,

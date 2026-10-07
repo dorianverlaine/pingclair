@@ -65,6 +65,80 @@ async fn h3_handle_errors_file_server_serves_the_error_page() {
     );
 }
 
+/// 🔤 A regex `rewrite` inside `handle_errors` resolves against the error
+/// route's own compiled pattern table over HTTP/3 too (#245).
+#[tokio::test]
+async fn h3_handle_errors_regex_rewrite_uses_the_error_routes_table() {
+    let error_root = tempfile::tempdir().unwrap();
+    std::fs::write(error_root.path().join("page.html"), "<h1>rewritten</h1>").unwrap();
+    let source = format!(
+        r#":443 {{
+            handle_errors {{
+                root * {error_root}
+                rewrite "^/boom/(.*)$" "/$1"
+                file_server
+            }}
+            handle /boom/* {{
+                error "exploded" 503
+            }}
+        }}"#,
+        error_root = error_root.path().display(),
+    );
+    let site = pingclair_config::compile(&source).unwrap().servers[0].clone();
+    let server = spawn_h3_server_with(|address| ServerConfig {
+        listen: vec![address.to_string()],
+        ..site
+    })
+    .await;
+
+    let response = h3_attempt(H3Attempt::to(server, "/boom/page.html"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            response.status,
+            String::from_utf8_lossy(&response.body).into_owned()
+        ),
+        (503, "<h1>rewritten</h1>".to_string())
+    );
+}
+
+/// 🔥 A template that fails to render is raised on HTTP/3 too, so
+/// `handle_errors` answers it exactly as HTTP/1 and HTTP/2 do (#245).
+#[tokio::test]
+async fn h3_a_template_failure_reaches_the_error_route() {
+    let site_root = tempfile::tempdir().unwrap();
+    std::fs::write(site_root.path().join("broken.html"), "before {{ unclosed").unwrap();
+    let source = format!(
+        r#":443 {{
+            root * {site_root}
+            handle_errors {{
+                respond "error page for {{err.status_code}}" 500
+            }}
+            templates
+            file_server
+        }}"#,
+        site_root = site_root.path().display(),
+    );
+    let site = pingclair_config::compile(&source).unwrap().servers[0].clone();
+    let server = spawn_h3_server_with(|address| ServerConfig {
+        listen: vec![address.to_string()],
+        ..site
+    })
+    .await;
+
+    let response = h3_attempt(H3Attempt::to(server, "/broken.html"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            response.status,
+            String::from_utf8_lossy(&response.body).into_owned()
+        ),
+        (500, "error page for 500".to_string())
+    );
+}
+
 /// 🚨 Errors the server produces itself reach `handle_errors` over HTTP/3 as
 /// on HTTP/1 and HTTP/2: an unreachable upstream (502), a body over its limit
 /// whether declared (413 before planning) or streamed (413 while draining),

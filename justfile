@@ -7,7 +7,7 @@
 set shell := ["bash", "-uc"]
 set positional-arguments
 
-rust := "1.98.1"
+rust := "1.99.0"
 
 # 💾 Where cargo actually puts build artifacts for this checkout. Asking cargo
 # instead of assuming ./target keeps the H3 recipes working when the target

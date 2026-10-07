@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::borrow::Cow;
 use thiserror::Error;
 use tokio::net::UdpSocket;
@@ -634,8 +634,10 @@ struct H3Request {
     path: String,
     /// `:authority` (or `host` header) value, may include a port.
     authority: String,
-    /// Regular (non-pseudo) headers, lower-cased names.
-    headers: Vec<(String, String)>,
+    /// Regular (non-pseudo) headers, as bytes: a field value may legitimately
+    /// carry obs-text (`0x80..=0xFF`), and rebuilding it as a `String` replaced
+    /// those bytes with U+FFFD before they reached the origin (#236).
+    headers: Vec<(http::HeaderName, http::HeaderValue)>,
 }
 
 /// Parse the pseudo-headers of an HTTP/3 request into an [`H3Request`].
@@ -730,9 +732,27 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
             b"te" if !h.value().trim_ascii().eq_ignore_ascii_case(b"trailers") => return None,
             _ => {}
         }
+        // 🛡️ An underscore aliases the hyphenated spelling in every CGI
+        // environment (`x_probe` and `x-probe` both become `HTTP_X_PROBE`),
+        // which is the injection the H1/H2 filter refuses before routing.
+        // Same policy, applied at the same point, or one configuration routes
+        // two ways (#269).
+        if crate::http_policy::underscore_named(name) {
+            tracing::debug!(
+                field = %String::from_utf8_lossy(name),
+                "🚫 Dropped an underscore-named request field"
+            );
+            continue;
+        }
+        // 🛡️ A name that is not a token, or a value carrying NUL, CR or LF,
+        // makes the field invalid and the message malformed (RFC 9114 §4.1.2).
+        // Both used to be repaired instead: an unparseable name was dropped and
+        // a value's bytes were replaced with U+FFFD before the origin saw them
+        // (#236). Everything else — including obs-text — goes through as the
+        // bytes the client sent.
         headers.push((
-            String::from_utf8_lossy(name).into_owned(),
-            String::from_utf8_lossy(h.value()).into_owned(),
+            http::HeaderName::from_bytes(name).ok()?,
+            http::HeaderValue::from_bytes(h.value()).ok()?,
         ));
     }
 
@@ -764,8 +784,8 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
     // refused above.
     let host = headers
         .iter()
-        .find(|(name, _)| name == "host")
-        .map(|(_, value)| value.as_str());
+        .find(|(name, _)| name == http::header::HOST)
+        .and_then(|(_, value)| value.to_str().ok());
     match (authority.as_deref(), host) {
         (Some(authority), Some(host)) if !authority.eq_ignore_ascii_case(host) => return None,
         (None, Some(host)) => authority = Some(host.to_owned()),
@@ -866,19 +886,26 @@ fn h3_request_header(req: &H3Request, method: http::Method) -> Result<RequestHea
     // 🍃 The fold borrows the one-cookie common case and allocates only for a
     // request that actually split it.
     let mut cookie = crate::http_policy::CookieFold::default();
+    // 🍪 Folding needs every piece as text; one that is not leaves the cookie
+    // lines exactly as the client sent them, as on H1/H2.
+    let fold_cookies = req
+        .headers
+        .iter()
+        .filter(|(name, _)| name == http::header::COOKIE)
+        .all(|(_, value)| value.to_str().is_ok());
     for (name, value) in &req.headers {
-        if name == "cookie" {
-            cookie.push(value);
+        if fold_cookies
+            && name == http::header::COOKIE
+            && let Ok(piece) = value.to_str()
+        {
+            cookie.push(piece);
             continue;
         }
-        let Ok(name) = http::HeaderName::from_bytes(name.as_bytes()) else {
-            continue;
-        };
         // 📋 Appended, not inserted. `insert_header` replaces every value under
         // the name, so a field the client sent twice arrived as whichever copy
         // came last — a list header such as `Accept-Encoding` reached the
         // origin describing something the client never said.
-        header.append_header(name, value.as_str()).ok();
+        header.append_header(name.clone(), value.clone()).ok();
     }
     if let Some(cookie) = cookie.finish() {
         header
@@ -1043,13 +1070,15 @@ impl ResponseSink {
     }
 
     /// 📊 What actually went out: status, body bytes, and time to first byte.
-    fn observed(&self) -> (u16, u64, Option<u128>) {
+    fn observed(&self) -> (u16, u64, Option<f64>) {
         use std::sync::atomic::Ordering::Relaxed;
         let first_byte = self.first_byte_us.load(Relaxed);
         (
             self.status.load(Relaxed),
             self.body_bytes.load(Relaxed),
-            (first_byte > 0).then(|| u128::from(first_byte) / 1000),
+            // ⏱️ Microsecond resolution kept as fractional milliseconds, the
+            // same shape the H1/H2 record writes (#160).
+            (first_byte > 0).then(|| first_byte as f64 / 1000.0),
         )
     }
 }
@@ -2399,6 +2428,7 @@ impl H3App {
             let Some((mut headers, mut fin)) = ss.pending_headers.take() else {
                 return;
             };
+            trim_h3_field_padding(&mut headers);
             let status = response_status(&headers);
             stamp_date(&mut headers, status);
             // 🤐 Decided here, at the one exit every H3 response takes, rather
@@ -2750,7 +2780,9 @@ async fn h3_raise_status(
     response_policy: &mut ResponseHeaderPolicy,
     verified_client_ip: &str,
     addresses: RequestAddresses,
-    handling_error: bool,
+    // 🚨 The error route this plan is running inside, if any: it carries both
+    // the re-entry guard and the route's own compiled patterns (#245).
+    error_scope: Option<crate::error_routes::ErrorScope>,
     request_vars: &mut crate::http_policy::RequestVars,
     response_handlers: &mut Option<Vec<pingclair_core::config::ResponseHandlerConfig>>,
 ) -> Result<H3Plan, HandlerError> {
@@ -2769,7 +2801,7 @@ async fn h3_raise_status(
         verified_client_ip,
         addresses,
         None,
-        handling_error,
+        error_scope,
         request_vars,
         response_handlers,
         // 📥 An error route runs after the request body is finished with, so a
@@ -2795,7 +2827,8 @@ async fn plan_h3_handler_with_connector(
     verified_client_ip: &str,
     addresses: RequestAddresses,
     precompile: Option<&MatcherPrecompile>,
-    handling_error: bool,
+    // 🚨 The error route this plan is running inside, if any (#245).
+    error_scope: Option<crate::error_routes::ErrorScope>,
     request_vars: &mut crate::http_policy::RequestVars,
     response_handlers: &mut Option<Vec<pingclair_core::config::ResponseHandlerConfig>>,
     // 📥 What this request's `request_body` handlers decided, if any ran.
@@ -2829,7 +2862,7 @@ async fn plan_h3_handler_with_connector(
                             response_policy,
                             verified_client_ip,
                             addresses,
-                            handling_error,
+                            error_scope,
                             request_vars,
                             response_handlers,
                         )
@@ -2850,7 +2883,7 @@ async fn plan_h3_handler_with_connector(
                     verified_client_ip,
                     addresses,
                     element_precompile,
-                    handling_error,
+                    error_scope,
                     request_vars,
                     response_handlers,
                     body_plan,
@@ -2889,7 +2922,7 @@ async fn plan_h3_handler_with_connector(
                             response_policy,
                             verified_client_ip,
                             addresses,
-                            handling_error,
+                            error_scope,
                             request_vars,
                             response_handlers,
                         )
@@ -2912,7 +2945,7 @@ async fn plan_h3_handler_with_connector(
                     verified_client_ip,
                     addresses,
                     element_precompile,
-                    handling_error,
+                    error_scope,
                     request_vars,
                     response_handlers,
                     body_plan,
@@ -2956,7 +2989,7 @@ async fn plan_h3_handler_with_connector(
                             response_policy,
                             verified_client_ip,
                             addresses,
-                            handling_error,
+                            error_scope,
                             request_vars,
                             response_handlers,
                         )
@@ -2979,7 +3012,7 @@ async fn plan_h3_handler_with_connector(
                     verified_client_ip,
                     addresses,
                     element_precompile,
-                    handling_error,
+                    error_scope,
                     request_vars,
                     response_handlers,
                     body_plan,
@@ -3015,8 +3048,11 @@ async fn plan_h3_handler_with_connector(
             for (name, value) in set {
                 block.set(name, value.clone());
             }
-            for (name, value) in add {
-                block.add(name, value.clone());
+            // 📋 Every value of every `+Name` line, in order (#276).
+            for (name, values) in add {
+                for value in values {
+                    block.add(name, value.clone());
+                }
             }
             for (name, value) in default_set {
                 block.set_if_absent(name, value.clone());
@@ -3035,10 +3071,12 @@ async fn plan_h3_handler_with_connector(
         } => {
             // 🏷️ Same order as H1/H2: sets and adds, then replacements over
             // what is now there, then removals last.
-            for (name, template, is_add) in set
-                .iter()
-                .map(|(name, value)| (name, value, false))
-                .chain(add.iter().map(|(name, value)| (name, value, true)))
+            for (name, template, is_add) in
+                set.iter().map(|(name, value)| (name, value, false)).chain(
+                    add.iter().flat_map(|(name, values)| {
+                        values.iter().map(move |value| (name, value, true))
+                    }),
+                )
             {
                 let value = if template.contains('{') {
                     resolve_caddy_placeholders(
@@ -3068,6 +3106,7 @@ async fn plan_h3_handler_with_connector(
                     crate::server::compiled_header_replacement(
                         state,
                         route_index,
+                        error_scope.map(|scope| scope.route),
                         replacement,
                         request_header,
                         Some(verified_client_ip),
@@ -3236,6 +3275,7 @@ async fn plan_h3_handler_with_connector(
             *effective_uri = state
                 .rewrite_request_uri(
                     route_index,
+                    error_scope.map(|scope| scope.route),
                     effective_uri,
                     resolved_prefix.as_deref(),
                     resolved_suffix.as_deref(),
@@ -3332,7 +3372,7 @@ async fn plan_h3_handler_with_connector(
             // same as on H1/H2 — an error page that names the status on one
             // transport and not the other is exactly the parity gap this crate
             // keeps having to close.
-            if !handling_error {
+            if error_scope.is_none() {
                 request_vars.set_error(*status, message.as_deref());
             }
             let raw = message.as_deref().unwrap_or_else(|| {
@@ -3348,7 +3388,7 @@ async fn plan_h3_handler_with_connector(
             );
             // 🚫 Inside an error route a second raise responds directly —
             // routing it again is the infinite recursion this guard stops.
-            if !handling_error {
+            if error_scope.is_none() {
                 for (index, route) in state.config.error_routes.iter().enumerate() {
                     if !route.matches(*status) {
                         continue;
@@ -3367,7 +3407,10 @@ async fn plan_h3_handler_with_connector(
                         verified_client_ip,
                         addresses,
                         Some(&prepared.precompile),
-                        true,
+                        Some(crate::error_routes::ErrorScope {
+                            route: index,
+                            status: *status,
+                        }),
                         request_vars,
                         response_handlers,
                         body_plan,
@@ -3504,7 +3547,7 @@ async fn plan_h3_handler_with_connector(
                         verified_client_ip,
                         addresses,
                         fallback_precompile,
-                        handling_error,
+                        error_scope,
                         request_vars,
                         response_handlers,
                         body_plan,
@@ -3534,7 +3577,8 @@ async fn plan_h3_handler(
     response_policy: &mut ResponseHeaderPolicy,
     verified_client_ip: &str,
     precompile: Option<&MatcherPrecompile>,
-    handling_error: bool,
+    // 🚨 The error route this plan is running inside, if any (#245).
+    error_scope: Option<crate::error_routes::ErrorScope>,
     request_vars: &mut crate::http_policy::RequestVars,
     response_handlers: &mut Option<Vec<pingclair_core::config::ResponseHandlerConfig>>,
     // 📥 What this request's `request_body` handlers decided, if any ran.
@@ -3559,7 +3603,7 @@ async fn plan_h3_handler(
             }
         },
         precompile,
-        handling_error,
+        error_scope,
         request_vars,
         response_handlers,
         body_plan,
@@ -3635,8 +3679,8 @@ async fn handle_request(
     let request_id = resolve_request_id(
         req.headers
             .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("x-request-id"))
-            .map(|(_, value)| value.as_str()),
+            .find(|(name, _)| name.as_str() == "x-request-id")
+            .and_then(|(_, value)| value.to_str().ok()),
     );
     let mut error_state = None;
     let mut matched_route = None;
@@ -3699,7 +3743,7 @@ async fn handle_request(
                     &resp_tx,
                     stream_id,
                     status,
-                    msg,
+                    None,
                     error_state.as_deref(),
                     &response_policy,
                     &request_id,
@@ -3730,8 +3774,8 @@ async fn handle_request(
 
 /// 🧾 Writes one HTTP/3 access record to the destinations this host selects.
 ///
-/// The record is built from the same [`crate::access_log::AccessEntry`] the
-/// H1/H2 path uses and goes through the same [`crate::access_log::LogTargets`],
+/// The record is built from the same [`pingclair_runtime::access_log::AccessEntry`] the
+/// H1/H2 path uses and goes through the same [`pingclair_runtime::access_log::LogTargets`],
 /// so `hostnames` and the record's shape cannot drift between transports —
 /// which is the failure mode this project keeps hitting whenever the two
 /// transports grow their own answer to the same question.
@@ -3756,32 +3800,34 @@ fn write_h3_access_log(
     // 🙈 The target can carry a credential in its query string, and `Referer`
     // carries the *previous* page's URL, so it can leak a token this request
     // never contained. Both go through the same redaction the H1/H2 record uses.
-    let logged_path = crate::redaction::redact_target(&req.path);
+    let logged_path = pingclair_runtime::redaction::redact_target(&req.path);
     let header = |wanted: &str| {
         req.headers
             .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
-            .map(|(_, value)| value.as_str())
+            .find(|(name, _)| name.as_str().eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| value.to_str().unwrap_or(""))
             .unwrap_or("")
     };
-    let redacted_referer = crate::redaction::redact_referer(header("referer"));
+    let redacted_referer = pingclair_runtime::redaction::redact_referer(header("referer"));
     let route = matched_route
         .and_then(|index| state.config.routes.get(index))
         .map(|route| route.path.as_str());
 
-    let entry = crate::access_log::AccessEntry {
+    let entry = pingclair_runtime::access_log::AccessEntry {
         // 🕰️ Both transports derive `ts` the same way from their own start
         // `Instant`, so the H3 record and the H1/H2 record place a request at the
         // same moment. A timestamp produced only on one of them would be the
         // parity gap this field exists to close.
-        started_unix: crate::access_log::unix_started_at(request_started),
+        started_unix: pingclair_runtime::access_log::unix_started_at(request_started),
         request_id,
         method: &req.method,
         host,
         path: logged_path.as_ref(),
         status,
         bytes: body_bytes,
-        duration_ms: request_started.elapsed().as_millis(),
+        // ⏱️ Fractional milliseconds, as on H1/H2: whole milliseconds round
+        // every fast response to `0` (#160).
+        duration_ms: request_started.elapsed().as_secs_f64() * 1000.0,
         ttfb_ms,
         client_ip: remote_ip,
         route,
@@ -3900,6 +3946,40 @@ async fn handle_request_inner(
             }
             return Err((404, "No Matching Virtual Host"));
         };
+        // 🧾 The selected virtual host's decoded field bounds are enforced
+        // here, before any matcher runs, exactly where H1/H2 enforces them
+        // (`early_request_filter`). An oversized section is then refused on
+        // its own terms instead of as a 404 from a path it never got to
+        // match, and site variables and matchers never run on headers that
+        // were already refused (#229).
+        //
+        // 📌 quiche was given a looser section limit (`QuicServer::run`), so
+        // an oversized section reaches this check and is refused on this
+        // stream alone, instead of quiche closing the connection with
+        // H3_EXCESSIVE_LOAD and failing every other request on it.
+        if let Some(breach) = crate::header_limits::check(
+            &state.config.limits,
+            req.headers.len(),
+            req.headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.len())),
+        ) {
+            // 🔎 RFC 6585 §5: name the one field at fault. A refusal before
+            // routing never enters `handle_errors` on any transport (#288);
+            // `send_error_response` still applies a configured
+            // `error_page 431`, exactly as H1/H2 do.
+            send_error_response(
+                resp_tx,
+                stream_id,
+                431,
+                breach.detail().as_deref(),
+                Some(&state),
+                response_policy,
+                request_id,
+            )
+            .await;
+            return Ok(());
+        }
         for (index, rule) in state.config.vars_routes.iter().enumerate() {
             let compiled = state.vars_precompiles.get(index).and_then(Option::as_ref);
             let matches = match compiled {
@@ -3974,39 +4054,6 @@ async fn handle_request_inner(
         .get(route_index)
         .ok_or((500, "Missing Route Handler"))?
         .handler;
-
-    // 🧾 Applies the selected virtual host's decoded H3 field bounds.
-    //
-    // 📌 quiche was given a looser section limit (`QuicServer::run`), so an
-    // oversized section reaches this check and is refused on this stream
-    // alone, instead of quiche closing the connection with H3_EXCESSIVE_LOAD
-    // and failing every other request on it.
-    if let Some(breach) = crate::header_limits::check(
-        &state.config.limits,
-        req.headers.len(),
-        req.headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.len())),
-    ) {
-        let Some(detail) = breach.detail() else {
-            return Err((431, "Request Header Fields Too Large"));
-        };
-        // 🔎 RFC 6585 §5: name the one field at fault. The sentence is built
-        // only here, on the rejection path, and sent directly because the
-        // shared error type carries static text only.
-        let message = format!("Request Header Fields Too Large: {detail}");
-        send_error_response(
-            resp_tx,
-            stream_id,
-            431,
-            &message,
-            Some(&state),
-            response_policy,
-            request_id,
-        )
-        .await;
-        return Ok(());
-    }
 
     // 🚫 Rejects advertised request trailers before a handler can consume an incomplete message.
     if header.headers.contains_key("trailer") {
@@ -4091,7 +4138,7 @@ async fn handle_request_inner(
                 response_policy,
                 &verified_client_ip_text,
                 addresses,
-                false,
+                None,
                 &mut request_vars,
                 &mut response_handlers,
             )
@@ -4109,7 +4156,7 @@ async fn handle_request_inner(
                 &verified_client_ip_text,
                 addresses,
                 route_precompile,
-                false,
+                None,
                 &mut request_vars,
                 &mut response_handlers,
                 &mut body_plan,
@@ -4300,7 +4347,7 @@ async fn handle_request_inner(
                     .await
                 }
 
-                H3Terminal::Templates { root } => {
+                H3Terminal::Templates { root } => 'templates: {
                     let root = root.unwrap_or_else(|| ".".to_string());
                     let relative = effective_uri.split('?').next().unwrap_or("/");
                     // 🛡️ Confined here as well as in the plan that selected this
@@ -4308,19 +4355,25 @@ async fn handle_request_inner(
                     // line that does not depend on the first having run — the same reason
                     // the static file server re-checks a configured index. It used to
                     // join the request path with no `..` check of its own at all.
+                    // 🚨 Every failure below leaves through the block's value
+                    // rather than the function's: an error raised here has to
+                    // meet `handle_errors` like any other, and returning from
+                    // the function skipped the routing loop entirely (#245).
                     let Some(mut file_path) = pingclair_core::percent::resolve_under_root(
                         std::path::Path::new(&root),
                         relative,
                     ) else {
-                        return Err((404, "Not Found"));
+                        break 'templates Err((404, "Not Found"));
                     };
                     if file_path.is_dir() {
                         file_path = file_path.join("index.html");
                     }
-                    let source =
-                        std::fs::read_to_string(&file_path).map_err(|_| (404, "Not Found"))?;
-                    let body = crate::server::render_template(&source, &root)
-                        .map_err(|_| (500, "Template Rendering Failed"))?;
+                    let Ok(source) = std::fs::read_to_string(&file_path) else {
+                        break 'templates Err((404, "Not Found"));
+                    };
+                    let Ok(body) = crate::server::render_template(&source, &root) else {
+                        break 'templates Err((500, "Template Rendering Failed"));
+                    };
                     let mut hdrs = http::HeaderMap::new();
                     hdrs.insert(
                         "content-type",
@@ -4346,7 +4399,7 @@ async fn handle_request_inner(
                     .await
                 }
 
-                H3Terminal::FileServer { error } => {
+                H3Terminal::FileServer { error } => 'file_server: {
                     // 🚨 Inside an error route the file server is that route's own,
                     // and the page goes out with the error's status, as on H1/H2.
                     let maybe_fs = match error {
@@ -4357,7 +4410,10 @@ async fn handle_request_inner(
                         None => state.file_servers.get(route_index).and_then(|f| f.clone()),
                     };
                     let Some(fs) = maybe_fs else {
-                        return Err((503, "File Server Unavailable"));
+                        // 🚨 The block's value, not the function's: the 503 has
+                        // to meet `handle_errors` like every other error the
+                        // terminal raises (#245).
+                        break 'file_server Err((503, "File Server Unavailable"));
                     };
                     let status_for = |own: u16| error.map_or(own, |scope| scope.status);
 
@@ -4601,6 +4657,15 @@ async fn handle_request_inner(
                             Err((404, "Not Found"))
                         }
                         Ok(None) => {
+                            // 🧾 The built-in 404 is the same sentence H1/H2
+                            // write from `serve_error_page`; an empty body here
+                            // was the one place the transports disagreed about
+                            // a missing file (#253).
+                            let mut hdrs = http::HeaderMap::new();
+                            hdrs.insert(
+                                "content-type",
+                                http::HeaderValue::from_static("text/plain"),
+                            );
                             send_h3_local_response(
                                 resp_tx,
                                 stream_id,
@@ -4611,8 +4676,10 @@ async fn handle_request_inner(
                                 &request_vars,
                                 response_handlers.as_deref(),
                                 404,
-                                http::HeaderMap::new(),
-                                H3LocalBody::Bytes(Bytes::new()),
+                                hdrs,
+                                H3LocalBody::Bytes(Bytes::from(crate::server::builtin_error_body(
+                                    404, None,
+                                ))),
                                 response_policy,
                                 request_id,
                                 request_deadline,
@@ -4719,7 +4786,7 @@ async fn handle_request_inner(
             response_policy,
             &verified_client_ip_text,
             addresses,
-            false,
+            None,
             &mut request_vars,
             &mut response_handlers,
         )
@@ -5018,6 +5085,62 @@ async fn stream_h3_subrequest_response(
     Ok(())
 }
 
+/// 📏 Reads an H3 FastCGI request body that arrived without a `Content-Length`.
+///
+/// The same policy as the H1/H2 half of the transport: PHP-FPM reads exactly
+/// `CONTENT_LENGTH` bytes from STDIN, so a body that did not declare a length
+/// is read here — through the same body limit, deadline, and upload pacer as
+/// the streaming path — and its length is what the environment will say (#248).
+/// The ceiling is the route's own `request_buffers` when it set one, and the
+/// module's hard ceiling otherwise; past it the body cannot be measured without
+/// unbounded memory, so the request fails closed with 413 rather than reaching
+/// php-fpm as a body the responder would read as empty.
+#[allow(clippy::too_many_arguments)]
+async fn read_lengthless_h3_fastcgi_body(
+    body_limit: u64,
+    body_timeout_ms: Option<u64>,
+    request_deadline: Option<Instant>,
+    upload_bytes_per_sec: Option<u64>,
+    ceiling: usize,
+    body_rx: &mut mpsc::Receiver<Bytes>,
+    body_notify: &Arc<Notify>,
+) -> Result<Bytes, HandlerError> {
+    let mut upload_pacer = upload_bytes_per_sec.map(StreamPacer::new);
+    let mut counted = 0u64;
+    let mut held = BytesMut::new();
+    loop {
+        let next = match body_timeout_ms {
+            Some(timeout_ms) => {
+                tokio::time::timeout(Duration::from_millis(timeout_ms), body_rx.recv())
+                    .await
+                    .map_err(|_| (408, "Request Body Timeout"))?
+            }
+            None => body_rx.recv().await,
+        };
+        let Some(chunk) = next else { break };
+        // 🔔 Releasing one bounded channel slot lets the QUIC reader resume.
+        body_notify.notify_one();
+        counted = counted.saturating_add(chunk.len() as u64);
+        if body_limit > 0 && counted > body_limit {
+            return Err((413, "Request Entity Too Large"));
+        }
+        if let Some(delay) = upload_pacer
+            .as_mut()
+            .and_then(|pacer| pacer.delay_for(chunk.len()))
+        {
+            if request_deadline.is_some_and(|deadline| Instant::now() + delay >= deadline) {
+                return Err((408, "Request Timeout"));
+            }
+            tokio::time::sleep(delay).await;
+        }
+        if held.len() + chunk.len() > ceiling {
+            return Err((413, "FastCGI Body Too Large To Measure"));
+        }
+        held.extend_from_slice(&chunk);
+    }
+    Ok(held.freeze())
+}
+
 /// 🧵 Proxies one HTTP/3 request through the shared FastCGI exchange.
 #[allow(clippy::too_many_arguments)]
 async fn fastcgi_upstream(
@@ -5049,17 +5172,36 @@ async fn fastcgi_upstream(
         .get("content-length")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    // 🚫 Refusing a lengthless FastCGI body before admission preserves both
-    // H1/H2 parity and upstream capacity for requests that can be served.
-    if !bodyless && content_length.is_none() {
-        let mut headers = vec![
-            quiche::h3::Header::new(b":status", b"411"),
-            quiche::h3::Header::new(b"content-length", b"0"),
-        ];
-        apply_h3_response_policy(&mut headers, response_policy, request_id, Some(state));
-        send_headers(resp_tx, stream_id, headers, true).await;
-        return Ok(());
-    }
+    // 🧾 PHP-FPM reads exactly `CONTENT_LENGTH` bytes from STDIN, so the number
+    // has to exist before the exchange opens. A client that declared one has
+    // given it to us; an H3 body only supplies bytes, so it is read and
+    // measured here, before the dial (#248). A request with no body simply
+    // measures zero. Measuring before admission also keeps a body this server
+    // cannot carry from occupying an upstream slot or a queue permit.
+    let measuring = content_length.is_none() && !bodyless;
+    let measured = if measuring {
+        let limits = &state.config.limits;
+        let request_deadline = limits
+            .request_timeout_ms
+            .filter(|value| *value > 0)
+            .map(|value| request_started + Duration::from_millis(value));
+        let ceiling = crate::body_buffer::measure_ceiling(state.buffering(route_index).request);
+        Some(
+            read_lengthless_h3_fastcgi_body(
+                body_limit,
+                body_timeout_ms,
+                request_deadline,
+                limits.upload_bytes_per_sec,
+                ceiling,
+                body_rx,
+                body_notify,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let content_length = content_length.or_else(|| measured.as_ref().map(|body| body.len() as u64));
     let _route_admission = match proxy.admit_route(state, route_index).await {
         Ok(admission) => admission,
         Err(crate::overload::AdmissionError::QueueFull) => {
@@ -5170,7 +5312,17 @@ async fn fastcgi_upstream(
     // still apply to each chunk as it arrives, before it is held.
     let buffering = state.buffering(route_index);
     let mut request_buffer = buffering.request.map(crate::body_buffer::BufferedBody::new);
-    if !bodyless {
+    if let Some(measured) = measured {
+        // 📏 This body was read to measure it, so the body limit, deadline, and
+        // upload pacer already ran while it was held; hand it over as it
+        // arrived rather than reading it a second time.
+        if !measured.is_empty() {
+            exchange
+                .send_body(&measured)
+                .await
+                .map_err(exchange_error)?;
+        }
+    } else if !bodyless {
         loop {
             let next = match body_timeout_ms {
                 Some(timeout_ms) => {
@@ -5208,7 +5360,8 @@ async fn fastcgi_upstream(
             exchange.send_body(&chunk).await.map_err(exchange_error)?;
         }
     }
-    if !bodyless
+    if !measuring
+        && !bodyless
         && let Some(content_length) = content_length
         && counted != content_length
     {
@@ -5218,7 +5371,10 @@ async fn fastcgi_upstream(
             "⚠️ H3 FastCGI request body length mismatch"
         );
         exchange.abort().await;
-        return Err((400, "Bad Request"));
+        // 📏 RFC 9114 §4.1.2: a body that ends before its declared length is a
+        // malformed request, not an answer this hop gives (#237).
+        send_reset(resp_tx, stream_id, quiche::h3::WireErrorCode::MessageError).await;
+        return Ok(());
     }
     if let Some(held) = request_buffer.as_mut().and_then(|buffer| buffer.finish()) {
         exchange.send_body(&held).await.map_err(exchange_error)?;
@@ -5537,8 +5693,9 @@ async fn reverse_proxy_upstream(
     let client_content_length: Option<u64> = req
         .headers
         .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.parse::<u64>().ok());
+        .find(|(name, _)| *name == http::header::CONTENT_LENGTH)
+        .and_then(|(_, value)| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
     let retry_policy = proxy_config
         .as_ref()
         .map(|config| config.retry.clone())
@@ -5920,6 +6077,10 @@ async fn reverse_proxy_upstream(
                 .ok();
         }
 
+        // 🧼 A value that arrived padded over H3 is trimmed before it reaches
+        // the origin, so the three transports hand over the same field (#256).
+        crate::http_policy::trim_pingora_request_padding(&mut up_req);
+
         session
             .write_request_header(Box::new(up_req))
             .await
@@ -6002,6 +6163,9 @@ async fn reverse_proxy_upstream(
             return Err((502, "Upstream Write Failed"));
         }
         // 📏 Rejects a body length mismatch before it can poison a reused connection.
+        // RFC 9114 §4.1.2 makes it a malformed request, so the client is told
+        // "you broke the protocol" with a stream reset rather than handed an
+        // application's `400` — the same signal the header path sends (#237).
         if let Some(content_length) = client_content_length
             && counted != content_length
         {
@@ -6011,7 +6175,8 @@ async fn reverse_proxy_upstream(
                 counted
             );
             session.shutdown().await;
-            return Err((400, "Bad Request"));
+            send_reset(resp_tx, stream_id, quiche::h3::WireErrorCode::MessageError).await;
+            return Ok(());
         }
 
         if let Err(error) = session.finish_request_body().await {
@@ -6281,17 +6446,12 @@ async fn reverse_proxy_upstream(
         return Err((effective_status, error_reason(effective_status)));
     }
 
-    if intercept_replacement.is_none()
-        && session
-            .response_header()
-            .is_some_and(|response| response.headers.contains_key("trailer"))
-    {
-        tracing::warn!(
-            "🚫 Rejecting an H3 upstream response that requires unsupported trailer forwarding"
-        );
-        session.shutdown().await;
-        return Err((502, "Upstream Response Trailers Not Supported"));
-    }
+    // 🧾 A `Trailer:` announcement is not an invalid response (RFC 9112
+    // §7.1.2 makes the trailer section part of the chunked coding, and
+    // RFC 9110 §15.6.3 reserves 502 for a response the proxy cannot parse).
+    // The response is relayed with the origin's own status; trailer fields
+    // that cannot be forwarded are dropped (#273). This is the H3 half of the
+    // same rule the H1/H2 response filter applies.
 
     let mut hdrs = Vec::new();
     if let Some(resp) = session.response_header() {
@@ -6411,39 +6571,46 @@ async fn reverse_proxy_upstream(
     }
     apply_h3_response_policy(&mut hdrs, &effective_policy, request_id, Some(state));
     // 🗜️ Final headers decide encoding, so outer policy cannot restore a strong validator.
-    let mut encoder = if crate::response_encoding::request_allows_encoding(&client_header.headers)
-        && intercept_file.is_none()
-        && intercept_replacement.is_none()
-        && !immediate_stream
-    {
-        let accepted = client_header
-            .headers
-            .get("accept-encoding")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("");
-        crate::encoding::negotiate(accepted, &state.config.encodings)
-            .filter(|_| {
-                crate::response_encoding::eligible_h3(
-                    &state.config,
-                    &state.encode_policy,
-                    &client_header.method,
-                    &hdrs,
-                )
+    // 🤐 A `HEAD` describes the response its `GET` would receive and has no
+    // body: the same decision runs, and the encoder it builds is dropped
+    // instead of installed (#264).
+    let bodiless = client_header.method == http::Method::HEAD;
+    let encode_decision =
+        if crate::response_encoding::request_allows_encoding(&client_header.headers)
+            && intercept_file.is_none()
+            && intercept_replacement.is_none()
+            && !immediate_stream
+        {
+            let accepted = client_header
+                .headers
+                .get("accept-encoding")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            crate::encoding::negotiate(accepted, &state.config.encodings).filter(|_| {
+                crate::response_encoding::eligible_h3(&state.config, &state.encode_policy, &hdrs)
             })
-            .and_then(|encoding| {
-                crate::encoding::ResponseEncoder::at_gzip_level(
-                    encoding,
-                    state.config.encode.gzip_level,
-                )
-                .map_err(|error| tracing::warn!("⚠️ Could not initialize H3 encoder: {error}"))
-                .ok()
-            })
-    } else {
-        None
-    };
-    let reencoded = encoder.is_some();
-    if let Some(encoder) = &encoder {
-        crate::response_encoding::reencode_h3_headers(&mut hdrs, encoder.token());
+        } else {
+            None
+        };
+    let mut encoder = None;
+    let mut coding = None;
+    if let Some(encoding) = encode_decision {
+        match crate::encoding::ResponseEncoder::at_gzip_level(
+            encoding,
+            state.config.encode.gzip_level,
+        ) {
+            Ok(built) => {
+                coding = Some(built.token());
+                if !bodiless {
+                    encoder = Some(built);
+                }
+            }
+            Err(error) => tracing::warn!("⚠️ Could not initialize H3 encoder: {error}"),
+        }
+    }
+    let reencoded = coding.is_some();
+    if let Some(coding) = coding {
+        crate::response_encoding::reencode_h3_headers(&mut hdrs, coding);
     }
 
     let mut download_pacer = limits.download_bytes_per_sec.map(StreamPacer::new);
@@ -6881,6 +7048,28 @@ fn set_h3_header(headers: &mut Vec<quiche::h3::Header>, name: &str, value: &str)
     ));
 }
 
+/// 🧼 Trims SP/HTAB padding from every H3 field value.
+///
+/// RFC 9114 §10.3 forbids a field value that starts or ends with SP/HTAB, and
+/// the value may come from the origin or from a configured `header`
+/// directive. The HTTP/1 path never sees the padding because its parser strips
+/// it; H2/H3 have to strip it themselves (#256).
+fn trim_h3_field_padding(headers: &mut Vec<quiche::h3::Header>) {
+    let padded = |header: &quiche::h3::Header| {
+        crate::http_policy::trim_field_value_ows(header.value()).len() != header.value().len()
+    };
+    if !headers.iter().any(padded) {
+        return;
+    }
+    *headers = std::mem::take(headers)
+        .into_iter()
+        .map(|header| {
+            let value = crate::http_policy::trim_field_value_ows(header.value()).to_vec();
+            quiche::h3::Header::new(header.name(), &value)
+        })
+        .collect();
+}
+
 /// 🔎 The header view a response matcher asks for, and nothing else.
 ///
 /// 📌 Only the names the matcher mentions are copied. A `match { header
@@ -6961,6 +7150,12 @@ fn apply_h3_response_policy(
 /// Split out so a gated block runs the same code as an unconditional one; the
 /// two would otherwise be a pair of sequences to keep in step by hand.
 fn apply_h3_ops(headers: &mut Vec<quiche::h3::Header>, policy: &ResponseHeaderPolicy) {
+    // 🧾 The body's own writer declared this before the policy runs; it is the
+    // only value the message can honour (#261).
+    let written_length = headers
+        .iter()
+        .find(|header| header.name().eq_ignore_ascii_case(b"content-length"))
+        .map(|header| header.value().to_vec());
     for (name, value) in policy.set_headers() {
         set_h3_header(headers, name, value);
     }
@@ -6995,6 +7190,23 @@ fn apply_h3_ops(headers: &mut Vec<quiche::h3::Header>, policy: &ResponseHeaderPo
     for name in policy.removed_headers() {
         headers.retain(|header| !header.name().eq_ignore_ascii_case(name.as_bytes()));
     }
+    match crate::http_policy::content_length_verdict(
+        written_length.as_deref(),
+        headers
+            .iter()
+            .find(|header| header.name().eq_ignore_ascii_case(b"content-length"))
+            .map(|header| header.value()),
+    ) {
+        crate::http_policy::ContentLengthVerdict::Keep => {}
+        crate::http_policy::ContentLengthVerdict::Restore => {
+            if let Some(written) = written_length.as_deref() {
+                set_h3_header(headers, "content-length", &String::from_utf8_lossy(written));
+            }
+        }
+        crate::http_policy::ContentLengthVerdict::Drop => {
+            headers.retain(|header| !header.name().eq_ignore_ascii_case(b"content-length"));
+        }
+    }
 }
 
 /// 🏁 The fields that go on every H3 response once the policy has run.
@@ -7010,7 +7222,13 @@ fn apply_h3_trailer_headers(
 ) {
     if suppress_server {
         headers.retain(|header| !header.name().eq_ignore_ascii_case(b"server"));
-    } else {
+    } else if !headers
+        .iter()
+        .any(|header| header.name().eq_ignore_ascii_case(b"server"))
+    {
+        // 🏷️ Same rule as the H1/H2 path: the upstream's own `Server` field
+        // line survives, and ours appears only when nothing else identified
+        // the response (#159).
         set_h3_header(headers, "server", "Pingclair");
     }
     set_h3_header(headers, "x-request-id", request_id);
@@ -7210,15 +7428,20 @@ async fn send_error_response(
     resp_tx: &ResponseSink,
     stream_id: u64,
     status: u16,
-    msg: &str,
+    detail: Option<&str>,
     state: Option<&ProxyState>,
     policy: &ResponseHeaderPolicy,
     request_id: &str,
 ) {
+    // 💬 The same sentence H1/H2 write for a status this hop generated —
+    // "413 Request Entity Too Large", plus a detail when there is one, like the
+    // field a 431 names (#252, #253). The handler's own phrase goes to the
+    // access log, not into the client's body.
+    let text = crate::server::builtin_error_body(status, detail);
     let (body, content_type) = state
         .and_then(|state| state.read_error_page(status))
         .map_or_else(
-            || (Bytes::copy_from_slice(msg.as_bytes()), "text/plain"),
+            || (Bytes::from(text), "text/plain"),
             |(page, content_type)| (Bytes::from(page), content_type),
         );
     let mut headers = vec![
@@ -7441,7 +7664,63 @@ mod tests {
         assert_eq!(req.authority, "example.com:443");
         assert_eq!(
             req.headers,
-            vec![("content-type".to_string(), "text/plain".to_string())]
+            vec![(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/plain")
+            )]
+        );
+    }
+
+    /// 🛡️ An underscore-named field is dropped before routing, exactly like
+    /// the H1/H2 filter drops it; the hyphenated spelling beside it survives,
+    /// which is what makes the two transports agree (#269).
+    /// 🚫 An invalid field name or value makes the request malformed.
+    ///
+    /// The name used to be dropped with `from_utf8_lossy` and the value
+    /// repaired byte by byte, so a request RFC 9114 §4.1.2 makes malformed
+    /// was served — with the origin seeing different bytes than the client
+    /// sent (#236).
+    #[test]
+    fn parse_h3_request_refuses_invalid_field_bytes() {
+        let request = |name: &'static [u8], value: &'static [u8]| {
+            vec![
+                quiche::h3::Header::new(b":method", b"GET"),
+                quiche::h3::Header::new(b":scheme", b"https"),
+                quiche::h3::Header::new(b":authority", b"example.com"),
+                quiche::h3::Header::new(b":path", b"/"),
+                quiche::h3::Header::new(name, value),
+            ]
+        };
+
+        // 🛡️ A name that is not a token, and a value carrying a control byte,
+        // are both malformed — the reset is `H3_MESSAGE_ERROR`.
+        assert!(parse_h3_request(&request(b"x bad", b"value")).is_none());
+        assert!(parse_h3_request(&request(b"x-probe", b"bad\x01")).is_none());
+
+        // 📋 Obs-text is legal in a field value (RFC 9110 §5.5) and has to
+        // reach the origin as the bytes the client sent, not as U+FFFD.
+        let parsed = parse_h3_request(&request(b"x-probe", b"caf\xe9")).unwrap();
+        assert_eq!(parsed.headers[0].1.as_bytes(), b"caf\xe9");
+    }
+
+    #[test]
+    fn parse_h3_request_drops_underscore_named_fields() {
+        let list = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"example.com"),
+            quiche::h3::Header::new(b":path", b"/"),
+            quiche::h3::Header::new(b"x_probe", b"present"),
+            quiche::h3::Header::new(b"x-probe", b"present"),
+        ];
+        let req = parse_h3_request(&list).unwrap();
+        assert_eq!(
+            req.headers,
+            vec![(
+                http::header::HeaderName::from_static("x-probe"),
+                http::HeaderValue::from_static("present")
+            )],
+            "the underscore spelling is dropped, the hyphenated one kept"
         );
     }
 
@@ -7676,8 +7955,14 @@ mod tests {
             path: "/resource?q=1".to_string(),
             authority: "example.test".to_string(),
             headers: vec![
-                ("user-agent".to_string(), "probe/1".to_string()),
-                ("x-custom-field".to_string(), "kept".to_string()),
+                (
+                    http::header::USER_AGENT,
+                    http::HeaderValue::from_static("probe/1"),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-custom-field"),
+                    http::HeaderValue::from_static("kept"),
+                ),
             ],
         };
 
@@ -7737,9 +8022,9 @@ mod tests {
             path: "/".to_string(),
             authority: "example.test".to_string(),
             headers: vec![
-                ("cookie".to_string(), "a=1".to_string()),
-                ("cookie".to_string(), "b=2".to_string()),
-                ("cookie".to_string(), "c=3".to_string()),
+                (http::header::COOKIE, http::HeaderValue::from_static("a=1")),
+                (http::header::COOKIE, http::HeaderValue::from_static("b=2")),
+                (http::header::COOKIE, http::HeaderValue::from_static("c=3")),
             ],
         };
 
@@ -7767,8 +8052,14 @@ mod tests {
             path: "/".to_string(),
             authority: "example.test".to_string(),
             headers: vec![
-                ("accept-encoding".to_string(), "gzip".to_string()),
-                ("accept-encoding".to_string(), "br".to_string()),
+                (
+                    http::header::ACCEPT_ENCODING,
+                    http::HeaderValue::from_static("gzip"),
+                ),
+                (
+                    http::header::ACCEPT_ENCODING,
+                    http::HeaderValue::from_static("br"),
+                ),
             ],
         };
 
@@ -7792,7 +8083,10 @@ mod tests {
             method: "GET".to_string(),
             path: "/".to_string(),
             authority: "example.test".to_string(),
-            headers: vec![("host".to_string(), "example.test".to_string())],
+            headers: vec![(
+                http::header::HOST,
+                http::HeaderValue::from_static("example.test"),
+            )],
         };
 
         let header = h3_request_header(&req, http::Method::GET).expect("valid request");
@@ -8279,7 +8573,10 @@ mod tests {
             method: "GET".to_string(),
             path: "/resource".to_string(),
             authority: "shop.example.test".to_string(),
-            headers: vec![("host".to_string(), "shop.example.test".to_string())],
+            headers: vec![(
+                http::header::HOST,
+                http::HeaderValue::from_static("shop.example.test"),
+            )],
         };
         let client_header = h3_request_header(&request, http::Method::GET).unwrap();
         let (body_tx, mut body_rx) = mpsc::channel(1);
@@ -8483,8 +8780,11 @@ mod tests {
             path: "/grpc.health.v1.Health/Check".to_string(),
             authority: "example.test".to_string(),
             headers: vec![
-                ("content-type".to_string(), "application/grpc".to_string()),
-                ("te".to_string(), "trailers".to_string()),
+                (
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("application/grpc"),
+                ),
+                (http::header::TE, http::HeaderValue::from_static("trailers")),
             ],
         };
         let mut client_header =
@@ -8596,7 +8896,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -8657,7 +8957,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -8699,7 +8999,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -8752,7 +9052,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -8867,7 +9167,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -8903,7 +9203,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -8952,7 +9252,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut registered,
             &mut RequestBodyPlan::default(),
@@ -9056,7 +9356,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -9096,7 +9396,7 @@ mod tests {
             &mut policy,
             "203.0.113.9",
             None,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -9151,7 +9451,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             precompile,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),
@@ -9175,7 +9475,7 @@ mod tests {
             &mut policy,
             "203.0.113.7",
             precompile,
-            false,
+            None,
             &mut crate::http_policy::RequestVars::default(),
             &mut None,
             &mut RequestBodyPlan::default(),

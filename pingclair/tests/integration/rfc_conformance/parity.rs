@@ -11,6 +11,7 @@
 //! says plainly which server it is measured against.
 
 use super::{ScriptedUpstream, TestServer, raw_http1, site};
+use crate::{no_proxy_client, read_until_marker};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -21,7 +22,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Replacing the unknown name with nothing is the one answer that silently
 /// changes content the operator wrote.
 #[tokio::test]
-#[ignore = "pingclair#260 — the unknown placeholder is replaced with nothing"]
 async fn test_unknown_placeholder_is_preserved() {
     let mut server = TestServer::new_pingclairfile(&site(r#"respond "open {brace} close""#));
     assert!(server.wait_until_ready().await, "server failed to start");
@@ -49,7 +49,6 @@ async fn test_unknown_placeholder_is_preserved() {
 /// `gzip_static` serves the identity file for ranges — but it has to be a choice,
 /// which is what this test records.
 #[tokio::test]
-#[ignore = "pingclair#254 — the identity representation is served instead"]
 async fn test_precompressed_range_uses_the_compressed_representation() {
     use std::io::Write;
 
@@ -94,7 +93,6 @@ async fn test_precompressed_range_uses_the_compressed_representation() {
 /// then writes a second, and the assertion is about the first event's *arrival*
 /// rather than the response's contents.
 #[tokio::test]
-#[ignore = "pingclair#247 — H1 holds a known-length body until it ends"]
 async fn test_known_length_body_arrives_before_it_ends() {
     let events = b"data: one\n\ndata: two\n\n";
     let head = format!(
@@ -152,7 +150,6 @@ async fn test_known_length_body_arrives_before_it_ends() {
 /// it already formed; a stream reset with no status at all leaves the client —
 /// and the operator reading the access log — with nothing to act on.
 #[tokio::test]
-#[ignore = "pingclair#249 — the H2 client receives a stream reset and no response"]
 async fn test_truncated_upstream_answers_an_h2_client() {
     let upstream = ScriptedUpstream::start(
         vec![
@@ -194,6 +191,108 @@ async fn test_truncated_upstream_answers_an_h2_client() {
             Err(error) => panic!("the client must not be left with a bare stream reset: {error}"),
         }
     }
+}
+
+/// 🧯 A truncated flushing route must not read as a complete HTTP/1.1
+/// response.
+///
+/// This is the same origin break the HTTP/2 test above pins: the origin
+/// declares 1 MiB, writes 256 KiB and hangs up. A route that asked for
+/// immediate flushing drops the length so each chunk leaves as it is written
+/// (#247), and a response whose head declares neither `Content-Length` nor
+/// `Transfer-Encoding` is delimited by the close — which turns the very break
+/// the client must notice into a clean end. Caddy relays the head it formed
+/// with chunked framing instead, so the missing terminating chunk stays
+/// visible.
+#[tokio::test]
+async fn test_truncated_flushing_response_is_not_a_clean_h1_end() {
+    let upstream = ScriptedUpstream::start(
+        vec![
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+              Content-Length: 1048576\r\n\r\n"
+                .to_vec(),
+            vec![b'x'; 256 * 1024],
+        ],
+        Duration::ZERO,
+    )
+    .await;
+    let mut server = TestServer::new_pingclairfile(&site(&format!(
+        "reverse_proxy 127.0.0.1:{} {{\n                flush_interval -1\n            }}",
+        upstream.address.port()
+    )));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let outcome = async {
+        let response = client.get(server.url(0, "/")).send().await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        Ok::<_, reqwest::Error>((status, body.len()))
+    }
+    .await;
+    server.stop();
+
+    match outcome {
+        // The break reached the client — a failed body read is the signal.
+        Err(_) => {}
+        Ok((status, bytes)) => panic!(
+            "the origin stopped 768 KiB short, yet the client read a complete \
+             response: {status} {bytes} bytes"
+        ),
+    }
+}
+
+/// 🔁 A flushing route keeps its HTTP/1.1 connection for the next request.
+///
+/// `flush_interval -1` drops the length so chunks leave as they are written
+/// (#247). A lengthless HTTP/1.1 response is close-delimited unless its head
+/// says chunked, and a close-delimited response ends the connection: without
+/// that framing every proxied response would pay a fresh TCP and TLS
+/// handshake. Caddy and nginx both frame it as chunked and keep the
+/// connection, and the second request on this one is the check.
+#[tokio::test]
+async fn test_flushing_route_keeps_its_h1_connection() {
+    let upstream = ScriptedUpstream::start(
+        vec![
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello"
+                .to_vec(),
+        ],
+        Duration::ZERO,
+    )
+    .await;
+    let mut server = TestServer::new_pingclairfile(&site(&format!(
+        "reverse_proxy 127.0.0.1:{} {{\n                flush_interval -1\n            }}",
+        upstream.address.port()
+    )));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let mut stream = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET /one HTTP/1.1\r\nHost: test\r\n\r\n")
+        .await
+        .unwrap();
+    let first = read_until_marker(&mut stream, b"hello", Duration::from_secs(5)).await;
+    stream
+        .write_all(b"GET /two HTTP/1.1\r\nHost: test\r\n\r\n")
+        .await
+        .unwrap();
+    let second = read_until_marker(&mut stream, b"hello", Duration::from_secs(5)).await;
+    server.stop();
+
+    let first_head = String::from_utf8_lossy(&first).to_ascii_lowercase();
+    assert!(
+        first_head.contains("transfer-encoding: chunked"),
+        "a lengthless HTTP/1.1 response must frame its body, not lean on the \
+         close: {first_head}"
+    );
+    assert!(
+        second
+            .windows(b"HTTP/1.1 200".len())
+            .any(|window| window == b"HTTP/1.1 200"),
+        "the second response must arrive on the same connection"
+    );
 }
 
 /// ⚖️ A zero weight means the upstream is not chosen.
@@ -247,7 +346,6 @@ async fn test_zero_weight_upstream_receives_no_traffic() {
 /// two cookies has no way to express itself if the compiled shape keeps one value
 /// per name. Caddy's block form emits both.
 #[tokio::test]
-#[ignore = "pingclair#276 — the second +Set-Cookie replaces the first inside one block"]
 async fn test_header_block_keeps_every_set_cookie() {
     let mut server = TestServer::new_pingclairfile(&site(
         "header {\n                +Set-Cookie \"a=1; Path=/\"\n                +Set-Cookie \"b=2; Path=/\"\n            }\n            respond \"ok\"",
@@ -268,11 +366,89 @@ async fn test_header_block_keeps_every_set_cookie() {
     assert_eq!(cookies, 2, "both configured cookies must be sent: {head}");
 }
 
+/// 🏷️ An upstream's `Server` field line reaches the client unchanged, and a
+/// response this server wrote itself carries ours.
+///
+/// Caddy sets its own `Server` before the handler chain runs
+/// (`modules/caddyhttp/server.go`) and its proxy then copies the upstream's
+/// headers over it, so what a client sees is the origin's product string when
+/// there is one and `Caddy` when there is not. This server inserted
+/// `Pingclair` over whatever arrived, which is why monitoring that identifies
+/// an origin, or a mixed fleet comparing nodes, saw something different
+/// (#159).
+#[tokio::test]
+async fn test_the_upstreams_server_header_survives_the_proxy() {
+    let upstream = ScriptedUpstream::start(
+        vec![
+            b"HTTP/1.1 200 OK\r\nServer: audit-upstream/u1\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+        ],
+        Duration::ZERO,
+    )
+    .await;
+    let mut server = TestServer::new_pingclairfile(&site(&format!(
+        "reverse_proxy 127.0.0.1:{}",
+        upstream.address.port()
+    )));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let (head, _) = raw_http1(
+        &server,
+        b"GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    server.stop();
+
+    let identifications: Vec<String> = head
+        .lines()
+        .filter(|line| line.to_ascii_lowercase().starts_with("server:"))
+        .map(|line| line.trim().to_ascii_lowercase())
+        .collect();
+    assert_eq!(
+        identifications,
+        vec!["server: audit-upstream/u1".to_string()],
+        "the origin's own product string must survive: {head}"
+    );
+    // 🤝 `Via` still names *this* intermediary, appended to whatever chain the
+    // request already crossed — the token is our product name because that is
+    // what the field is for (RFC 9110 §7.6.3).
+    let via = head
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("via:"))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(via.contains("1.1 pingclair"), "got: {via:?} in {head}");
+}
+
+/// 🏷️ A response this server produced itself still says so.
+#[tokio::test]
+async fn test_a_local_response_carries_our_server_header() {
+    let mut server = TestServer::new_pingclairfile(&site(r#"respond "local""#));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let (head, _) = raw_http1(
+        &server,
+        b"GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    server.stop();
+
+    let identifications: Vec<String> = head
+        .lines()
+        .filter(|line| line.to_ascii_lowercase().starts_with("server:"))
+        .map(|line| line.trim().to_ascii_lowercase())
+        .collect();
+    assert_eq!(identifications, vec!["server: pingclair".to_string()]);
+}
+
 /// ✅ `header X v` produces one field line, even when the origin sent its own.
 ///
 /// This is the recorded decision from pingclair#272: Caddy keeps both values,
-/// this server replaces, and the verb says what it does. The test exists so the
-/// choice is visible to whoever next reads the compatibility note.
+/// this server replaces, and the verb says what it does. nginx keeps both too
+/// (`ngx_http_add_header`, `ngx_http_headers_filter_module.c:568`, pushes onto
+/// the response without touching the upstream's), and replacing a field there
+/// takes `proxy_hide_header` plus `add_header` — so the difference is kept on
+/// purpose rather than by accident. The test exists so the choice is visible to
+/// whoever next reads the compatibility note.
 #[tokio::test]
 async fn test_header_set_yields_one_field_line() {
     let upstream = ScriptedUpstream::start(

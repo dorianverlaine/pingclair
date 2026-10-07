@@ -191,9 +191,6 @@ impl BodyCache {
 // MARK: - Response metadata cache
 
 impl FileServer {
-    /// 🧮 Process-wide metadata entry limit; this is not a byte or RSS limit.
-    pub(super) const META_CACHE_CAP: usize = 4096;
-
     /// Return the prebuilt response metadata for `file_path`, building and
     /// caching it on the first request and on every mtime/size change.
     pub(super) fn file_meta(
@@ -584,8 +581,9 @@ mod meta_cache_tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = server(dir.path());
 
+        let cap = crate::file_server::budget::cache_budgets().metadata_entries;
         let mut paths = Vec::new();
-        for index in 0..(FileServer::META_CACHE_CAP + 8) {
+        for index in 0..(cap + 8) {
             let path = dir.path().join(format!("f{index}.txt"));
             std::fs::write(&path, format!("body-{index}")).unwrap();
             let _ = meta_for(&fs, &path);
@@ -593,7 +591,7 @@ mod meta_cache_tests {
         }
 
         assert!(
-            fs.meta_cache.load().len() <= FileServer::META_CACHE_CAP,
+            fs.meta_cache.load().len() <= cap,
             "the cache grew past its cap: {}",
             fs.meta_cache.load().len()
         );

@@ -22,13 +22,11 @@ pub mod segment_tree;
 #[allow(clippy::module_inception)]
 pub mod parser;
 pub mod semantic;
-pub mod variables;
 
 pub use ast::*;
 pub use lexer::{LexError, Location, Spanned, Token, tokenize};
 pub use parser::{ParseError, parse};
 pub use semantic::{SemanticAnalyzer, SemanticError};
-pub use variables::{ResolvedVariable, VariableResolver};
 
 pub use crate::adapter::caddyfile::{AdapterError, adapt};
 

@@ -57,7 +57,6 @@ async fn test_cl_and_te_together_end_the_connection() {
 /// defined Content-Length" — invents a refusal the client did not earn. A
 /// bodyless `POST` or `DELETE` is ordinary traffic.
 #[tokio::test]
-#[ignore = "pingclair#248 — a bodyless POST/DELETE to php_fastcgi answers 411"]
 async fn test_bodyless_post_reaches_fastcgi() {
     let port = closed_port();
     let mut server = TestServer::new_pingclairfile(&site(&format!(
@@ -87,7 +86,6 @@ async fn test_bodyless_post_reaches_fastcgi() {
 /// the server only has to read it. Caddy reached the same conclusion in 2.9.1 by
 /// buffering FastCGI bodies by default (caddyserver/caddy#6759).
 #[tokio::test]
-#[ignore = "pingclair#248 — a chunked POST to php_fastcgi answers 411"]
 async fn test_chunked_post_reaches_fastcgi() {
     let port = closed_port();
     let mut server = TestServer::new_pingclairfile(&site(&format!(

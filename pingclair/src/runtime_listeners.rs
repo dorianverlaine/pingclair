@@ -529,7 +529,7 @@ impl ConfigPublisher for RuntimeListeners {
                 .insert(listener.address.clone(), listener.policy.clone());
             self.bootstrap.start(listener);
         }
-        pingclair_proxy::access_log::register_channels(&config.logging.channels);
+        pingclair_runtime::access_log::register_channels(&config.logging.channels);
         // 🔁 A reload that adds or removes `metrics` takes effect here, not at
         // the next restart.
         pingclair_proxy::metrics::configure(config.global.metrics);

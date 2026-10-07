@@ -2,7 +2,7 @@
 #
 # 🧊 The environment is `deployment/Builder.Dockerfile`, the same image CI and
 # every Linux builder runs — which is also what makes this image's build
-# artifacts interchangeable with theirs. It pins Ubuntu 24.04, Rust 1.98.1,
+# artifacts interchangeable with theirs. It pins Ubuntu 24.04, Rust 1.99.0,
 # clang/cmake/BoringSSL's dependencies, and the workspace path; the apt list
 # that used to live here is defined once, there.
 #

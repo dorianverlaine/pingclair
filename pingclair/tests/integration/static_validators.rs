@@ -62,6 +62,21 @@ fn set_mtime(path: &std::path::Path, at: SystemTime) {
         .unwrap();
 }
 
+/// 🕰️ The modification time the filesystem actually stored, in nanoseconds.
+///
+/// Read back rather than assumed: a coarser timestamp granularity than the
+/// caller asked for is the one platform difference that can turn two writes
+/// into one validator (#184).
+fn mtime_nanos(path: &std::path::Path) -> u128 {
+    std::fs::metadata(path)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+}
+
 /// 🏷️ RFC 9110 §8.8.1: the gzip sidecar and the plain file are different
 /// bytes, so one strong tag cannot describe both.
 #[tokio::test]
@@ -88,9 +103,42 @@ async fn test_file_server_etag_differs_per_content_coding() {
     assert_ne!(gzip.0, identity.0, "each representation needs its own tag");
 }
 
+/// 🏷️ The validator is Caddy's spelling for the same file.
+///
+/// Caddy derives a static file's tag as
+/// `"<base36(mtime_ns)>-<base36(size)>"` (`calculateEtag`,
+/// `modules/caddyhttp/fileserver/staticfiles.go`, v2.11.7). A site moved
+/// between the two servers therefore keeps the validators its browsers and CDN
+/// already stored, instead of re-downloading every file on the day of the
+/// switch (#158).
+#[tokio::test]
+async fn test_file_server_etag_is_caddys_base36_pair() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("gzip.txt");
+    std::fs::write(&path, "x".repeat(7200)).unwrap();
+    // 🕰️ A whole second, because the digit string below is what Caddy prints
+    // for this exact pair: 1_700_000_000 s in nanoseconds is `cwyvpelgpse8`,
+    // and 7200 bytes is `5k0`.
+    set_mtime(&path, UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+    let mut server = sidecar_site(root.path().to_str().unwrap());
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let etag = etag_of(&server, "/gzip.txt", "identity").await.0;
+    server.stop();
+
+    assert_eq!(etag, "\"cwyvpelgpse8-5k0\"");
+}
+
 /// 🕰️ Two same-size edits inside one second must not share a tag. With a
 /// whole-second mtime they did, and a client resuming a download would have
 /// spliced bytes from two different files together.
+///
+/// 📌 The assertion is against the mtimes the filesystem actually stored, read
+/// back between the two requests: a container filesystem with coarse timestamp
+/// granularity can land both writes on one instant, and two identical
+/// validators are then the *correct* answer — the unit test in
+/// `pingclair-static` is where the nanosecond property itself is pinned, and
+/// this one is about the file server noticing the change (#184).
 #[tokio::test]
 async fn test_file_server_etag_changes_within_one_second() {
     let root = tempfile::tempdir().unwrap();
@@ -105,13 +153,29 @@ async fn test_file_server_etag_changes_within_one_second() {
     let mut server = sidecar_site(root.path().to_str().unwrap());
     assert!(server.wait_until_ready().await, "server failed to start");
     let before = etag_of(&server, "/f.txt", "identity").await.0;
+    let first_mtime = mtime_nanos(&path);
 
     std::fs::write(&path, "version-B").unwrap();
     set_mtime(&path, at(600));
+    let second_mtime = mtime_nanos(&path);
     let after = etag_of(&server, "/f.txt", "identity").await.0;
     server.stop();
 
-    assert_ne!(before, after, "a same-second, same-size edit kept its ETag");
+    if first_mtime == second_mtime {
+        // 🕰️ The filesystem could not tell the two instants apart: identical
+        // validators are the correct answer, and the property this test is
+        // about cannot be observed here. Say so rather than passing quietly.
+        eprintln!(
+            "note: this filesystem stored both writes at mtime {first_mtime}; \
+             the same-second property is pinned by the unit test instead"
+        );
+        assert_eq!(before, after);
+    } else {
+        assert_ne!(
+            before, after,
+            "a same-second, same-size edit kept its ETag (mtime {first_mtime} -> {second_mtime})"
+        );
+    }
 }
 
 /// 🪟 RFC 9110 §13.1.5: `If-Range` decides whether `Range` applies. A client
@@ -225,5 +289,80 @@ async fn test_file_server_skips_a_sidecar_etag_that_is_not_an_entity_tag() {
             (200, false, source()),
             (200, true, source())
         ]
+    );
+}
+
+/// 🏷️ A configured `ETag` is the validator, not just a label.
+///
+/// RFC 9110 §13.1.2 compares `If-None-Match` against "the entity tag of the
+/// selected representation", and §8.8.3 makes the `ETag` field that tag's
+/// carrier. There is one representation and one tag on the wire, so the tag
+/// the client was given is the tag that decides `304` — revalidating against
+/// it must not answer `200` while some tag the client never saw answers `304`
+/// (#265).
+#[tokio::test]
+async fn test_a_configured_etag_is_the_validator_the_client_revalidates_with() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("file.txt"), "configured-tag").unwrap();
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+            header Etag "\"quoted-hash-9\""
+            file_server
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+        "#,
+        root = root.path().display()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let served = no_proxy_client()
+        .get(server.url(0, "/file.txt"))
+        .send()
+        .await
+        .unwrap();
+    let advertised = served.headers()["etag"].to_str().unwrap().to_string();
+    assert_eq!(advertised, "\"quoted-hash-9\"");
+    served.bytes().await.unwrap();
+
+    let revalidated = no_proxy_client()
+        .get(server.url(0, "/file.txt"))
+        .header("If-None-Match", &advertised)
+        .send()
+        .await
+        .unwrap();
+    let status = revalidated.status().as_u16();
+    revalidated.bytes().await.unwrap();
+
+    // 🧷 The same tag gates a resumable range: the client's copy is the version
+    // the server described, so the range is honoured rather than ignored.
+    let partial = no_proxy_client()
+        .get(server.url(0, "/file.txt"))
+        .header("Range", "bytes=0-3")
+        .header("If-Range", &advertised)
+        .send()
+        .await
+        .unwrap();
+    let partial_status = partial.status().as_u16();
+    let partial_body = partial.text().await.unwrap();
+    server.stop();
+
+    assert_eq!(
+        status, 304,
+        "the tag the client was given must be the tag that answers 304"
+    );
+    assert_eq!(
+        (partial_status, partial_body.as_str()),
+        (206, "conf"),
+        "If-Range must trust the tag the client was given"
     );
 }

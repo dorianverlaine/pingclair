@@ -412,6 +412,24 @@ pub(super) fn adapt_server(
                     }
                 },
                 "tls" => {
+                    // 🚫 A bare `tls` names nothing, and Caddy refuses it at
+                    // parse time ("wrong argument count or unexpected line
+                    // ending after 'tls'"). This server accepted it as "turn
+                    // automatic HTTPS on", which is the dangerous direction:
+                    // a file that Caddy refuses would start here and only
+                    // here, so it could never be checked on the reference
+                    // implementation first (#147). An address with a hostname
+                    // already gets automatic HTTPS without any `tls` line.
+                    if sub_d.args.is_empty() && sub_d.block.is_none() {
+                        return Err(AdapterError::InvalidArgument(
+                            "tls".into(),
+                            "a bare `tls` names nothing; write `tls internal` for a local \
+                             certificate, `tls <cert_file> <key_file>` for your own, `tls <email>` \
+                             for ACME, or a `tls { … }` block. A site address with a hostname \
+                             already gets automatic HTTPS"
+                                .into(),
+                        ));
+                    }
                     server.tls = Some(adapt_tls_directive(&sub_d)?);
                 }
                 "limits" => {
@@ -518,6 +536,20 @@ pub(super) fn adapt_server(
                     // 'example.com'" describes the symptom while hiding the
                     // cause.
                     if sub_d.block.is_some() && !super::registry::is_directive_name(&sub_d.name) {
+                        // 🪪 An option that belongs inside `tls { … }` is not a
+                        // directive of its own: `client_auth { … }` written at
+                        // the top level of a site is a misplaced TLS option,
+                        // and the second-site message sends the operator
+                        // looking for a missing brace instead (#285).
+                        if super::tls::is_tls_option(&sub_d.name) {
+                            return Err(AdapterError::InvalidArgument(
+                                "tls option".into(),
+                                format!(
+                                    "`{}` is a `tls` option; write it inside `tls {{ … }}`",
+                                    sub_d.name
+                                ),
+                            ));
+                        }
                         return Err(AdapterError::InvalidArgument(
                             "site address".into(),
                             format!(
@@ -547,13 +579,9 @@ pub(super) fn adapt_server(
                     }
                     // 🌐 Caddy's `*` matcher token matches every request and
                     // exists only to disambiguate data arguments from path
-                    // matchers; it must never reach an upstream list.
-                    let wildcard_matcher = handler_d.name == "reverse_proxy"
-                        && handler_d.args.first().is_some_and(|a| a == "*");
-                    if wildcard_matcher {
-                        handler_d.drop_first_arg();
-                    }
-                    if matcher.is_some() {
+                    // matchers; it must never reach a handler's data — an
+                    // upstream list, a response body, or anything else (#135).
+                    if matcher.is_some() || handler_d.args.first().is_some_and(|arg| arg == "*") {
                         if handler_d.args.is_empty() {
                             return Err(AdapterError::ArgumentCount(sub_d.name, 1, 0));
                         }

@@ -31,7 +31,15 @@ import (
 )
 
 const host = "h3.go.test"
-const deadline = 8 * time.Second
+
+// 🧪 Every use of this budget is a wait — readiness, an awaited cancellation
+// signal, a shutdown grace, a client context — so a real hang still fails; a
+// generous number only stops a loaded runner from reporting one. Measured:
+// the cancellation signals arrive in ~0.24 s, but on a busy CI runner the same
+// commit failed one 8 s wait and passed an identical parallel run, twice, in
+// two different tests. The earlier 1 s SSE window failed the same way and was
+// widened for the same reason.
+const deadline = 20 * time.Second
 
 // 🛰️ A session owns exactly one QUIC connection and never redials a failed one.
 type session struct {

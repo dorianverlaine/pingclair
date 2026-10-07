@@ -305,10 +305,43 @@ impl TlsManager {
     pub fn serves_name(&self, domain: &str) -> bool {
         let domain = canonical_domain(domain);
         let domain = domain.as_ref();
-        self.manual_pem_certs.read().contains_key(domain)
+        self.manual_covers(domain)
             || covered_by_any(&self.internal_domains.read(), domain)
             || (self.auto_https.is_some()
                 && covered_by_any(&self.public_issuance_domains.read(), domain))
+    }
+
+    /// 📜 The manual pair for `name`: the exact entry first, then a wildcard
+    /// whose one label it fills.
+    ///
+    /// A manual certificate filed under `*.example.com` describes the same set
+    /// of names as an issued wildcard, so a client asking for
+    /// `a.example.com` has to be answered with it — the table used to be read
+    /// by exact spelling only, so the handshake was refused with
+    /// `unrecognized_name` instead (#285).
+    fn manual_pem(&self, name: &str) -> Option<(String, String)> {
+        let table = self.manual_pem_certs.read();
+        if let Some(pair) = table.get(name) {
+            return Some(pair.clone());
+        }
+        // 🃏 The one-label wildcard rule is the one issuance and the internal
+        // authority already answer by, so the three cannot disagree.
+        table
+            .iter()
+            .find(|(pattern, _)| crate::acme::pattern_covers(pattern, name))
+            .map(|(_, pair)| pair.clone())
+    }
+
+    /// 🃏 Whether the manual table names `name`, wildcards included.
+    ///
+    /// 🏎️ No clone: this runs once per handshake, including the ones a
+    /// stranger sends with a made-up name.
+    fn manual_covers(&self, name: &str) -> bool {
+        let table = self.manual_pem_certs.read();
+        table.contains_key(name)
+            || table
+                .keys()
+                .any(|pattern| crate::acme::pattern_covers(pattern, name))
     }
 
     /// 🏛️ Enables local issuance for one configured domain and eagerly prepares its leaf.
@@ -423,11 +456,7 @@ impl TlsManager {
     /// public ACME issuance. HTTP/3 uses it to refresh the SNI certificate table.
     pub async fn peek_pem(&self, domain: &str) -> Option<(String, String)> {
         // 📜 Explicit PEM pairs always take precedence.
-        let manual = self
-            .manual_pem_certs
-            .read()
-            .get(canonical_domain(domain).as_ref())
-            .cloned();
+        let manual = self.manual_pem(canonical_domain(domain).as_ref());
         if let Some(pems) = manual {
             return Some(pems);
         }
@@ -459,11 +488,7 @@ impl TlsManager {
     /// 🔍 Resolves a PEM pair for a client hello.
     pub async fn resolve_pem(&self, domain: &str) -> Option<(String, String)> {
         // 📜 Explicit PEM pairs always take precedence.
-        let manual = self
-            .manual_pem_certs
-            .read()
-            .get(canonical_domain(domain).as_ref())
-            .cloned();
+        let manual = self.manual_pem(canonical_domain(domain).as_ref());
         if let Some(pems) = manual {
             return Some(pems);
         }
@@ -492,11 +517,7 @@ impl TlsManager {
     /// 🔍 Resolves a parsed rustls certificate for a client hello.
     pub async fn resolve_cert(&self, domain: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
         // 📜 Explicit PEM pairs always take precedence.
-        let manual = self
-            .manual_pem_certs
-            .read()
-            .get(canonical_domain(domain).as_ref())
-            .cloned();
+        let manual = self.manual_pem(canonical_domain(domain).as_ref());
         if let Some((cert_pem, key_pem)) = manual {
             let cert = crate::Certificate {
                 cert_pem,
@@ -889,6 +910,43 @@ mod tests {
         .map(|name| manager.serves_name(name))
         .collect();
         assert_eq!(served, [true, true, true, false, false, false]);
+    }
+
+    /// 🃏 A manual wildcard certificate covers one label underneath it.
+    ///
+    /// A site that files `tls cert.pem key.pem` under `*.sandbox.test`
+    /// describes the same names as an issued wildcard, so a client asking for
+    /// `other.sandbox.test` has to be served — reading the manual table by
+    /// exact spelling refused that handshake with `unrecognized_name`, while
+    /// the same site with `tls internal` answered (#285).
+    #[tokio::test]
+    async fn a_manual_wildcard_covers_one_label_underneath_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, _issuer) = issuing_manager(directory.path());
+        manager.add_manual_cert(
+            "*.sandbox.test",
+            "CERT for *.sandbox.test".to_string(),
+            "KEY for *.sandbox.test".to_string(),
+        );
+
+        // 🎯 One label underneath, and nothing else: not the apex, not a
+        // second level, exactly as a TLS wildcard has always worked.
+        let served: Vec<bool> = ["other.sandbox.test", "sandbox.test", "a.b.sandbox.test"]
+            .iter()
+            .map(|name| manager.serves_name(name))
+            .collect();
+        assert_eq!(served, [true, false, false]);
+
+        let pair = Some((
+            "CERT for *.sandbox.test".to_string(),
+            "KEY for *.sandbox.test".to_string(),
+        ));
+        assert_eq!(manager.resolve_pem("other.sandbox.test").await, pair);
+        assert_eq!(manager.peek_pem("other.sandbox.test").await, pair);
+
+        // 📌 The wildcard's own spelling still resolves unchanged, which is
+        // how the HTTP/3 certificate table seeds the pattern it matches with.
+        assert_eq!(manager.peek_pem("*.sandbox.test").await, pair);
     }
 
     /// 🕳️ An empty allowlist authorises nothing.

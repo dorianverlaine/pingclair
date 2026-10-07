@@ -54,3 +54,101 @@ fn matcher_scoped_root_inside_handle_errors_is_refused() {
         "unexpected refusal: {error}"
     );
 }
+
+/// 🚫 A `reverse_proxy` inside `handle_errors` is refused by name.
+///
+/// The upstream exchange is a lifecycle step outside the handler chain here,
+/// and an error route has no route slot for it to read, so the handler used to
+/// compile and then answer nothing — the silent no-op this repository refuses
+/// instead of accepting (#245). The check walks the containers too, so a proxy
+/// behind `handle` is found as well as one at the top of the block.
+#[test]
+fn reverse_proxy_inside_handle_errors_is_refused() {
+    for source in [
+        "example.com {\n\thandle_errors {\n\t\treverse_proxy 127.0.0.1:9000\n\t}\n}",
+        "example.com {\n\thandle_errors {\n\t\thandle {\n\t\t\treverse_proxy 127.0.0.1:9000\n\t\t}\n\t}\n}",
+    ] {
+        let error = crate::compile(source)
+            .expect_err("a `reverse_proxy` inside `handle_errors` must not load");
+        let message = error.to_string();
+        assert!(message.contains("cannot proxy yet"), "{message}");
+        assert!(message.contains("do nothing"), "{message}");
+    }
+
+    // 📌 The refusal is about the proxy, not about the block: an error route
+    // that answers with its own page still loads.
+    crate::compile("example.com {\n\thandle_errors {\n\t\trespond \"gone\" 503\n\t}\n}")
+        .expect("an error route that does not proxy must load");
+}
+
+/// 🔢 Directives inside `handle_errors` run in Caddy's directive order, not in
+/// file order: the block is an ordinary route body (#245).
+#[test]
+fn handle_errors_runs_its_directives_in_caddys_order() {
+    let config = crate::compile(
+        "example.com {\n\thandle_errors {\n\t\trespond \"gone\"\n\t\theader X-Test y\n\t}\n}",
+    )
+    .unwrap();
+    let order: Vec<&str> = config.servers[0].error_routes[0]
+        .handlers
+        .iter()
+        .map(|element| match &element.handler {
+            HandlerConfig::Headers { .. } => "header",
+            HandlerConfig::Respond { .. } => "respond",
+            other => panic!("unexpected handler in the error route: {other:?}"),
+        })
+        .collect();
+    assert_eq!(order, vec!["header", "respond"]);
+}
+
+/// 🏷️ A named matcher defined inside `handle_errors` belongs to that block and
+/// resolves like any other route body's matcher (#245).
+#[test]
+fn handle_errors_accepts_named_matcher_definitions() {
+    let config = crate::compile(
+        "example.com {\n\thandle_errors {\n\t\t@gone path /gone\n\t\trespond @gone \"gone\"\n\t\trespond \"other\"\n\t}\n}",
+    )
+    .unwrap();
+    let handlers = &config.servers[0].error_routes[0].handlers;
+    let matchers: Vec<Option<pingclair_core::config::Matcher>> = handlers
+        .iter()
+        .map(|element| element.matcher.clone())
+        .collect();
+    assert_eq!(
+        matchers,
+        vec![
+            Some(pingclair_core::config::Matcher::Path {
+                patterns: vec!["/gone".to_string()],
+            }),
+            None,
+        ]
+    );
+}
+
+/// 🚫 A name defined inside the error route does not leak into the site block,
+/// and a site-level name still reaches the error route.
+#[test]
+fn handle_errors_shares_the_site_matcher_scope_but_keeps_its_own() {
+    let shared = crate::compile(
+        "example.com {\n\t@site path /site\n\thandle_errors {\n\t\trespond @site \"site\"\n\t}\n}",
+    )
+    .unwrap();
+    let matcher = shared.servers[0].error_routes[0].handlers[0]
+        .matcher
+        .clone();
+    assert_eq!(
+        matcher,
+        Some(pingclair_core::config::Matcher::Path {
+            patterns: vec!["/site".to_string()],
+        })
+    );
+
+    let leak = crate::compile(
+        "example.com {\n\thandle_errors {\n\t\t@local path /local\n\t\trespond @local \"local\"\n\t}\n\trespond @local \"site\"\n}",
+    )
+    .expect_err("a name defined inside handle_errors must not reach the site block");
+    assert!(
+        leak.to_string().contains("matcher `local` is not defined"),
+        "unexpected refusal: {leak}"
+    );
+}

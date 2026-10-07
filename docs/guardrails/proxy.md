@@ -131,7 +131,7 @@ follow from it.
   one case that cannot be driven in-process because lowering `RLIMIT_NOFILE`
   would poison every other test in the binary). All four configure the server
   with a **Pingclairfile**, not JSON: the DSL is the half an operator's
-  configuration goes through. The Linux half runs in docker `rust:1.98-bookworm`.
+  configuration goes through. The Linux half runs in docker `rust:1.99-bookworm`.
 
 > ✅ **The `ba37ffc` migration passed this gate** (2026-07-30, evidence in
 > `benchmarks/results/20260730_day28_f26d0a1/`): Linux release build, no
@@ -140,7 +140,7 @@ follow from it.
 > 14/14.
 
 > ⚠️ **Building on Linux needs `cmake` (BoringSSL) and `clang`/`libclang-dev`
-> (bindgen).** A clean `rust:1.98-bookworm` has neither, and without them
+> (bindgen).** A clean `rust:1.99-bookworm` has neither, and without them
 > `boring-sys` fails in its build script. Both release artefacts and the CI
 > environment must carry them.
 >

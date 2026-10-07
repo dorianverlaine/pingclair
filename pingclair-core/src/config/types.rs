@@ -1716,8 +1716,14 @@ pub enum HandlerConfig {
     RequestHeaders {
         #[serde(default)]
         set: BTreeMap<String, String>,
-        #[serde(default)]
-        add: BTreeMap<String, String>,
+        /// 📋 Multi-valued, like the response side: two `+Name` lines are two
+        /// field lines (#276). A single string still loads.
+        #[serde(
+            default,
+            deserialize_with = "deserialize_probe_headers",
+            skip_serializing_if = "BTreeMap::is_empty"
+        )]
+        add: BTreeMap<String, Vec<String>>,
         #[serde(default)]
         remove: Vec<String>,
         /// 🔁 Regex search-and-replace over a header's existing values, in
@@ -1774,8 +1780,16 @@ pub enum HandlerConfig {
     Headers {
         #[serde(default)]
         set: BTreeMap<String, String>,
-        #[serde(default)]
-        add: BTreeMap<String, String>,
+        /// 📋 Multi-valued: two `+Set-Cookie` lines in one block are two
+        /// cookies, and RFC 6265 §3 forbids folding them into one field line
+        /// (#276). A single string still loads, so JSON written before
+        /// multi-value support keeps working; a name may hold several values.
+        #[serde(
+            default,
+            deserialize_with = "deserialize_probe_headers",
+            skip_serializing_if = "BTreeMap::is_empty"
+        )]
+        add: BTreeMap<String, Vec<String>>,
         #[serde(default)]
         remove: Vec<String>,
         /// 🔁 Regex search-and-replace over values the response already
@@ -2250,8 +2264,17 @@ pub struct ReverseProxyConfig {
     /// this struct already spells the request side: `headers_up` is the set
     /// half and `headers_up_remove` is the delete half. A second, nested
     /// shape here would be a second way to say the same thing.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub headers_down_add: BTreeMap<String, String>,
+    ///
+    /// 📋 Multi-valued, because a field may be added more than once: two
+    /// `+Set-Cookie` lines in one `header` block are two cookies, and RFC 6265
+    /// §3 forbids folding them into one field line (#276). A single string
+    /// still loads, so configurations written before this keep working.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_probe_headers",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub headers_down_add: BTreeMap<String, Vec<String>>,
 
     /// 🚫 Response header names to remove, from `header_down -Name`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

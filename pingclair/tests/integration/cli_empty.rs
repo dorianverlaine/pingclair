@@ -14,9 +14,55 @@ impl Drop for ChildGuard {
     }
 }
 
+/// 🔒 Holds the machine-wide slot for the default Admin port across processes.
+///
+/// A config-less `pingclair run` binds `127.0.0.1:2019`, which is the contract
+/// this test exists to check — and a port is a machine-wide resource, so the
+/// documented reproduction for load-sensitive failures (several copies of this
+/// binary at once, `CLAUDE.md`) makes five of six runs fail on `AddrInUse`
+/// before the contract is ever exercised (#184). A file lock is what the port
+/// needs: process-wide serialisation would not help when the collision is
+/// between processes.
+#[cfg(unix)]
+struct DefaultAdminPortLock(std::fs::File);
+
+#[cfg(unix)]
+impl DefaultAdminPortLock {
+    fn acquire() -> Self {
+        use std::os::unix::io::AsRawFd as _;
+
+        let path = std::env::temp_dir().join("pingclair-test-default-admin-2019.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("the lock file for the default admin port");
+        // SAFETY: `flock` on a descriptor this process owns; the lock outlives
+        // the call and is released when the file is dropped (or explicitly).
+        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(locked, 0, "flock on the default admin port lock failed");
+        Self(file)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DefaultAdminPortLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd as _;
+
+        // SAFETY: the same descriptor, still owned by this process.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn cli_run_without_config_starts_admin_only() {
+    // 🔒 Before the port probe, so another copy of this test cannot take 2019
+    // between the check and the child's bind.
+    let _port_lock = DefaultAdminPortLock::acquire();
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("notify.sock");
     let notify = std::os::unix::net::UnixDatagram::bind(&socket).unwrap();
@@ -242,6 +288,12 @@ async fn cli_stdin_startup_survives_reload_signals() {
     notify.set_nonblocking(true).unwrap();
     let port = super::free_port();
     let token = uuid::Uuid::new_v4().to_string();
+    // 📓 The child's log is kept, not discarded: this test failed once on a
+    // loaded postmerge shard with "terminated on -HUP" and nothing else, and a
+    // panic that cannot say why is a flake nobody can fix (#184's first
+    // lesson). It is read only when the child dies unexpectedly.
+    let log_path = dir.path().join("stdin-startup.log");
+    let log = std::fs::File::create(&log_path).unwrap();
     let mut child = ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_pingclair"))
             .args(["run", "-c", "-"])
@@ -249,7 +301,7 @@ async fn cli_stdin_startup_survives_reload_signals() {
             .env("NOTIFY_SOCKET", &socket)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(log))
             .spawn()
             .unwrap(),
     );
@@ -288,7 +340,8 @@ async fn cli_stdin_startup_survives_reload_signals() {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         assert!(
             child.0.try_wait().unwrap().is_none(),
-            "stdin startup terminated on {signal}"
+            "stdin startup terminated on {signal}:\n{}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
         );
         assert_eq!(
             client

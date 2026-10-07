@@ -166,11 +166,19 @@ const NON_HANDLER_MODULES: [&str; 6] = [
 /// from `/pki/`.
 ///
 /// 📌 The authority for what is in this list is the route match in
-/// `pingclair-api/src/server.rs` — that is where `/load` and `/metrics` are
-/// answered, and where `/pki/` and `/reverse_proxy/` are not. There is no route
-/// table to derive it from, so the tie is a comment and a reviewer's eye rather
-/// than a test.
-const ADMIN_API_MODULES: [&str; 2] = ["admin.api.load", "admin.api.metrics"];
+/// `pingclair-api/src/server.rs` — that is where `/load`, `/metrics` and
+/// `/reverse_proxy/upstreams` are answered, and where `/pki/` is not. There is
+/// no route table to derive it from, so the tie is a comment, the unit test
+/// below, and the live probe in `admin_compat.rs` rather than a derivation.
+///
+/// 🚫 `admin.api.pki` stays out: this build answers `404` for `/pki/`, and
+/// advertising a module whose endpoint is missing is exactly what the bare
+/// `admin-api` tag did (#151).
+const ADMIN_API_MODULES: [&str; 3] = [
+    "admin.api.load",
+    "admin.api.metrics",
+    "admin.api.reverse_proxy",
+];
 
 /// 📡 Modules a Caddy build gains from the DNS-provider plugin ecosystem.
 ///
@@ -1298,26 +1306,30 @@ mod tests {
     /// asking "do you expose `/pki/`?" got "yes, something admin-shaped" from
     /// the inventory and a 404 from the endpoint. The four names Caddy
     /// registers are `admin.api.load`, `admin.api.metrics`, `admin.api.pki` and
-    /// `admin.api.reverse_proxy`; this build answers two of them.
+    /// `admin.api.reverse_proxy`; this build answers three of them.
     ///
     /// 📌 Measured on 2026-09-23 against a running server: `POST /load` answers
-    /// 400 to a bad body — the endpoint exists — and `GET /metrics` answers
-    /// 200, while `GET /pki/` and `GET /reverse_proxy/upstreams` both answer
-    /// 404. The assertion below is the half of that which can be checked
-    /// without a server.
+    /// 400 to a bad body — the endpoint exists — `GET /metrics` answers 200,
+    /// and `GET /pki/` answers 404. `GET /reverse_proxy/upstreams` was in that
+    /// 404 group then and is answered now, which is why it moved into the list
+    /// (#151). The live half of this check is the probe in `admin_compat.rs`.
     #[test]
     fn the_admin_api_half_names_only_the_endpoints_that_answer() {
         let ids = module_ids();
-        for present in ["admin.api.load", "admin.api.metrics"] {
+        for present in [
+            "admin.api.load",
+            "admin.api.metrics",
+            "admin.api.reverse_proxy",
+        ] {
             assert!(ids.contains(&present.to_string()), "`{present}` is missing");
         }
-        for absent in ["admin.api.pki", "admin.api.reverse_proxy"] {
-            assert!(
-                !ids.contains(&absent.to_string()),
-                "`{absent}` is listed, but this build answers 404 for that endpoint — \
-                 advertising it is the failure the bare `admin-api` tag already caused"
-            );
-        }
+        // 🚫 `pki` is the one name Caddy registers that this build must not
+        // advertise: `/pki/` answers 404, and a listing that claims otherwise
+        // is the failure the bare `admin-api` tag already caused.
+        assert!(
+            !ids.contains(&"admin.api.pki".to_string()),
+            "`admin.api.pki` is listed, but this build answers 404 for `/pki/`"
+        );
     }
 
     /// 🏷️ The three sources are labelled by namespace, not by a marker line,

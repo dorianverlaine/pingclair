@@ -423,6 +423,10 @@ async fn handle_request_inner(
             ))
         }
         (&Method::GET, "/metrics") => {
+            // 📌 Prometheus text exposition, whatever the client asked for:
+            // this build writes no OpenMetrics body, so it advertises none
+            // (#45). `metrics { disable_openmetrics }` describes the same fact
+            // from the configuration side.
             let buffer = pingclair_proxy::metrics::gather();
             Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -603,6 +607,14 @@ async fn handle_request_inner(
                 // document they copied from a working Caddy install. It
                 // is not a typo; the two shapes are different, and the
                 // message should say which one this endpoint takes.
+                //
+                // 🛑 This boundary is deliberate and permanent, not a missing
+                // adapter: the two documents share no top-level key and no
+                // handler name, so accepting Caddy's JSON would add a second
+                // configuration surface to keep in step with Caddy's module
+                // tree. A Caddyfile is what `POST /load` takes besides this
+                // schema, and the diagnostic here is what turns "unknown
+                // field" into that answer (#164).
                 let describe_error = |error: &serde_json::Error| {
                     if looks_like_caddy_document(&body_bytes) {
                         "this admin API takes pingclair's own configuration JSON, \

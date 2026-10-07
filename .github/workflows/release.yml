@@ -135,7 +135,7 @@ jobs:
           r2-secret-access-key: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
 
       - name: Build the release binary
-        run: cargo +1.98.1 build --release --locked --target ${{ matrix.platform.target }}
+        run: cargo +1.99.0 build --release --locked --target ${{ matrix.platform.target }}
 
       - name: Smoke test the binary
         run: |

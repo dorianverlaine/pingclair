@@ -66,9 +66,21 @@ impl SemanticAnalyzer {
         // `http://localhost` (explicit plaintext :80) are both valid Caddy
         // sites and must coexist. Identical name AND identical listeners is
         // the real mistake.
+        //
+        // 📍 `bind` is part of that identity, not only of the socket: two
+        // blocks on one port with different interfaces are two sites, which is
+        // the shape Caddy accepts since caddyserver/caddy#4635 (#279). The
+        // bind host stands in for every listener's host, because that is what
+        // it does at load time, and a site with no `listen` of its own still
+        // carries its interface into the signature.
         let mut server_signatures = HashMap::new();
         for server_node in &ast.servers {
             let name = &server_node.inner.name;
+            let bind_host = server_node
+                .inner
+                .bind
+                .as_deref()
+                .and_then(pingclair_core::config::bind_socket_host);
             let mut listens: Vec<String> = server_node
                 .inner
                 .listens
@@ -76,11 +88,14 @@ impl SemanticAnalyzer {
                 .map(|l| {
                     format!(
                         "{}:{}",
-                        l.host,
+                        bind_host.as_deref().unwrap_or(l.host.as_str()),
                         l.port.map_or_else(|| "?".to_string(), |p| p.to_string())
                     )
                 })
                 .collect();
+            if listens.is_empty() {
+                listens.push(format!("{}:?", bind_host.as_deref().unwrap_or("[::]")));
+            }
             listens.sort();
             let signature = (name.clone(), listens);
             if server_signatures.contains_key(&signature) {
@@ -234,7 +249,15 @@ impl SemanticAnalyzer {
                 add: headers
                     .add
                     .iter()
-                    .map(|(k, v)| (k.clone(), self.substitute_string(v, subs)))
+                    .map(|(k, values)| {
+                        (
+                            k.clone(),
+                            values
+                                .iter()
+                                .map(|value| self.substitute_string(value, subs))
+                                .collect(),
+                        )
+                    })
                     .collect(),
                 remove: headers.remove.clone(),
                 replace: headers.replace.clone(),
@@ -413,6 +436,61 @@ mod tests {
             result.is_ok(),
             "different listeners must allow the same hostname: {result:?}"
         );
+    }
+
+    /// 🧩 `bind` decides which interface a site's socket sits on, so it decides
+    /// which site a block is: two blocks on one port with different interfaces
+    /// are two sites, and Caddy accepts them (caddyserver/caddy#4635, #279).
+    #[test]
+    fn two_interfaces_on_one_port_are_two_sites() {
+        let source = r#"
+            http://:21966 {
+                bind 127.0.0.1
+                respond "v4"
+            }
+            http://:21966 {
+                bind [::1]
+                respond "v6"
+            }
+        "#;
+
+        let directives = crate::parser::parse(source).unwrap();
+        let ast = crate::adapter::caddyfile::adapt(directives).unwrap();
+        let mut analyzer = SemanticAnalyzer::new();
+        let result = analyzer.analyze(ast);
+        assert!(
+            result.is_ok(),
+            "different interfaces must allow the same port: {result:?}"
+        );
+    }
+
+    /// 🛡️ The same name on the same port and the same interface is still the
+    /// mistake this check exists for — including when one block spells the
+    /// address with brackets and the other does not.
+    #[test]
+    fn the_same_interface_twice_is_still_a_duplicate() {
+        for (first, second) in [("127.0.0.1", "127.0.0.1"), ("::1", "[::1]")] {
+            let source = format!(
+                r#"
+                http://:21966 {{
+                    bind {first}
+                    respond "a"
+                }}
+                http://:21966 {{
+                    bind {second}
+                    respond "b"
+                }}
+                "#
+            );
+            let directives = crate::parser::parse(&source).unwrap();
+            let ast = crate::adapter::caddyfile::adapt(directives).unwrap();
+            let mut analyzer = SemanticAnalyzer::new();
+            let result = analyzer.analyze(ast);
+            assert!(
+                matches!(result, Err(SemanticError::DuplicateServer { .. })),
+                "{first} and {second} are one interface: {result:?}"
+            );
+        }
     }
 
     #[test]

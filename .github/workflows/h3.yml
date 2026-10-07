@@ -20,10 +20,10 @@ jobs:
 
       - uses: ./.github/actions/setup-ci
 
-      - name: Install Rust 1.98
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1 (toolchain is an input; ignored on 1.98.x branch refs)
+      - name: Install Rust 1.99
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1 (toolchain is an input; ignored on 1.99.x branch refs)
         with:
-          toolchain: 1.98.1
+          toolchain: 1.99.0
 
       - uses: ./.github/actions/setup-rust-cache
         with:

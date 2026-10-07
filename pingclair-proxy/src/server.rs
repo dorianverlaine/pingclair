@@ -56,7 +56,7 @@ use crate::metrics;
 use crate::overload::{AdmissionError, RouteAdmission, RouteProtection, UpstreamAdmission};
 use crate::upstream::{DynamicDialPlan, HostName, Scheme, UpstreamSpec};
 use crate::{HealthChecker, LoadBalancer, Strategy, Upstream, UpstreamEntry};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use ipnet::IpNet;
 use pingclair_core::config::Encoding;
 use regex::Regex;
@@ -239,6 +239,14 @@ pub struct RequestContext {
     /// `error_page` is configured — for a 431, which field was too large.
     /// Unlike `error_message` it never replaces the operator's page.
     pub error_detail: Option<std::borrow::Cow<'static, str>>,
+    /// 🚫 This request was refused before any route could run.
+    ///
+    /// `handle_errors` routes and `error_page` files exist so a site can answer
+    /// for its handlers; a request refused before routing never reached one,
+    /// and its refusal carries the detail that says what was wrong (#288).
+    /// HTTP/3 already answers these directly, so this is also the shape all
+    /// three transports share.
+    pub refused_before_routing: bool,
     /// 🏷️ Why the latest upstream attempt failed. Recorded by
     /// `fail_to_connect` and `error_while_proxy`, cleared once an attempt
     /// connects, and settled by `fail_to_proxy`; only the error page that
@@ -355,6 +363,7 @@ impl Default for RequestContext {
             error_status: None,
             error_message: None,
             error_detail: None,
+            refused_before_routing: false,
             proxy_error: None,
             request_vars: crate::http_policy::RequestVars::default(),
             intercept_handlers: Vec::new(),
@@ -670,7 +679,7 @@ pub struct ProxyState {
     /// unconditionally. They are one list now because the question a request
     /// asks is not "which kind of logger is this" but "does this host belong
     /// here", and that is answered once, at configuration time.
-    log_targets: crate::access_log::LogTargets,
+    log_targets: pingclair_runtime::access_log::LogTargets,
     /// 🔐 The built-in `Strict-Transport-Security` value, rendered once.
     pub(crate) strict_transport: crate::http_policy::StrictTransport,
 }
@@ -678,7 +687,7 @@ pub struct ProxyState {
 impl ProxyState {
     /// 🪵 The access-log destinations this server can reach, for the HTTP/3
     /// path, which builds its record outside this module.
-    pub(crate) fn log_targets(&self) -> &crate::access_log::LogTargets {
+    pub(crate) fn log_targets(&self) -> &pingclair_runtime::access_log::LogTargets {
         &self.log_targets
     }
 
@@ -1435,14 +1444,14 @@ impl ProxyState {
         // channel subscribing to the site's log source with
         // `include http.log.access.<name>`. Only the first used to resolve, so
         // the second passed validation and then received nothing.
-        let mut log_channels: Vec<Arc<crate::access_log::AccessLogger>> = Vec::new();
+        let mut log_channels: Vec<Arc<pingclair_runtime::access_log::AccessLogger>> = Vec::new();
         for name in &config.log_channels {
-            if let Some(logger) = crate::access_log::channel_logger(name) {
+            if let Some(logger) = pingclair_runtime::access_log::channel_logger(name) {
                 log_channels.push(logger);
             }
-            for subscriber in
-                crate::access_log::channels_admitting(&format!("http.log.access.{name}"))
-            {
+            for subscriber in pingclair_runtime::access_log::channels_admitting(&format!(
+                "http.log.access.{name}"
+            )) {
                 // 🚫 A channel named directly and subscribing by namespace is
                 // still one destination; two entries would double every line.
                 if !log_channels
@@ -1457,10 +1466,12 @@ impl ProxyState {
         // 🏠 A named logger's `hostnames` decides which requests reach it. The
         // list travels with the logger so `LogTargets` can resolve it once,
         // here, instead of the request path re-reading configuration.
-        let mut named_targets: Vec<(Vec<String>, Arc<crate::access_log::AccessLogger>)> =
-            Vec::new();
+        let mut named_targets: Vec<(
+            Vec<String>,
+            Arc<pingclair_runtime::access_log::AccessLogger>,
+        )> = Vec::new();
         for named in &config.named_logs {
-            match crate::access_log::AccessLogger::from_config(Some(&named.config)) {
+            match pingclair_runtime::access_log::AccessLogger::from_config(Some(&named.config)) {
                 Ok(Some(logger)) => {
                     let logger = Arc::new(logger);
                     named_targets.push((named.config.hostnames.clone(), logger.clone()));
@@ -1477,23 +1488,25 @@ impl ProxyState {
             }
         }
 
-        let access_logger = match crate::access_log::AccessLogger::from_config(config.log.as_ref())
-        {
-            Ok(logger) => logger.map(Arc::new),
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    server = config.name.as_deref().unwrap_or("<default>"),
-                    "❌ Could not open configured access log; falling back to tracing output"
-                );
-                None
-            }
-        };
+        let access_logger =
+            match pingclair_runtime::access_log::AccessLogger::from_config(config.log.as_ref()) {
+                Ok(logger) => logger.map(Arc::new),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        server = config.name.as_deref().unwrap_or("<default>"),
+                        "❌ Could not open configured access log; falling back to tracing output"
+                    );
+                    None
+                }
+            };
 
         // 🪵 The server's own `log` block and any global channels are not
         // host-restricted; only named loggers carry `hostnames`.
-        let mut target_entries: Vec<(Vec<String>, Arc<crate::access_log::AccessLogger>)> =
-            Vec::new();
+        let mut target_entries: Vec<(
+            Vec<String>,
+            Arc<pingclair_runtime::access_log::AccessLogger>,
+        )> = Vec::new();
         if let Some(logger) = &access_logger {
             target_entries.push((Vec::new(), logger.clone()));
         }
@@ -1501,7 +1514,7 @@ impl ProxyState {
             target_entries.push((Vec::new(), channel.clone()));
         }
         target_entries.extend(named_targets);
-        let log_targets = crate::access_log::LogTargets::new(target_entries);
+        let log_targets = pingclair_runtime::access_log::LogTargets::new(target_entries);
         let strict_transport = crate::http_policy::StrictTransport::from_security(&config.security);
         let cache_scopes = Arc::new(crate::cache_key::route_scopes(&config, |route| {
             find_reverse_proxy_config(&route.handler).is_some_and(|proxy| proxy.cache.is_some())
@@ -1636,14 +1649,6 @@ impl ProxyState {
     /// looked up here by the pattern text that named it. A request path is not
     /// a place to compile a regex: the answer can never differ from the one
     /// configuration already decided.
-    pub(crate) fn route_regex(&self, route_index: usize, pattern: &str) -> Option<&Regex> {
-        self.route_regexes
-            .get(route_index)
-            .and_then(|regexes| regexes.get(pattern).map(AsRef::as_ref))
-    }
-
-    /// ⚡ The same lookup, handing out a shared reference the response policy
-    /// can outlive this borrow with.
     ///
     /// A response header replacement is queued during handler dispatch and run
     /// when the response is written, which is later and elsewhere — so the
@@ -1660,6 +1665,7 @@ impl ProxyState {
     pub(crate) fn rewrite_request_uri(
         &self,
         route_index: usize,
+        error_route: Option<usize>,
         current: &str,
         strip_prefix: Option<&str>,
         strip_suffix: Option<&str>,
@@ -1667,11 +1673,20 @@ impl ProxyState {
         regex_pattern: Option<&str>,
         regex_replace: Option<&str>,
     ) -> Result<String, &'static str> {
+        // 🚨 While an error route runs, only that route's own table answers:
+        // the pattern belongs to the route body being run, and the table of
+        // the route that raised the error is a different configuration (#245).
         let compiled = if let Some(pattern) = regex_pattern {
-            Some(
-                self.route_regex(route_index, pattern)
+            Some(match error_route {
+                Some(index) => self
+                    .error_routes
+                    .get(index)
+                    .and_then(|route| route.regexes.get(pattern).cloned())
                     .ok_or("invalid rewrite regex in active configuration")?,
-            )
+                None => self
+                    .route_regex_arc(route_index, pattern)
+                    .ok_or("invalid rewrite regex in active configuration")?,
+            })
         } else {
             None
         };
@@ -1680,7 +1695,7 @@ impl ProxyState {
             strip_prefix,
             strip_suffix,
             replace,
-            compiled,
+            compiled.as_deref(),
             regex_replace,
         ))
     }
@@ -1719,6 +1734,22 @@ pub(crate) fn error_reason(status: u16) -> &'static str {
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
         _ => "Error",
+    }
+}
+
+/// 💬 The body this hop writes for a status it generated itself.
+///
+/// One shape for all three transports: the status, its reason phrase, and the
+/// detail when this hop has one to add — for a `431`, the field that was too
+/// large (RFC 6585 §5). Caddy's built-in bodies are empty; these are
+/// deliberately informative, because the alternative was a client that could
+/// not tell why it was refused, and the transports agreeing with each other
+/// matters more than agreeing with an empty body (#252, #253).
+pub(crate) fn builtin_error_body(status: u16, detail: Option<&str>) -> String {
+    let reason = error_reason(status);
+    match detail {
+        Some(detail) if !detail.is_empty() => format!("{status} {reason}: {detail}"),
+        _ => format!("{status} {reason}"),
     }
 }
 
@@ -2123,8 +2154,10 @@ impl PingclairProxy {
             let mut next = RouteTable {
                 hosts: current.hosts.clone(),
                 default: current.default.clone(),
+                access_logging: current.access_logging,
             };
             Self::register_site(&mut next, current, config.clone());
+            next.refresh_access_logging();
             next
         });
     }
@@ -2202,6 +2235,7 @@ impl PingclairProxy {
         for config in servers {
             Self::register_site(&mut next, previous, config);
         }
+        next.refresh_access_logging();
         next
     }
 
@@ -2218,6 +2252,7 @@ impl PingclairProxy {
         self.listener_policy.replace_routes(|_| RouteTable {
             hosts: next.hosts.clone(),
             default: next.default.clone(),
+            access_logging: next.access_logging,
         });
         tracing::info!("♻️ Configuration reloaded successfully");
     }
@@ -3246,6 +3281,48 @@ impl PingclairProxy {
         self.proxy_subrequest(session, ctx, &prepared).await
     }
 
+    /// 📏 Reads a FastCGI request body that arrived without a `Content-Length`.
+    ///
+    /// The FastCGI transport has to state the body's length before it writes a
+    /// single STDIN byte, so a body framed by chunked coding — which is how
+    /// HTTP/1.1, and every HTTP/2 or HTTP/3 stream, can define a length by
+    /// construction — is read here and measured (#248). The limit, deadline,
+    /// and upload pacer of the streaming path run while it is held, because
+    /// measuring a body must not become the one way past `client_max_body_size`.
+    ///
+    /// The ceiling is the route's own `request_buffers` when it set one, and
+    /// this module's hard ceiling otherwise. Past it the length cannot be
+    /// measured without unbounded memory, so the request fails closed with 413
+    /// instead of reaching php-fpm as a body the responder would read as empty.
+    async fn read_lengthless_fastcgi_body(
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        config: &ReverseProxyConfig,
+    ) -> pingora_core::Result<Bytes> {
+        let ceiling = crate::body_buffer::measure_ceiling(crate::body_buffer::resolve_limit(
+            config.request_buffer_bytes,
+        ));
+        let h2_pause = Self::h2_body_pause(session, ctx);
+        let mut held = BytesMut::new();
+        while let Some(chunk) =
+            crate::body_timeout::read_within(h2_pause, session.read_request_body()).await?
+        {
+            Self::enforce_request_body_chunk(session, ctx, chunk.len()).await?;
+            if held.len() + chunk.len() > ceiling {
+                session.as_mut().set_keepalive(None);
+                return pingora_core::Error::e_explain(
+                    pingora_core::ErrorType::HTTPStatus(413),
+                    format!(
+                        "a FastCGI body without a declared length must fit its \
+                         {ceiling}-byte buffering ceiling so its length can be measured"
+                    ),
+                );
+            }
+            held.extend_from_slice(&chunk);
+        }
+        Ok(held.freeze())
+    }
+
     /// 🧵 Serves one request through the FastCGI transport.
     ///
     /// The whole round trip runs inline in `request_filter`, like
@@ -3278,17 +3355,20 @@ impl PingclairProxy {
             .get("content-length")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
-        // 🚫 PHP-FPM needs CONTENT_LENGTH before any STDIN byte; refusing
-        // first also keeps invalid requests from consuming an upstream slot.
-        if !bodyless && content_length.is_none() {
-            let mut response = ResponseHeader::build(411, Some(2)).unwrap();
-            response.insert_header("Content-Length", "0").unwrap();
-            Self::apply_local_response_headers(&mut response, ctx)?;
-            session
-                .write_response_header(Box::new(response), true)
-                .await?;
-            return Ok(true);
-        }
+        // 🧾 PHP-FPM reads exactly `CONTENT_LENGTH` bytes from STDIN, so the
+        // number has to exist before the exchange opens. A client that declared
+        // one has given it to us; a body framed any other way — chunked coding,
+        // or an H2 stream — only supplies bytes, so it is read and measured
+        // here, before the dial (#248). A request that says nothing about a
+        // body simply measures zero. Reading first also keeps a body this
+        // server cannot carry from consuming an upstream slot.
+        let measured = if content_length.is_none() && !bodyless {
+            Some(Self::read_lengthless_fastcgi_body(session, ctx, config).await?)
+        } else {
+            None
+        };
+        let content_length =
+            content_length.or_else(|| measured.as_ref().map(|body| body.len() as u64));
         let balance_key = self.balancing_identity(session, ctx);
         let (upstream, mut upstream_admission) = self
             .select_admitted_upstream(&state, route_index, balance_key.as_deref(), &HashSet::new())
@@ -3377,11 +3457,10 @@ impl PingclairProxy {
             proxy_error(502, "FastCGI document root could not be resolved")
         })?;
         env.insert("REQUEST_METHOD".to_string(), method.clone().into());
-        if bodyless {
-            env.insert("CONTENT_LENGTH".to_string(), b"0".to_vec());
-        } else if let Some(length) = content_length {
-            env.insert("CONTENT_LENGTH".to_string(), length.to_string().into());
-        }
+        env.insert(
+            "CONTENT_LENGTH".to_string(),
+            content_length.unwrap_or(0).to_string().into(),
+        );
 
         let protocol_error = |error: crate::fastcgi::ExchangeError| {
             tracing::warn!(%error, "🧵 FastCGI exchange failed");
@@ -3393,7 +3472,17 @@ impl PingclairProxy {
         // filter: a slow client keeps a php-fpm worker waiting only once it
         // has sent the whole body or outgrown the buffer.
         let mut request_buffer = ctx.request_buffer.take();
-        if !bodyless {
+        if let Some(measured) = measured {
+            // 📏 This body was read to measure it, so the limit, deadline, and
+            // upload pacer already ran while it was held; hand it over as it
+            // arrived rather than reading it a second time.
+            if !measured.is_empty() {
+                exchange
+                    .send_body(&measured)
+                    .await
+                    .map_err(protocol_error)?;
+            }
+        } else if !bodyless {
             // ⏱️ An HTTP/2 upload that stops halfway would otherwise hold this
             // stream and a php-fpm worker forever; see `h2_body_pause`.
             let h2_pause = Self::h2_body_pause(session, ctx);
@@ -3905,6 +3994,10 @@ impl PingclairProxy {
         if !ResponseContent::for_status(response.status.as_u16()).allows_content_length() {
             response.remove_header(&http::header::CONTENT_LENGTH);
         }
+        // 🧼 RFC 9113 §8.2.1 / RFC 9114 §10.3 forbid a field value that starts
+        // or ends with SP/HTAB, and a configured value may contain one; H1's
+        // serializer is the only place that padding is invisible (#256).
+        crate::http_policy::trim_pingora_response_padding(response);
         Ok(())
     }
 
@@ -3970,7 +4063,7 @@ impl PingclairProxy {
         ctx: &mut RequestContext,
         route_index: usize,
         set: &std::collections::BTreeMap<String, String>,
-        add: &std::collections::BTreeMap<String, String>,
+        add: &std::collections::BTreeMap<String, Vec<String>>,
         remove: &[String],
         replace: &[pingclair_core::config::HeaderReplacement],
     ) -> PingoraResult<()> {
@@ -3983,7 +4076,12 @@ impl PingclairProxy {
         for (name, template, is_add) in set
             .iter()
             .map(|(name, value)| (name, value, false))
-            .chain(add.iter().map(|(name, value)| (name, value, true)))
+            // 📋 Every value of every `+Name` line, in order: the request side
+            // is multi-valued now too (#276).
+            .chain(
+                add.iter()
+                    .flat_map(|(name, values)| values.iter().map(move |value| (name, value, true))),
+            )
         {
             let value = if template.contains('{') {
                 resolve_caddy_placeholders(
@@ -4020,6 +4118,7 @@ impl PingclairProxy {
                 compiled_header_replacement(
                     state,
                     route_index,
+                    ctx.error_scope.map(|scope| scope.route),
                     replacement,
                     header,
                     verified_client_ip.as_deref(),
@@ -4163,6 +4262,7 @@ impl PingclairProxy {
             })?
             .rewrite_request_uri(
                 route_index,
+                ctx.error_scope.map(|scope| scope.route),
                 current,
                 rule.strip_prefix,
                 rule.strip_suffix,
@@ -4213,11 +4313,10 @@ impl PingclairProxy {
             Self::write_local_body(session, ctx, Bytes::from(content), true).await?;
             return Ok(());
         }
-        let reason = error_reason(status);
-        let body = match ctx.error_detail.take() {
-            Some(detail) => format!("{status} {reason}: {detail}"),
-            None => format!("{status} {reason}"),
-        };
+        // 📌 `error_detail` is taken, not read: it belongs to the one response
+        // that answers the failure it describes.
+        let detail = ctx.error_detail.take();
+        let body = builtin_error_body(status, detail.as_deref());
         Self::write_simple_response(session, ctx, status, &body).await
     }
 
@@ -4569,11 +4668,13 @@ impl PingclairProxy {
                     Ok(rendered) => rendered,
                     Err(error) => {
                         tracing::warn!(%error, path, "⚠️ Template rendering failed");
-                        let mut response = ResponseHeader::build(500, Some(2)).unwrap();
-                        Self::apply_local_response_headers(&mut response, ctx)?;
-                        session
-                            .write_response_header(Box::new(response), true)
-                            .await?;
+                        // 🚨 Raised rather than written here: Caddy returns a
+                        // template error to its chain, so `handle_errors` is
+                        // where an operator's 500 page lives. Answering inline
+                        // skipped that route on this transport and produced a
+                        // different 500 from HTTP/3 (#245).
+                        ctx.error_status = Some(500);
+                        ctx.error_message = Some("Template Rendering Failed".to_string());
                         return Ok(true);
                     }
                 };
@@ -5070,6 +5171,7 @@ impl PingclairProxy {
                         compiled_header_replacement(
                             state,
                             route_index,
+                            ctx.error_scope.map(|scope| scope.route),
                             entry,
                             session.req_header(),
                             verified_client_ip.as_deref(),
@@ -5090,10 +5192,8 @@ impl PingclairProxy {
                 // template and the request, so the policy downstream stays a plain
                 // list of literal values and every response path benefits without
                 // being touched.
-                let needs_resolution = set
-                    .iter()
-                    .chain(add.iter())
-                    .any(|(_, value)| value.contains('{'));
+                let needs_resolution = set.values().any(|value| value.contains('{'))
+                    || add.values().flatten().any(|value| value.contains('{'));
                 let resolve = |value: &String, session: &Session, ctx: &RequestContext| {
                     if value.contains('{') {
                         resolve_caddy_placeholders(
@@ -5117,7 +5217,9 @@ impl PingclairProxy {
                         .collect();
                     let resolved_add: Vec<(String, String)> = add
                         .iter()
-                        .map(|(k, v)| (k.clone(), resolve(v, session, ctx)))
+                        .flat_map(|(k, values)| {
+                            values.iter().map(|v| (k.clone(), resolve(v, session, ctx)))
+                        })
                         .collect();
                     for (k, v) in resolved_set {
                         block.set(k, v);
@@ -5129,8 +5231,11 @@ impl PingclairProxy {
                     for (k, v) in set {
                         block.set(k, v.clone());
                     }
-                    for (k, v) in add {
-                        block.add(k, v.clone());
+                    // 📋 Every value of every `+Name` line, in order (#276).
+                    for (k, values) in add {
+                        for v in values {
+                            block.add(k, v.clone());
+                        }
                     }
                 }
                 for name in remove {
@@ -5942,14 +6047,48 @@ fn resolve_single_placeholder(
     scheme: &'static str,
     vars: &crate::http_policy::RequestVars,
 ) -> String {
-    // {http.request.header.Header-Name}
-    if let Some(header_name) = name.strip_prefix("http.request.header.") {
-        return req
-            .headers
-            .get(header_name)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+    // 🏷️ Caddy's `{header.X}` shorthand for `{http.request.header.X}`, and the
+    // long form, are one lookup. Every value of a repeated field is joined
+    // with a comma, which is what Caddy reads out of `req.Header`
+    // (`modules/caddyhttp/replacer.go`) and what a client that sent two
+    // `X-Forwarded-Proto` fields expects to see.
+    if let Some(header_name) = name
+        .strip_prefix("http.request.header.")
+        .or_else(|| name.strip_prefix("header."))
+    {
+        let mut joined = String::new();
+        let mut first = true;
+        for value in req.headers.get_all(header_name) {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            if !first {
+                joined.push(',');
+            }
+            first = false;
+            joined.push_str(value);
+        }
+        return joined;
+    }
+    // 🧭 `{query.X}` and `{http.request.uri.query.X}` are one query parameter,
+    // read the way Go's `url.Values` exposes it. The bare `{query}` below is
+    // the whole query string, which is a different thing.
+    if let Some(parameter) = name
+        .strip_prefix("http.request.uri.query.")
+        .or_else(|| name.strip_prefix("query."))
+    {
+        return query_parameter(req.uri.query().unwrap_or_default(), parameter);
+    }
+    // 🧭 `{path.N}` and `{http.request.uri.path.N}` are path segments,
+    // 0-based from the left; `dir` and `file` are Go's `path.Split` halves
+    // (`modules/caddyhttp/replacer.go`). A suffix that is neither is not a
+    // placeholder this resolver knows, so the name is left as written.
+    if let Some(suffix) = name
+        .strip_prefix("http.request.uri.path.")
+        .or_else(|| name.strip_prefix("path."))
+        && let Some(part) = path_part(req.uri.path(), suffix)
+    {
+        return part;
     }
     // 🧰 `{http.vars.<name>}` reads a request-scoped variable set by a
     // `vars` handler or rule; an unset variable is empty, like every other
@@ -6093,12 +6232,20 @@ fn resolve_single_placeholder(
             .map(|target| target.as_str().to_string())
             .unwrap_or_else(|| req.uri.path().to_string()),
         "path" | "http.request.uri.path" => req.uri.path().to_string(),
+        // 🗂️ The bare shorthands for the two halves of `path.Split`; their
+        // long forms were handled above, where the suffix is read.
+        "dir" => path_part(req.uri.path(), "dir").unwrap_or_default(),
+        "file" => path_part(req.uri.path(), "file").unwrap_or_default(),
         _ => {
             // 🚧 Still missing: {dir}, {file}, {file.*}, {re.*}, {env.*},
-            // {http.vars.*}, {err.*}. An unknown name resolves to the empty
-            // string rather than being echoed back, which is what the format
-            // does — printing `{nonsense}` into a response body would turn a
-            // typo into content.
+            // {http.vars.*}, {err.*}.
+            //
+            // 🧭 An unknown name is left exactly as written, which is what
+            // Caddy's replacer does: a body carrying literal braces — JSON,
+            // JavaScript, documentation — survives, and a `header_down` value
+            // such as `{some.unknown.thing}` stays readable as a debugging
+            // tool. Erasing it was the only answer that silently changed
+            // content the operator wrote (#260).
             //
             // 🤡 This list used to name `{scheme}` and `{method}` too, six and
             // eleven lines above where both are handled. On 2026-08-07 a survey
@@ -6107,9 +6254,82 @@ fn resolve_single_placeholder(
             // for features that already existed. A comment that outlives what
             // it describes does not announce itself; it just gets believed.
             tracing::debug!("⚠️ Unresolved Caddy placeholder: {{{}}}", name);
-            String::new()
+            format!("{{{name}}}")
         }
     }
+}
+
+/// 🧭 One `{path.*}` part: a segment index, the directory, or the file name.
+///
+/// The split mirrors Caddy's: the path is split on `/`, the leading empty
+/// element is dropped, and an index past the end is empty rather than unknown.
+/// Middle empty segments stay, so `/a//b` has three parts.
+fn path_part(path: &str, suffix: &str) -> Option<String> {
+    match suffix {
+        // 🗂️ Go's `path.Split`: everything up to and including the last
+        // slash, and everything after it.
+        "dir" => Some(path.rsplit_once('/').map_or_else(String::new, |(dir, _)| {
+            let mut with_slash = dir.to_string();
+            with_slash.push('/');
+            with_slash
+        })),
+        "file" => Some(
+            path.rsplit_once('/')
+                .map_or_else(|| path.to_string(), |(_, file)| file.to_string()),
+        ),
+        index => {
+            let index: usize = index.parse().ok()?;
+            let mut parts: Vec<&str> = path.split('/').collect();
+            if parts.first() == Some(&"") {
+                parts.remove(0);
+            }
+            Some(parts.get(index).copied().unwrap_or("").to_string())
+        }
+    }
+}
+
+/// 🧭 One query parameter the way Go's `url.Values` exposes it: every
+/// occurrence, percent-decoded, joined with a comma.
+///
+/// 📌 `+` is a space here and not in a path component, and a malformed escape
+/// drops the pair rather than the whole query — both are `url.ParseQuery`'s
+/// behaviour, which `req.URL.Query()` exposes.
+fn query_parameter(query: &str, wanted: &str) -> String {
+    let mut joined = String::new();
+    let mut first = true;
+    for pair in query.split('&') {
+        let (name, raw) = pair.split_once('=').unwrap_or((pair, ""));
+        if decode_query_component(name).as_deref() != Some(wanted) {
+            continue;
+        }
+        let Some(value) = decode_query_component(raw) else {
+            continue;
+        };
+        if !first {
+            joined.push(',');
+        }
+        first = false;
+        joined.push_str(&value);
+    }
+    joined
+}
+
+/// 🔤 Percent-decodes one query component, or `None` when the escape is
+/// malformed.
+fn decode_query_component(raw: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut chars = raw.bytes();
+    while let Some(byte) = chars.next() {
+        match byte {
+            b'+' => bytes.push(b' '),
+            b'%' => {
+                let digits = [chars.next()?, chars.next()?];
+                bytes.push(u8::from_str_radix(std::str::from_utf8(&digits).ok()?, 16).ok()?);
+            }
+            other => bytes.push(other),
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 // MARK: - ProxyHttp Trait
@@ -6277,6 +6497,7 @@ impl ProxyHttp for PingclairProxy {
         ctx.state = Some(state);
         if breach.is_some() {
             ctx.error_detail = detail;
+            ctx.refused_before_routing = true;
             session.as_mut().set_keepalive(None);
             return pingora_core::Error::e_explain(
                 pingora_core::ErrorType::HTTPStatus(431),
@@ -6594,6 +6815,19 @@ impl ProxyHttp for PingclairProxy {
         // after the selected site's configuration proves they can be observed.
         ctx.orig_uri = session.req_header().uri.clone();
 
+        // 🛡️ Resolve the client identity once, before any answer can be
+        // produced. A refused `Host`, refused framing, or a `Host` that names
+        // no site still writes an access record, and every one of those used to
+        // fall back to the session peer — which on a PROXY-protocol listener is
+        // the ingress hop, so the traffic an operator goes looking for
+        // (scanners, misdirected hosts) was logged as `127.0.0.1` (#281).
+        // Neither input needs a site: the trusted-proxy policy is global and
+        // the tunnel registry is per listener.
+        let (transport_peer_ip, transport_client_ip, verified_client_ip) =
+            self.downstream_identity(session, &session.req_header().headers);
+        ctx.verified_client_ip = Some(verified_client_ip);
+        ctx.remote_ip = Some(transport_client_ip.ip());
+
         // 🛡️ Framing is settled before anything else reads the request, because
         // a message whose length two parsers can read differently must not be
         // routed, logged as a normal request, or forwarded at all.
@@ -6683,13 +6917,17 @@ impl ProxyHttp for PingclairProxy {
         // identity headers `forward_auth copy_headers` is supposed to own.
         // Drop underscore-named headers before anything routes on them,
         // matching Caddy's default.
-        let underscore_headers: Vec<String> = session
-            .req_header()
-            .headers
-            .keys()
-            .filter(|name| name.as_str().contains('_'))
-            .map(|name| name.as_str().to_string())
-            .collect();
+        let underscore_headers =
+            crate::http_policy::underscore_named_fields(&session.req_header().headers);
+        if !underscore_headers.is_empty() {
+            // 👁️ The drop used to be invisible at every log level, which is
+            // what made "the field is simply gone" a support-ticket mystery
+            // (#269).
+            tracing::debug!(
+                fields = ?underscore_headers,
+                "🚫 Dropped underscore-named request fields before routing"
+            );
+        }
         for name in underscore_headers {
             session.req_header_mut().remove_header(name.as_str());
         }
@@ -6881,9 +7119,6 @@ impl ProxyHttp for PingclairProxy {
                 );
             }
 
-            // 🛡️ Resolve proxy headers only when the immediate peer is trusted.
-            let (transport_peer_ip, transport_client_ip, verified_client_ip) =
-                self.downstream_identity(session, &request_header.headers);
             // 🌐 `remote_ip` matches the connection's peer and `client_ip` the
             // client a trusted proxy vouched for, as in Caddy. A PROXY-protocol
             // source is the peer: that header replaces the connection address.
@@ -7101,12 +7336,13 @@ impl ProxyHttp for PingclairProxy {
                     self.handle_raised_error(session, ctx, 413).await?;
                     return Ok(true);
                 }
-                let mut header = pingora_http::ResponseHeader::build(413, Some(4)).unwrap();
-                header.insert_header("Connection", "close").unwrap();
-                Self::apply_local_response_headers(&mut header, ctx)?;
-                session
-                    .write_response_header(Box::new(header), true)
-                    .await?;
+                // 🧾 The built-in refusal is the same sentence H1-chunked, H2
+                // and H3 write: a body on three of the four paths and none on
+                // the fourth was the drift #252 names. The connection still
+                // closes, because the body was never read.
+                session.as_mut().set_keepalive(None);
+                let body = builtin_error_body(413, None);
+                Self::write_simple_response(session, ctx, 413, &body).await?;
                 return Ok(true);
             }
         }
@@ -7775,6 +8011,12 @@ impl ProxyHttp for PingclairProxy {
         // proxy, handed to the origin.
         strip_hop_by_hop_headers(session, upstream_request)?;
 
+        // 🧼 RFC 9113 §8.2.1 / RFC 9114 §10.3 forbid a field value that starts
+        // or ends with SP/HTAB; an HTTP/1 parser strips it silently, so the
+        // same padded header is harmless on H1 and malformed on H2. Trimming
+        // here makes the transports agree (#256).
+        crate::http_policy::trim_pingora_request_padding(upstream_request);
+
         // 🧾 A replaced body is a different length from the one the client
         // declared, so the framing is rewritten here or the origin waits for
         // bytes that are never coming. This is the only place that can do it:
@@ -7933,15 +8175,13 @@ impl ProxyHttp for PingclairProxy {
         for name in crate::http_policy::connection_named_fields(&upstream_response.headers) {
             upstream_response.remove_header(name.as_ref());
         }
-        if upstream_response.headers.contains_key("trailer") {
-            tracing::warn!(
-                "🚫 Rejecting an upstream response that requires unsupported trailer forwarding"
-            );
-            return pingora_core::Error::e_explain(
-                pingora_core::ErrorType::HTTPStatus(502),
-                "Upstream response trailers are unsupported",
-            );
-        }
+        // 🧾 A `Trailer:` announcement is not an invalid response: RFC 9112
+        // §7.1.2 makes the trailer section part of the chunked coding, and
+        // RFC 9110 §15.6.3 reserves 502 for a response the proxy cannot parse.
+        // The same bytes already relay when the origin forgets to announce
+        // them, so the announcement must not turn a 200 into a 502 — trailer
+        // fields that cannot be forwarded downstream are dropped instead
+        // (#273). The H3 path carries the same rule.
 
         let retry_policy = ctx
             .state
@@ -8123,6 +8363,96 @@ impl ProxyHttp for PingclairProxy {
             Some(upstream_response.version),
         )?;
 
+        // 🧼 The same padding rule in the other direction: a configured value
+        // with a stray space is a protocol error on H2/H3 (#256).
+        crate::http_policy::trim_pingora_response_padding(upstream_response);
+
+        // 🚫 RFC 9110 §8.6: a 1xx or 204 response cannot carry a
+        // `Content-Length`. An origin that sends one made its mistake here;
+        // forwarding it would make it ours, and an HTTP/1.1 client that
+        // believes the announced length on a bodiless status waits for bytes
+        // that never arrive (#270). This is the last header hook before the
+        // response is written, and the one every transport passes through.
+        if !crate::http_policy::ResponseContent::for_status(upstream_response.status.as_u16())
+            .allows_content_length()
+        {
+            upstream_response.remove_header(&http::header::CONTENT_LENGTH);
+        }
+
+        // 🧾 RFC 9112 §6.1: `Transfer-Encoding` may only be sent to a client
+        // that speaks HTTP/1.1 or later, and §2.3 asks that an HTTP/1.0
+        // recipient receive a message it can parse. The status line follows
+        // the client's version, and a body whose length the origin never
+        // declared is delimited by the close that ends the connection —
+        // never by chunk sizes an HTTP/1.0 client would read as content
+        // (#277). Local responses already downgrade their version; this is
+        // the proxied half.
+        if session.req_header().version == http::Version::HTTP_10 {
+            upstream_response.set_version(http::Version::HTTP_10);
+            if upstream_response
+                .headers
+                .contains_key(http::header::TRANSFER_ENCODING)
+            {
+                upstream_response.remove_header(&http::header::TRANSFER_ENCODING);
+                session.as_mut().set_keepalive(None);
+            }
+        }
+
+        // 🌊 Pingora's HTTP/1 writer flushes a known-length body only once the
+        // body ends, so a bounded event stream that declares its length sits
+        // in the buffer until it is over and reaches the client in one lump
+        // (#247). A stream can drop the length instead: chunked framing (1.1)
+        // and close-delimited framing (1.0) are both flushed per chunk, and
+        // neither loses a byte. Only responses whose whole point is immediacy
+        // pay that trade — `Content-Type: text/event-stream`, or a route that
+        // asked for `flush_interval -1` — and only when a body is coming.
+        let immediate_stream = upstream_response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_streaming_content_type)
+            || ctx
+                .state
+                .as_ref()
+                .zip(ctx.route_index)
+                .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
+                .is_some_and(|config| wants_immediate_flush(config.flush_interval));
+        let body_is_coming = session.req_header().method != http::Method::HEAD
+            && crate::http_policy::ResponseContent::for_status(upstream_response.status.as_u16())
+                .has_body();
+        if immediate_stream
+            && body_is_coming
+            && upstream_response
+                .headers
+                .contains_key(http::header::CONTENT_LENGTH)
+        {
+            upstream_response.remove_header(&http::header::CONTENT_LENGTH);
+            if session.req_header().version == http::Version::HTTP_10 {
+                // 🧾 A 1.0 client cannot be chunked; the close delimits it,
+                // and `do_write_until_close_body` flushes every chunk.
+                session.as_mut().set_keepalive(None);
+            }
+        }
+
+        // 🌊 A lengthless HTTP/1.1 body needs chunked framing: pingora frames
+        // a response whose head declares neither `Content-Length` nor
+        // `Transfer-Encoding` as close-delimited, and a close-delimited body
+        // ends the connection. An origin's early close would then read as a
+        // complete message (#249), and the route would pay a fresh handshake
+        // for every request. This mirrors the rule local responses already
+        // follow, and it also covers an origin that answered close-delimited.
+        if session.req_header().version == http::Version::HTTP_11
+            && body_is_coming
+            && !upstream_response
+                .headers
+                .contains_key(http::header::CONTENT_LENGTH)
+            && !upstream_response
+                .headers
+                .contains_key(http::header::TRANSFER_ENCODING)
+        {
+            upstream_response.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
+        }
+
         // 🛡️ Applies the same security policy used by locally generated responses.
         if let Some(state) = &ctx.state {
             Self::apply_security_response_headers(upstream_response, state)?;
@@ -8194,48 +8524,63 @@ impl ProxyHttp for PingclairProxy {
             && crate::response_encoding::eligible(
                 &state.config,
                 &state.encode_policy,
-                &session.req_header().method,
                 upstream_response,
             )
             && !ctx.streaming_response
             && ctx.intercepted_response.is_none()
         {
-            match ResponseEncoder::at_gzip_level(encoding, state.config.encode.gzip_level) {
-                Ok(encoder) => {
-                    // 🛡️ Headers are only rewritten once the encoder is
-                    // in place. Announcing a coding that nothing then
-                    // applies would hand the client a body it cannot
-                    // decode.
-                    let token = encoder.token();
-                    if !crate::response_encoding::install(
-                        &mut session.downstream_modules_ctx,
-                        encoder,
-                    ) {
-                        return Ok(());
+            // 🤐 A `HEAD` describes the response its `GET` would receive but
+            // has no body, so the header rewrite below is the whole answer and
+            // no encoder is installed (#264).
+            let encodes_body = crate::response_encoding::encodes_a_body(
+                &session.req_header().method,
+                upstream_response,
+            );
+            let token = encoding.token();
+            let ready = if encodes_body {
+                match ResponseEncoder::at_gzip_level(encoding, state.config.encode.gzip_level) {
+                    Ok(encoder) => {
+                        // 🛡️ Headers are only rewritten once the encoder is
+                        // in place. Announcing a coding that nothing then
+                        // applies would hand the client a body it cannot
+                        // decode.
+                        if !crate::response_encoding::install(
+                            &mut session.downstream_modules_ctx,
+                            encoder,
+                        ) {
+                            return Ok(());
+                        }
+                        true
                     }
-                    upstream_response.insert_header("Content-Encoding", token)?;
-                    let _ = upstream_response.remove_header("Content-Length");
-                    crate::response_encoding::drop_integrity_fields(upstream_response);
-                    crate::response_encoding::weaken_etag(upstream_response)?;
-                    // 🌊 With Content-Length gone, HTTP/1.1 needs explicit
-                    // chunked framing. Pingora only adds it before this
-                    // filter runs, and has already promised keep-alive,
-                    // so leaving it out ends the body by closing a
-                    // connection the client was told would stay open.
-                    // HTTP/1.0 has no chunked coding and closes anyway;
-                    // Pingora's H2 writer strips the field itself.
-                    if session.req_header().version == http::Version::HTTP_11 {
-                        upstream_response.insert_header("Transfer-Encoding", "chunked")?;
+                    Err(e) => {
+                        tracing::warn!(
+                            "⚠️ Could not initialize {} encoder, serving identity: {}",
+                            encoding.token(),
+                            e
+                        );
+                        false
                     }
-                    crate::response_encoding::vary_on_accept_encoding(upstream_response)?;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "⚠️ Could not initialize {} encoder, serving identity: {}",
-                        encoding.token(),
-                        e
-                    );
+            } else {
+                true
+            };
+            if ready {
+                upstream_response.insert_header("Content-Encoding", token)?;
+                let _ = upstream_response.remove_header("Content-Length");
+                crate::response_encoding::drop_integrity_fields(upstream_response);
+                crate::response_encoding::weaken_etag(upstream_response)?;
+                // 🌊 With Content-Length gone, HTTP/1.1 needs explicit
+                // chunked framing. Pingora only adds it before this
+                // filter runs, and has already promised keep-alive,
+                // so leaving it out ends the body by closing a
+                // connection the client was told would stay open.
+                // HTTP/1.0 has no chunked coding and closes anyway;
+                // Pingora's H2 writer strips the field itself. A `HEAD`
+                // has no body to frame, so it needs none of this.
+                if encodes_body && session.req_header().version == http::Version::HTTP_11 {
+                    upstream_response.insert_header("Transfer-Encoding", "chunked")?;
                 }
+                crate::response_encoding::vary_on_accept_encoding(upstream_response)?;
             }
         }
 
@@ -8643,16 +8988,33 @@ impl ProxyHttp for PingclairProxy {
             _ => None,
         };
         let served = if already_responded {
-            // 🔪 The original response is already on the wire, so an error
-            // page could only be spliced onto it: on H2 its header block is
-            // dropped and its body arrives as more DATA on the same stream,
-            // which then ends normally; on H1 it lands inside the first
-            // response's framing. Abandoning the message is the only honest
-            // signal left — RST_STREAM(INTERNAL_ERROR) on H2, a closed
-            // connection on H1 — and the access log keeps the status that
-            // actually went out.
-            session.downstream_session.shutdown().await;
-            false
+            // 🔪 An error page cannot be spliced onto a response that is
+            // already on the wire: on H2 its header block would be dropped and
+            // its body would arrive as more DATA on the same stream; on H1 it
+            // would land inside the first response's framing.
+            //
+            // 🔚 Whether the message may be *ended* instead depends on who
+            // broke it. An origin that closed mid-response already formed the
+            // status and headers the client is entitled to, so the relay ends
+            // where the origin did: with a declared `Content-Length` the short
+            // body is the evidence, exactly as Caddy passes along the head it
+            // formed (#249). A response this hop abandons — a deadline, a
+            // write failure, an internal fault — has no origin answer to
+            // relay, and the break must be the visible signal, so it keeps
+            // RST_STREAM(INTERNAL_ERROR) on H2 (#95). The same reset stays for
+            // an origin break without a declared length: a clean end of a
+            // chunked or close-delimited message would look complete.
+            let declared_length = session.response_written().is_some_and(|response| {
+                response.headers.contains_key(http::header::CONTENT_LENGTH)
+            });
+            let origin_broke_mid_response =
+                crate::upstream_failure::classify_response_error(e).implicates_backend();
+            if declared_length && origin_broke_mid_response {
+                session.write_response_body(None, true).await.is_ok()
+            } else {
+                session.downstream_session.shutdown().await;
+                false
+            }
         } else if let Some(status) = ctx.response_decision_error.take() {
             // 🚫 A response subroute owns the original upstream response once
             // it matches. Its raised status may enter error routing once, but
@@ -8660,6 +9022,16 @@ impl ProxyHttp for PingclairProxy {
             // wrap itself recursively.
             ctx.intercept_handlers.clear();
             self.handle_raised_error(session, ctx, status).await.is_ok()
+        } else if ctx.refused_before_routing && code > 0 {
+            // 🚫 A refusal this hop made before any route could run — an
+            // oversized header block, today — never reaches `handle_errors`:
+            // that exists so a site can answer for its handlers, and this
+            // request never reached one. A configured `error_page` for the
+            // status still applies, and without one the built-in body keeps
+            // the detail that names what was wrong, which is the client's
+            // whole diagnosis (#288). HTTP/3 answers through the same two
+            // steps, so the three transports agree.
+            self.serve_error_page(session, ctx, code).await.is_ok()
         } else if code > 0
             && !ctx.handling_error
             && ctx
@@ -8824,7 +9196,7 @@ impl ProxyHttp for PingclairProxy {
                 let upstream = ctx
                     .upstream
                     .as_ref()
-                    .map(|value| crate::access_log::LogUpstream::Address(&value.addr));
+                    .map(|value| pingclair_runtime::access_log::LogUpstream::Address(&value.addr));
                 let route = ctx
                     .route_index
                     .and_then(|index| state.config.routes.get(index))
@@ -8838,19 +9210,19 @@ impl ProxyHttp for PingclairProxy {
                     .uri
                     .path_and_query()
                     .map_or_else(|| req_header.uri.path(), |value| value.as_str());
-                let logged_path = crate::redaction::redact_target(target);
+                let logged_path = pingclair_runtime::redaction::redact_target(target);
                 // 🙈 Referer carries the *previous* page's URL, so it can leak a
                 // token this request never contained.
-                let redacted_referer = crate::redaction::redact_referer(referer);
+                let redacted_referer = pingclair_runtime::redaction::redact_referer(referer);
 
                 // 🏷️ The entry lends each destination the original maps. Each
                 // logger narrows and masks them while writing its own final buffer,
                 // avoiding dozens of temporary strings per request.
                 let logged_request_headers =
-                    crate::access_log::LogHeaders::new(&req_header.headers);
-                let logged_response_headers = session
-                    .response_written()
-                    .map(|response| crate::access_log::LogHeaders::new(&response.headers));
+                    pingclair_runtime::access_log::LogHeaders::new(&req_header.headers);
+                let logged_response_headers = session.response_written().map(|response| {
+                    pingclair_runtime::access_log::LogHeaders::new(&response.headers)
+                });
                 // 🔐 `digest` carries the handshake result; a plaintext listener
                 // simply has none, which is why both fields are optional rather
                 // than empty strings.
@@ -8864,7 +9236,7 @@ impl ProxyHttp for PingclairProxy {
                     (None, None)
                 };
 
-                let entry = crate::access_log::AccessEntry {
+                let entry = pingclair_runtime::access_log::AccessEntry {
                     request_headers: Some(logged_request_headers),
                     response_headers: logged_response_headers,
                     tls_version,
@@ -8873,7 +9245,7 @@ impl ProxyHttp for PingclairProxy {
                     // finished: a five-second request logged at its end would
                     // otherwise sit in a shipper's timeline beside requests that
                     // arrived after it.
-                    started_unix: crate::access_log::unix_started_at(ctx.start_time),
+                    started_unix: pingclair_runtime::access_log::unix_started_at(ctx.start_time),
                     request_id: ctx.request_id(),
                     method,
                     host,
@@ -8884,10 +9256,13 @@ impl ProxyHttp for PingclairProxy {
                     // well, but this counter remains Pingclair's cross-transport
                     // access-log contract.
                     bytes: ctx.response_bytes,
-                    duration_ms: elapsed.as_millis(),
+                    // ⏱️ Fractional milliseconds: a whole-millisecond
+                    // integer renders every fast request as `0`, which no
+                    // average or percentile can recover (#160).
+                    duration_ms: elapsed.as_secs_f64() * 1000.0,
                     ttfb_ms: ctx
                         .first_byte_at
-                        .map(|at| at.duration_since(ctx.start_time).as_millis()),
+                        .map(|at| at.duration_since(ctx.start_time).as_secs_f64() * 1000.0),
                     client_ip: remote_ip,
                     route,
                     upstream,
@@ -8911,6 +9286,20 @@ impl ProxyHttp for PingclairProxy {
                 }
                 return;
             }
+        }
+
+        // 🚫 Nothing on this listener asked for access logging, so this request
+        // gets no record. Caddy's `ServerLogConfig` is per server: one site's
+        // `log` enables records for the whole listener, and a server whose
+        // sites never mention `log` writes none at all — which is what the
+        // documented "Default: no access log" means (#213). The fallback below
+        // is therefore kept only for a listener that logs, where an unmapped
+        // `Host` belongs to Caddy's default access logger.
+        //
+        // ⚡ One bit read: whether this listener logs was decided when its route
+        // table was published, so the request path does not walk the sites.
+        if !self.request_generation(ctx).routes().has_access_logging() {
+            return;
         }
 
         // Structured access log
@@ -9210,9 +9599,13 @@ fn collect_request_body_timeouts(handler: &HandlerConfig) -> RouteBodyTimeouts {
 ///
 /// Returns `None` when the pattern is missing or does not compile, having said
 /// so — a replacement that cannot run must not silently rewrite nothing.
+// 🚨 One argument past the lint's limit: the lookup needs both the route whose
+// table it reads and, while an error route runs, which error route (#245).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compiled_header_replacement(
     state: &ProxyState,
     route_index: usize,
+    error_route: Option<usize>,
     entry: &pingclair_core::config::HeaderReplacement,
     request_header: &pingora_http::RequestHeader,
     verified_client_ip: Option<&str>,
@@ -9233,7 +9626,17 @@ pub(crate) fn compiled_header_replacement(
     };
 
     if !entry.search_regexp.contains('{') {
-        return match state.route_regex_arc(route_index, &entry.search_regexp) {
+        // 🚨 While an error route runs, its own table answers: the header
+        // operation belongs to the route body being run, and the table of the
+        // route that raised the error is a different configuration (#245).
+        let compiled = match error_route {
+            Some(index) => state
+                .error_routes
+                .get(index)
+                .and_then(|route| route.regexes.get(&entry.search_regexp).cloned()),
+            None => state.route_regex_arc(route_index, &entry.search_regexp),
+        };
+        return match compiled {
             Some(pattern) => Some((pattern, replacement)),
             None => {
                 tracing::warn!(
@@ -9265,7 +9668,10 @@ pub(crate) fn compiled_header_replacement(
     }
 }
 
-fn collect_route_regexes(handler: &HandlerConfig, regexes: &mut HashMap<String, Arc<Regex>>) {
+pub(crate) fn collect_route_regexes(
+    handler: &HandlerConfig,
+    regexes: &mut HashMap<String, Arc<Regex>>,
+) {
     match handler {
         HandlerConfig::Rewrite {
             regex: Some(pattern),
@@ -9527,6 +9933,42 @@ mod forwarded_headers_tests;
 
 #[cfg(test)]
 mod p0_regression_tests;
+
+#[cfg(test)]
+mod placeholder_shorthand_tests {
+    use super::{decode_query_component, path_part, query_parameter};
+
+    /// 🧭 Path parts follow Caddy's split: the leading empty element goes,
+    /// middle empty segments stay, and `dir`/`file` are `path.Split`'s halves.
+    #[test]
+    fn path_parts_match_caddys_split() {
+        assert_eq!(path_part("/a/b", "0").as_deref(), Some("a"));
+        assert_eq!(path_part("/a/b", "1").as_deref(), Some("b"));
+        assert_eq!(path_part("/a/b", "2").as_deref(), Some(""));
+        assert_eq!(path_part("/a//b", "1").as_deref(), Some(""));
+        assert_eq!(path_part("/a/b", "dir").as_deref(), Some("/a/"));
+        assert_eq!(path_part("/a/b", "file").as_deref(), Some("b"));
+        assert_eq!(path_part("/only", "dir").as_deref(), Some("/"));
+        assert_eq!(path_part("relative", "dir").as_deref(), Some(""));
+        assert_eq!(path_part("/a/b", "not-a-part"), None);
+        assert_eq!(path_part("/a/b", "01"), Some("b".to_string()));
+    }
+
+    /// 🧭 Query parameters keep every occurrence, decode escapes, and treat
+    /// `+` as a space — Go's `url.Values`, which is what Caddy reads.
+    #[test]
+    fn query_parameters_match_go_values() {
+        assert_eq!(query_parameter("a=1&a=2&b=3", "a"), "1,2");
+        assert_eq!(query_parameter("b=x+y", "b"), "x y");
+        assert_eq!(query_parameter("a%2Fb=1", "a/b"), "1");
+        assert_eq!(query_parameter("a=1", "missing"), "");
+        assert_eq!(query_parameter("a", "a"), "");
+        // 🚫 A malformed escape drops that pair, as `url.ParseQuery` does.
+        assert_eq!(query_parameter("a=%zz&a=2", "a"), "2");
+        assert_eq!(decode_query_component("a%2Fb").as_deref(), Some("a/b"));
+        assert_eq!(decode_query_component("%zz"), None);
+    }
+}
 
 #[cfg(test)]
 mod streaming_flush_tests {

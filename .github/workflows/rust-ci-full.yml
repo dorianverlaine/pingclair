@@ -36,6 +36,14 @@ jobs:
 
       - uses: ./.github/actions/setup-ci
 
+      - name: Make sure the pinned toolchain has rustfmt and clippy
+        # 🧰 Same reason as `rust-ci.yml`: the builder image is a moving tag,
+        # so the run that bumps the toolchain can still be looking at the
+        # previous image and an auto-installed toolchain has no components.
+        run: |
+          set -euo pipefail
+          rustup component add rustfmt clippy --toolchain "$(just --evaluate rust)"
+
       - uses: ./.github/actions/setup-rust-cache
         with:
           target: x86_64-unknown-linux-gnu
@@ -48,10 +56,10 @@ jobs:
           r2-secret-access-key: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
 
       - name: Check formatting
-        run: cargo +1.98.1 fmt --all -- --check
+        run: cargo +1.99.0 fmt --all -- --check
 
       - name: Run Clippy with the release profile
-        run: cargo +1.98.1 clippy --locked --workspace --all-targets --profile release -- -D warnings
+        run: cargo +1.99.0 clippy --locked --workspace --all-targets --profile release -- -D warnings
 
       - uses: ./.github/actions/check-clean-worktree
         with:

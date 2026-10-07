@@ -723,7 +723,7 @@ pub(super) fn adapt_handle_path(
 /// Caddy's three scope rules live here: named matcher definitions are copied
 /// from the parent scope, additions stay local to this block, and nothing is
 /// written back to the parent.
-fn collect_subroute_elements(
+pub(super) fn collect_subroute_elements(
     block: &Block,
     parent_matchers: &HashMap<String, Matcher>,
     order: &DirectiveOrder,
@@ -748,7 +748,12 @@ fn collect_subroute_elements(
         }
         let matcher = resolve_matcher_token(inner_d, &local)?;
         let mut stripped = inner_d.clone();
-        if matcher.is_some() {
+        // 🌐 `*` is a matcher *token* that names no matcher: Caddy writes
+        // `respond * "text"` to say "the next argument is my data". The
+        // generic rule reads it as "no matcher", so the token itself still has
+        // to be consumed here — it used to reach the handler and become the
+        // body (#135).
+        if matcher.is_some() || stripped.args.first().is_some_and(|arg| arg == "*") {
             stripped.drop_first_arg();
         }
         let handler = adapt_handler(stripped, &local, order)?;
@@ -1642,7 +1647,13 @@ pub(super) fn apply_header_op(
 
     match field.chars().next() {
         Some('+') => {
-            config.add.insert(field[1..].to_string(), value);
+            // 📋 Appended, so two `+Set-Cookie` lines stay two cookies
+            // (RFC 6265 §3 forbids folding them into one field line, #276).
+            config
+                .add
+                .entry(field[1..].to_string())
+                .or_default()
+                .push(value);
         }
         Some('-') => {
             // 📌 A value beside a removal is ignored rather than refused, and
@@ -1822,6 +1833,12 @@ pub(super) fn adapt_abort_directive(d: &Directive) -> Result<Handler, AdapterErr
 /// [`data_args`] before this runs — upstream's handler parser likewise rejects
 /// every positional argument and lets the registration helper take the matcher
 /// token first. So anything still here is a genuine surplus argument.
+///
+/// 📌 `disable_openmetrics` is accepted and truthful: this build writes
+/// Prometheus text exposition (`text/plain; version=0.0.4; charset=utf-8`)
+/// whatever the client asks for, so the option describes what already happens.
+/// It is not a switch that turns anything off, and it must not become one
+/// without an OpenMetrics encoder behind it (#45).
 pub(super) fn adapt_metrics_directive(d: &Directive) -> Result<Handler, AdapterError> {
     let args = data_args(d);
     if !args.is_empty() {

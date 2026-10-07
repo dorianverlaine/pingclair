@@ -1201,7 +1201,7 @@ impl LoadBalancer {
             0
         } else {
             self.health_backoff
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                     Some((value + 1).min(3))
                 })
                 .unwrap_or(0)

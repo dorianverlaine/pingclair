@@ -11,8 +11,8 @@ pub mod secret;
 mod shared_ports;
 mod types;
 
-pub use bind::bind_listeners;
-pub use ip_ranges::{InvalidIpRange, IpRanges};
+pub use bind::{bind_listeners, bind_socket_host};
+pub use ip_ranges::{InvalidIpRange, IpRanges, PRIVATE_RANGES};
 pub use layer4::{Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher};
 pub use loader::ConfigLoader;
 pub use secret::SecretString;

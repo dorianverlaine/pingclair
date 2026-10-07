@@ -212,8 +212,16 @@ pub fn evaluate_response_handlers(
                 // finished response, which this pass does not have.
                 require: _,
             } => {
-                for (name, value) in set.iter().chain(add.iter()) {
+                for (name, value) in set {
                     outcome.header_set.push((name.clone(), value.clone()));
+                }
+                // 📋 The subroute surface collects name/value edits and its
+                // consumers build a map from them, so a repeated `+Name` keeps
+                // the meaning it had before multi-value adds (#276).
+                for (name, values) in add {
+                    for value in values {
+                        outcome.header_set.push((name.clone(), value.clone()));
+                    }
                 }
                 outcome.header_remove.extend(remove.iter().cloned());
             }
@@ -552,10 +560,15 @@ mod response_interception_tests {
 mod h3_duplicate_framing_tests {
     use super::*;
 
-    fn fields(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    fn fields(pairs: &[(&str, &str)]) -> Vec<(http::HeaderName, http::HeaderValue)> {
         pairs
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .map(|(k, v)| {
+                (
+                    http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    http::HeaderValue::from_str(v).unwrap(),
+                )
+            })
             .collect()
     }
 
@@ -1038,7 +1051,7 @@ impl ResponseHeaderPolicy {
     pub(crate) fn merge_proxy_response_ops(
         &mut self,
         set: &BTreeMap<String, String>,
-        add: &BTreeMap<String, String>,
+        add: &BTreeMap<String, Vec<String>>,
         remove: &[String],
         default_set: &BTreeMap<String, String>,
     ) {
@@ -1046,8 +1059,13 @@ impl ResponseHeaderPolicy {
             return;
         }
         self.merge_proxy_set(set);
-        for (name, value) in add {
-            self.add(name.clone(), value.clone());
+        // 📋 Every value of every `+Name` line, in order: two `+Set-Cookie`
+        // lines are two cookies, and RFC 6265 §3 forbids folding them into one
+        // field line (#276).
+        for (name, values) in add {
+            for value in values {
+                self.add(name.clone(), value.clone());
+            }
         }
         for name in remove {
             self.remove(name.clone());
@@ -1153,6 +1171,12 @@ impl ResponseHeaderPolicy {
     /// response is the only input, which is what lets one block be applied on
     /// its own.
     fn apply_ops(&self, response: &mut ResponseHeader) -> PingoraResult<()> {
+        // 🧾 The body's own writer declared this before the policy runs; it is
+        // the only value the message can honour (#261).
+        let written_length = response
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .map(|value| value.as_bytes().to_vec());
         for entry in self.set.values() {
             match &entry.header_value {
                 Some(header_value) => {
@@ -1210,6 +1234,25 @@ impl ResponseHeaderPolicy {
         for name in &self.remove {
             let _ = response.remove_header(name);
         }
+        match content_length_verdict(
+            written_length.as_deref(),
+            response
+                .headers
+                .get(http::header::CONTENT_LENGTH)
+                .map(|value| value.as_bytes()),
+        ) {
+            ContentLengthVerdict::Keep => {}
+            ContentLengthVerdict::Restore => {
+                if let Some(written) = written_length.as_deref()
+                    && let Ok(value) = http::header::HeaderValue::from_bytes(written)
+                {
+                    let _ = response.insert_header(http::header::CONTENT_LENGTH, value);
+                }
+            }
+            ContentLengthVerdict::Drop => {
+                let _ = response.remove_header(&http::header::CONTENT_LENGTH);
+            }
+        }
         Ok(())
     }
 
@@ -1229,7 +1272,14 @@ impl ResponseHeaderPolicy {
     ) -> PingoraResult<()> {
         if suppress_server {
             let _ = response.remove_header("server");
-        } else {
+        } else if !response.headers.contains_key("server") {
+            // 🏷️ Only when the response has none. Caddy sets its own `Server`
+            // before the handler chain runs and the proxy then copies the
+            // upstream's headers over it, so what a client sees is the
+            // upstream's value when there is one — the product string an
+            // operator's monitoring reads, and the one a mixed fleet would
+            // otherwise disagree about (#159). A response this server produced
+            // itself has no `Server` field yet and gets ours.
             response.insert_header("server", "Pingclair")?;
         }
 
@@ -1669,6 +1719,100 @@ pub(crate) fn connection_named_fields(headers: &HeaderMap) -> Vec<Box<str>> {
         .collect()
 }
 
+/// 🛡️ Whether a field name carries an underscore.
+///
+/// Such a name aliases its hyphenated form in every CGI/FastCGI environment —
+/// `x_probe` and `x-probe` both become `HTTP_X_PROBE` — so a client could
+/// inject the identity headers `forward_auth copy_headers` is supposed to own.
+/// The policy is one drop, before anything routes, on every transport (#269).
+pub(crate) fn underscore_named(name: &[u8]) -> bool {
+    name.contains(&b'_')
+}
+
+/// 🛡️ The names in `headers` that [`underscore_named`] refuses.
+pub(crate) fn underscore_named_fields(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .keys()
+        .filter(|name| underscore_named(name.as_str().as_bytes()))
+        .map(|name| name.as_str().to_string())
+        .collect()
+}
+
+/// ✂️ The value with its leading and trailing SP/HTAB removed.
+///
+/// RFC 9110 §5.5 makes that whitespace `OWS`: allowed around a field value and
+/// not part of it. An HTTP/1 parser strips it silently, so the same header is
+/// harmless there and a protocol error on HTTP/2 or HTTP/3, where RFC 9113
+/// §8.2.1 and RFC 9114 §10.3 forbid a value that starts or ends with it
+/// (#256).
+pub(crate) fn trim_field_value_ows(value: &[u8]) -> &[u8] {
+    let is_ows = |byte: u8| byte == b' ' || byte == b'\t';
+    let start = value
+        .iter()
+        .copied()
+        .take_while(|byte| is_ows(*byte))
+        .count();
+    let trailing = value
+        .iter()
+        .rev()
+        .copied()
+        .take_while(|byte| is_ows(*byte))
+        .count();
+    // ✂️ `trailing` is a count, not an index; an all-whitespace value must
+    // also not slice backwards.
+    let end = (value.len() - trailing).max(start);
+    &value[start..end]
+}
+
+/// 🔎 The names whose values carry SP/HTAB padding, with their trimmed values.
+///
+/// Collected before anything is replaced, because the replacement goes through
+/// Pingora's per-name API: the wrapper exposes `remove_header`/`append_header`
+/// rather than the map itself.
+fn padded_replacements(
+    headers: &HeaderMap,
+) -> Vec<(http::header::HeaderName, Vec<http::header::HeaderValue>)> {
+    let mut replacements = Vec::new();
+    for name in headers.keys() {
+        let mut padded = false;
+        let mut values = Vec::new();
+        for value in headers.get_all(name) {
+            let raw = value.as_bytes();
+            let trimmed = trim_field_value_ows(raw);
+            if trimmed.len() != raw.len() {
+                padded = true;
+            }
+            values.push(
+                http::header::HeaderValue::from_bytes(trimmed).unwrap_or_else(|_| value.clone()),
+            );
+        }
+        if padded {
+            replacements.push((name.clone(), values));
+        }
+    }
+    replacements
+}
+
+/// 🧼 Trims SP/HTAB padding from every value of a Pingora request wrapper.
+pub(crate) fn trim_pingora_request_padding(header: &mut pingora_http::RequestHeader) {
+    for (name, values) in padded_replacements(&header.headers) {
+        header.remove_header(&name);
+        for value in values {
+            let _ = header.append_header(name.clone(), value);
+        }
+    }
+}
+
+/// 🧼 Trims SP/HTAB padding from every value of a Pingora response wrapper.
+pub(crate) fn trim_pingora_response_padding(header: &mut pingora_http::ResponseHeader) {
+    for (name, values) in padded_replacements(&header.headers) {
+        header.remove_header(&name);
+        for value in values {
+            let _ = header.append_header(name.clone(), value);
+        }
+    }
+}
+
 /// 🧪 The one header matrix every sink is tested against.
 ///
 /// Lives beside the filter rather than in a test module because four different
@@ -1776,6 +1920,40 @@ impl ResponseContent {
     /// 📏 Whether the header may carry `Content-Length`.
     pub(crate) fn allows_content_length(self) -> bool {
         !matches!(self, Self::Forbidden)
+    }
+}
+
+/// 🧾 What must happen to a response's `Content-Length` after the header
+/// policy ran.
+///
+/// RFC 9110 §8.6 makes the declared length a property of the message content,
+/// so only the body's writer knows it. A policy may remove the field (shorter
+/// framing is always valid) but never replace the writer's value with a
+/// different one, and a value it invents where the writer declared none is
+/// dropped: that pair is a silent truncation on HTTP/1.1 and a protocol error
+/// the client pays for on HTTP/2 and HTTP/3 (#261).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ContentLengthVerdict {
+    /// The policy left the writer's declaration alone, or removed it.
+    Keep,
+    /// The policy replaced it; the writer's value goes back.
+    Restore,
+    /// The writer declared no length, and the policy invented one.
+    Drop,
+}
+
+/// 🧾 Compares the body writer's declaration with what the policy left behind.
+pub(crate) fn content_length_verdict(
+    written: Option<&[u8]>,
+    after: Option<&[u8]>,
+) -> ContentLengthVerdict {
+    match (written, after) {
+        (Some(written), Some(after)) if written == after => ContentLengthVerdict::Keep,
+        (Some(_), Some(_)) => ContentLengthVerdict::Restore,
+        // 🚫 An explicit removal is safe: chunked or close-delimited framing
+        // always describes the body that follows.
+        (Some(_), None) | (None, None) => ContentLengthVerdict::Keep,
+        (None, Some(_)) => ContentLengthVerdict::Drop,
     }
 }
 
@@ -1907,20 +2085,20 @@ fn content_length_value_invalid(raw: &[u8]) -> bool {
 /// which is what a split `Cookie` needs — removes that accidental cover, so
 /// the rule has to be stated rather than relied upon.
 pub(crate) fn check_h3_request_framing(
-    headers: &[(String, String)],
+    headers: &[(http::HeaderName, http::HeaderValue)],
 ) -> Result<(), FramingRejection> {
     let mut lengths = 0;
     let mut hosts = 0;
     for (name, value) in headers {
-        if name.eq_ignore_ascii_case("transfer-encoding") {
+        if name == http::header::TRANSFER_ENCODING {
             return Err(FramingRejection::TransferEncodingForbidden);
         }
-        if name.eq_ignore_ascii_case("content-length") {
+        if name == http::header::CONTENT_LENGTH {
             lengths += 1;
             if content_length_value_invalid(value.as_bytes()) {
                 return Err(FramingRejection::MalformedContentLength);
             }
-        } else if name.eq_ignore_ascii_case("host") {
+        } else if name == http::header::HOST {
             hosts += 1;
         }
     }
@@ -2603,18 +2781,18 @@ mod tests {
             vec![("content-length", "5"), ("content-length", "x")],
             vec![("content-length", "5"), ("Content-Length", "6")],
         ] {
-            let list: Vec<(String, String)> = headers
+            let list: Vec<(http::HeaderName, http::HeaderValue)> = headers
                 .iter()
-                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .map(|(name, value)| {
+                    (
+                        http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                        http::HeaderValue::from_str(value).unwrap(),
+                    )
+                })
                 .collect();
             let mut map = http::HeaderMap::new();
             for (name, value) in &list {
-                if let (Ok(name), Ok(value)) = (
-                    http::header::HeaderName::from_bytes(name.as_bytes()),
-                    http::HeaderValue::from_str(value),
-                ) {
-                    map.append(name, value);
-                }
+                map.append(name.clone(), value.clone());
             }
             assert_eq!(
                 check_h3_request_framing(&list),
@@ -2622,18 +2800,6 @@ mod tests {
                 "H3 list framing diverged from the shared rule for {headers:?}"
             );
         }
-    }
-
-    #[test]
-    fn h3_framing_fails_closed_on_values_the_header_map_cannot_carry() {
-        // 🚨 A value that cannot become an `http::HeaderValue` was silently
-        // dropped by the old H3 path, which then accepted the request. The
-        // raw-list variant rejects it instead, matching the H1/H2 rule that
-        // a declared `Content-Length` must be `1*DIGIT`.
-        assert_eq!(
-            check_h3_request_framing(&[("content-length".to_string(), "5\x01".to_string())]),
-            Err(FramingRejection::MalformedContentLength)
-        );
     }
 
     #[test]
@@ -3157,6 +3323,63 @@ mod outbound_filter_tests {
         ] {
             assert!(filter.blocks(name), "`{name}` slipped past on spelling");
         }
+    }
+
+    /// ✂️ OWS trimming removes only the padding, in both directions.
+    #[test]
+    fn field_value_padding_is_trimmed_to_the_value() {
+        for (raw, expected) in [
+            ("val3", "val3"),
+            ("val3 ", "val3"),
+            (" val3", "val3"),
+            ("\tval3\t", "val3"),
+            ("val3 \t", "val3"),
+            // 🕳️ An all-padding value becomes empty; it must not slice
+            // backwards, which is the bug this test exists for.
+            ("   ", ""),
+            ("", ""),
+        ] {
+            assert_eq!(
+                std::str::from_utf8(trim_field_value_ows(raw.as_bytes())).unwrap(),
+                expected,
+                "{raw:?} must trim to {expected:?}"
+            );
+        }
+    }
+
+    /// 🧾 The body's declaration wins over the policy, a policy-invented
+    /// length is dropped, and an explicit removal stays removed (#261).
+    #[test]
+    fn content_length_verdict_protects_the_body_declaration() {
+        use ContentLengthVerdict::{Drop, Keep, Restore};
+
+        assert_eq!(content_length_verdict(Some(b"10"), Some(b"10")), Keep);
+        assert_eq!(content_length_verdict(Some(b"10"), Some(b"3")), Restore);
+        assert_eq!(content_length_verdict(Some(b"10"), None), Keep);
+        assert_eq!(content_length_verdict(None, Some(b"3")), Drop);
+        assert_eq!(content_length_verdict(None, None), Keep);
+    }
+
+    /// 🛡️ The underscore rule is one rule: the names the H1/H2 filter drops
+    /// are the names the H3 parser drops (#269).
+    #[test]
+    fn underscore_named_fields_are_the_ones_the_filter_drops() {
+        for (name, dropped) in [
+            ("x_probe", true),
+            ("X_Probe", true),
+            ("_leading", true),
+            ("x-probe", false),
+            ("xprobe", false),
+        ] {
+            assert_eq!(underscore_named(name.as_bytes()), dropped, "{name}");
+        }
+
+        let headers = client_headers(&[
+            ("x_probe", "present"),
+            ("x-probe", "present"),
+            ("content-type", "text/plain"),
+        ]);
+        assert_eq!(underscore_named_fields(&headers), vec!["x_probe"]);
     }
 
     /// 🔗 A field named by `Connection` is dropped, whatever it is called.

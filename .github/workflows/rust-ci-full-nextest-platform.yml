@@ -62,11 +62,11 @@ jobs:
 
       - name: Build the real binary for integration tests
         run: |
-          cargo +1.98.1 build --locked --profile ${{ inputs.profile }} --target ${{ inputs.target }} -p pingclair --bin pingclair
+          cargo +1.99.0 build --locked --profile ${{ inputs.profile }} --target ${{ inputs.target }} -p pingclair --bin pingclair
 
       - name: Build nextest archive
         run: |
-          cargo +1.98.1 nextest archive \
+          cargo +1.99.0 nextest archive \
             --locked \
             --archive-file "${RUNNER_TEMP}/${NEXTEST_ARCHIVE_FILE}" \
             --target ${{ inputs.target }} \
@@ -167,7 +167,7 @@ jobs:
           # 🎲 Through the shared policy: a partition that hits the known
           # websocket flake retries it exactly as the whole suite does, instead
           # of turning the shard red (2026-09-22).
-          scripts/retry-known-flakes.sh cargo +1.98.1 nextest run \
+          scripts/retry-known-flakes.sh cargo +1.99.0 nextest run \
             --no-fail-fast \
             --profile ci \
             --archive-file "${RUNNER_TEMP}/nextest-archive/${NEXTEST_ARCHIVE_FILE}" \

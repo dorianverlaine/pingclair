@@ -560,21 +560,6 @@ fn looks_like_address(token: &str) -> bool {
     token.parse::<ipnet::IpNet>().is_ok() || token.parse::<std::net::IpAddr>().is_ok()
 }
 
-/// 🌐 The six prefixes behind the `private_ranges` keyword, in Caddy's own
-/// order (`internal.PrivateRangesCIDR`, `internal/ranges.go` at `ff6da121`).
-///
-/// `127.0.0.1/8` and `::1` are in the list because loopback counts as private
-/// upstream, which is what makes `trusted_proxies static private_ranges` the
-/// ordinary single-line spelling for a server behind a local reverse proxy.
-const PRIVATE_RANGES: [&str; 6] = [
-    "192.168.0.0/16",
-    "172.16.0.0/12",
-    "10.0.0.0/8",
-    "127.0.0.1/8",
-    "fd00::/8",
-    "::1",
-];
-
 /// 🏠 Whether a host is a bind wildcard rather than a name a client can send.
 ///
 /// These are the addresses that mean "every interface". A request's `Host`
@@ -765,7 +750,11 @@ fn parse_trusted_proxies(args: &[String], into: &mut Vec<String>) -> Result<(), 
         // its own: upstream expands it in `StaticIPRange.UnmarshalCaddyfile` to
         // the six prefixes of `internal.PrivateRangesCIDR()`.
         if rule == "private_ranges" {
-            into.extend(PRIVATE_RANGES.iter().map(|range| (*range).to_string()));
+            into.extend(
+                pingclair_core::config::PRIVATE_RANGES
+                    .iter()
+                    .map(|range| (*range).to_string()),
+            );
             continue;
         }
         if !looks_like_address(rule) {

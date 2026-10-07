@@ -19,7 +19,6 @@ use std::time::Duration;
 /// or rewriting it from the body are all acceptable answers; sending the pair as
 /// written is not, because the client pays for it with a reset connection.
 #[tokio::test]
-#[ignore = "pingclair#261 — H2 receives the mismatched length and the stream is reset"]
 async fn test_h2_declared_length_matches_the_body() {
     let mut server = TestServer::new_pingclairfile(&site(
         "handle /cl/* {\n                header Content-Length \"3\"\n                respond \"0123456789\"\n            }",
@@ -100,7 +99,6 @@ async fn test_proxied_body_length_matches_its_header() {
 /// HTTP/1.1 client that believes the announced length on a bodiless status waits
 /// for bytes that never arrive.
 #[tokio::test]
-#[ignore = "pingclair#270 — the proxied H1 path forwards the origin's Content-Length on a 204"]
 async fn test_proxied_204_carries_no_content_length() {
     let upstream = ScriptedUpstream::start(
         vec![b"HTTP/1.1 204 No Content\r\nContent-Length: 42\r\n\r\n".to_vec()],
@@ -238,7 +236,6 @@ async fn test_head_describes_the_same_response_as_get() {
 /// relay when the origin forgets to announce them, which is the tell that this is
 /// a policy trigger rather than a parsing limit.
 #[tokio::test]
-#[ignore = "pingclair#273 — the announcement alone turns a 200 into a 502"]
 async fn test_declared_upstream_trailer_is_not_a_gateway_error() {
     let upstream = ScriptedUpstream::start(
         vec![
@@ -277,7 +274,6 @@ async fn test_declared_upstream_trailer_is_not_a_gateway_error() {
 /// 1.0 client as `Content-Length` or as a close-delimited body — never as chunk
 /// sizes the client will read as content.
 #[tokio::test]
-#[ignore = "pingclair#277 — a proxied chunked response reaches an HTTP/1.0 client as HTTP/1.1 + chunked"]
 async fn test_http10_client_is_not_sent_chunked_framing() {
     let upstream = ScriptedUpstream::start(
         vec![

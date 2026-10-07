@@ -47,7 +47,12 @@ use std::net::Ipv6Addr;
 /// value that is already bracketed stays as it is.
 ///
 /// `None` for an empty value, which names no interface.
-pub(crate) fn bind_socket_host(bind: &str) -> Option<String> {
+///
+/// 📌 Public because the DSL's duplicate-site check has to compare the
+/// interface a site actually listens on: two blocks on one port with different
+/// interfaces are two sites, and `::1` written with brackets has to compare
+/// equal to the same address written without them (#279).
+pub fn bind_socket_host(bind: &str) -> Option<String> {
     if bind.is_empty() {
         return None;
     }

@@ -11,7 +11,6 @@
 
 // MARK: - Modules
 
-pub mod access_log;
 mod acme_challenge;
 pub mod alt_svc;
 mod body_buffer;
@@ -43,7 +42,6 @@ mod proxy_status;
 pub mod quic;
 pub mod rate_limit;
 pub mod readiness;
-pub mod redaction;
 mod response_encoding;
 mod retry;
 pub mod server;

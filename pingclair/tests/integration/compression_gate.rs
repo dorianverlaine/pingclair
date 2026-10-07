@@ -129,19 +129,20 @@ async fn test_cached_range_is_not_compressed() {
     assert_eq!(reply.text().await.unwrap(), &body[..300]);
 }
 
-/// 📐 `HEAD` has no body to compress, so its headers keep describing the
-/// origin's identity representation.
+/// 📏 `HEAD` describes the response its own `GET` would receive.
+///
+/// RFC 9110 §9.3.2 asks a `HEAD` for the fields its `GET` would have sent, so
+/// the negotiated coding is announced even though there is no body to run
+/// through the encoder. The compressed length is not known before the body is
+/// produced and §8.6 makes the field the content's length, so the identity
+/// length is dropped rather than left describing bytes no client will receive
+/// (#264). Measured against Caddy 2.11.7 on 2026-10-07: its streamed-proxy
+/// `HEAD` announces `gzip` with `Content-Length: 20`, the length of a gzip
+/// stream over an empty body — a number that describes neither representation.
 #[tokio::test]
-async fn test_head_is_not_compressed() {
+async fn test_head_describes_the_encoded_representation() {
     let body = compressible_body();
-    let (origin, _hits) = spawn_scripted_origin(
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes(),
-    )
-    .await;
+    let (origin, _hits) = spawn_scripted_origin(origin_reply("200 OK", "", &body)).await;
     let mut server = TestServer::new_pingclairfile(&proxy_pingclairfile(origin, ""));
     assert!(server.wait_until_ready().await, "server failed to start");
 
@@ -151,17 +152,40 @@ async fn test_head_is_not_compressed() {
         .send()
         .await
         .unwrap();
+    let get = no_proxy_client()
+        .get(server.url(0, "/page"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    let head_coding = reply
+        .headers()
+        .get("content-encoding")
+        .map(|value| value.to_str().unwrap().to_string());
+    let get_coding = get
+        .headers()
+        .get("content-encoding")
+        .map(|value| value.to_str().unwrap().to_string());
+    let head_length = reply
+        .headers()
+        .get("content-length")
+        .map(|value| value.to_str().unwrap().to_string());
+    let get_length = get
+        .headers()
+        .get("content-length")
+        .map(|value| value.to_str().unwrap().to_string());
+    let _ = get.bytes().await.unwrap();
     assert_eq!(reply.status(), 200);
-    assert!(reply.headers().get("content-encoding").is_none());
+    assert_eq!(head_coding.as_deref(), Some("gzip"));
     assert_eq!(
-        reply
-            .headers()
-            .get("content-length")
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        body.len().to_string()
+        head_coding, get_coding,
+        "the HEAD must describe the representation its GET receives"
     );
+    assert_eq!(
+        head_length, get_length,
+        "a length the GET does not send cannot be advertised by the HEAD"
+    );
+    assert_eq!(head_length, None);
 }
 
 /// 🛡️ `Cache-Control: no-transform` from the origin keeps the body byte-exact.

@@ -129,26 +129,38 @@ pub(crate) fn vary_covers_accept_encoding(headers: &http::HeaderMap) -> bool {
 /// 📐 Whether this response carries a complete representation that the
 /// proxy may re-encode for the client.
 ///
-/// 🚫 A `206` or any response with `Content-Range` encloses a slice counted
-/// in the origin's identity bytes (RFC 9110 §14.1.2). Compressing it keeps a
+/// 📏 Whether this response describes a full representation of the resource.
+///
+/// 🚫 A `206` or any response with `Content-Range` encloses a slice counted in
+/// the origin's identity bytes (RFC 9110 §14.1.2). Compressing it keeps a
 /// `Content-Range` that no longer describes the body, so a client splicing
-/// ranges together writes the wrong bytes at the wrong offsets. `HEAD`,
-/// `204` and `304` have no body to compress, and an informational response
-/// only predicts the final one.
-pub(crate) fn is_full_representation(method: &http::Method, header: &ResponseHeader) -> bool {
+/// ranges together writes the wrong bytes at the wrong offsets. `204`, `304`
+/// and informational responses have no representation at all.
+///
+/// 📏 `HEAD` *does* describe one — the representation its `GET` would receive
+/// (RFC 9110 §9.3.2) — so its headers are re-encoded; [`encodes_a_body`] is
+/// what says there is no body for an encoder to produce.
+pub(crate) fn is_full_representation(header: &ResponseHeader) -> bool {
     full_representation(
-        method,
         header.status,
         header.headers.contains_key(http::header::CONTENT_RANGE),
     )
 }
 
-fn full_representation(method: &http::Method, status: http::StatusCode, partial: bool) -> bool {
+/// 🤐 Whether running an encoder over this response produces a body.
+///
+/// A `HEAD` describes the encoded representation in its headers and has no
+/// body to run through the encoder (#264); everything else that describes a
+/// full representation does.
+pub(crate) fn encodes_a_body(method: &http::Method, header: &ResponseHeader) -> bool {
+    *method != http::Method::HEAD && is_full_representation(header)
+}
+
+fn full_representation(status: http::StatusCode, partial: bool) -> bool {
     !(status.is_informational()
         || status == http::StatusCode::NO_CONTENT
         || status == http::StatusCode::PARTIAL_CONTENT
         || status == http::StatusCode::NOT_MODIFIED
-        || *method == http::Method::HEAD
         || partial)
 }
 
@@ -221,7 +233,6 @@ fn eligible_facts(
 pub(crate) fn eligible(
     config: &pingclair_core::config::ServerConfig,
     policy: &pingclair_core::encoding::EncodePolicy,
-    method: &http::Method,
     response: &ResponseHeader,
 ) -> bool {
     eligible_facts(
@@ -239,7 +250,7 @@ pub(crate) fn eligible(
                 .get("content-length")
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse().ok()),
-            full: is_full_representation(method, response),
+            full: is_full_representation(response),
             encoded: response.headers.contains_key("content-encoding"),
             no_transform: forbids_transform(response),
         },
@@ -267,7 +278,6 @@ fn h3_header<'a>(headers: &'a [quiche::h3::Header], name: &[u8]) -> Option<&'a s
 pub(crate) fn eligible_h3(
     config: &pingclair_core::config::ServerConfig,
     policy: &pingclair_core::encoding::EncodePolicy,
-    method: &http::Method,
     headers: &[quiche::h3::Header],
 ) -> bool {
     eligible_facts(
@@ -280,7 +290,6 @@ pub(crate) fn eligible_h3(
             content_type: h3_header(headers, b"content-type").unwrap_or(""),
             length: h3_header(headers, b"content-length").and_then(|value| value.parse().ok()),
             full: full_representation(
-                method,
                 http::StatusCode::from_u16(
                     h3_header(headers, b":status")
                         .and_then(|value| value.parse().ok())
@@ -386,12 +395,30 @@ impl HttpModule for ResponseEncodingModule {
         stream_chunk(&mut self.encoder, body, end_of_stream).map_err(abandon)
     }
 
+    /// 🧹 Writes the coding's trailer when trailer fields end the body.
+    ///
+    /// An HTTP/2 origin may end its response with trailing HEADERS, announced
+    /// or not, and Pingora makes that task the end of the message instead of
+    /// sending `Done` — this filter is the last hook that runs before the
+    /// writer closes the body. Without it the client held compressed DATA with
+    /// no gzip trailer and could not decode a byte of it (#225).
+    ///
+    /// 🧾 Pingora writes the returned bytes as the final body chunk and drops
+    /// the trailer fields with it. A field that cannot share that chunk is the
+    /// price of a body the client can decode, and the alternative is a message
+    /// that no client can read at all. Responses without an installed encoder
+    /// return `None` and keep their trailers untouched.
+    fn response_trailer_filter(
+        &mut self,
+        _trailers: &mut Option<Box<http::HeaderMap>>,
+    ) -> pingora_core::Result<Option<Bytes>> {
+        self.finish()
+    }
+
     /// 🧹 Writes the coding's trailer for bodies that end with `Done` rather
     /// than with a chunk flagged as the last one.
     fn response_done_filter(&mut self) -> pingora_core::Result<Option<Bytes>> {
-        let mut tail = None;
-        stream_chunk(&mut self.encoder, &mut tail, true).map_err(abandon)?;
-        Ok(tail)
+        self.finish()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -400,6 +427,19 @@ impl HttpModule for ResponseEncodingModule {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+}
+
+impl ResponseEncodingModule {
+    /// 🏁 Finalizes the coding and returns its trailing bytes, if any.
+    ///
+    /// Both end-of-body tasks funnel through here: the coder is taken out of
+    /// the slot, so whichever task arrives first finalizes once and a later
+    /// one writes nothing.
+    fn finish(&mut self) -> pingora_core::Result<Option<Bytes>> {
+        let mut tail = None;
+        stream_chunk(&mut self.encoder, &mut tail, true).map_err(abandon)?;
+        Ok(tail)
     }
 }
 
@@ -424,19 +464,20 @@ mod tests {
             .collect()
     }
 
-    /// 🚫 Partial, bodiless and interim responses are never re-encoded.
+    /// 📏 A `HEAD` describes a representation; only interim, bodiless and
+    /// partial responses describe none, and only a `HEAD` skips the encoder.
     #[test]
-    fn only_complete_bodies_are_rewritable() {
+    fn only_complete_representations_are_rewritable() {
         let get = http::Method::GET;
-        for (status, method, range, expected) in [
-            (200, &get, false, true),
-            (404, &get, false, true),
-            (200, &get, true, false),
-            (206, &get, true, false),
-            (204, &get, false, false),
-            (304, &get, false, false),
-            (103, &get, false, false),
-            (200, &http::Method::HEAD, false, false),
+        for (status, method, range, described, encoded) in [
+            (200, &get, false, true, true),
+            (404, &get, false, true, true),
+            (200, &get, true, false, false),
+            (206, &get, true, false, false),
+            (204, &get, false, false, false),
+            (304, &get, false, false, false),
+            (103, &get, false, false, false),
+            (200, &http::Method::HEAD, false, true, false),
         ] {
             let mut header = ResponseHeader::build(status, None).unwrap();
             if range {
@@ -445,9 +486,14 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(
-                is_full_representation(method, &header),
-                expected,
-                "{status} {method} range={range}"
+                is_full_representation(&header),
+                described,
+                "described: {status} {method} range={range}"
+            );
+            assert_eq!(
+                encodes_a_body(method, &header),
+                encoded,
+                "encoded: {status} {method} range={range}"
             );
         }
     }

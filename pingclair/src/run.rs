@@ -83,6 +83,9 @@ pub(crate) fn run_server_with_adapter(
     // work with a single atomic load instead of consulting the configuration.
     pingclair_proxy::metrics::configure(config.global.metrics);
     pingclair_proxy::server::configure_response_cache(&config.servers);
+    // 🧮 The static-file caches are sized from this machine's memory before any
+    // file server exists to size itself from a constant (#33).
+    crate::memory_budget::install_cache_budgets();
 
     // 📡 OTLP push is parsed so a configuration written elsewhere still loads
     // and still says what it meant, but nothing here exports it. Refusing beats
@@ -111,7 +114,7 @@ pub(crate) fn run_server_with_adapter(
     // reference to one. Registration is idempotent, so a reload that keeps a
     // channel keeps its writer thread and its queue rather than spawning a
     // second writer onto the same file.
-    pingclair_proxy::access_log::register_channels(&config.logging.channels);
+    pingclair_runtime::access_log::register_channels(&config.logging.channels);
 
     // 🔢 The startup configuration is version 1. The number itself is
     // meaningless; two instances behind one balancer reporting *different*

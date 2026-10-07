@@ -122,6 +122,63 @@ async fn test_handle_errors_file_server_serves_the_error_page() {
     }
 }
 
+/// 🧾 A header block over the limit is refused before error routing.
+///
+/// `handle_errors` answers for a site's handlers, and a request refused before
+/// routing never reached one — Caddy refuses an oversized header block before
+/// any handler runs. The site's page replaced the one sentence naming the
+/// field that was too large, which is the client's entire diagnosis, and
+/// HTTP/3 already answered with the plain refusal (#288).
+#[tokio::test]
+async fn test_an_oversized_header_block_never_reaches_the_error_route() {
+    let site = error_page_site("limits {\n    max_header_bytes 8192\n}\n");
+    let mut server = TestServer::new_pingclairfile(&site.config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let big = "x".repeat(9_000);
+    for http2 in [false, true] {
+        let builder = reqwest::Client::builder().no_proxy();
+        let client = if http2 {
+            builder.http2_prior_knowledge()
+        } else {
+            builder.http1_only()
+        }
+        .build()
+        .unwrap();
+        let response = client
+            .get(server.url(0, "/present.txt"))
+            .header("X-Big", &big)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, 431, "http2={http2}");
+        assert!(
+            body.contains("x-big"),
+            "http2={http2}: the refusal must name the field: {body}"
+        );
+        assert!(
+            !body.contains("page for"),
+            "http2={http2}: the site's page must not replace the refusal: {body}"
+        );
+    }
+
+    // 🎯 Control: an error the handler chain produced still reaches the route,
+    // so this refuses one shape rather than turning error routing off.
+    let missing = no_proxy_client()
+        .get(server.url(0, "/missing.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+    assert!(
+        missing.text().await.unwrap().contains("page for 404"),
+        "a handler's error must keep reaching the error route"
+    );
+    server.stop();
+}
+
 /// 🚨 Errors the server produces itself, not only the ones a handler raises,
 /// reach `handle_errors`: a proxy that cannot reach its upstream (502), and a
 /// body over its limit (413), whether it declared its length or streamed past
@@ -223,6 +280,257 @@ async fn test_handle_errors_answers_proxy_and_body_size_errors() {
             ("small body", 200, "accepted".to_string()),
             ("streamed body", 413, "<h1>page for 413</h1>".to_string()),
         ]
+    );
+}
+
+/// 🧾 A body over the limit is refused with one sentence on every framing.
+///
+/// The 413's body used to depend on the framing a client chose — nothing for a
+/// declared length, `413 Request Entity Too Large` for a chunked upload, and a
+/// body without the status line at all on HTTP/3 (#252).
+#[tokio::test]
+async fn test_a_body_over_the_limit_is_refused_with_one_sentence() {
+    let mut server = TestServer::new_pingclairfile(
+        r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle /upload {
+                request_body {
+                    max_size 10
+                }
+                respond "accepted"
+            }
+        }
+        "#,
+    );
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let address = server.address(0);
+    let expected = "413 Request Entity Too Large".to_string();
+
+    // 📏 A declared length over the limit is refused before the body is read.
+    let (declared_status, declared_body) = raw_exchange(
+        address,
+        &format!(
+            "POST /upload HTTP/1.1\r\nHost: {address}\r\nContent-Length: 100\r\n\
+             Connection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!((declared_status, declared_body), (413, expected.clone()));
+
+    // 🌊 A chunked body trips the same limit while it streams.
+    let chunk = "x".repeat(100);
+    let (streamed_status, streamed_body) = raw_exchange(
+        address,
+        &format!(
+            "POST /upload HTTP/1.1\r\nHost: {address}\r\nTransfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n{:X}\r\n{chunk}\r\n0\r\n\r\n",
+            chunk.len()
+        ),
+    )
+    .await;
+    assert_eq!((streamed_status, streamed_body), (413, expected.clone()));
+
+    // 🔀 The same request over HTTP/2 carries the same sentence.
+    let h2 = reqwest::Client::builder()
+        .no_proxy()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let response = h2
+        .post(server.url(0, "/upload"))
+        .body("x".repeat(100))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 413);
+    assert_eq!(response.text().await.unwrap(), expected);
+    server.stop();
+}
+
+/// 🔢 Directives in `handle_errors` run in Caddy's order, not in file order.
+///
+/// The block used to run its directives in the order they were written, so a
+/// `respond` written first answered before a `header` written after it ever
+/// applied — the same block, a different site, depending on line order (#245).
+#[tokio::test]
+async fn test_handle_errors_applies_a_header_written_after_respond() {
+    let mut server = TestServer::new_pingclairfile(
+        r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle_errors {
+                respond "page" 503
+                header X-Error-Route ordered
+            }
+
+            handle /boom {
+                error "exploded" 503
+            }
+        }
+        "#,
+    );
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/boom"))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let header = response
+        .headers()
+        .get("x-error-route")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        (status, header, body),
+        (503, Some("ordered".to_string()), "page".to_string())
+    );
+}
+
+/// 🔤 A regex `rewrite` inside `handle_errors` resolves against the error
+/// route's own compiled patterns.
+///
+/// The lookup used to go to the table of the route that raised the error, so
+/// the pattern was missing and the rewrite failed exactly when the error page
+/// was being built (#245).
+#[tokio::test]
+async fn test_handle_errors_regex_rewrite_uses_its_own_table() {
+    let error_root = tempfile::tempdir().expect("error root");
+    std::fs::write(error_root.path().join("page.html"), "rewritten page").unwrap();
+    let mut server = TestServer::new_pingclairfile(&format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle_errors {{
+                root * {error_root}
+                rewrite "^/boom/(.*)$" "/$1"
+                file_server
+            }}
+
+            handle /boom/* {{
+                error "exploded" 503
+            }}
+        }}
+        "#,
+        error_root = error_root.path().display(),
+    ));
+    assert!(server.wait_until_ready().await, "server did not start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/boom/page.html"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        (response.status().as_u16(), response.text().await.unwrap()),
+        (503, "rewritten page".to_string())
+    );
+}
+
+/// 🔁 A `header` search-and-replace inside `handle_errors` resolves against the
+/// error route's own pattern table, like its `rewrite` does (#245).
+#[tokio::test]
+async fn test_handle_errors_header_replace_uses_its_own_table() {
+    let mut server = TestServer::new_pingclairfile(
+        r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle_errors {
+                header Content-Type "text/plain" "text/html"
+                respond "page" 503
+            }
+
+            handle /boom {
+                error "exploded" 503
+            }
+        }
+        "#,
+    );
+    assert!(server.wait_until_ready().await, "server did not start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/boom"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            response.status().as_u16(),
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+        ),
+        (503, Some("text/html; charset=utf-8".to_string()))
+    );
+}
+
+/// 🔥 A template that fails to render is raised, so `handle_errors` answers it
+/// like any other 500 (#245).
+#[tokio::test]
+async fn test_a_template_failure_reaches_the_error_route() {
+    let site_root = tempfile::tempdir().expect("site root");
+    std::fs::write(site_root.path().join("broken.html"), "before {{ unclosed").unwrap();
+    let mut server = TestServer::new_pingclairfile(&format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            root * {site_root}
+
+            handle_errors {{
+                respond "error page for {{err.status_code}}" 500
+            }}
+
+            templates
+            file_server
+        }}
+        "#,
+        site_root = site_root.path().display(),
+    ));
+    assert!(server.wait_until_ready().await, "server did not start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/broken.html"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        (response.status().as_u16(), response.text().await.unwrap()),
+        (500, "error page for 500".to_string())
     );
 }
 

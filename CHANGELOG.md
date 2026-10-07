@@ -34,6 +34,348 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🧾 An immediately-flushed response is chunked on HTTP/1.1, so a short body stays short
+
+Immediate flushing drops the declared length so every chunk leaves as it is
+written, and the response that followed leaned on the connection close to end
+the body. That was wrong twice. An origin which declared a megabyte, wrote a
+quarter of it and hung up reached the client as a complete `200` — the missing
+bytes were indistinguishable from the end of the message — and the connection
+could not be reused, so every request on the route paid a fresh TCP and TLS
+handshake. The response is now framed as chunked, the way Caddy and nginx
+frame a body whose length is not known in advance; a body the origin never
+finished is missing its terminating chunk, and the client reports that as an
+error (#304).
+
+### 🛡️ Every answer is logged with the client the listener established
+
+A request that matched no site — and one refused before routing, for a bad
+`Host` or untrustworthy framing — was logged with the session peer. On a
+PROXY-protocol listener that peer is the local ingress hop, so scanners,
+misdirected `Host` values and typos all appeared as `127.0.0.1`, which is the
+one answer an operator cannot use. The client identity is now resolved once,
+before any answer can be produced; the trusted-proxy policy is global and the
+PROXY-protocol tunnel registry is per listener, so none of it needed a site
+(#281).
+
+### 🚫 A `reverse_proxy` inside `handle_errors` is refused instead of doing nothing
+
+The upstream exchange is a lifecycle step outside the handler chain in this
+build, and an error route has no route slot for it to read, so
+`handle_errors { reverse_proxy … }` compiled and then answered nothing — the
+silent no-op this repository refuses rather than accepts. It is now refused at
+load, with a message that says why and what to write instead (proxy in the site
+route and render its errors with `respond` or `file_server`). Everything else
+about the block is unchanged and ordinary: Caddy's directive order, `@name`
+matchers, the block's own `rewrite` patterns (#245).
+
+### 🚫 A bare `tls` is refused, as Caddy refuses it
+
+`example.com { tls }` — no argument, no block — used to load here as "turn
+automatic HTTPS on", while Caddy refuses it at parse time. That is the
+direction that matters: a file which is broken on the reference implementation
+started on this one, so it could not be checked there before being deployed
+here. The refusal names the spellings that do say something — `tls internal`,
+`tls <cert> <key>`, `tls <email>`, or a `tls { … }` block — and notes that a
+site address with a hostname already gets automatic HTTPS (#147).
+
+### 🌐 `remote_ip private_ranges` and `client_ip private_ranges` load
+
+Caddy's single-word spelling for its own list of private, loopback and
+link-local ranges was refused here at load — the same six prefixes
+`trusted_proxies static private_ranges` already expanded to, but only there.
+Both matchers now expand the keyword to the same list, from the one definition
+in `pingclair-core`, so a Caddyfile written with it loads and matches (#195).
+
+### 🧹 The old `VariableResolver` API is gone
+
+`pingclair-config` exported `VariableResolver` and `ResolvedVariable` for the
+pre-Caddyfile native DSL's `${req.header["X"]}` syntax, and nothing called
+either: the Caddyfile adapter and the runtime replacer are the whole story
+now, and the old resolver was also the last place that gave the retired
+`${remote_ip}` name a meaning. The module and both exports are removed (#201);
+a configuration still spellable today is unaffected.
+
+### 🧩 Caddy's shorthand placeholders resolve, and `*` no longer becomes the body
+
+The Caddyfile adapter read a leading `*` as "no matcher" but left the token in
+the argument list, so `respond * "hello"` answered with the single byte `*`
+and the text an operator wrote never reached the client. It also knew only the
+long placeholder names, so `{header.content-type}`, `{query.p}` and
+`{path.0}` — Caddy's shorthands, and what its own corpus fixture uses —
+resolved to nothing. Both are fixed: the wildcard token is consumed before any
+handler reads its data, and the shorthands resolve with Caddy's semantics
+(`{header.X}` joins repeated fields with a comma, `{query.X}` decodes and
+joins every occurrence, `{path.N}` is a segment 0-based from the left, and
+`{path.dir}`/`{path.file}` are `path.Split`'s halves) (#135).
+
+### ⏱️ An access record keeps sub-millisecond durations, and says which key is which
+
+`duration_ms` and `ttfb_ms` were whole milliseconds, so every request faster
+than a millisecond logged `0` and an average or percentile computed from the
+file could not tell "fast" from "instant" — or be compared with the reference
+implementation's seconds-as-float. Both are now fractional milliseconds with
+microsecond resolution, and a whole millisecond still renders exactly as
+before (`42`, not `42.000`), so an existing pipeline keeps parsing (#160).
+
+The record's keys are unchanged otherwise, and the reference page now carries
+the Caddy-to-here mapping table, including the two differences that were
+silent before: `duration` there is seconds, `duration_ms` here is
+milliseconds, and request-body bytes are not logged at all.
+
+### 🏷️ A static file's `ETag` is Caddy's, so a moved site keeps its validators
+
+The validator was a `<size hex>-<mtime hex>` pair where Caddy writes
+`"<mtime in base36>-<size in base36>"` (`calculateEtag`,
+`modules/caddyhttp/fileserver/staticfiles.go`, v2.11.7). The same unchanged
+file therefore had two different validators, and a site moved between the two
+servers invalidated every stored copy at once: every browser, CDN and reverse
+proxy re-downloaded the file, and every `If-None-Match` that would have
+answered `304` answered `200` instead. The derived tag now uses Caddy's
+spelling, so the stored validators survive the move (#158). Each
+representation still carries its own tag — a precompressed sidecar's ends
+`-sidecar-gzip`, a live-compressed body's `-gzip-<level>` — because their bytes
+differ, and a validators file beside the asset still wins.
+
+### 🏷️ An upstream's `Server` field line reaches the client unchanged
+
+A proxied response used to carry `Server: Pingclair` where the origin had sent
+its own product string, so monitoring that identifies an origin, or a mixed
+fleet comparing nodes, read something the operator never configured. Caddy
+sets its own `Server` before the handler chain and lets the proxy's copy of
+the upstream headers replace it, so a client sees the origin's value when
+there is one; this server now does the same on HTTP/1.1, HTTP/2 and HTTP/3,
+and still identifies itself on the responses it writes itself (#159). `Via`
+continues to name this intermediary — `1.1 Pingclair` — which is what the
+field records (RFC 9110 §7.6.3).
+
+### 📝 No `log` directive now means no access record
+
+This server wrote an access record for every request through its process log
+whether or not the configuration asked for one, which contradicted this
+release's own documentation ("Default: no access log") and Caddy, where a
+server writes access records only once one of its sites declares `log`. The
+record is now written where the configuration puts it: a site's own `log`
+destinations, and the process log only for a listener that has access logging
+at all, which is where an unmapped `Host` belongs (#213). The answer costs one
+bit per request, decided when the listener's routes are published.
+
+### 🚨 `handle_errors` is an ordinary route body
+
+A `handle_errors` block used to run its directives in the order they were
+written, so a `respond` written above a `header` answered before the header
+ever applied, and a named matcher defined inside the block (`@name …`) was
+refused. The block is now built like any other route body: directives run in
+Caddy's directive order, and its matchers belong to its own scope, seeing the
+site's definitions without leaking its own back out (#245).
+
+The block's own regular expressions come with it. A `rewrite` or a `header`
+search-and-replace inside `handle_errors` used to look its pattern up in the
+table of the route that *raised* the error — a different route's
+configuration — so the rewrite failed with a `500` and the replacement quietly
+did nothing, on every transport.
+
+A template that fails to render is now raised instead of answered inline, so
+the block's page renders for it. HTTP/1 and HTTP/2 wrote their own bare `500`
+and HTTP/3 returned from deep inside its terminal, both bypassing
+`handle_errors`; HTTP/3 keeps two more such exits — a template file that
+disappears between planning and serving, and a file server that was not built
+— inside its routing loop, where Caddy would have them.
+
+### 🧩 Two sites on one port, one per interface, are two sites
+
+Two site blocks on the same port were refused as duplicates whenever their
+names matched, even when each block named a different `bind` interface — the
+configuration Caddy accepts since caddyserver/caddy#4635, and the natural way
+to answer IPv4 and IPv6 clients with different content. The interface a site
+binds is now part of its identity, normalized so `bind ::1` and `bind [::1]`
+are one interface: the same name on the same port and the same interface is
+still refused, and a `bind`-restricted site that shares its port with a
+wildcard listener is still refused with the message that explains why (#279).
+
+### 🍪 Two `+Set-Cookie` lines in one `header` block are two cookies
+
+A block that added one field twice kept only the last value: the compiled shape
+was a map of name to a single value, so `header { +Set-Cookie "a=1" +Set-Cookie
+"b=2" }` sent one cookie while the same two operations written as two separate
+`header` directives sent both — one configuration, two answers. Add operations
+are now multi-valued from the Caddyfile AST through the compiled configuration
+to both transports, matching Caddy's `add` shape (a name holds a list of
+values) and RFC 6265 §3, which forbids folding cookies into one field line
+(#276). A JSON document that wrote a single string still loads unchanged;
+`set` and the `?` default stay single-valued, as they are in Caddy.
+
+### 🧭 An unknown `{placeholder}` stays exactly as written
+
+A name the replacer did not know was replaced with nothing, so a body carrying
+literal braces — JSON, JavaScript, documentation — lost them, and a
+`header_down` value such as `{some.unknown.thing}` emptied out. Caddy's
+replacer leaves an unknown name verbatim, which is what makes such a value
+usable as a debugging tool; the resolver now does the same, while a known
+placeholder that is merely unset still resolves to the empty string (#260).
+
+### 🛡️ A `basic_auth` realm is escaped as a quoted-string
+
+A realm containing a double quote was interpolated into the challenge
+verbatim, so `WWW-Authenticate: Basic realm="He said "hi" ok"` was three glued
+quoted-strings: a strict parser refused the challenge and a lenient one
+truncated the realm at the first inner quote (RFC 7617 §2 makes the value a
+`quoted-string`, whose `"` and `\` travel as `quoted-pair`s). The shared
+challenge builder now escapes both, so the bytes on the wire are one
+well-formed quoted-string on HTTP/1.1, HTTP/2 and HTTP/3 (#268).
+
+### 🧾 An HTTP/3 request field is validated as bytes, not repaired
+
+A field whose name was not a token was dropped with `from_utf8_lossy`, and its
+value was rebuilt the same lossy way — so `x bad: value` silently left the
+request and a legal obs-text value — a byte as ordinary as Latin-1 `0xE9` —
+reached the origin as the bytes of U+FFFD, while HTTP/1.1 and HTTP/2 refuse the
+first and forward the second verbatim (#236). Field names and values are now
+validated where the request is parsed: an invalid name or a value carrying
+NUL, CR or LF is a malformed request and resets the stream with
+`H3_MESSAGE_ERROR`, and obs-text is forwarded unchanged. The parsed header list
+carries `HeaderName` and `HeaderValue` end to end, so a repaired copy cannot
+come back by accident.
+
+### 📏 An HTTP/3 body that ends early is a protocol error, not a `400`
+
+A request declaring `Content-Length: 10` and sending five bytes was answered
+`400 Bad Request` on both the proxied and the FastCGI paths — an application's
+refusal, which reads to a client or intermediary exactly like a site that
+chose to say no. RFC 9114 §4.1.2 makes it a malformed request, so both paths
+now reset the stream with `H3_MESSAGE_ERROR`, the same signal the header
+framing path already sends (#237). On FastCGI the responder is aborted too, so
+PHP-FPM is never handed a truncated body with a full-length `CONTENT_LENGTH`.
+
+### 🧾 The built-in error body is one sentence on every transport
+
+One refusal had four bodies: a missing static file answered `404 Not Found` on
+HTTP/1.1 and HTTP/2 and an empty `404` on HTTP/3, while a body over
+`request_body max_size` answered nothing at all for a declared length on
+H1/H2, `413 Request Entity Too Large` when the same H1 request streamed, and
+the bare `Request Entity Too Large` on H3 (#252, #253). All three transports
+now write one sentence from one place: the status, its reason phrase, and the
+detail when this hop has one — the field a `431` names, per RFC 6585 §5.
+Caddy's built-in bodies are empty; this is a deliberate divergence, recorded
+here, because the alternative was a client that could not tell what was
+refused. A configured `error_page <status>` still supplies the body, and
+`handle_errors` still answers everything a handler raised.
+
+### 🧾 An oversized header block is refused before routing on every transport
+
+A request whose header block exceeded `limits { max_header_bytes }` was
+answered differently by each transport. On HTTP/1.1 and HTTP/2 the site's
+`handle_errors` rendered the 431, so its page replaced the one sentence naming
+the field that was too large; on HTTP/3 the check ran after route resolution,
+so the same request to a path that matched no route was answered `404` and
+site variables and matchers ran on headers that should already have been
+refused (#288, #229). All three transports now enforce the limit before any
+matcher runs, answer the refusal directly rather than through `handle_errors`,
+and name the field when one field alone is at fault. A configured
+`error_page 431` still supplies the body, as it already did.
+
+### 🃏 A manual wildcard certificate serves the names beneath it
+
+A site written `https://*.sandbox.test { tls cert.pem key.pem }` refused a
+handshake for `other.sandbox.test` with `unrecognized_name`, even though the
+certificate covered that name — the manual table was read by exact spelling,
+while the same site written with `tls internal` answered, because the internal
+authority already matched wildcards (#285). Manual pairs now follow the same
+one-label wildcard rule as issuance and the internal authority, on TCP and
+HTTP/3, at startup and reload. A top-level `client_auth { … }` is refused with
+the scope it belongs to instead of "`client_auth` looks like a second site".
+
+### 🛡️ A glob expansion is bounded by the entries it reads
+
+A `file` matcher's glob — `try_files /cache/*` — read and sorted a directory in
+full before its 1,024-result ceiling could stop anything, and `**` walked a
+whole tree for a pattern that matched nothing, so the work one request could
+ask for was bounded by the filesystem rather than by the configuration (#240).
+The walk now examines at most 16,384 directory entries per evaluation: far
+above any plausible configuration, and far below a directory that would make
+one request expensive. Names already collected are still followed, so a
+truncated read costs matches at the end of a directory, not the ones it found.
+
+### 🧮 The static caches are sized from the machine
+
+The file server's caches had fixed ceilings — 64 MiB of compressed bodies,
+16 MiB of raw ones, 4,096 metadata entries — and the keepalive pools may
+reserve 512 idle descriptors per connector per worker. Those numbers are now
+what they always were *at most*: at startup the process sizes the caches from
+the memory it may actually use (a cgroup limit first, then the machine's
+available memory) and logs the values it chose, so a 512 MiB container keeps a
+sixteenth of what a 16 GiB host does instead of the same fixed block. The
+descriptor side already warned when the pools alone can exceed
+`RLIMIT_NOFILE`; both halves now belong to one sizing policy (#33).
+
+### 🚫 A directory listing answers `GET` and `HEAD` only
+
+With `browse` on and no index file, a `POST` to the directory received the
+`200` listing: the browse branch returned before the method check that
+answers `405` for a file. A listing is this server's representation of the
+directory, so it is served to the same methods a file is, and the refusal
+carries `Allow: GET, HEAD` (#242). A path that does not exist is still `404`.
+
+### 📏 A `HEAD` describes the response its `GET` would receive
+
+With `encode` configured, a `HEAD` forwarded the origin's identity fields while
+the matching `GET` received compressed bytes — a client that sized its
+download from the `HEAD` was told the identity length and then read a shorter,
+encoded body (#264). A `HEAD` now announces the negotiated coding, drops the
+identity `Content-Length` (the compressed length is only known once the body
+has been produced, and RFC 9110 §8.6 makes the field the content's length),
+and carries the same weakened validator as the `GET`. Caddy 2.11.7 announces
+the coding too but reports the length of a gzip stream over an *empty* body,
+which describes neither representation; this release omits the field instead.
+
+### 🗜️ A range over a precompressed sidecar ranges over the sidecar
+
+A client that accepted `gzip` and sent a `Range` was answered with the identity
+representation — identity bytes, identity `Content-Range`, identity `ETag` —
+while the same client's full request received the sidecar, because any parsed
+range skipped the precompressed branch entirely (#254). The sidecar *is* the
+representation the client negotiated, so its bytes are what a range applies
+to, which is what Caddy serves. `If-Range` and `If-None-Match` compare against
+the sidecar's own tag for that shape, and a range whose `If-Range` does not
+hold is ignored in favour of the whole sidecar. On-the-fly compression still
+never applies to a range response: a compressed stream cannot start at an
+arbitrary offset.
+
+### 🏷️ A configured `ETag` is the validator, not just a label
+
+A site that set `ETag` with the `header` directive sent that tag to every
+client, but `If-None-Match` and `If-Range` were still compared against the file
+server's own size-and-mtime tag — so revalidating with the tag the client had
+been given answered `200`, while a tag nobody had ever been sent answered `304`
+(#265). Preconditions now read back the tag the site's own header policy would
+put on the response and use it as the representation's validator, which is what
+RFC 9110 §13.1.2 asks for: one representation, one tag on the wire, and the tag
+the client was given is the one that decides.
+
+### 🗜️ A compressed response stays decodable when trailers end it
+
+An HTTP/2 origin can end a response with trailing HEADERS, announced or not,
+and Pingora writes that task as the end of the message instead of the `Done`
+task the response encoder used to wait for. The gzip or zstd trailer was never
+written, so the client held compressed bytes it could not decode and the whole
+response was lost (#225). The encoder now finalizes on the trailer task as
+well. Trailer fields cannot share the final body chunk through this
+dependency's hook, so a compressed response drops them: the body decodes,
+while the same response without `encode` keeps its trailers.
+
+### 🧵 `php_fastcgi` measures a body that did not declare its length
+
+A request to a `php_fastcgi` route was answered `411 Length Required` whenever
+it carried no `Content-Length` header: a chunked upload, and a bodyless `POST`
+or `DELETE`, which RFC 9112 §6.3 says simply has no body. PHP-FPM does read
+exactly `CONTENT_LENGTH` bytes from STDIN, so the proxy now reads a lengthless
+body itself — up to the route's `request_buffers`, and this server's own
+buffering ceiling when the route set none — and sends the measured length,
+while a request that says nothing about a body arrives as `CONTENT_LENGTH: 0`.
+A lengthless body larger than the ceiling is refused with `413 Payload Too
+Large` instead of reaching php-fpm as a body the responder would read as empty.
+The same policy holds on HTTP/1.1, HTTP/2, and HTTP/3 (#248).
+
 ### 🛑 HTTP/3 cancellation releases idle upstream requests
 
 Cancelling an HTTP/3 request now releases its upstream exchange even when the
@@ -2600,27 +2942,29 @@ Found before the release and deliberately left for the next version, because
 none of them widens what a configuration exposes. Each has an open issue with a
 reproduction; the workaround, where there is one, is in the issue.
 
-- **HTTP/1.1 holds a response that declares its length until the body ends**, so
-  an event stream sent with `Content-Length` arrives in one piece at the end
-  (#247). Streams sent chunked, and every HTTP/2 and HTTP/3 response, are not
-  affected.
-- **Proxy compression may end a gzip body early** when an HTTP/2 upstream sends
-  trailers it did not announce (#225).
-- **An upstream response that announces `Trailer` is answered `502`** (#273).
-- **An HTTP/1.0 client can receive chunked framing** from a proxied route whose
-  upstream sends no length (#277).
 - **After an upgrade, a client that half-closes ends the tunnel**, and bytes the
-  backend still had to send are lost (#274).
-- **An upstream that fails before its first body byte** leaves an HTTP/2 client
-  with a stream reset rather than a `502` (#249).
-- **A configured `ETag` header is advertised but not used for revalidation**
-  (#265).
-- **An empty path segment (`/a//b`) is collapsed** before forwarding (#275).
-- **`php_fastcgi` answers `411`** to a chunked or bodyless request (#248).
+  backend still had to send are lost (#274). The dependency's upgrade loop
+  ends the whole exchange when the request side finishes, and it offers an
+  embedder no hook to keep the other direction open.
+- **The HTTP/3 path does not use the response cache**: a route with a `cache`
+  block answers from the store over HTTP/1.1 and HTTP/2, and reaches the origin
+  over HTTP/3. The documentation's `cache` page states it, an in-process H3
+  test pins it, and wiring the cache in is a 0.3 feature (#205, #297).
+- **An upstream `103 Early Hints` reaches only HTTP/1.1 clients**: the HTTP/2
+  path drops interim responses inside `pingora-core 0.9.0` (its H2 writer
+  returns early with a comment that predates `h2`'s
+  `SendResponse::send_informational`), and the HTTP/3 path skips them by design
+  (#116, #207). The H1 half is pinned by an integration test, and the H2 half
+  by an ignored one that is ready to enable when the dependency forwards it.
 - **HTTP/3 transport-parameter checks** fail 18 of 77 h3spec cases; the fix
   belongs in the QUIC library (#282).
 - **A wildcard site's manual certificate** is not served for the names it
   covers over TCP; `tls internal` is not affected (#285).
+- **A request's trailer fields are discarded on HTTP/1**, so an `aws-chunked`
+  upload's checksum never reaches the origin while the client is answered
+  normally. The dependency's HTTP/1 body reader parses the trailer section to
+  find the end of the body and does not surface the fields; its own source
+  marks proper trailer handling as a TODO (#257).
 
 ### ⚠️ Breaking
 
@@ -2849,8 +3193,8 @@ reproduction; the workaround, where there is one, is in the issue.
 
 ### 🔄 Changed
 
-- 🦀 **Building from source now requires Rust 1.98 instead of 1.97.** The
-  workspace's `rust-version` is 1.98 and CI pins 1.98.1, so the toolchain is the
+- 🦀 **Building from source now requires Rust 1.99 instead of 1.97.** The
+  workspace's `rust-version` is 1.99 and CI pins 1.99.0, so the toolchain is the
   same one the tests ran under. `cargo install` picks the toolchain up from the
   manifest; anyone on a pinned 1.97 needs `rustup update` first.
 

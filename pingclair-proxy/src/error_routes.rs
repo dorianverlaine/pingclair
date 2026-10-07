@@ -15,10 +15,12 @@
 //! route, is empty. H1/H2 then sent the bare error text and HTTP/3 answered
 //! `503 File Server Unavailable`, whatever the error route said.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use pingclair_core::config::{HandlerConfig, ServerConfig};
 use pingclair_core::server::MatcherPrecompile;
+use regex::Regex;
 
 /// 🚨 One error route, ready to run on either transport.
 pub(crate) struct PreparedErrorRoute {
@@ -30,6 +32,13 @@ pub(crate) struct PreparedErrorRoute {
     /// 📂 The file server a `file_server` inside the route serves from, built
     /// from that handler's own configuration — root included.
     pub(crate) file_server: Option<Arc<pingclair_static::FileServer>>,
+    /// ⚡ This route's own compiled regular expressions, looked up by pattern.
+    ///
+    /// 🚨 A `rewrite` inside `handle_errors` used to look its pattern up in
+    /// the table of the route that *raised* the error — a different route's
+    /// configuration, which does not hold it, so the rewrite failed exactly
+    /// when the error page was being built (#245).
+    pub(crate) regexes: HashMap<String, Arc<Regex>>,
 }
 
 /// 🚨 Prepares every error route of one server, index-aligned with
@@ -42,9 +51,12 @@ pub(crate) fn prepare(site: &ServerConfig) -> Arc<[PreparedErrorRoute]> {
             let pipeline = HandlerConfig::Pipeline {
                 handlers: route.handlers.clone(),
             };
+            let mut regexes = HashMap::new();
+            crate::server::collect_route_regexes(&pipeline, &mut regexes);
             PreparedErrorRoute {
                 file_server: crate::server::build_file_server(&pipeline, site),
                 precompile: pingclair_core::server::precompile_handler_list(&route.handlers),
+                regexes,
                 pipeline,
             }
         })

@@ -116,6 +116,17 @@ mod error_routes;
 #[path = "h3_end_to_end/uri_placeholders.rs"]
 mod uri_placeholders;
 
+// 📏 A body that ends before its declared length is malformed.
+#[path = "h3_end_to_end/body_length.rs"]
+mod body_length;
+
+// 🧊 HTTP/3 does not use the response cache, which the docs state.
+#[path = "h3_end_to_end/cache_parity.rs"]
+mod cache_parity;
+
+#[path = "h3_end_to_end/server_header.rs"]
+mod server_header;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {

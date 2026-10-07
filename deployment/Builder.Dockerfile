@@ -70,7 +70,7 @@ RUN mkdir -p /workspace /cache && chmod 777 /cache
 # against a toolchain that silently never arrived.
 RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-connrefused -sSf \
         https://sh.rustup.rs -o /tmp/rustup-init.sh \
-    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.98.1 \
+    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 \
         -c rustfmt -c clippy \
     && rm -f /tmp/rustup-init.sh \
     && cargo --version \

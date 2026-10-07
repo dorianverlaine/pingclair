@@ -1141,7 +1141,7 @@ mod fail_closed_tests {
         );
         assert_eq!(
             proxy.headers_down_add.get("X-Add"),
-            Some(&"added".to_string())
+            Some(&vec!["added".to_string()])
         );
         assert_eq!(proxy.headers_down_remove, vec!["X-Remove".to_string()]);
         assert_eq!(
@@ -2651,6 +2651,79 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🌐 `remote_ip private_ranges` and `client_ip private_ranges` expand to
+    /// Caddy's own six prefixes at load time — the same list
+    /// `trusted_proxies static private_ranges` uses (#195).
+    #[test]
+    fn ip_matchers_expand_private_ranges() {
+        for directive in ["remote_ip", "client_ip"] {
+            let config = crate::compile(&format!(
+                "example.com {{\n    @local {directive} private_ranges\n    respond @local \"local\"\n}}"
+            ))
+            .unwrap_or_else(|error| panic!("`{directive} private_ranges` must load: {error}"));
+            let matcher = config.servers[0]
+                .routes
+                .iter()
+                .find_map(|route| route.matcher.as_ref())
+                .expect("the fixture route has a matcher");
+            let json = serde_json::to_value(matcher).expect("a matcher serializes");
+            let expanded: Vec<&str> = json[directive]
+                .as_array()
+                .unwrap_or_else(|| panic!("`{directive}` must carry the ranges: {json}"))
+                .iter()
+                .map(|range| range.as_str().expect("a range is a string"))
+                .collect();
+            assert_eq!(
+                expanded,
+                pingclair_core::config::PRIVATE_RANGES.to_vec(),
+                "`{directive} private_ranges` must expand to Caddy's list, in its order"
+            );
+        }
+    }
+
+    /// 🚫 A bare `tls` names nothing, and Caddy refuses it; this server used to
+    /// accept it as "automatic HTTPS on", which meant a file Caddy rejects
+    /// would start here (#147).
+    #[test]
+    fn a_bare_site_tls_is_refused_with_the_spellings_that_work() {
+        let error = crate::compile("example.com {\n    tls\n    respond \"hi\"\n}")
+            .expect_err("a bare `tls` must not load");
+        let message = error.to_string();
+        for expected in [
+            "names nothing",
+            "tls internal",
+            "tls <cert_file> <key_file>",
+            "tls { … }",
+            "already gets automatic HTTPS",
+        ] {
+            assert!(
+                message.contains(expected),
+                "missing {expected:?} in: {message}"
+            );
+        }
+
+        // 📌 The spellings that do say something still load, so the refusal is
+        // about the empty form rather than about `tls` itself.
+        for accepted in [
+            "example.com {\n    tls internal\n    respond \"hi\"\n}",
+            "example.com {\n    tls off\n    respond \"hi\"\n}",
+        ] {
+            crate::compile(accepted)
+                .unwrap_or_else(|error| panic!("`{accepted}` must load: {error}"));
+        }
+
+        // 🚧 And a `tls` block option this build has not implemented is still
+        // refused by name, which is the other half of #147's `tls` row.
+        let unimplemented = crate::compile(
+            "example.com {\n    tls {\n        protocols tls1.3\n    }\n    respond \"hi\"\n}",
+        )
+        .expect_err("an unimplemented TLS option must not load");
+        assert!(
+            unimplemented.to_string().contains("protocols"),
+            "the refusal must name the option: {unimplemented}"
+        );
+    }
+
     /// 🧭 `private_ranges` is a keyword inside `static` rather than a module of
     /// its own, and it expands to Caddy's own six prefixes — `127.0.0.1/8` and
     /// `::1` included, because loopback counts as private upstream.
@@ -2831,7 +2904,10 @@ mod fail_closed_tests {
         let route = &config.servers[0].routes[0];
         let found = handlers_of(&route.handler).into_iter().any(|handler| {
             matches!(handler, HandlerConfig::Headers { add, set, .. }
-                if add.get("X-Foo").is_some_and(|value| value == "bar") && set.is_empty())
+                if add
+                    .get("X-Foo")
+                    .is_some_and(|values| values.iter().any(|value| value == "bar"))
+                    && set.is_empty())
         });
         assert!(
             found,
@@ -2975,7 +3051,9 @@ mod fail_closed_tests {
             } = handler
             {
                 saw_set |= set.get("Denis").is_some_and(|value| value == "Ritchie");
-                saw_add |= add.get("Edsger").is_some_and(|value| value == "Dijkstra");
+                saw_add |= add
+                    .get("Edsger")
+                    .is_some_and(|values| values.iter().any(|value| value == "Dijkstra"));
                 saw_remove |= remove.iter().any(|name| name == "Wolfram");
             }
         }
@@ -3009,7 +3087,10 @@ mod fail_closed_tests {
         let route = &config.servers[0].routes[0];
         let found = handlers_of(&route.handler).into_iter().any(|handler| {
             matches!(handler, HandlerConfig::RequestHeaders { add, replace, .. }
-                if add.get("Foo").is_some_and(|value| value == "bar") && replace.is_empty())
+                if add
+                    .get("Foo")
+                    .is_some_and(|values| values.iter().any(|value| value == "bar"))
+                    && replace.is_empty())
         });
         assert!(found, "`+Foo bar baz` appends `bar` and ignores `baz`");
     }
@@ -4051,6 +4132,24 @@ mod p3_syntax_tests {
         assert!(
             error.to_string().contains("looks like a second site")
                 && error.to_string().contains("{ }"),
+            "got {error}"
+        );
+    }
+
+    /// 🪪 A top-level TLS option is named as one, not as a second site.
+    ///
+    /// `client_auth { … }` belongs inside `tls { … }`; written at the top of
+    /// a site it is not a directive, and the second-site message sent the
+    /// operator looking for a missing brace (#285).
+    #[test]
+    fn a_top_level_tls_option_names_its_scope() {
+        let error = compile("example.com {\n\tclient_auth {\n\t\tmode require_and_verify\n\t}\n}")
+            .expect_err("a top-level client_auth must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("`client_auth` is a `tls` option")
+                && error.to_string().contains("tls { … }"),
             "got {error}"
         );
     }

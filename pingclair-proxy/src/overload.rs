@@ -145,7 +145,7 @@ impl RouteProtection {
 
         let pending = self
             .pending
-            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
+            .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
                 (current < self.overload.max_pending).then_some(current + 1)
             })
             .map_err(|_| {

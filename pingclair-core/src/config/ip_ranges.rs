@@ -19,6 +19,23 @@ use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::net::IpAddr;
 
+/// 🌐 The ranges behind Caddy's `private_ranges` keyword, in its own order
+/// (`internal.PrivateRangesCIDR`, `internal/ranges.go`).
+///
+/// Defined once because three spellings expand to it: `trusted_proxies static
+/// private_ranges`, `remote_ip private_ranges` and `client_ip private_ranges`.
+/// `127.0.0.1/8` and `::1` are in the list because loopback counts as a
+/// private upstream, which is what makes the single-word spelling the ordinary
+/// one for a server behind a local reverse proxy.
+pub const PRIVATE_RANGES: [&str; 6] = [
+    "192.168.0.0/16",
+    "172.16.0.0/12",
+    "10.0.0.0/8",
+    "127.0.0.1/8",
+    "fd00::/8",
+    "::1",
+];
+
 /// 🌐 A parsed list of IP addresses and CIDR ranges.
 ///
 /// The original spellings are kept beside the parsed networks so the value
