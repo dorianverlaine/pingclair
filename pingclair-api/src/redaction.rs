@@ -17,9 +17,13 @@
 //!   like a password, a basic-auth hash. These are recognised by the name
 //!   they are stored under ([`is_credential_name`]), wherever it appears.
 //!
-//! A masked value is replaced by [`SecretString::REDACTED`], and a document
-//! carrying that placeholder at a secret position is refused on the way back
-//! in ([`carries_placeholder`]), so a masked export cannot be loaded as-is.
+//! A masked value is replaced by [`SecretString::REDACTED`]. A masked export
+//! posted back is the supported read-modify-write cycle: every placeholder is
+//! restored from the running document at the same secret position
+//! ([`restore_placeholders`]), so an edit beside a secret does not have to
+//! re-type it. A placeholder the running document cannot satisfy — a newly
+//! added provider, a field that never held a secret — is still refused by
+//! [`carries_placeholder`].
 //!
 //! 📌 Off the request path: this runs once per admin read or write and clones
 //! the document, which is the clear shape rather than the fast one.
@@ -79,6 +83,93 @@ pub(crate) fn carries_placeholder(document: &Value) -> bool {
         found |= secret.as_str() == Some(SecretString::REDACTED);
     });
     found
+}
+
+/// ♻️ Puts back the secrets a masked read removed, at the positions they were
+/// removed from.
+///
+/// `incoming` is the document about to be loaded and `running` the one serving
+/// now. Every secret position whose incoming value is the placeholder takes the
+/// running document's value at the same position, so the read-modify-write
+/// cycle `GET /config` → edit → `POST /load` works without the client ever
+/// holding the secret. Restoration never invents a value: a placeholder with no
+/// running secret behind it stays a placeholder, and [`carries_placeholder`]
+/// then refuses the document.
+pub(crate) fn restore_placeholders(incoming: &Value, running: &Value) -> Value {
+    let mut restored = incoming.clone();
+    restore_each_secret(&mut restored, running);
+    restored
+}
+
+/// 🧭 Mirrors [`each_secret`], walking both documents together so every
+/// placeholder can be answered by the running value at the same position.
+fn restore_each_secret(node: &mut Value, running: &Value) {
+    match node {
+        Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                if is_credential_name(key) {
+                    restore_strings(value, running.get(key));
+                    continue;
+                }
+                if DNS_PROVIDER_KEYS.contains(&key.as_str())
+                    && let Some(arguments) = value.get_mut("arguments")
+                {
+                    restore_strings(
+                        arguments,
+                        running
+                            .get(key)
+                            .and_then(|provider| provider.get("arguments")),
+                    );
+                }
+                restore_each_secret(value, running.get(key).unwrap_or(&Value::Null));
+            }
+        }
+        Value::Array(items) => {
+            let running_items = running.as_array();
+            for (index, item) in items.iter_mut().enumerate() {
+                restore_each_secret(
+                    item,
+                    running_items
+                        .and_then(|array| array.get(index))
+                        .unwrap_or(&Value::Null),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 🔎 Replaces a placeholder with the running value, for one string or each
+/// string of an array, mirroring [`each_string`].
+fn restore_strings(value: &mut Value, running: Option<&Value>) {
+    match value {
+        Value::String(text) if text == SecretString::REDACTED => {
+            if let Some(real) = real_secret(running) {
+                *text = real.to_owned();
+            }
+        }
+        Value::Array(items) => {
+            let running_items = running.and_then(Value::as_array);
+            for (index, item) in items.iter_mut().enumerate() {
+                if let Value::String(text) = item
+                    && text == SecretString::REDACTED
+                    && let Some(real) =
+                        real_secret(running_items.and_then(|array| array.get(index)))
+                {
+                    *text = real.to_owned();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 🔐 The running document's value at a secret position, when it is a real
+/// secret rather than a missing, empty, or already-masked one.
+fn real_secret(running: Option<&Value>) -> Option<&str> {
+    running
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty() && *text != SecretString::REDACTED)
 }
 
 /// 🧭 Calls `visit` on every non-empty string in a secret position.
@@ -218,6 +309,75 @@ mod tests {
                 "health_headers": { "X-Auth-Token": ["[redacted]", "[redacted]"] },
                 "accounts": [{ "username": "admin", "password": "[redacted]" }]
             })
+        );
+    }
+
+    /// ♻️ The read-modify-write cycle an operator performs: a masked export,
+    /// an edit beside the secrets, a load. Every placeholder keeps the running
+    /// secret at its own position.
+    #[test]
+    fn test_a_masked_export_round_trips_with_its_secrets() {
+        let running = serde_json::json!({
+            "admin": { "api_key": "real-admin-key" },
+            "global": { "dns": { "name": "cloudflare", "arguments": ["real-token"] } },
+            "servers": [{
+                "tls": { "dns_challenge": {
+                    "provider": { "name": "cloudflare", "arguments": ["site-token"] }
+                } }
+            }],
+            "headers_up": {
+                "Authorization": "Bearer real",
+                "X-Plain": "kept",
+                "X-Auth-Token": ["first", "second"]
+            },
+            "debug": false
+        });
+        let masked = redacted(&running);
+        assert!(carries_placeholder(&masked), "the fixture really masks");
+
+        let mut edited = masked;
+        edited["debug"] = serde_json::json!(true);
+        let restored = restore_placeholders(&edited, &running);
+        assert_eq!(
+            (
+                restored["admin"]["api_key"].clone(),
+                restored["global"]["dns"]["arguments"].clone(),
+                restored["servers"][0]["tls"]["dns_challenge"]["provider"]["arguments"].clone(),
+                restored["headers_up"]["Authorization"].clone(),
+                restored["headers_up"]["X-Auth-Token"].clone(),
+                restored["headers_up"]["X-Plain"].clone(),
+                restored["debug"].clone(),
+            ),
+            (
+                serde_json::json!("real-admin-key"),
+                serde_json::json!(["real-token"]),
+                serde_json::json!(["site-token"]),
+                serde_json::json!("Bearer real"),
+                serde_json::json!(["first", "second"]),
+                serde_json::json!("kept"),
+                serde_json::json!(true),
+            )
+        );
+        assert!(
+            !carries_placeholder(&restored),
+            "every placeholder found its running secret: {restored}"
+        );
+    }
+
+    /// 🚫 Restoration never invents a secret: a placeholder the running
+    /// document cannot satisfy stays refused, so the literal placeholder can
+    /// never be installed as a credential.
+    #[test]
+    fn test_a_placeholder_without_a_running_secret_stays_refused() {
+        let running = serde_json::json!({ "servers": [] });
+        let incoming = serde_json::json!({
+            "admin": { "api_key": "[redacted]" },
+            "global": { "dns": { "name": "cloudflare", "arguments": ["[redacted]"] } }
+        });
+        let restored = restore_placeholders(&incoming, &running);
+        assert!(
+            carries_placeholder(&restored),
+            "nothing to restore means the refusal stands: {restored}"
         );
     }
 }
