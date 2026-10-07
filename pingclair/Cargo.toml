@@ -8,6 +8,19 @@ repository.workspace = true
 rust-version.workspace = true
 description = "A modern, high-performance web server built on Pingora"
 
+categories = [
+    "network-programming",
+    "web-programming::http-server",
+]
+
+keywords = [
+    "proxy",
+    "reverse-proxy",
+    "web-server",
+    "http",
+    "pingora",
+]
+
 [[bin]]
 name = "pingclair"
 path = "src/main.rs"

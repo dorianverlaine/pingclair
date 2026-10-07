@@ -62,6 +62,21 @@ fn set_mtime(path: &std::path::Path, at: SystemTime) {
         .unwrap();
 }
 
+/// 🕰️ The modification time the filesystem actually stored, in nanoseconds.
+///
+/// Read back rather than assumed: a coarser timestamp granularity than the
+/// caller asked for is the one platform difference that can turn two writes
+/// into one validator (#184).
+fn mtime_nanos(path: &std::path::Path) -> u128 {
+    std::fs::metadata(path)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+}
+
 /// 🏷️ RFC 9110 §8.8.1: the gzip sidecar and the plain file are different
 /// bytes, so one strong tag cannot describe both.
 #[tokio::test]
@@ -117,6 +132,13 @@ async fn test_file_server_etag_is_caddys_base36_pair() {
 /// 🕰️ Two same-size edits inside one second must not share a tag. With a
 /// whole-second mtime they did, and a client resuming a download would have
 /// spliced bytes from two different files together.
+///
+/// 📌 The assertion is against the mtimes the filesystem actually stored, read
+/// back between the two requests: a container filesystem with coarse timestamp
+/// granularity can land both writes on one instant, and two identical
+/// validators are then the *correct* answer — the unit test in
+/// `pingclair-static` is where the nanosecond property itself is pinned, and
+/// this one is about the file server noticing the change (#184).
 #[tokio::test]
 async fn test_file_server_etag_changes_within_one_second() {
     let root = tempfile::tempdir().unwrap();
@@ -131,13 +153,29 @@ async fn test_file_server_etag_changes_within_one_second() {
     let mut server = sidecar_site(root.path().to_str().unwrap());
     assert!(server.wait_until_ready().await, "server failed to start");
     let before = etag_of(&server, "/f.txt", "identity").await.0;
+    let first_mtime = mtime_nanos(&path);
 
     std::fs::write(&path, "version-B").unwrap();
     set_mtime(&path, at(600));
+    let second_mtime = mtime_nanos(&path);
     let after = etag_of(&server, "/f.txt", "identity").await.0;
     server.stop();
 
-    assert_ne!(before, after, "a same-second, same-size edit kept its ETag");
+    if first_mtime == second_mtime {
+        // 🕰️ The filesystem could not tell the two instants apart: identical
+        // validators are the correct answer, and the property this test is
+        // about cannot be observed here. Say so rather than passing quietly.
+        eprintln!(
+            "note: this filesystem stored both writes at mtime {first_mtime}; \
+             the same-second property is pinned by the unit test instead"
+        );
+        assert_eq!(before, after);
+    } else {
+        assert_ne!(
+            before, after,
+            "a same-second, same-size edit kept its ETag (mtime {first_mtime} -> {second_mtime})"
+        );
+    }
 }
 
 /// 🪟 RFC 9110 §13.1.5: `If-Range` decides whether `Range` applies. A client
