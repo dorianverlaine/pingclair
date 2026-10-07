@@ -38,6 +38,17 @@ before any answer can be produced; the trusted-proxy policy is global and the
 PROXY-protocol tunnel registry is per listener, so none of it needed a site
 (#281).
 
+### 🚫 A `reverse_proxy` inside `handle_errors` is refused instead of doing nothing
+
+The upstream exchange is a lifecycle step outside the handler chain in this
+build, and an error route has no route slot for it to read, so
+`handle_errors { reverse_proxy … }` compiled and then answered nothing — the
+silent no-op this repository refuses rather than accepts. It is now refused at
+load, with a message that says why and what to write instead (proxy in the site
+route and render its errors with `respond` or `file_server`). Everything else
+about the block is unchanged and ordinary: Caddy's directive order, `@name`
+matchers, the block's own `rewrite` patterns (#245).
+
 ### 🚫 A bare `tls` is refused, as Caddy refuses it
 
 `example.com { tls }` — no argument, no block — used to load here as "turn

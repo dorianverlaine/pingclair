@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "pingclair",
     "pingclair-fastcgi",
@@ -22,6 +22,7 @@ edition = "2024"
 authors = ["Dorian Verlaine <dorian@pingclair.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/dorianverlaine/pingclair"
+homepage = "https://pingclair.com"
 rust-version = "1.99"
 
 [workspace.lints.rust]
