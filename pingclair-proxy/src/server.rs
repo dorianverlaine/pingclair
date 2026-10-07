@@ -1266,12 +1266,20 @@ impl ProxyState {
                             tls_policy,
                         ) {
                             Ok(peer_template) => {
-                                let host = hc_config.host.clone().unwrap_or_else(|| {
-                                    upstream
-                                        .ext
-                                        .get::<HostName>()
-                                        .map(|host| host.0.clone())
-                                        .unwrap_or_else(|| upstream.addr.to_string())
+                                // 🏷️ The probe's Host is the authority it
+                                // dialled, port included when it is not the
+                                // scheme's default; the operator's explicit
+                                // `health_host` still wins.
+                                let host = hc_config.host.clone().unwrap_or_else(|| match upstream
+                                    .ext
+                                    .get::<HostName>()
+                                {
+                                    Some(name) => crate::upstream::authority(
+                                        &name.0,
+                                        &upstream.addr,
+                                        upstream.ext.get::<Scheme>().copied(),
+                                    ),
+                                    None => upstream.addr.to_string(),
                                 });
                                 load_balancer.set_health_check(
                                     crate::health_check::HealthCheckConfig {

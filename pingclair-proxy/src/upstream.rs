@@ -32,6 +32,39 @@ pub enum Scheme {
 #[derive(Debug, Clone)]
 pub struct HostName(pub String);
 
+/// 🏷️ The authority to write in `Host` for a backend reached at `address`.
+///
+/// The configured hostname carries no port, and a backend keyed on
+/// `localhost:57532` answered every portless probe with 404 and was retired
+/// while it was healthy (#271). The scheme's default port is the one
+/// exception — `example.com` is the canonical authority of `example.com:443`,
+/// and some frameworks key their vhosts on that spelling — and an IPv6
+/// literal gains its brackets before the port.
+pub(crate) fn authority(
+    host: &str,
+    address: &pingora_core::protocols::l4::socket::SocketAddr,
+    scheme: Option<Scheme>,
+) -> String {
+    let Some(inet) = address.as_inet() else {
+        // 🔌 A Unix-socket backend has no port to add.
+        return host.to_string();
+    };
+    let default_port = match scheme.unwrap_or(Scheme::Http) {
+        Scheme::Https | Scheme::H2 => 443,
+        Scheme::Http | Scheme::H2c => 80,
+    };
+    if inet.port() == default_port {
+        return host.to_string();
+    }
+    if host.starts_with('[') {
+        format!("{host}:{}", inet.port())
+    } else if host.contains(':') {
+        format!("[{host}]:{}", inet.port())
+    } else {
+        format!("{host}:{}", inet.port())
+    }
+}
+
 // MARK: - Resolver
 
 /// 🔍 Name resolution behind a trait so the refresher can be driven by a
