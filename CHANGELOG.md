@@ -27,6 +27,17 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🛡️ Every answer is logged with the client the listener established
+
+A request that matched no site — and one refused before routing, for a bad
+`Host` or untrustworthy framing — was logged with the session peer. On a
+PROXY-protocol listener that peer is the local ingress hop, so scanners,
+misdirected `Host` values and typos all appeared as `127.0.0.1`, which is the
+one answer an operator cannot use. The client identity is now resolved once,
+before any answer can be produced; the trusted-proxy policy is global and the
+PROXY-protocol tunnel registry is per listener, so none of it needed a site
+(#281).
+
 ### 🚨 `handle_errors` is an ordinary route body
 
 A `handle_errors` block used to run its directives in the order they were

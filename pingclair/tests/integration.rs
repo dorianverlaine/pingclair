@@ -1045,6 +1045,20 @@ async fn proxy_protocol_request(
     path: &str,
     extra_headers: &[(&str, &str)],
 ) -> std::io::Result<Vec<u8>> {
+    let host = address.to_string();
+    proxy_protocol_request_to_host(address, source_ip, prefix, path, &host, extra_headers).await
+}
+
+/// 🧭 The same exchange with an explicit `Host`, for a request that must reach
+/// a named site or deliberately miss every one of them.
+async fn proxy_protocol_request_to_host(
+    address: SocketAddr,
+    source_ip: std::net::IpAddr,
+    prefix: &[u8],
+    path: &str,
+    host: &str,
+    extra_headers: &[(&str, &str)],
+) -> std::io::Result<Vec<u8>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let socket = match source_ip {
@@ -1054,7 +1068,7 @@ async fn proxy_protocol_request(
     socket.bind(SocketAddr::new(source_ip, 0))?;
     let mut stream = socket.connect(address).await?;
     let mut request = prefix.to_vec();
-    request.extend_from_slice(format!("GET {path} HTTP/1.1\r\nHost: {address}\r\n").as_bytes());
+    request.extend_from_slice(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n").as_bytes());
     for (name, value) in extra_headers {
         request.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
     }
@@ -10444,6 +10458,119 @@ async fn test_proxy_protocol_and_forwarded_share_verified_identity() {
     .await
     .unwrap();
     assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+}
+
+/// 🛡️ A `Host` that matches no site is logged with the client the listener
+/// established, not with the ingress hop the PROXY-protocol header arrived
+/// from (#281).
+///
+/// The identity used to be resolved after routing, so every answer produced
+/// before a site matched — a refused `Host`, refused framing, or this
+/// unmatched one — fell back to the session peer. On a PROXY-protocol
+/// listener that peer is the local ingress hop, which turns the traffic an
+/// operator most wants to see into `127.0.0.1`.
+#[tokio::test]
+async fn test_an_unmatched_host_is_logged_with_the_proxy_protocol_client() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let process_log = dir.path().join("process.log");
+    let config = serde_json::json!({
+        "global": {
+            "http3": false,
+            "trusted_proxies": ["127.0.0.1/32"]
+        },
+        // 🪵 The unmatched path has no site to read a `log` block from, so its
+        // record travels through the process log. Pointing that at a file is
+        // what makes the record readable while the child runs.
+        "logging": {
+            "default": {
+                "output": { "file": process_log.display().to_string() },
+                "format": "text"
+            }
+        },
+        "servers": [{
+            "name": "known.test",
+            "listen": ["127.0.0.1:0"],
+            "proxy_protocol_listen": ["0"],
+            "routes": [{
+                "path": "/",
+                "handler": { "type": "respond", "status": 200, "body": "known" }
+            }]
+        }]
+    })
+    .to_string();
+    let mut server = TestServer::new(&config);
+    let address = server.address(0);
+    let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let known_host = format!("known.test:{}", address.port());
+
+    // 🚦 Readiness needs the PROXY preamble *and* the site's own `Host`: the
+    // harness's default probe carries the socket address, which this fixture
+    // deliberately does not answer.
+    let mut ready = false;
+    for _ in 0..50 {
+        if server.exit_status().is_some() {
+            break;
+        }
+        let prefix = proxy_v1_prefix("127.0.0.1", address);
+        if let Ok(response) = proxy_protocol_request_to_host(
+            address,
+            loopback,
+            &prefix,
+            &server.readiness_path,
+            &known_host,
+            &[],
+        )
+        .await
+            && String::from_utf8_lossy(&response).contains(&server.readiness_token)
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !ready {
+        server.print_diagnostics();
+    }
+    assert!(ready, "PROXY protocol listener failed to start");
+
+    // 🌐 The scanner: a claimed client of 5.6.7.8, a `Host` no site claims.
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut request = proxy_v1_prefix("5.6.7.8", address);
+    request.extend_from_slice(b"GET / HTTP/1.1\r\nHost: unknown.test\r\nConnection: close\r\n\r\n");
+    stream.write_all(&request).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    assert!(
+        !response.is_empty(),
+        "the unmatched request must still be answered"
+    );
+
+    // 🕰️ The logging phase runs at the end of the request, so the record lands
+    // shortly after the connection closes.
+    let mut record = None;
+    for _ in 0..50 {
+        let output = std::fs::read_to_string(&process_log).unwrap_or_default();
+        if let Some(found) = output
+            .lines()
+            .find(|line| line.contains(r#"host="unknown.test""#))
+            .map(ToString::to_string)
+        {
+            record = Some(found);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let record = record.unwrap_or_else(|| {
+        server.print_diagnostics();
+        let log = std::fs::read_to_string(&process_log).unwrap_or_default();
+        panic!("the unmatched request must produce an access record; process log:\n{log}")
+    });
+    assert!(
+        record.contains("remote_ip=5.6.7.8"),
+        "the access record must name the PROXY-protocol client, got: {record}"
+    );
 }
 
 #[tokio::test]

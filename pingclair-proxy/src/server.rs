@@ -6696,6 +6696,19 @@ impl ProxyHttp for PingclairProxy {
         // after the selected site's configuration proves they can be observed.
         ctx.orig_uri = session.req_header().uri.clone();
 
+        // 🛡️ Resolve the client identity once, before any answer can be
+        // produced. A refused `Host`, refused framing, or a `Host` that names
+        // no site still writes an access record, and every one of those used to
+        // fall back to the session peer — which on a PROXY-protocol listener is
+        // the ingress hop, so the traffic an operator goes looking for
+        // (scanners, misdirected hosts) was logged as `127.0.0.1` (#281).
+        // Neither input needs a site: the trusted-proxy policy is global and
+        // the tunnel registry is per listener.
+        let (transport_peer_ip, transport_client_ip, verified_client_ip) =
+            self.downstream_identity(session, &session.req_header().headers);
+        ctx.verified_client_ip = Some(verified_client_ip);
+        ctx.remote_ip = Some(transport_client_ip.ip());
+
         // 🛡️ Framing is settled before anything else reads the request, because
         // a message whose length two parsers can read differently must not be
         // routed, logged as a normal request, or forwarded at all.
@@ -6987,9 +7000,6 @@ impl ProxyHttp for PingclairProxy {
                 );
             }
 
-            // 🛡️ Resolve proxy headers only when the immediate peer is trusted.
-            let (transport_peer_ip, transport_client_ip, verified_client_ip) =
-                self.downstream_identity(session, &request_header.headers);
             // 🌐 `remote_ip` matches the connection's peer and `client_ip` the
             // client a trusted proxy vouched for, as in Caddy. A PROXY-protocol
             // source is the peer: that header replaces the connection address.
