@@ -8170,6 +8170,42 @@ impl ProxyHttp for PingclairProxy {
             }
         }
 
+        // 🌊 Pingora's HTTP/1 writer flushes a known-length body only once the
+        // body ends, so a bounded event stream that declares its length sits
+        // in the buffer until it is over and reaches the client in one lump
+        // (#247). A stream can drop the length instead: chunked framing (1.1)
+        // and close-delimited framing (1.0) are both flushed per chunk, and
+        // neither loses a byte. Only responses whose whole point is immediacy
+        // pay that trade — `Content-Type: text/event-stream`, or a route that
+        // asked for `flush_interval -1` — and only when a body is coming.
+        let immediate_stream = upstream_response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_streaming_content_type)
+            || ctx
+                .state
+                .as_ref()
+                .zip(ctx.route_index)
+                .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
+                .is_some_and(|config| wants_immediate_flush(config.flush_interval));
+        let body_is_coming = session.req_header().method != http::Method::HEAD
+            && crate::http_policy::ResponseContent::for_status(upstream_response.status.as_u16())
+                .has_body();
+        if immediate_stream
+            && body_is_coming
+            && upstream_response
+                .headers
+                .contains_key(http::header::CONTENT_LENGTH)
+        {
+            upstream_response.remove_header(&http::header::CONTENT_LENGTH);
+            if session.req_header().version == http::Version::HTTP_10 {
+                // 🧾 A 1.0 client cannot be chunked; the close delimits it,
+                // and `do_write_until_close_body` flushes every chunk.
+                session.as_mut().set_keepalive(None);
+            }
+        }
+
         // 🛡️ Applies the same security policy used by locally generated responses.
         if let Some(state) = &ctx.state {
             Self::apply_security_response_headers(upstream_response, state)?;

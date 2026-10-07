@@ -94,7 +94,6 @@ async fn test_precompressed_range_uses_the_compressed_representation() {
 /// then writes a second, and the assertion is about the first event's *arrival*
 /// rather than the response's contents.
 #[tokio::test]
-#[ignore = "pingclair#247 — H1 holds a known-length body until it ends"]
 async fn test_known_length_body_arrives_before_it_ends() {
     let events = b"data: one\n\ndata: two\n\n";
     let head = format!(
