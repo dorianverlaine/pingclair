@@ -261,6 +261,7 @@ fn apply_global_dns_challenge(config: &mut PingclairConfig) {
 }
 
 fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> CompileResult<()> {
+    config.layer4.clone_from(&global.layer4);
     // Set debug mode
     if let Some(debug) = global.debug {
         config.debug = debug;
@@ -1019,6 +1020,7 @@ fn validate_cache_ceiling_agrees(config: &PingclairConfig) -> CompileResult<()> 
 }
 
 pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
+    crate::layer4::validate(config)?;
     for server in &config.servers {
         pingclair_core::server::Router::validate_paths(&server.routes).map_err(|error| {
             CompileError::InvalidRoute {

@@ -25,6 +25,7 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
 
         for sub in directives {
             match sub.name.as_str() {
+                "layer4" => global.layer4.extend(super::layer4::adapt(&sub)?),
                 // 🪵 `log <name> { … }` declares a named channel. Several
                 // servers may reference one channel, and they share a single
                 // writer — two writers on one file would interleave, so "the

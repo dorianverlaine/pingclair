@@ -27,6 +27,7 @@
 pub mod adapter;
 pub mod compiler;
 mod header_fields;
+mod layer4;
 pub mod parser;
 mod retired_placeholders;
 mod shared_ports;
@@ -170,6 +171,7 @@ fn merge_files(
 
         final_config.debug = final_config.debug || config.debug;
         final_config.servers.extend(config.servers);
+        final_config.layer4.extend(config.layer4);
 
         // 🗂️ The last file naming an admin block wins. Two admin listeners is
         // not a shape the runtime has, so merging them would have to invent an

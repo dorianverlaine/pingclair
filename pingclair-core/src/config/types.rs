@@ -67,6 +67,10 @@ pub struct PingclairConfig {
     #[serde(default)]
     pub servers: Vec<ServerConfig>,
 
+    /// 🔌 TCP listeners are independent of HTTP servers and global options.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layer4: Vec<super::Layer4Server>,
+
     /// Admin API configuration
     #[serde(default)]
     pub admin: Option<AdminConfig>,

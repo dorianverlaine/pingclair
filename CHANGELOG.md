@@ -14,6 +14,13 @@ fact.
 
 ## [Unreleased]
 
+### 🔌 Layer 4 configuration groundwork for 0.3
+
+The configuration library can represent TCP listener, SNI, ALPN, peer-address
+and upstream declarations. CLI adaptation, validation and startup refuse L4
+until its runtime exists. Buffer units follow nginx: `16k` is 16,384
+bytes. This groundwork does not provide a working TCP proxy.
+
 📦 This section becomes `## [0.2.0]` when 0.2.0 is cut, and its text is the
 release notes of that tag. It covers every change since `v0.1.7`, including
 the three release candidates (`0.2.0-rc.1` on 2026-08-20, `0.2.0-rc.2` on

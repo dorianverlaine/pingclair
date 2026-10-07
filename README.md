@@ -26,6 +26,10 @@ Pingclair is currently distributed as a release candidate. Review the
 [project status](https://pingclair.com/project/status/) before using it for a
 production deployment.
 
+🔌 Layer 4 TCP routing is under development. Its configuration schema is
+available internally, but `adapt`, validation and startup explicitly reject
+L4 listeners until the runtime exists. HTTP serving behavior is unchanged.
+
 ## ✨ Highlights
 
 - **HTTP/1.1, HTTP/2, and HTTP/3** — Serve all three protocols from one

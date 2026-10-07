@@ -42,6 +42,8 @@ pub struct Ast {
 /// Global configuration block
 #[derive(Debug, Clone, Default)]
 pub struct GlobalBlock {
+    /// 🔌 Global-block syntax becomes a separate top-level runtime application.
+    pub layer4: Vec<pingclair_core::config::Layer4Server>,
     pub protocols: Vec<Protocol>,
     pub debug: Option<bool>,
     pub logging: Option<LoggingConfig>,
