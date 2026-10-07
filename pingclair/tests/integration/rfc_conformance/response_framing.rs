@@ -236,7 +236,6 @@ async fn test_head_describes_the_same_response_as_get() {
 /// relay when the origin forgets to announce them, which is the tell that this is
 /// a policy trigger rather than a parsing limit.
 #[tokio::test]
-#[ignore = "pingclair#273 — the announcement alone turns a 200 into a 502"]
 async fn test_declared_upstream_trailer_is_not_a_gateway_error() {
     let upstream = ScriptedUpstream::start(
         vec![

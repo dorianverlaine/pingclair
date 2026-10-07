@@ -9536,8 +9536,14 @@ async fn test_declared_request_trailers_fail_clearly_without_an_upstream_exchang
     );
 }
 
+/// 🧾 A declared upstream trailer is relayed, not turned into a gateway error.
+///
+/// RFC 9110 §15.6.3 reserves 502 for an invalid upstream response, and the
+/// trailer section is part of the chunked coding (RFC 9112 §7.1.2). An H1
+/// client drops trailer fields that cannot be forwarded; the status it sees
+/// stays the origin's own (#273).
 #[tokio::test]
-async fn test_upstream_response_trailers_fail_before_response_commit() {
+async fn test_upstream_response_trailers_are_relayed_not_a_gateway_error() {
     use tokio::io::AsyncWriteExt;
 
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9559,8 +9565,12 @@ async fn test_upstream_response_trailers_fail_before_response_commit() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 502);
-    assert_eq!(response.text().await.unwrap(), "502 Bad Gateway");
+    assert_eq!(
+        response.status(),
+        200,
+        "a declared trailer must not become a gateway error"
+    );
+    assert_eq!(response.text().await.unwrap(), "ok");
     upstream_task.await.unwrap();
 }
 

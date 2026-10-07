@@ -7947,15 +7947,13 @@ impl ProxyHttp for PingclairProxy {
         for name in crate::http_policy::connection_named_fields(&upstream_response.headers) {
             upstream_response.remove_header(name.as_ref());
         }
-        if upstream_response.headers.contains_key("trailer") {
-            tracing::warn!(
-                "🚫 Rejecting an upstream response that requires unsupported trailer forwarding"
-            );
-            return pingora_core::Error::e_explain(
-                pingora_core::ErrorType::HTTPStatus(502),
-                "Upstream response trailers are unsupported",
-            );
-        }
+        // 🧾 A `Trailer:` announcement is not an invalid response: RFC 9112
+        // §7.1.2 makes the trailer section part of the chunked coding, and
+        // RFC 9110 §15.6.3 reserves 502 for a response the proxy cannot parse.
+        // The same bytes already relay when the origin forgets to announce
+        // them, so the announcement must not turn a 200 into a 502 — trailer
+        // fields that cannot be forwarded downstream are dropped instead
+        // (#273). The H3 path carries the same rule.
 
         let retry_policy = ctx
             .state

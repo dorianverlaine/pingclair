@@ -171,7 +171,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         try:
-            # 🚫 Exercises fail-closed handling before trailer metadata can disappear.
+            # 🧾 A declared trailer is part of a valid chunked response: the
+            # proxy must relay the message and may drop the trailer field
+            # rather than fail the exchange (#273).
             self._write_chunk(b"ok")
             self.wfile.write(b"0\r\nX-Checksum: abc\r\n\r\n")
             self.wfile.flush()
@@ -276,10 +278,9 @@ response_trailer_status="$("${curl_bin}" --noproxy '*' --http3-only -ksS \
     -o "${run_dir}/response-trailer.out" \
     -w '%{http_code}' \
     "https://${host_name}:${h3_port}/response-trailers")"
-if [[ "${response_trailer_status}" != "502" ]] \
-    || ! grep -Fq 'Upstream Response Trailers Not Supported' \
-        "${run_dir}/response-trailer.out"; then
-    log "❌ H3 upstream response trailers did not fail clearly with 502."
+if [[ "${response_trailer_status}" != "200" ]] \
+    || ! grep -Fq 'ok' "${run_dir}/response-trailer.out"; then
+    log "❌ A declared H3 upstream trailer was not relayed: status ${response_trailer_status}."
     exit 1
 fi
 
@@ -391,4 +392,4 @@ if [[ "$("${curl_bin}" --noproxy '*' --http3-only -kfsS \
     exit 1
 fi
 
-log "✅ Local HTTP/3 SSE, cancellation, and trailer rejection passed."
+log "✅ Local HTTP/3 SSE, cancellation, request-trailer rejection, and response-trailer relay passed."

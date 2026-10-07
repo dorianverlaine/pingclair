@@ -6298,17 +6298,12 @@ async fn reverse_proxy_upstream(
         return Err((effective_status, error_reason(effective_status)));
     }
 
-    if intercept_replacement.is_none()
-        && session
-            .response_header()
-            .is_some_and(|response| response.headers.contains_key("trailer"))
-    {
-        tracing::warn!(
-            "🚫 Rejecting an H3 upstream response that requires unsupported trailer forwarding"
-        );
-        session.shutdown().await;
-        return Err((502, "Upstream Response Trailers Not Supported"));
-    }
+    // 🧾 A `Trailer:` announcement is not an invalid response (RFC 9112
+    // §7.1.2 makes the trailer section part of the chunked coding, and
+    // RFC 9110 §15.6.3 reserves 502 for a response the proxy cannot parse).
+    // The response is relayed with the origin's own status; trailer fields
+    // that cannot be forwarded are dropped (#273). This is the H3 half of the
+    // same rule the H1/H2 response filter applies.
 
     let mut hdrs = Vec::new();
     if let Some(resp) = session.response_header() {
