@@ -263,6 +263,80 @@ async fn test_header_block_keeps_every_set_cookie() {
     assert_eq!(cookies, 2, "both configured cookies must be sent: {head}");
 }
 
+/// 🏷️ An upstream's `Server` field line reaches the client unchanged, and a
+/// response this server wrote itself carries ours.
+///
+/// Caddy sets its own `Server` before the handler chain runs
+/// (`modules/caddyhttp/server.go`) and its proxy then copies the upstream's
+/// headers over it, so what a client sees is the origin's product string when
+/// there is one and `Caddy` when there is not. This server inserted
+/// `Pingclair` over whatever arrived, which is why monitoring that identifies
+/// an origin, or a mixed fleet comparing nodes, saw something different
+/// (#159).
+#[tokio::test]
+async fn test_the_upstreams_server_header_survives_the_proxy() {
+    let upstream = ScriptedUpstream::start(
+        vec![
+            b"HTTP/1.1 200 OK\r\nServer: audit-upstream/u1\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+        ],
+        Duration::ZERO,
+    )
+    .await;
+    let mut server = TestServer::new_pingclairfile(&site(&format!(
+        "reverse_proxy 127.0.0.1:{}",
+        upstream.address.port()
+    )));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let (head, _) = raw_http1(
+        &server,
+        b"GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    server.stop();
+
+    let identifications: Vec<String> = head
+        .lines()
+        .filter(|line| line.to_ascii_lowercase().starts_with("server:"))
+        .map(|line| line.trim().to_ascii_lowercase())
+        .collect();
+    assert_eq!(
+        identifications,
+        vec!["server: audit-upstream/u1".to_string()],
+        "the origin's own product string must survive: {head}"
+    );
+    // 🤝 `Via` still names *this* intermediary, appended to whatever chain the
+    // request already crossed — the token is our product name because that is
+    // what the field is for (RFC 9110 §7.6.3).
+    let via = head
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("via:"))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(via.contains("1.1 pingclair"), "got: {via:?} in {head}");
+}
+
+/// 🏷️ A response this server produced itself still says so.
+#[tokio::test]
+async fn test_a_local_response_carries_our_server_header() {
+    let mut server = TestServer::new_pingclairfile(&site(r#"respond "local""#));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let (head, _) = raw_http1(
+        &server,
+        b"GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    server.stop();
+
+    let identifications: Vec<String> = head
+        .lines()
+        .filter(|line| line.to_ascii_lowercase().starts_with("server:"))
+        .map(|line| line.trim().to_ascii_lowercase())
+        .collect();
+    assert_eq!(identifications, vec!["server: pingclair".to_string()]);
+}
+
 /// ✅ `header X v` produces one field line, even when the origin sent its own.
 ///
 /// This is the recorded decision from pingclair#272: Caddy keeps both values,

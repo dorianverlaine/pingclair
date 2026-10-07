@@ -7218,7 +7218,13 @@ fn apply_h3_trailer_headers(
 ) {
     if suppress_server {
         headers.retain(|header| !header.name().eq_ignore_ascii_case(b"server"));
-    } else {
+    } else if !headers
+        .iter()
+        .any(|header| header.name().eq_ignore_ascii_case(b"server"))
+    {
+        // 🏷️ Same rule as the H1/H2 path: the upstream's own `Server` field
+        // line survives, and ours appears only when nothing else identified
+        // the response (#159).
         set_h3_header(headers, "server", "Pingclair");
     }
     set_h3_header(headers, "x-request-id", request_id);

@@ -124,6 +124,9 @@ mod body_length;
 #[path = "h3_end_to_end/cache_parity.rs"]
 mod cache_parity;
 
+#[path = "h3_end_to_end/server_header.rs"]
+mod server_header;
+
 const ALPN: &[u8] = b"h3";
 
 fn self_signed_pem(names: &[&str]) -> (String, String) {

@@ -1272,7 +1272,14 @@ impl ResponseHeaderPolicy {
     ) -> PingoraResult<()> {
         if suppress_server {
             let _ = response.remove_header("server");
-        } else {
+        } else if !response.headers.contains_key("server") {
+            // 🏷️ Only when the response has none. Caddy sets its own `Server`
+            // before the handler chain runs and the proxy then copies the
+            // upstream's headers over it, so what a client sees is the
+            // upstream's value when there is one — the product string an
+            // operator's monitoring reads, and the one a mixed fleet would
+            // otherwise disagree about (#159). A response this server produced
+            // itself has no `Server` field yet and gets ours.
             response.insert_header("server", "Pingclair")?;
         }
 

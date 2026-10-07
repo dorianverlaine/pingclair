@@ -38,6 +38,18 @@ before any answer can be produced; the trusted-proxy policy is global and the
 PROXY-protocol tunnel registry is per listener, so none of it needed a site
 (#281).
 
+### 🏷️ An upstream's `Server` field line reaches the client unchanged
+
+A proxied response used to carry `Server: Pingclair` where the origin had sent
+its own product string, so monitoring that identifies an origin, or a mixed
+fleet comparing nodes, read something the operator never configured. Caddy
+sets its own `Server` before the handler chain and lets the proxy's copy of
+the upstream headers replace it, so a client sees the origin's value when
+there is one; this server now does the same on HTTP/1.1, HTTP/2 and HTTP/3,
+and still identifies itself on the responses it writes itself (#159). `Via`
+continues to name this intermediary — `1.1 Pingclair` — which is what the
+field records (RFC 9110 §7.6.3).
+
 ### 📝 No `log` directive now means no access record
 
 This server wrote an access record for every request through its process log
