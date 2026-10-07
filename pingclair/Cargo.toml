@@ -26,6 +26,8 @@ name = "pingclair"
 path = "src/main.rs"
 
 [dependencies]
+arc-swap.workspace = true
+pingclair-l4 = { path = "../pingclair-l4" }
 pingclair-core = { path = "../pingclair-core" }
 pingclair-config = { path = "../pingclair-config" }
 pingclair-proxy = { path = "../pingclair-proxy" }

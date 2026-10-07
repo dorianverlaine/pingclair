@@ -144,8 +144,11 @@ pub(crate) fn run_server_with_adapter(
     }
 
     // 📡 An admin-only process must stay alive even without data-plane listeners.
-    if config.servers.is_empty() && !config.admin.as_ref().is_some_and(|admin| admin.enabled) {
-        tracing::warn!("⚠️ No HTTP servers or admin API configured!");
+    if config.servers.is_empty()
+        && config.layer4.is_empty()
+        && !config.admin.as_ref().is_some_and(|admin| admin.enabled)
+    {
+        tracing::warn!("⚠️ No HTTP servers, L4 listeners, or admin API configured!");
         return Ok(());
     }
 
@@ -197,6 +200,11 @@ pub(crate) fn run_server_with_adapter(
         .into_owned();
     let prepared_listener_policies = prepare_listener_policies(&config, automatic_http_available)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let layer4 = Arc::new(crate::layer4::Runtime::default());
+    layer4.publish(
+        crate::layer4::prepare(&config, prepared_listener_policies.keys().cloned())
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+    );
     let listener_security_by_address: HashMap<String, Arc<PublishedListenerPolicy>> =
         prepared_listener_policies
             .iter()
@@ -294,12 +302,14 @@ pub(crate) fn run_server_with_adapter(
         },
     )?;
 
+    crate::layer4::register(&mut server, &layer4)?;
+
     // ⚠️ Every listener is known now, so this is the first point where the
     // descriptors the keepalive pools may hold can be compared with the limit.
     crate::fd_budget::warn_if_over_limit(crate::fd_budget::DescriptorReservation {
         pool_size: server.configuration.upstream_keepalive_pool_size,
         worker_threads: server.configuration.threads,
-        tcp_listeners: port_proxies.read().len(),
+        tcp_listeners: port_proxies.read().len() + config.layer4.len(),
         h3_ports: https_ports.len(),
         admin_listener: config.admin.as_ref().is_some_and(|admin| admin.enabled),
     });
@@ -347,6 +357,7 @@ pub(crate) fn run_server_with_adapter(
     let config_publisher: Arc<dyn pingclair_proxy::server::ConfigPublisher> =
         Arc::new(RuntimeListeners::new(
             RuntimePublisherInputs {
+                layer4,
                 #[cfg(unix)]
                 bootstrap: crate::runtime_listeners::BootstrapRuntime {
                     handle: bg_handle.clone(),

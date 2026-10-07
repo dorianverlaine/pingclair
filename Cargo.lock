@@ -2516,6 +2516,7 @@ name = "pingclair"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "argon2",
  "async-trait",
  "bcrypt",
@@ -2534,6 +2535,7 @@ dependencies = [
  "pingclair-api",
  "pingclair-config",
  "pingclair-core",
+ "pingclair-l4",
  "pingclair-proxy",
  "pingclair-runtime",
  "pingclair-static",

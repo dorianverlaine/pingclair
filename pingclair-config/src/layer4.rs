@@ -17,19 +17,26 @@ pub(crate) fn validate(config: &PingclairConfig) -> CompileResult<()> {
     if config.layer4.is_empty() {
         return Ok(());
     }
-    validate_declarations(config)?;
-    // 🚧 Remove this gate only with the listener, reload and shutdown integration.
-    Err(CompileError::UnsupportedFeature {
-        feature: "layer4 TCP listeners are not implemented yet; the configuration library can represent declarations, but this build cannot run them".into(),
-    })
+    validate_declarations(config)
 }
 
 fn validate_declarations(config: &PingclairConfig) -> CompileResult<()> {
-    let http: Vec<String> = config
+    let mut http: Vec<String> = config
         .servers
         .iter()
-        .flat_map(|s| s.listen_addresses(config.global.http_port, config.global.https_port))
+        .flat_map(|server| {
+            let mut server = server.clone();
+            server.inherit_default_bind(&config.global.default_bind);
+            server.apply_bind();
+            server.listen_addresses(config.global.http_port, config.global.https_port)
+        })
         .collect();
+    if let Some(admin) = &config.admin
+        && admin.enabled
+        && let Some(address) = pingclair_core::config::parse_listen_addr(&admin.listen)
+    {
+        http.push(address.to_string());
+    }
     let mut listeners = Vec::new();
     for server in &config.layer4 {
         let address = normalize_listen_addr(&server.listen)

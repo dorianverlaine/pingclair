@@ -26,9 +26,9 @@ Pingclair is currently distributed as a release candidate. Review the
 [project status](https://pingclair.com/project/status/) before using it for a
 production deployment.
 
-🔌 Layer 4 TCP routing is under development. Its configuration schema is
-available internally, but `adapt`, validation and startup explicitly reject
-L4 listeners until the runtime exists. HTTP serving behavior is unchanged.
+🔌 The 0.3 alpha branch supports TCP forwarding with TLS ClientHello SNI/ALPN
+and source-IP routing. TLS passes through unchanged; it is not terminated.
+See the [L4 boundaries](docs/guardrails/layer4.md) for syntax and current limits.
 
 ## ✨ Highlights
 

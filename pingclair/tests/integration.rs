@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
+#[path = "integration/layer4.rs"]
+mod layer4;
+
 #[path = "integration/canonical_redirect.rs"]
 mod canonical_redirect;
 

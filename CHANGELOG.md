@@ -14,12 +14,18 @@ fact.
 
 ## [Unreleased]
 
-### 🔌 Layer 4 configuration groundwork for 0.3
+### 🔌 Layer 4 TCP routing for 0.3 alpha
 
-The configuration library can represent TCP listener, SNI, ALPN, peer-address
-and upstream declarations. CLI adaptation, validation and startup refuse L4
-until its runtime exists. Buffer units follow nginx: `16k` is 16,384
-bytes. This groundwork does not provide a working TCP proxy.
+Global `layer4` blocks can forward TCP by ClientHello SNI/ALPN and peer IP.
+The independent classifier preserves TLS bytes; bounded bidirectional buffers
+preserve backpressure, and `proxy_timeout` measures inactivity. Preread timeout
+or overflow closes the connection without using a fallback. Buffer units follow
+nginx: `16k` is 16,384 bytes. `proxy_half_close on` permits replies after EOF.
+
+Route reloads apply to new connections while existing tunnels keep their
+snapshot. Listener topology and limit changes require restart. TCP tunnels
+participate in graceful shutdown. This alpha supports static upstream addresses;
+UDP, TLS termination, PROXY protocol and dynamic DNS are outside its scope.
 
 📦 This section becomes `## [0.2.0]` when 0.2.0 is cut, and its text is the
 release notes of that tag. It covers every change since `v0.1.7`, including

@@ -64,19 +64,9 @@ fn layer4_adapts_complete_structure_and_round_trips_json() {
         serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
     assert_eq!(decoded.layer4, config.layer4);
     for config in [config, decoded] {
-        assert!(
-            validate(&config)
-                .unwrap_err()
-                .to_string()
-                .contains("not implemented")
-        );
+        validate(&config).unwrap();
     }
-    assert!(
-        crate::compile(SOURCE)
-            .unwrap_err()
-            .to_string()
-            .contains("not implemented")
-    );
+    crate::compile(SOURCE).unwrap();
 }
 
 #[test]
@@ -282,10 +272,36 @@ fn layer4_directory_merge_preserves_every_listener() {
             .collect::<Vec<_>>(),
         vec![":9443", ":9444"]
     );
+    crate::compile_directory(dir.path()).unwrap();
+}
+
+#[test]
+fn layer4_overlap_checks_use_effective_bind_and_admin_addresses() {
+    let mut config = crate::adapt(&SOURCE.replace(":9443", "127.0.0.1:9443")).unwrap();
+    config.servers = crate::adapt("http://:9443 {\n respond ok\n}")
+        .unwrap()
+        .servers;
+    config.servers[0].bind = Some("127.0.0.2".into());
+    validate(&config).unwrap();
+    config.servers[0].bind = Some("127.0.0.1".into());
     assert!(
-        crate::compile_directory(dir.path())
+        validate(&config)
             .unwrap_err()
             .to_string()
-            .contains("not implemented")
+            .contains("overlaps")
+    );
+    config.servers[0].bind = None;
+    config.global.default_bind = vec!["127.0.0.2".into()];
+    validate(&config).unwrap();
+    config.servers.clear();
+    config.admin = crate::adapt("{\n admin 127.0.0.1:2019\n}").unwrap().admin;
+    let admin = config.admin.as_mut().unwrap();
+    admin.enabled = true;
+    admin.listen = "127.0.0.1:9443".into();
+    assert!(
+        validate(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("overlaps")
     );
 }

@@ -210,6 +210,7 @@ struct ActiveRuntimeConfig {
 
 /// 📣 Serialises and publishes every post-start configuration transaction.
 pub(crate) struct RuntimeListeners {
+    layer4: Arc<crate::layer4::Runtime>,
     pub(crate) port_proxies: Arc<RwLock<HashMap<String, PingclairProxy>>>,
     pub(crate) tls_manager: Arc<TlsManager>,
     pub(crate) h3_cert_table: Option<Arc<pingclair_proxy::quic::CertTable>>,
@@ -225,6 +226,7 @@ pub(crate) struct RuntimeListeners {
 
 /// 🧩 Shared runtime handles captured by the configuration publisher.
 pub(crate) struct RuntimePublisherInputs {
+    pub(crate) layer4: Arc<crate::layer4::Runtime>,
     #[cfg(unix)]
     pub(crate) bootstrap: BootstrapRuntime,
     pub(crate) port_proxies: Arc<RwLock<HashMap<String, PingclairProxy>>>,
@@ -244,6 +246,7 @@ impl RuntimeListeners {
         prepared: HashMap<String, PreparedListenerPolicy>,
     ) -> Self {
         Self {
+            layer4: inputs.layer4,
             port_proxies: inputs.port_proxies,
             tls_manager: inputs.tls_manager,
             h3_cert_table: inputs.h3_cert_table,
@@ -288,6 +291,8 @@ impl RuntimeListeners {
                 "global options changed; restart Pingclair so every process-wide policy is rebuilt",
             ));
         }
+
+        crate::layer4::ensure_hot_compatible(&current.config, next_config)?;
 
         let current_addresses: HashSet<&str> =
             current.listeners.keys().map(String::as_str).collect();
@@ -429,6 +434,7 @@ impl ConfigPublisher for RuntimeListeners {
         let next = prepare_listener_policies(config, self.automatic_http_available)?;
         let current = self.current.read();
         self.ensure_hot_compatible(&current, config, &next)?;
+        let prepared_l4 = crate::layer4::prepare(config, next.keys().cloned())?;
         let prepared_manual_certs = self.prepare_manual_certs(config)?;
         let previous_manual_names: Vec<String> = current
             .config
@@ -503,6 +509,7 @@ impl ConfigPublisher for RuntimeListeners {
         };
         drop(current);
 
+        self.layer4.publish(prepared_l4);
         pingclair_proxy::server::configure_response_cache(&config.servers);
         // 📦 Every reader keeps its published generation while the next is installed.
         if let (Some(table), Some(prepared)) = (&self.h3_cert_table, prepared_h3_certs) {
