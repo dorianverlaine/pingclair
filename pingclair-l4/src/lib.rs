@@ -5,3 +5,6 @@
 
 mod hello;
 pub use hello::{Classification, ClientHello, classify};
+
+mod relay;
+pub use relay::{RelayOptions, relay};

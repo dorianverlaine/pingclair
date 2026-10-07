@@ -8,8 +8,12 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Bounded TCP routing and TLS ClientHello classification"
 
+[dependencies]
+tokio.workspace = true
+
 [dev-dependencies]
 proptest = "1"
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
