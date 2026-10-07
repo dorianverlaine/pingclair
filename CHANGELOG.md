@@ -27,6 +27,17 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🃏 A manual wildcard certificate serves the names beneath it
+
+A site written `https://*.sandbox.test { tls cert.pem key.pem }` refused a
+handshake for `other.sandbox.test` with `unrecognized_name`, even though the
+certificate covered that name — the manual table was read by exact spelling,
+while the same site written with `tls internal` answered, because the internal
+authority already matched wildcards (#285). Manual pairs now follow the same
+one-label wildcard rule as issuance and the internal authority, on TCP and
+HTTP/3, at startup and reload. A top-level `client_auth { … }` is refused with
+the scope it belongs to instead of "`client_auth` looks like a second site".
+
 ### 🛡️ A glob expansion is bounded by the entries it reads
 
 A `file` matcher's glob — `try_files /cache/*` — read and sorted a directory in

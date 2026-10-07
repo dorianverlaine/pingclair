@@ -4055,6 +4055,24 @@ mod p3_syntax_tests {
         );
     }
 
+    /// 🪪 A top-level TLS option is named as one, not as a second site.
+    ///
+    /// `client_auth { … }` belongs inside `tls { … }`; written at the top of
+    /// a site it is not a directive, and the second-site message sent the
+    /// operator looking for a missing brace (#285).
+    #[test]
+    fn a_top_level_tls_option_names_its_scope() {
+        let error = compile("example.com {\n\tclient_auth {\n\t\tmode require_and_verify\n\t}\n}")
+            .expect_err("a top-level client_auth must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("`client_auth` is a `tls` option")
+                && error.to_string().contains("tls { … }"),
+            "got {error}"
+        );
+    }
+
     #[test]
     fn env_vars_expand_before_parsing() {
         // 🛡️ These tests run single-threaded; env mutation is sound here.

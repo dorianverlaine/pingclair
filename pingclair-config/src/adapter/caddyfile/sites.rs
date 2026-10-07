@@ -518,6 +518,20 @@ pub(super) fn adapt_server(
                     // 'example.com'" describes the symptom while hiding the
                     // cause.
                     if sub_d.block.is_some() && !super::registry::is_directive_name(&sub_d.name) {
+                        // 🪪 An option that belongs inside `tls { … }` is not a
+                        // directive of its own: `client_auth { … }` written at
+                        // the top level of a site is a misplaced TLS option,
+                        // and the second-site message sends the operator
+                        // looking for a missing brace instead (#285).
+                        if super::tls::is_tls_option(&sub_d.name) {
+                            return Err(AdapterError::InvalidArgument(
+                                "tls option".into(),
+                                format!(
+                                    "`{}` is a `tls` option; write it inside `tls {{ … }}`",
+                                    sub_d.name
+                                ),
+                            ));
+                        }
                         return Err(AdapterError::InvalidArgument(
                             "site address".into(),
                             format!(

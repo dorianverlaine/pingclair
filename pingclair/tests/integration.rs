@@ -244,6 +244,10 @@ mod alt_svc_opt_out;
 #[path = "integration/two_name_sites.rs"]
 mod two_name_sites;
 
+// 🃏 A wildcard site's manual certificate serves the names it covers.
+#[path = "integration/wildcard_certificate.rs"]
+mod wildcard_certificate;
+
 // 🛡️ A malformed `blocked_ips` entry is refused at the Admin door.
 #[path = "integration/blocked_ips.rs"]
 mod blocked_ips;
