@@ -2399,6 +2399,7 @@ impl H3App {
             let Some((mut headers, mut fin)) = ss.pending_headers.take() else {
                 return;
             };
+            trim_h3_field_padding(&mut headers);
             let status = response_status(&headers);
             stamp_date(&mut headers, status);
             // 🤐 Decided here, at the one exit every H3 response takes, rather
@@ -5920,6 +5921,10 @@ async fn reverse_proxy_upstream(
                 .ok();
         }
 
+        // 🧼 A value that arrived padded over H3 is trimmed before it reaches
+        // the origin, so the three transports hand over the same field (#256).
+        crate::http_policy::trim_pingora_request_padding(&mut up_req);
+
         session
             .write_request_header(Box::new(up_req))
             .await
@@ -6879,6 +6884,28 @@ fn set_h3_header(headers: &mut Vec<quiche::h3::Header>, name: &str, value: &str)
         normalized.as_bytes(),
         value.as_bytes(),
     ));
+}
+
+/// 🧼 Trims SP/HTAB padding from every H3 field value.
+///
+/// RFC 9114 §10.3 forbids a field value that starts or ends with SP/HTAB, and
+/// the value may come from the origin or from a configured `header`
+/// directive. The HTTP/1 path never sees the padding because its parser strips
+/// it; H2/H3 have to strip it themselves (#256).
+fn trim_h3_field_padding(headers: &mut Vec<quiche::h3::Header>) {
+    let padded = |header: &quiche::h3::Header| {
+        crate::http_policy::trim_field_value_ows(header.value()).len() != header.value().len()
+    };
+    if !headers.iter().any(padded) {
+        return;
+    }
+    *headers = std::mem::take(headers)
+        .into_iter()
+        .map(|header| {
+            let value = crate::http_policy::trim_field_value_ows(header.value()).to_vec();
+            quiche::h3::Header::new(header.name(), &value)
+        })
+        .collect();
 }
 
 /// 🔎 The header view a response matcher asks for, and nothing else.

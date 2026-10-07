@@ -3905,6 +3905,10 @@ impl PingclairProxy {
         if !ResponseContent::for_status(response.status.as_u16()).allows_content_length() {
             response.remove_header(&http::header::CONTENT_LENGTH);
         }
+        // 🧼 RFC 9113 §8.2.1 / RFC 9114 §10.3 forbid a field value that starts
+        // or ends with SP/HTAB, and a configured value may contain one; H1's
+        // serializer is the only place that padding is invisible (#256).
+        crate::http_policy::trim_pingora_response_padding(response);
         Ok(())
     }
 
@@ -7775,6 +7779,12 @@ impl ProxyHttp for PingclairProxy {
         // proxy, handed to the origin.
         strip_hop_by_hop_headers(session, upstream_request)?;
 
+        // 🧼 RFC 9113 §8.2.1 / RFC 9114 §10.3 forbid a field value that starts
+        // or ends with SP/HTAB; an HTTP/1 parser strips it silently, so the
+        // same padded header is harmless on H1 and malformed on H2. Trimming
+        // here makes the transports agree (#256).
+        crate::http_policy::trim_pingora_request_padding(upstream_request);
+
         // 🧾 A replaced body is a different length from the one the client
         // declared, so the framing is rewritten here or the origin waits for
         // bytes that are never coming. This is the only place that can do it:
@@ -8122,6 +8132,10 @@ impl ProxyHttp for PingclairProxy {
             &ctx.request_id_value,
             Some(upstream_response.version),
         )?;
+
+        // 🧼 The same padding rule in the other direction: a configured value
+        // with a stray space is a protocol error on H2/H3 (#256).
+        crate::http_policy::trim_pingora_response_padding(upstream_response);
 
         // 🛡️ Applies the same security policy used by locally generated responses.
         if let Some(state) = &ctx.state {

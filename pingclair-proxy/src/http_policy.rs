@@ -1669,6 +1669,81 @@ pub(crate) fn connection_named_fields(headers: &HeaderMap) -> Vec<Box<str>> {
         .collect()
 }
 
+/// ✂️ The value with its leading and trailing SP/HTAB removed.
+///
+/// RFC 9110 §5.5 makes that whitespace `OWS`: allowed around a field value and
+/// not part of it. An HTTP/1 parser strips it silently, so the same header is
+/// harmless there and a protocol error on HTTP/2 or HTTP/3, where RFC 9113
+/// §8.2.1 and RFC 9114 §10.3 forbid a value that starts or ends with it
+/// (#256).
+pub(crate) fn trim_field_value_ows(value: &[u8]) -> &[u8] {
+    let is_ows = |byte: u8| byte == b' ' || byte == b'\t';
+    let start = value
+        .iter()
+        .copied()
+        .take_while(|byte| is_ows(*byte))
+        .count();
+    let trailing = value
+        .iter()
+        .rev()
+        .copied()
+        .take_while(|byte| is_ows(*byte))
+        .count();
+    // ✂️ `trailing` is a count, not an index; an all-whitespace value must
+    // also not slice backwards.
+    let end = (value.len() - trailing).max(start);
+    &value[start..end]
+}
+
+/// 🔎 The names whose values carry SP/HTAB padding, with their trimmed values.
+///
+/// Collected before anything is replaced, because the replacement goes through
+/// Pingora's per-name API: the wrapper exposes `remove_header`/`append_header`
+/// rather than the map itself.
+fn padded_replacements(
+    headers: &HeaderMap,
+) -> Vec<(http::header::HeaderName, Vec<http::header::HeaderValue>)> {
+    let mut replacements = Vec::new();
+    for name in headers.keys() {
+        let mut padded = false;
+        let mut values = Vec::new();
+        for value in headers.get_all(name) {
+            let raw = value.as_bytes();
+            let trimmed = trim_field_value_ows(raw);
+            if trimmed.len() != raw.len() {
+                padded = true;
+            }
+            values.push(
+                http::header::HeaderValue::from_bytes(trimmed).unwrap_or_else(|_| value.clone()),
+            );
+        }
+        if padded {
+            replacements.push((name.clone(), values));
+        }
+    }
+    replacements
+}
+
+/// 🧼 Trims SP/HTAB padding from every value of a Pingora request wrapper.
+pub(crate) fn trim_pingora_request_padding(header: &mut pingora_http::RequestHeader) {
+    for (name, values) in padded_replacements(&header.headers) {
+        header.remove_header(&name);
+        for value in values {
+            let _ = header.append_header(name.clone(), value);
+        }
+    }
+}
+
+/// 🧼 Trims SP/HTAB padding from every value of a Pingora response wrapper.
+pub(crate) fn trim_pingora_response_padding(header: &mut pingora_http::ResponseHeader) {
+    for (name, values) in padded_replacements(&header.headers) {
+        header.remove_header(&name);
+        for value in values {
+            let _ = header.append_header(name.clone(), value);
+        }
+    }
+}
+
 /// 🧪 The one header matrix every sink is tested against.
 ///
 /// Lives beside the filter rather than in a test module because four different
@@ -3156,6 +3231,28 @@ mod outbound_filter_tests {
             "PrOxY",
         ] {
             assert!(filter.blocks(name), "`{name}` slipped past on spelling");
+        }
+    }
+
+    /// ✂️ OWS trimming removes only the padding, in both directions.
+    #[test]
+    fn field_value_padding_is_trimmed_to_the_value() {
+        for (raw, expected) in [
+            ("val3", "val3"),
+            ("val3 ", "val3"),
+            (" val3", "val3"),
+            ("\tval3\t", "val3"),
+            ("val3 \t", "val3"),
+            // 🕳️ An all-padding value becomes empty; it must not slice
+            // backwards, which is the bug this test exists for.
+            ("   ", ""),
+            ("", ""),
+        ] {
+            assert_eq!(
+                std::str::from_utf8(trim_field_value_ows(raw.as_bytes())).unwrap(),
+                expected,
+                "{raw:?} must trim to {expected:?}"
+            );
         }
     }
 

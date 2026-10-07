@@ -65,7 +65,6 @@ async fn test_configured_field_value_with_crlf_never_becomes_a_field_line() {
 /// a configuration value is not cosmetic. Trimming the value and omitting it are
 /// both fine; sending the padding is not.
 #[tokio::test]
-#[ignore = "pingclair#256 — `x-pad:   padded  ` goes out on H2"]
 async fn test_h2_response_field_value_carries_no_padding() {
     let mut server = TestServer::new_pingclairfile(&site(
         "handle /probe/* {\n                header X-Pad \"  padded  \"\n                respond \"ok\"\n            }",
@@ -101,7 +100,6 @@ async fn test_h2_response_field_value_carries_no_padding() {
 /// judge the field it receives. The origin here records the bytes it saw, which
 /// is the only place the padding is visible.
 #[tokio::test]
-#[ignore = "pingclair#256 — the trailing SP is forwarded to the origin"]
 async fn test_h2_request_field_padding_is_not_forwarded() {
     let upstream = ScriptedUpstream::start(
         vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()],
