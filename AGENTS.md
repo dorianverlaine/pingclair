@@ -169,11 +169,20 @@ Before editing:
 
 1. Inspect `git status --short --branch`.
 2. Preserve unrelated user changes.
-3. Locate the real execution path.
-4. Read the narrowest relevant guardrail:
+3. **Check the engineering memory repository, if it is present on this machine.**
+   Its checkout is a sibling of this one, `../pingclair-memory`, and it records
+   *why* the system is built this way: the design decisions, the rejected
+   alternatives, the research already done, and the problems already found. Read
+   `architecture/` first, then search `decisions/` and `research/`, then
+   **`findings/resolved/`** — a `rejected` Finding there means the suspicion was
+   already tested and dismissed, and re-investigating it is the specific cost
+   that repository exists to prevent. Its own `AGENTS.md` has the procedure.
+   Absent on a public clone; skip this step rather than creating it.
+4. Locate the real execution path.
+5. Read the narrowest relevant guardrail:
    `docs/guardrails/{testing,config,tls,proxy}.md`.
-5. Decide the required verification level.
-6. Define one coherent theme for the change.
+6. Decide the required verification level.
+7. Define one coherent theme for the change.
 
 Trace the actual request path: Pingclairfile → parser → adapter → compiler →
 validation → `PingclairConfig` → `ProxyState` → request execution → local
