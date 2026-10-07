@@ -323,6 +323,15 @@ const MAX_BIND_RACE_RESPAWNS: u32 = 3;
 /// (`pingclair/src/run.rs`); readiness probes wait for it.
 const STARTUP_BANNER: &str = "🚀 Pingclair running...";
 
+/// 🚦 How many 200 ms probes a readiness wait makes before giving up.
+///
+/// Twenty seconds, not ten: the documented reproduction runs six suites at
+/// once, and with another build sharing the machine a child can need longer
+/// than ten to bind and answer. A genuinely broken child still fails — the
+/// probe interval is unchanged, and a child that exits is caught on the first
+/// iteration after it does (#184).
+const READINESS_ATTEMPTS: usize = 100;
+
 /// 🔎 What one readiness wait ended with, before any respawn decision.
 enum Readiness {
     Ready,
@@ -724,7 +733,7 @@ impl TestServer {
             .map(|address| format!("http://{address}/health"));
         let mut server_ready = false;
         let mut admin_ready = admin_url.is_none();
-        for _ in 0..50 {
+        for _ in 0..READINESS_ATTEMPTS {
             if let Some(status) = self.exit_status() {
                 eprintln!("❌ Server exited unexpectedly with status: {status}");
                 self.stop();
@@ -805,7 +814,7 @@ impl TestServer {
         let admin_client = no_proxy_client();
         let mut tls_ready = false;
         let mut admin_ready = admin_url.is_none();
-        for _ in 0..50 {
+        for _ in 0..READINESS_ATTEMPTS {
             if let Some(status) = self.exit_status() {
                 eprintln!("❌ Server exited unexpectedly with status: {status}");
                 self.stop();
