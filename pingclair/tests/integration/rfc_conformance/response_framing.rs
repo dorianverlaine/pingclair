@@ -274,7 +274,6 @@ async fn test_declared_upstream_trailer_is_not_a_gateway_error() {
 /// 1.0 client as `Content-Length` or as a close-delimited body — never as chunk
 /// sizes the client will read as content.
 #[tokio::test]
-#[ignore = "pingclair#277 — a proxied chunked response reaches an HTTP/1.0 client as HTTP/1.1 + chunked"]
 async fn test_http10_client_is_not_sent_chunked_framing() {
     let upstream = ScriptedUpstream::start(
         vec![

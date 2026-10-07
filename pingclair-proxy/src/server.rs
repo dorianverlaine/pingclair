@@ -8151,6 +8151,25 @@ impl ProxyHttp for PingclairProxy {
             upstream_response.remove_header(&http::header::CONTENT_LENGTH);
         }
 
+        // 🧾 RFC 9112 §6.1: `Transfer-Encoding` may only be sent to a client
+        // that speaks HTTP/1.1 or later, and §2.3 asks that an HTTP/1.0
+        // recipient receive a message it can parse. The status line follows
+        // the client's version, and a body whose length the origin never
+        // declared is delimited by the close that ends the connection —
+        // never by chunk sizes an HTTP/1.0 client would read as content
+        // (#277). Local responses already downgrade their version; this is
+        // the proxied half.
+        if session.req_header().version == http::Version::HTTP_10 {
+            upstream_response.set_version(http::Version::HTTP_10);
+            if upstream_response
+                .headers
+                .contains_key(http::header::TRANSFER_ENCODING)
+            {
+                upstream_response.remove_header(&http::header::TRANSFER_ENCODING);
+                session.as_mut().set_keepalive(None);
+            }
+        }
+
         // 🛡️ Applies the same security policy used by locally generated responses.
         if let Some(state) = &ctx.state {
             Self::apply_security_response_headers(upstream_response, state)?;
