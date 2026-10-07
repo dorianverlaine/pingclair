@@ -234,7 +234,15 @@ impl SemanticAnalyzer {
                 add: headers
                     .add
                     .iter()
-                    .map(|(k, v)| (k.clone(), self.substitute_string(v, subs)))
+                    .map(|(k, values)| {
+                        (
+                            k.clone(),
+                            values
+                                .iter()
+                                .map(|value| self.substitute_string(value, subs))
+                                .collect(),
+                        )
+                    })
                     .collect(),
                 remove: headers.remove.clone(),
                 replace: headers.replace.clone(),

@@ -3043,8 +3043,11 @@ async fn plan_h3_handler_with_connector(
             for (name, value) in set {
                 block.set(name, value.clone());
             }
-            for (name, value) in add {
-                block.add(name, value.clone());
+            // 📋 Every value of every `+Name` line, in order (#276).
+            for (name, values) in add {
+                for value in values {
+                    block.add(name, value.clone());
+                }
             }
             for (name, value) in default_set {
                 block.set_if_absent(name, value.clone());
@@ -3063,10 +3066,12 @@ async fn plan_h3_handler_with_connector(
         } => {
             // 🏷️ Same order as H1/H2: sets and adds, then replacements over
             // what is now there, then removals last.
-            for (name, template, is_add) in set
-                .iter()
-                .map(|(name, value)| (name, value, false))
-                .chain(add.iter().map(|(name, value)| (name, value, true)))
+            for (name, template, is_add) in
+                set.iter().map(|(name, value)| (name, value, false)).chain(
+                    add.iter().flat_map(|(name, values)| {
+                        values.iter().map(move |value| (name, value, true))
+                    }),
+                )
             {
                 let value = if template.contains('{') {
                     resolve_caddy_placeholders(

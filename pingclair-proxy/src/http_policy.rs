@@ -212,8 +212,16 @@ pub fn evaluate_response_handlers(
                 // finished response, which this pass does not have.
                 require: _,
             } => {
-                for (name, value) in set.iter().chain(add.iter()) {
+                for (name, value) in set {
                     outcome.header_set.push((name.clone(), value.clone()));
+                }
+                // 📋 The subroute surface collects name/value edits and its
+                // consumers build a map from them, so a repeated `+Name` keeps
+                // the meaning it had before multi-value adds (#276).
+                for (name, values) in add {
+                    for value in values {
+                        outcome.header_set.push((name.clone(), value.clone()));
+                    }
                 }
                 outcome.header_remove.extend(remove.iter().cloned());
             }
@@ -1043,7 +1051,7 @@ impl ResponseHeaderPolicy {
     pub(crate) fn merge_proxy_response_ops(
         &mut self,
         set: &BTreeMap<String, String>,
-        add: &BTreeMap<String, String>,
+        add: &BTreeMap<String, Vec<String>>,
         remove: &[String],
         default_set: &BTreeMap<String, String>,
     ) {
@@ -1051,8 +1059,13 @@ impl ResponseHeaderPolicy {
             return;
         }
         self.merge_proxy_set(set);
-        for (name, value) in add {
-            self.add(name.clone(), value.clone());
+        // 📋 Every value of every `+Name` line, in order: two `+Set-Cookie`
+        // lines are two cookies, and RFC 6265 §3 forbids folding them into one
+        // field line (#276).
+        for (name, values) in add {
+            for value in values {
+                self.add(name.clone(), value.clone());
+            }
         }
         for name in remove {
             self.remove(name.clone());

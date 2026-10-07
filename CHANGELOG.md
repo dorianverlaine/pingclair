@@ -27,6 +27,18 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🍪 Two `+Set-Cookie` lines in one `header` block are two cookies
+
+A block that added one field twice kept only the last value: the compiled shape
+was a map of name to a single value, so `header { +Set-Cookie "a=1" +Set-Cookie
+"b=2" }` sent one cookie while the same two operations written as two separate
+`header` directives sent both — one configuration, two answers. Add operations
+are now multi-valued from the Caddyfile AST through the compiled configuration
+to both transports, matching Caddy's `add` shape (a name holds a list of
+values) and RFC 6265 §3, which forbids folding cookies into one field line
+(#276). A JSON document that wrote a single string still loads unchanged;
+`set` and the `?` default stay single-valued, as they are in Caddy.
+
 ### 🧭 An unknown `{placeholder}` stays exactly as written
 
 A name the replacer did not know was replaced with nothing, so a body carrying

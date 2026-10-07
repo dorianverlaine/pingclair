@@ -1642,7 +1642,13 @@ pub(super) fn apply_header_op(
 
     match field.chars().next() {
         Some('+') => {
-            config.add.insert(field[1..].to_string(), value);
+            // 📋 Appended, so two `+Set-Cookie` lines stay two cookies
+            // (RFC 6265 §3 forbids folding them into one field line, #276).
+            config
+                .add
+                .entry(field[1..].to_string())
+                .or_default()
+                .push(value);
         }
         Some('-') => {
             // 📌 A value beside a removal is ignored rather than refused, and

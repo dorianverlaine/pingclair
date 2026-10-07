@@ -243,7 +243,6 @@ async fn test_zero_weight_upstream_receives_no_traffic() {
 /// two cookies has no way to express itself if the compiled shape keeps one value
 /// per name. Caddy's block form emits both.
 #[tokio::test]
-#[ignore = "pingclair#276 — the second +Set-Cookie replaces the first inside one block"]
 async fn test_header_block_keeps_every_set_cookie() {
     let mut server = TestServer::new_pingclairfile(&site(
         "header {\n                +Set-Cookie \"a=1; Path=/\"\n                +Set-Cookie \"b=2; Path=/\"\n            }\n            respond \"ok\"",

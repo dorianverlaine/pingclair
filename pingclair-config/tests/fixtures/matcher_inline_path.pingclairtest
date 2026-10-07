@@ -51,7 +51,6 @@ example.com {
                 "set": {
                   "Cache-Control": "max-age=3600"
                 },
-                "add": {},
                 "remove": []
               },
               {

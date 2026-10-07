@@ -32,16 +32,30 @@ pub(crate) fn validate_header_fields(handler: &HandlerConfig) -> CompileResult<(
             default_set,
             ..
         } => {
-            for fields in [set, add, default_set] {
+            for fields in [set, default_set] {
                 check_fields(fields)?;
+            }
+            // 📋 Every value a `+Name` line carries, not just the last: two
+            // `+Set-Cookie` lines are two fields, and both have to be legal
+            // (#276).
+            for (name, values) in add {
+                check_name(name)?;
+                for value in values {
+                    check_value(value)?;
+                }
             }
             check_replacements(replace)
         }
         HandlerConfig::RequestHeaders {
             set, add, replace, ..
         } => {
-            for fields in [set, add] {
-                check_fields(fields)?;
+            check_fields(set)?;
+            // 📋 Every value of every `+Name` line, as on the response side.
+            for (name, values) in add {
+                check_name(name)?;
+                for value in values {
+                    check_value(value)?;
+                }
             }
             check_replacements(replace)
         }
@@ -64,11 +78,17 @@ pub(crate) fn validate_header_fields(handler: &HandlerConfig) -> CompileResult<(
             for fields in [
                 &proxy.headers_up,
                 &proxy.headers_down,
-                &proxy.headers_down_add,
                 &proxy.headers_down_default,
             ] {
                 fields.values().try_for_each(|value| check_value(value))?;
             }
+            // 📋 `header_down +Name` values are multi-valued now, so every one
+            // of them is checked, not just the last (#276).
+            proxy
+                .headers_down_add
+                .values()
+                .flatten()
+                .try_for_each(|value| check_value(value))?;
             for replacement in &proxy.headers_down_replace {
                 check_value(&replacement.replace)?;
             }

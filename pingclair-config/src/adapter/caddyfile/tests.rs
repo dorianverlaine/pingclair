@@ -1141,7 +1141,7 @@ mod fail_closed_tests {
         );
         assert_eq!(
             proxy.headers_down_add.get("X-Add"),
-            Some(&"added".to_string())
+            Some(&vec!["added".to_string()])
         );
         assert_eq!(proxy.headers_down_remove, vec!["X-Remove".to_string()]);
         assert_eq!(
@@ -2831,7 +2831,10 @@ mod fail_closed_tests {
         let route = &config.servers[0].routes[0];
         let found = handlers_of(&route.handler).into_iter().any(|handler| {
             matches!(handler, HandlerConfig::Headers { add, set, .. }
-                if add.get("X-Foo").is_some_and(|value| value == "bar") && set.is_empty())
+                if add
+                    .get("X-Foo")
+                    .is_some_and(|values| values.iter().any(|value| value == "bar"))
+                    && set.is_empty())
         });
         assert!(
             found,
@@ -2975,7 +2978,9 @@ mod fail_closed_tests {
             } = handler
             {
                 saw_set |= set.get("Denis").is_some_and(|value| value == "Ritchie");
-                saw_add |= add.get("Edsger").is_some_and(|value| value == "Dijkstra");
+                saw_add |= add
+                    .get("Edsger")
+                    .is_some_and(|values| values.iter().any(|value| value == "Dijkstra"));
                 saw_remove |= remove.iter().any(|name| name == "Wolfram");
             }
         }
@@ -3009,7 +3014,10 @@ mod fail_closed_tests {
         let route = &config.servers[0].routes[0];
         let found = handlers_of(&route.handler).into_iter().any(|handler| {
             matches!(handler, HandlerConfig::RequestHeaders { add, replace, .. }
-                if add.get("Foo").is_some_and(|value| value == "bar") && replace.is_empty())
+                if add
+                    .get("Foo")
+                    .is_some_and(|values| values.iter().any(|value| value == "bar"))
+                    && replace.is_empty())
         });
         assert!(found, "`+Foo bar baz` appends `bar` and ignores `baz`");
     }

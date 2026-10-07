@@ -11,7 +11,6 @@ use base64::Engine as _;
 use bcrypt::HashParts;
 use bytes::Bytes;
 use http::StatusCode;
-use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
@@ -37,8 +36,27 @@ pub type HandlerResult = Result<HandlerResponse, HandlerError>;
 #[derive(Debug)]
 pub struct HandlerResponse {
     pub status: StatusCode,
-    pub headers: BTreeMap<String, String>,
+    /// 📋 Multi-valued, because a response may carry one field line per value
+    /// — two `+Set-Cookie` lines are two cookies, and RFC 6265 §3 forbids
+    /// folding them into one (#276). The transports build the same shape on
+    /// the serving path.
+    pub headers: http::HeaderMap,
     pub body: Option<Bytes>,
+}
+
+/// 📋 Appends `value` under `name`, skipping a pair that is not a valid field.
+///
+/// The transports do the same thing when they build their own header maps, so
+/// an unusable value is dropped in one place rather than panicking here — the
+/// `HeaderMap::insert` shortcut panics on a value with a control byte, which a
+/// configuration is not allowed to turn into a process abort.
+fn append_header(headers: &mut http::HeaderMap, name: &str, value: &str) {
+    if let (Ok(name), Ok(value)) = (
+        http::header::HeaderName::from_bytes(name.as_bytes()),
+        http::HeaderValue::from_str(value),
+    ) {
+        headers.append(name, value);
+    }
 }
 
 /// Handler error
@@ -59,7 +77,7 @@ impl HandlerResponse {
     pub fn status(code: u16) -> Self {
         Self {
             status: StatusCode::from_u16(code).unwrap_or(StatusCode::OK),
-            headers: BTreeMap::new(),
+            headers: http::HeaderMap::new(),
             body: None,
         }
     }
@@ -68,22 +86,22 @@ impl HandlerResponse {
     pub fn with_body(code: u16, body: impl Into<Bytes>) -> Self {
         Self {
             status: StatusCode::from_u16(code).unwrap_or(StatusCode::OK),
-            headers: BTreeMap::new(),
+            headers: http::HeaderMap::new(),
             body: Some(body.into()),
         }
     }
 
     /// Add a header
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.insert(name.into(), value.into());
+        append_header(&mut self.headers, &name.into(), &value.into());
         self
     }
 
     /// Create redirect response
     pub fn redirect(to: &str, code: u16) -> Self {
         let status = StatusCode::from_u16(code).unwrap_or(StatusCode::FOUND);
-        let mut headers = BTreeMap::new();
-        headers.insert("Location".to_string(), to.to_string());
+        let mut headers = http::HeaderMap::new();
+        append_header(&mut headers, "Location", to);
 
         Self {
             status,
@@ -111,7 +129,9 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
                 HandlerResponse::status(*status)
             };
 
-            response.headers = headers.clone();
+            for (name, value) in headers {
+                append_header(&mut response.headers, name, value);
+            }
             Ok(response)
         }
 
@@ -165,15 +185,21 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             // Return a passthrough response
             let mut response = HandlerResponse::status(200);
             for (k, v) in set {
-                response.headers.insert(k.clone(), v.clone());
+                append_header(&mut response.headers, k, v);
             }
-            for (k, v) in add {
-                response.headers.insert(k.clone(), v.clone());
+            for (k, values) in add {
+                for v in values {
+                    // 📋 Appended, not replaced: a name added twice is two
+                    // field lines, which is what `+Set-Cookie` means (#276).
+                    append_header(&mut response.headers, k, v);
+                }
             }
             // ❓ Nothing was there before this response existed, so a default
             // always applies.
             for (k, v) in default_set {
-                response.headers.entry(k.clone()).or_insert_with(|| v.clone());
+                if !response.headers.contains_key(k) {
+                    append_header(&mut response.headers, k, v);
+                }
             }
             Ok(response)
         }
@@ -271,26 +297,18 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
 
             // Set special headers to communicate rewrite intent to proxy layer
             if let Some(prefix) = strip_prefix {
-                response
-                    .headers
-                    .insert("X-Pingclair-Strip-Prefix".to_string(), prefix.clone());
+                append_header(&mut response.headers, "X-Pingclair-Strip-Prefix", prefix);
             }
             if let Some(suffix) = strip_suffix {
-                response
-                    .headers
-                    .insert("X-Pingclair-Strip-Suffix".to_string(), suffix.clone());
+                append_header(&mut response.headers, "X-Pingclair-Strip-Suffix", suffix);
             }
             if let Some(replacement) = replace {
-                response
-                    .headers
-                    .insert("X-Pingclair-Replace-Path".to_string(), replacement.clone());
+                append_header(&mut response.headers, "X-Pingclair-Replace-Path", replacement);
             }
             // Note: regex support would need the regex crate here
             // For now, regex rewrites are handled separately
 
-            response
-                .headers
-                .insert("X-Pingclair-Rewrite".to_string(), "true".to_string());
+            append_header(&mut response.headers, "X-Pingclair-Rewrite", "true");
             Ok(response)
         }
 
@@ -303,9 +321,11 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
                 Ok(HandlerResponse::status(200))
             } else {
                 let mut response = HandlerResponse::with_body(401, "Unauthorized");
-                response
-                    .headers
-                    .insert("WWW-Authenticate".to_string(), basic_auth_challenge(realm));
+                append_header(
+                    &mut response.headers,
+                    "WWW-Authenticate",
+                    &basic_auth_challenge(realm),
+                );
                 Ok(response)
             }
         }
@@ -353,9 +373,7 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             // but here we are generating instructions/response.
             // The X-Pingclair-Strip-Prefix hopefully tells the proxy to modify the request *as it processes it*.
             // LIMITATION: This assumes the proxy sees this header and acts on it for *subsequent* or *current* processing.
-            response
-                .headers
-                .insert("X-Pingclair-Strip-Prefix".to_string(), prefix.clone());
+            append_header(&mut response.headers, "X-Pingclair-Strip-Prefix", prefix);
             Ok(response)
         }
 
@@ -539,6 +557,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as BASE64;
+    use std::collections::BTreeMap;
 
     fn empty_headers() -> http::HeaderMap {
         http::HeaderMap::new()
@@ -592,8 +611,8 @@ mod tests {
         let response = execute_handler(&config, &empty_headers()).unwrap();
         assert_eq!(response.status, StatusCode::MOVED_PERMANENTLY);
         assert_eq!(
-            response.headers.get("Location"),
-            Some(&"https://example.com".to_string())
+            response.headers.get("Location").unwrap(),
+            "https://example.com"
         );
     }
 
@@ -612,7 +631,7 @@ mod tests {
         };
 
         let response = execute_handler(&config, &empty_headers()).unwrap();
-        assert_eq!(response.headers.get("X-Custom"), Some(&"value".to_string()));
+        assert_eq!(response.headers.get("X-Custom").unwrap(), "value");
     }
 
     fn basic_auth_config() -> HandlerConfig {
@@ -680,8 +699,8 @@ mod tests {
         let response = execute_handler(&config, &empty_headers()).unwrap();
         assert_eq!(response.status, StatusCode::UNAUTHORIZED);
         assert_eq!(
-            response.headers.get("WWW-Authenticate"),
-            Some(&"Basic realm=\"Restricted\"".to_string())
+            response.headers.get("WWW-Authenticate").unwrap(),
+            "Basic realm=\"Restricted\""
         );
     }
 

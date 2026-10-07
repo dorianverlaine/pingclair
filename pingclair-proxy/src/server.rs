@@ -4053,7 +4053,7 @@ impl PingclairProxy {
         ctx: &mut RequestContext,
         route_index: usize,
         set: &std::collections::BTreeMap<String, String>,
-        add: &std::collections::BTreeMap<String, String>,
+        add: &std::collections::BTreeMap<String, Vec<String>>,
         remove: &[String],
         replace: &[pingclair_core::config::HeaderReplacement],
     ) -> PingoraResult<()> {
@@ -4066,7 +4066,12 @@ impl PingclairProxy {
         for (name, template, is_add) in set
             .iter()
             .map(|(name, value)| (name, value, false))
-            .chain(add.iter().map(|(name, value)| (name, value, true)))
+            // 📋 Every value of every `+Name` line, in order: the request side
+            // is multi-valued now too (#276).
+            .chain(
+                add.iter()
+                    .flat_map(|(name, values)| values.iter().map(move |value| (name, value, true))),
+            )
         {
             let value = if template.contains('{') {
                 resolve_caddy_placeholders(
@@ -5172,10 +5177,8 @@ impl PingclairProxy {
                 // template and the request, so the policy downstream stays a plain
                 // list of literal values and every response path benefits without
                 // being touched.
-                let needs_resolution = set
-                    .iter()
-                    .chain(add.iter())
-                    .any(|(_, value)| value.contains('{'));
+                let needs_resolution = set.values().any(|value| value.contains('{'))
+                    || add.values().flatten().any(|value| value.contains('{'));
                 let resolve = |value: &String, session: &Session, ctx: &RequestContext| {
                     if value.contains('{') {
                         resolve_caddy_placeholders(
@@ -5199,7 +5202,9 @@ impl PingclairProxy {
                         .collect();
                     let resolved_add: Vec<(String, String)> = add
                         .iter()
-                        .map(|(k, v)| (k.clone(), resolve(v, session, ctx)))
+                        .flat_map(|(k, values)| {
+                            values.iter().map(|v| (k.clone(), resolve(v, session, ctx)))
+                        })
                         .collect();
                     for (k, v) in resolved_set {
                         block.set(k, v);
@@ -5211,8 +5216,11 @@ impl PingclairProxy {
                     for (k, v) in set {
                         block.set(k, v.clone());
                     }
-                    for (k, v) in add {
-                        block.add(k, v.clone());
+                    // 📋 Every value of every `+Name` line, in order (#276).
+                    for (k, values) in add {
+                        for v in values {
+                            block.add(k, v.clone());
+                        }
                     }
                 }
                 for name in remove {
