@@ -6645,12 +6645,13 @@ impl ProxyHttp for PingclairProxy {
 
         // 🧭 Resolve `.` and `..` before anything routes on the path, so this
         // proxy and the origin agree on which resource was asked for. nginx and
-        // Caddy both do this, and the policy that matters is the one attached to
-        // the resolved path.
+        // Caddy both do this — and both leave interior empty segments alone,
+        // which this does too — and the policy that matters is the one attached
+        // to the resolved path.
         //
         // ⚠️ Only the path-and-query is rewritten, never the whole URI. An H2
-        // request target is absolute (`https://host/path`), and folding its
-        // `//` as if it were a duplicate separator would corrupt the authority.
+        // request target is absolute (`https://host/path`), and rewriting it
+        // wholesale would corrupt the authority.
         {
             let path_and_query = session
                 .req_header()
