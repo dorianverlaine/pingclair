@@ -9126,10 +9126,13 @@ impl ProxyHttp for PingclairProxy {
                     // well, but this counter remains Pingclair's cross-transport
                     // access-log contract.
                     bytes: ctx.response_bytes,
-                    duration_ms: elapsed.as_millis(),
+                    // ⏱️ Fractional milliseconds: a whole-millisecond
+                    // integer renders every fast request as `0`, which no
+                    // average or percentile can recover (#160).
+                    duration_ms: elapsed.as_secs_f64() * 1000.0,
                     ttfb_ms: ctx
                         .first_byte_at
-                        .map(|at| at.duration_since(ctx.start_time).as_millis()),
+                        .map(|at| at.duration_since(ctx.start_time).as_secs_f64() * 1000.0),
                     client_ip: remote_ip,
                     route,
                     upstream,

@@ -38,6 +38,20 @@ before any answer can be produced; the trusted-proxy policy is global and the
 PROXY-protocol tunnel registry is per listener, so none of it needed a site
 (#281).
 
+### ⏱️ An access record keeps sub-millisecond durations, and says which key is which
+
+`duration_ms` and `ttfb_ms` were whole milliseconds, so every request faster
+than a millisecond logged `0` and an average or percentile computed from the
+file could not tell "fast" from "instant" — or be compared with the reference
+implementation's seconds-as-float. Both are now fractional milliseconds with
+microsecond resolution, and a whole millisecond still renders exactly as
+before (`42`, not `42.000`), so an existing pipeline keeps parsing (#160).
+
+The record's keys are unchanged otherwise, and the reference page now carries
+the Caddy-to-here mapping table, including the two differences that were
+silent before: `duration` there is seconds, `duration_ms` here is
+milliseconds, and request-body bytes are not logged at all.
+
 ### 🏷️ A static file's `ETag` is Caddy's, so a moved site keeps its validators
 
 The validator was a `<size hex>-<mtime hex>` pair where Caddy writes

@@ -1070,13 +1070,15 @@ impl ResponseSink {
     }
 
     /// 📊 What actually went out: status, body bytes, and time to first byte.
-    fn observed(&self) -> (u16, u64, Option<u128>) {
+    fn observed(&self) -> (u16, u64, Option<f64>) {
         use std::sync::atomic::Ordering::Relaxed;
         let first_byte = self.first_byte_us.load(Relaxed);
         (
             self.status.load(Relaxed),
             self.body_bytes.load(Relaxed),
-            (first_byte > 0).then(|| u128::from(first_byte) / 1000),
+            // ⏱️ Microsecond resolution kept as fractional milliseconds, the
+            // same shape the H1/H2 record writes (#160).
+            (first_byte > 0).then(|| first_byte as f64 / 1000.0),
         )
     }
 }
@@ -3823,7 +3825,9 @@ fn write_h3_access_log(
         path: logged_path.as_ref(),
         status,
         bytes: body_bytes,
-        duration_ms: request_started.elapsed().as_millis(),
+        // ⏱️ Fractional milliseconds, as on H1/H2: whole milliseconds round
+        // every fast response to `0` (#160).
+        duration_ms: request_started.elapsed().as_secs_f64() * 1000.0,
         ttfb_ms,
         client_ip: remote_ip,
         route,
