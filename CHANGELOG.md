@@ -2614,6 +2614,11 @@ reproduction; the workaround, where there is one, is in the issue.
   belongs in the QUIC library (#282).
 - **A wildcard site's manual certificate** is not served for the names it
   covers over TCP; `tls internal` is not affected (#285).
+- **A request's trailer fields are discarded on HTTP/1**, so an `aws-chunked`
+  upload's checksum never reaches the origin while the client is answered
+  normally. The dependency's HTTP/1 body reader parses the trailer section to
+  find the end of the body and does not surface the fields; its own source
+  marks proper trailer handling as a TODO (#257).
 
 ### ⚠️ Breaking
 
