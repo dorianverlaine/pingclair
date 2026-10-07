@@ -1153,6 +1153,12 @@ impl ResponseHeaderPolicy {
     /// response is the only input, which is what lets one block be applied on
     /// its own.
     fn apply_ops(&self, response: &mut ResponseHeader) -> PingoraResult<()> {
+        // 🧾 The body's own writer declared this before the policy runs; it is
+        // the only value the message can honour (#261).
+        let written_length = response
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .map(|value| value.as_bytes().to_vec());
         for entry in self.set.values() {
             match &entry.header_value {
                 Some(header_value) => {
@@ -1209,6 +1215,25 @@ impl ResponseHeaderPolicy {
         }
         for name in &self.remove {
             let _ = response.remove_header(name);
+        }
+        match content_length_verdict(
+            written_length.as_deref(),
+            response
+                .headers
+                .get(http::header::CONTENT_LENGTH)
+                .map(|value| value.as_bytes()),
+        ) {
+            ContentLengthVerdict::Keep => {}
+            ContentLengthVerdict::Restore => {
+                if let Some(written) = written_length.as_deref()
+                    && let Ok(value) = http::header::HeaderValue::from_bytes(written)
+                {
+                    let _ = response.insert_header(http::header::CONTENT_LENGTH, value);
+                }
+            }
+            ContentLengthVerdict::Drop => {
+                let _ = response.remove_header(&http::header::CONTENT_LENGTH);
+            }
         }
         Ok(())
     }
@@ -1870,6 +1895,40 @@ impl ResponseContent {
     /// 📏 Whether the header may carry `Content-Length`.
     pub(crate) fn allows_content_length(self) -> bool {
         !matches!(self, Self::Forbidden)
+    }
+}
+
+/// 🧾 What must happen to a response's `Content-Length` after the header
+/// policy ran.
+///
+/// RFC 9110 §8.6 makes the declared length a property of the message content,
+/// so only the body's writer knows it. A policy may remove the field (shorter
+/// framing is always valid) but never replace the writer's value with a
+/// different one, and a value it invents where the writer declared none is
+/// dropped: that pair is a silent truncation on HTTP/1.1 and a protocol error
+/// the client pays for on HTTP/2 and HTTP/3 (#261).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ContentLengthVerdict {
+    /// The policy left the writer's declaration alone, or removed it.
+    Keep,
+    /// The policy replaced it; the writer's value goes back.
+    Restore,
+    /// The writer declared no length, and the policy invented one.
+    Drop,
+}
+
+/// 🧾 Compares the body writer's declaration with what the policy left behind.
+pub(crate) fn content_length_verdict(
+    written: Option<&[u8]>,
+    after: Option<&[u8]>,
+) -> ContentLengthVerdict {
+    match (written, after) {
+        (Some(written), Some(after)) if written == after => ContentLengthVerdict::Keep,
+        (Some(_), Some(_)) => ContentLengthVerdict::Restore,
+        // 🚫 An explicit removal is safe: chunked or close-delimited framing
+        // always describes the body that follows.
+        (Some(_), None) | (None, None) => ContentLengthVerdict::Keep,
+        (None, Some(_)) => ContentLengthVerdict::Drop,
     }
 }
 
@@ -3273,6 +3332,19 @@ mod outbound_filter_tests {
                 "{raw:?} must trim to {expected:?}"
             );
         }
+    }
+
+    /// 🧾 The body's declaration wins over the policy, a policy-invented
+    /// length is dropped, and an explicit removal stays removed (#261).
+    #[test]
+    fn content_length_verdict_protects_the_body_declaration() {
+        use ContentLengthVerdict::{Drop, Keep, Restore};
+
+        assert_eq!(content_length_verdict(Some(b"10"), Some(b"10")), Keep);
+        assert_eq!(content_length_verdict(Some(b"10"), Some(b"3")), Restore);
+        assert_eq!(content_length_verdict(Some(b"10"), None), Keep);
+        assert_eq!(content_length_verdict(None, Some(b"3")), Drop);
+        assert_eq!(content_length_verdict(None, None), Keep);
     }
 
     /// 🛡️ The underscore rule is one rule: the names the H1/H2 filter drops

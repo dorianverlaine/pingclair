@@ -7000,6 +7000,12 @@ fn apply_h3_response_policy(
 /// Split out so a gated block runs the same code as an unconditional one; the
 /// two would otherwise be a pair of sequences to keep in step by hand.
 fn apply_h3_ops(headers: &mut Vec<quiche::h3::Header>, policy: &ResponseHeaderPolicy) {
+    // 🧾 The body's own writer declared this before the policy runs; it is the
+    // only value the message can honour (#261).
+    let written_length = headers
+        .iter()
+        .find(|header| header.name().eq_ignore_ascii_case(b"content-length"))
+        .map(|header| header.value().to_vec());
     for (name, value) in policy.set_headers() {
         set_h3_header(headers, name, value);
     }
@@ -7033,6 +7039,23 @@ fn apply_h3_ops(headers: &mut Vec<quiche::h3::Header>, policy: &ResponseHeaderPo
     }
     for name in policy.removed_headers() {
         headers.retain(|header| !header.name().eq_ignore_ascii_case(name.as_bytes()));
+    }
+    match crate::http_policy::content_length_verdict(
+        written_length.as_deref(),
+        headers
+            .iter()
+            .find(|header| header.name().eq_ignore_ascii_case(b"content-length"))
+            .map(|header| header.value()),
+    ) {
+        crate::http_policy::ContentLengthVerdict::Keep => {}
+        crate::http_policy::ContentLengthVerdict::Restore => {
+            if let Some(written) = written_length.as_deref() {
+                set_h3_header(headers, "content-length", &String::from_utf8_lossy(written));
+            }
+        }
+        crate::http_policy::ContentLengthVerdict::Drop => {
+            headers.retain(|header| !header.name().eq_ignore_ascii_case(b"content-length"));
+        }
     }
 }
 

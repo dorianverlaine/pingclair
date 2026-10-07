@@ -19,7 +19,6 @@ use std::time::Duration;
 /// or rewriting it from the body are all acceptable answers; sending the pair as
 /// written is not, because the client pays for it with a reset connection.
 #[tokio::test]
-#[ignore = "pingclair#261 — H2 receives the mismatched length and the stream is reset"]
 async fn test_h2_declared_length_matches_the_body() {
     let mut server = TestServer::new_pingclairfile(&site(
         "handle /cl/* {\n                header Content-Length \"3\"\n                respond \"0123456789\"\n            }",
