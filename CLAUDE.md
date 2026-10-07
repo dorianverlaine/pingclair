@@ -7,8 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `AGENTS.md` is the operating manual and takes precedence over this file wherever
 they overlap. It covers the ghost-process trap, editing discipline (comment
 style, emoji conventions, commit subjects), architecture constraints per
-subsystem, and documentation ownership. This file adds the command details and
-the cross-crate picture that only emerge from reading several files at once.
+subsystem, and documentation ownership. This file adds the command details, the
+cross-crate picture that only emerge from reading several files at once, and the
+cross-repository picture below.
 
 These documents own distinct things, and the project treats mixing them as a
 defect:
@@ -20,6 +21,28 @@ defect:
 | `docs/guardrails/{testing,config,tls,proxy}.md` | Environment constraints and implementation rules, one file per subsystem. Every entry is a failure that already happened. `docs/GUARDRAILS.md` is the index over them, nothing more. |
 | `benchmarks/README.md` | Performance claims and methodology. Raw per-run evidence stays local under `benchmarks/results/`, never committed. |
 | `CHANGELOG.md` | What changed between releases, for someone upgrading. Written the same day as the change. |
+
+### The engineering memory repository
+
+Everything in the table above documents **what** Pingclair does. **Why** it does
+it lives in a separate, private repository whose checkout is a sibling of this
+one: `../pingclair-memory`. It holds the architecture constraints, the ADRs (with
+the alternatives that were rejected and the reasons), the research already
+carried out, and the findings already settled — including the ones that were
+investigated and found not to be real.
+
+📌 **Read it before proposing a design or "fixing" deliberate behaviour.** A
+`rejected` Finding there records that a suspicion was already tested and
+dismissed; re-investigating it is the specific cost that repository exists to
+prevent. Its own `AGENTS.md` has the procedure, and `POLICY.md` in it states who
+may change what.
+
+🔒 **Two rules about the boundary.** This repository is public and that one is
+private, so **never publish its contents here, never link it from here, and never
+add it to published documentation** — the pointer in this file is local
+navigation, not a reference. And except for this pointer, **its absence is
+expected**: a public clone has no sibling checkout, and a task scoped to this
+repository must not depend on one. Treat it as absent rather than creating it.
 
 Historical Caddyfile audit documents were retired in September 2026 because
 they lagged behind the implementation. Check the current code and GitHub issues
