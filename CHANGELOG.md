@@ -38,6 +38,14 @@ before any answer can be produced; the trusted-proxy policy is global and the
 PROXY-protocol tunnel registry is per listener, so none of it needed a site
 (#281).
 
+### 🌐 `remote_ip private_ranges` and `client_ip private_ranges` load
+
+Caddy's single-word spelling for its own list of private, loopback and
+link-local ranges was refused here at load — the same six prefixes
+`trusted_proxies static private_ranges` already expanded to, but only there.
+Both matchers now expand the keyword to the same list, from the one definition
+in `pingclair-core`, so a Caddyfile written with it loads and matches (#195).
+
 ### 🧹 The old `VariableResolver` API is gone
 
 `pingclair-config` exported `VariableResolver` and `ResolvedVariable` for the

@@ -30,6 +30,24 @@ fn ip_matcher_server() -> TestServer {
             @readiness path __PINGCLAIR_TEST_READINESS_PATH__
             respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
 
+            # 🌐 Caddy's single-word spelling for its own list of private,
+            # loopback and link-local ranges. The harness connects over
+            # loopback, so these only match if the keyword reached the matcher
+            # as ranges (#195). The two names read different addresses: with no
+            # `X-Forwarded-For` both see loopback, and with one only
+            # `remote_ip` does.
+            @private_peer {
+                path /private
+                remote_ip private_ranges
+            }
+            respond @private_peer "remote_ip private_ranges matched the peer"
+
+            @private_client {
+                path /private-client
+                client_ip private_ranges
+            }
+            respond @private_client "client_ip private_ranges matched loopback"
+
             handle /nested {
                 @peer remote_ip 127.0.0.0/8 ::1
                 respond @peer "nested remote_ip matched the proxy"
@@ -67,10 +85,19 @@ async fn test_remote_ip_matches_the_proxy_and_client_ip_the_forwarded_client() {
     let client = no_proxy_client();
 
     let mut answers = Vec::new();
-    for path in ["/remote", "/remote-as-client", "/client", "/nested"] {
-        let body = client
-            .get(server.url(0, path))
-            .header("X-Forwarded-For", "203.0.113.7")
+    for (path, forwarded_for) in [
+        ("/private", true),
+        ("/private-client", false),
+        ("/remote", true),
+        ("/remote-as-client", true),
+        ("/client", true),
+        ("/nested", true),
+    ] {
+        let mut request = client.get(server.url(0, path));
+        if forwarded_for {
+            request = request.header("X-Forwarded-For", "203.0.113.7");
+        }
+        let body = request
             .send()
             .await
             .expect("request")
@@ -83,6 +110,17 @@ async fn test_remote_ip_matches_the_proxy_and_client_ip_the_forwarded_client() {
     assert_eq!(
         answers,
         [
+            // 🌐 The trusted-proxy policy resolves this request's client to
+            // loopback, which is inside Caddy's private ranges — and the peer
+            // is loopback whether or not a forwarding header is present.
+            (
+                "/private",
+                "remote_ip private_ranges matched the peer".to_string()
+            ),
+            (
+                "/private-client",
+                "client_ip private_ranges matched loopback".to_string()
+            ),
             ("/remote", "remote_ip matched the proxy".to_string()),
             ("/remote-as-client", "no match".to_string()),
             (

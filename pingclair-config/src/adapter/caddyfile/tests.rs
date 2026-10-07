@@ -2651,6 +2651,36 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🌐 `remote_ip private_ranges` and `client_ip private_ranges` expand to
+    /// Caddy's own six prefixes at load time — the same list
+    /// `trusted_proxies static private_ranges` uses (#195).
+    #[test]
+    fn ip_matchers_expand_private_ranges() {
+        for directive in ["remote_ip", "client_ip"] {
+            let config = crate::compile(&format!(
+                "example.com {{\n    @local {directive} private_ranges\n    respond @local \"local\"\n}}"
+            ))
+            .unwrap_or_else(|error| panic!("`{directive} private_ranges` must load: {error}"));
+            let matcher = config.servers[0]
+                .routes
+                .iter()
+                .find_map(|route| route.matcher.as_ref())
+                .expect("the fixture route has a matcher");
+            let json = serde_json::to_value(matcher).expect("a matcher serializes");
+            let expanded: Vec<&str> = json[directive]
+                .as_array()
+                .unwrap_or_else(|| panic!("`{directive}` must carry the ranges: {json}"))
+                .iter()
+                .map(|range| range.as_str().expect("a range is a string"))
+                .collect();
+            assert_eq!(
+                expanded,
+                pingclair_core::config::PRIVATE_RANGES.to_vec(),
+                "`{directive} private_ranges` must expand to Caddy's list, in its order"
+            );
+        }
+    }
+
     /// 🧭 `private_ranges` is a keyword inside `static` rather than a module of
     /// its own, and it expands to Caddy's own six prefixes — `127.0.0.1/8` and
     /// `::1` included, because loopback counts as private upstream.

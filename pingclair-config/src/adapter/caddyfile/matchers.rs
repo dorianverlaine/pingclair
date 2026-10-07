@@ -614,13 +614,32 @@ pub(super) fn parse_single_matcher_at(
             if d.args.is_empty() {
                 return Err(AdapterError::ArgumentCount(d.name.clone(), 1, 0));
             }
+            // 🌐 `private_ranges` is Caddy's keyword for its own list of
+            // private, loopback and link-local ranges (the same six
+            // `trusted_proxies static private_ranges` expands to). Upstream
+            // expands it while the matcher is read, so the configuration that
+            // reaches the runtime carries ranges either way (#195).
+            let ranges: Vec<String> = d
+                .args
+                .iter()
+                .flat_map(|argument| {
+                    if argument == "private_ranges" {
+                        pingclair_core::config::PRIVATE_RANGES
+                            .iter()
+                            .map(|range| (*range).to_string())
+                            .collect::<Vec<String>>()
+                    } else {
+                        vec![argument.clone()]
+                    }
+                })
+                .collect();
             // 🌐 The two names read different addresses, as in Caddy: behind a
             // trusted load balancer `remote_ip` sees the balancer and
             // `client_ip` sees the client it vouches for.
             if d.name == "remote_ip" {
-                Ok(Matcher::RemoteIp(d.args.clone()))
+                Ok(Matcher::RemoteIp(ranges))
             } else {
-                Ok(Matcher::ClientIp(d.args.clone()))
+                Ok(Matcher::ClientIp(ranges))
             }
         }
         "header" => {
