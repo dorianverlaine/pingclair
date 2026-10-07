@@ -57,6 +57,53 @@ async fn missing_config_reads_return_null_and_support_creation() {
     assert!(!error.contains("top level"), "{error}");
 }
 
+/// 🧭 A Caddy document is refused by name, and the endpoints automation reads
+/// exist.
+///
+/// `{"apps":{}}` is the smallest possible Caddy configuration, and serde's own
+/// answer to it is `unknown field 'apps'` — which reads like a typo in a
+/// document copied from a working Caddy install. The endpoint says which
+/// schema it takes instead (#164). The upstream list is the other half: a
+/// health check that enumerates upstreams used to get a `404`, which is
+/// indistinguishable from a deployment that has none.
+#[tokio::test]
+async fn a_caddy_document_is_refused_by_name_and_upstreams_are_listed() {
+    let mut server =
+        TestServer::new_pingclairfile(&admin_test_pingclairfile("/__compat", "sentinel"));
+    assert!(server.wait_until_ready().await);
+    let client = no_proxy_client();
+
+    // 🚫 Caddy's top level is named, and the message says what to send instead.
+    let refused = client
+        .post(server.admin_url("/load"))
+        .json(&serde_json::json!({ "apps": {} }))
+        .send()
+        .await
+        .unwrap();
+    let status = refused.status().as_u16();
+    let body = refused.text().await.unwrap();
+    assert_eq!(status, 400);
+    assert!(
+        body.contains("not Caddy's") && body.contains("Caddyfile"),
+        "the refusal must name the schema and the way out: {body}"
+    );
+
+    // 🧭 The endpoint a health check enumerates answers with a list, not a 404.
+    let upstreams = client
+        .get(server.admin_url("/reverse_proxy/upstreams"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upstreams.status().as_u16(), 200);
+    assert!(
+        upstreams
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+            .is_array()
+    );
+}
+
 #[tokio::test]
 async fn metrics_export_caddy_names_and_retain_extensions() {
     let config = admin_test_pingclairfile("/__metrics_names", "metrics").replace(
