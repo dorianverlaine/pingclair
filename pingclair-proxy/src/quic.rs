@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::borrow::Cow;
 use thiserror::Error;
 use tokio::net::UdpSocket;
@@ -5031,6 +5031,62 @@ async fn stream_h3_subrequest_response(
     Ok(())
 }
 
+/// 📏 Reads an H3 FastCGI request body that arrived without a `Content-Length`.
+///
+/// The same policy as the H1/H2 half of the transport: PHP-FPM reads exactly
+/// `CONTENT_LENGTH` bytes from STDIN, so a body that did not declare a length
+/// is read here — through the same body limit, deadline, and upload pacer as
+/// the streaming path — and its length is what the environment will say (#248).
+/// The ceiling is the route's own `request_buffers` when it set one, and the
+/// module's hard ceiling otherwise; past it the body cannot be measured without
+/// unbounded memory, so the request fails closed with 413 rather than reaching
+/// php-fpm as a body the responder would read as empty.
+#[allow(clippy::too_many_arguments)]
+async fn read_lengthless_h3_fastcgi_body(
+    body_limit: u64,
+    body_timeout_ms: Option<u64>,
+    request_deadline: Option<Instant>,
+    upload_bytes_per_sec: Option<u64>,
+    ceiling: usize,
+    body_rx: &mut mpsc::Receiver<Bytes>,
+    body_notify: &Arc<Notify>,
+) -> Result<Bytes, HandlerError> {
+    let mut upload_pacer = upload_bytes_per_sec.map(StreamPacer::new);
+    let mut counted = 0u64;
+    let mut held = BytesMut::new();
+    loop {
+        let next = match body_timeout_ms {
+            Some(timeout_ms) => {
+                tokio::time::timeout(Duration::from_millis(timeout_ms), body_rx.recv())
+                    .await
+                    .map_err(|_| (408, "Request Body Timeout"))?
+            }
+            None => body_rx.recv().await,
+        };
+        let Some(chunk) = next else { break };
+        // 🔔 Releasing one bounded channel slot lets the QUIC reader resume.
+        body_notify.notify_one();
+        counted = counted.saturating_add(chunk.len() as u64);
+        if body_limit > 0 && counted > body_limit {
+            return Err((413, "Request Entity Too Large"));
+        }
+        if let Some(delay) = upload_pacer
+            .as_mut()
+            .and_then(|pacer| pacer.delay_for(chunk.len()))
+        {
+            if request_deadline.is_some_and(|deadline| Instant::now() + delay >= deadline) {
+                return Err((408, "Request Timeout"));
+            }
+            tokio::time::sleep(delay).await;
+        }
+        if held.len() + chunk.len() > ceiling {
+            return Err((413, "FastCGI Body Too Large To Measure"));
+        }
+        held.extend_from_slice(&chunk);
+    }
+    Ok(held.freeze())
+}
+
 /// 🧵 Proxies one HTTP/3 request through the shared FastCGI exchange.
 #[allow(clippy::too_many_arguments)]
 async fn fastcgi_upstream(
@@ -5062,17 +5118,36 @@ async fn fastcgi_upstream(
         .get("content-length")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    // 🚫 Refusing a lengthless FastCGI body before admission preserves both
-    // H1/H2 parity and upstream capacity for requests that can be served.
-    if !bodyless && content_length.is_none() {
-        let mut headers = vec![
-            quiche::h3::Header::new(b":status", b"411"),
-            quiche::h3::Header::new(b"content-length", b"0"),
-        ];
-        apply_h3_response_policy(&mut headers, response_policy, request_id, Some(state));
-        send_headers(resp_tx, stream_id, headers, true).await;
-        return Ok(());
-    }
+    // 🧾 PHP-FPM reads exactly `CONTENT_LENGTH` bytes from STDIN, so the number
+    // has to exist before the exchange opens. A client that declared one has
+    // given it to us; an H3 body only supplies bytes, so it is read and
+    // measured here, before the dial (#248). A request with no body simply
+    // measures zero. Measuring before admission also keeps a body this server
+    // cannot carry from occupying an upstream slot or a queue permit.
+    let measuring = content_length.is_none() && !bodyless;
+    let measured = if measuring {
+        let limits = &state.config.limits;
+        let request_deadline = limits
+            .request_timeout_ms
+            .filter(|value| *value > 0)
+            .map(|value| request_started + Duration::from_millis(value));
+        let ceiling = crate::body_buffer::measure_ceiling(state.buffering(route_index).request);
+        Some(
+            read_lengthless_h3_fastcgi_body(
+                body_limit,
+                body_timeout_ms,
+                request_deadline,
+                limits.upload_bytes_per_sec,
+                ceiling,
+                body_rx,
+                body_notify,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let content_length = content_length.or_else(|| measured.as_ref().map(|body| body.len() as u64));
     let _route_admission = match proxy.admit_route(state, route_index).await {
         Ok(admission) => admission,
         Err(crate::overload::AdmissionError::QueueFull) => {
@@ -5183,7 +5258,17 @@ async fn fastcgi_upstream(
     // still apply to each chunk as it arrives, before it is held.
     let buffering = state.buffering(route_index);
     let mut request_buffer = buffering.request.map(crate::body_buffer::BufferedBody::new);
-    if !bodyless {
+    if let Some(measured) = measured {
+        // 📏 This body was read to measure it, so the body limit, deadline, and
+        // upload pacer already ran while it was held; hand it over as it
+        // arrived rather than reading it a second time.
+        if !measured.is_empty() {
+            exchange
+                .send_body(&measured)
+                .await
+                .map_err(exchange_error)?;
+        }
+    } else if !bodyless {
         loop {
             let next = match body_timeout_ms {
                 Some(timeout_ms) => {
@@ -5221,7 +5306,8 @@ async fn fastcgi_upstream(
             exchange.send_body(&chunk).await.map_err(exchange_error)?;
         }
     }
-    if !bodyless
+    if !measuring
+        && !bodyless
         && let Some(content_length) = content_length
         && counted != content_length
     {

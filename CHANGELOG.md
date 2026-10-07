@@ -27,6 +27,19 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🧵 `php_fastcgi` measures a body that did not declare its length
+
+A request to a `php_fastcgi` route was answered `411 Length Required` whenever
+it carried no `Content-Length` header: a chunked upload, and a bodyless `POST`
+or `DELETE`, which RFC 9112 §6.3 says simply has no body. PHP-FPM does read
+exactly `CONTENT_LENGTH` bytes from STDIN, so the proxy now reads a lengthless
+body itself — up to the route's `request_buffers`, and this server's own
+buffering ceiling when the route set none — and sends the measured length,
+while a request that says nothing about a body arrives as `CONTENT_LENGTH: 0`.
+A lengthless body larger than the ceiling is refused with `413 Payload Too
+Large` instead of reaching php-fpm as a body the responder would read as empty.
+The same policy holds on HTTP/1.1, HTTP/2, and HTTP/3 (#248).
+
 ### 🛑 HTTP/3 cancellation releases idle upstream requests
 
 Cancelling an HTTP/3 request now releases its upstream exchange even when the

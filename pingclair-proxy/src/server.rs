@@ -56,7 +56,7 @@ use crate::metrics;
 use crate::overload::{AdmissionError, RouteAdmission, RouteProtection, UpstreamAdmission};
 use crate::upstream::{DynamicDialPlan, HostName, Scheme, UpstreamSpec};
 use crate::{HealthChecker, LoadBalancer, Strategy, Upstream, UpstreamEntry};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use ipnet::IpNet;
 use pingclair_core::config::Encoding;
 use regex::Regex;
@@ -3246,6 +3246,48 @@ impl PingclairProxy {
         self.proxy_subrequest(session, ctx, &prepared).await
     }
 
+    /// 📏 Reads a FastCGI request body that arrived without a `Content-Length`.
+    ///
+    /// The FastCGI transport has to state the body's length before it writes a
+    /// single STDIN byte, so a body framed by chunked coding — which is how
+    /// HTTP/1.1, and every HTTP/2 or HTTP/3 stream, can define a length by
+    /// construction — is read here and measured (#248). The limit, deadline,
+    /// and upload pacer of the streaming path run while it is held, because
+    /// measuring a body must not become the one way past `client_max_body_size`.
+    ///
+    /// The ceiling is the route's own `request_buffers` when it set one, and
+    /// this module's hard ceiling otherwise. Past it the length cannot be
+    /// measured without unbounded memory, so the request fails closed with 413
+    /// instead of reaching php-fpm as a body the responder would read as empty.
+    async fn read_lengthless_fastcgi_body(
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        config: &ReverseProxyConfig,
+    ) -> pingora_core::Result<Bytes> {
+        let ceiling = crate::body_buffer::measure_ceiling(crate::body_buffer::resolve_limit(
+            config.request_buffer_bytes,
+        ));
+        let h2_pause = Self::h2_body_pause(session, ctx);
+        let mut held = BytesMut::new();
+        while let Some(chunk) =
+            crate::body_timeout::read_within(h2_pause, session.read_request_body()).await?
+        {
+            Self::enforce_request_body_chunk(session, ctx, chunk.len()).await?;
+            if held.len() + chunk.len() > ceiling {
+                session.as_mut().set_keepalive(None);
+                return pingora_core::Error::e_explain(
+                    pingora_core::ErrorType::HTTPStatus(413),
+                    format!(
+                        "a FastCGI body without a declared length must fit its \
+                         {ceiling}-byte buffering ceiling so its length can be measured"
+                    ),
+                );
+            }
+            held.extend_from_slice(&chunk);
+        }
+        Ok(held.freeze())
+    }
+
     /// 🧵 Serves one request through the FastCGI transport.
     ///
     /// The whole round trip runs inline in `request_filter`, like
@@ -3278,17 +3320,20 @@ impl PingclairProxy {
             .get("content-length")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
-        // 🚫 PHP-FPM needs CONTENT_LENGTH before any STDIN byte; refusing
-        // first also keeps invalid requests from consuming an upstream slot.
-        if !bodyless && content_length.is_none() {
-            let mut response = ResponseHeader::build(411, Some(2)).unwrap();
-            response.insert_header("Content-Length", "0").unwrap();
-            Self::apply_local_response_headers(&mut response, ctx)?;
-            session
-                .write_response_header(Box::new(response), true)
-                .await?;
-            return Ok(true);
-        }
+        // 🧾 PHP-FPM reads exactly `CONTENT_LENGTH` bytes from STDIN, so the
+        // number has to exist before the exchange opens. A client that declared
+        // one has given it to us; a body framed any other way — chunked coding,
+        // or an H2 stream — only supplies bytes, so it is read and measured
+        // here, before the dial (#248). A request that says nothing about a
+        // body simply measures zero. Reading first also keeps a body this
+        // server cannot carry from consuming an upstream slot.
+        let measured = if content_length.is_none() && !bodyless {
+            Some(Self::read_lengthless_fastcgi_body(session, ctx, config).await?)
+        } else {
+            None
+        };
+        let content_length =
+            content_length.or_else(|| measured.as_ref().map(|body| body.len() as u64));
         let balance_key = self.balancing_identity(session, ctx);
         let (upstream, mut upstream_admission) = self
             .select_admitted_upstream(&state, route_index, balance_key.as_deref(), &HashSet::new())
@@ -3377,11 +3422,10 @@ impl PingclairProxy {
             proxy_error(502, "FastCGI document root could not be resolved")
         })?;
         env.insert("REQUEST_METHOD".to_string(), method.clone().into());
-        if bodyless {
-            env.insert("CONTENT_LENGTH".to_string(), b"0".to_vec());
-        } else if let Some(length) = content_length {
-            env.insert("CONTENT_LENGTH".to_string(), length.to_string().into());
-        }
+        env.insert(
+            "CONTENT_LENGTH".to_string(),
+            content_length.unwrap_or(0).to_string().into(),
+        );
 
         let protocol_error = |error: crate::fastcgi::ExchangeError| {
             tracing::warn!(%error, "🧵 FastCGI exchange failed");
@@ -3393,7 +3437,17 @@ impl PingclairProxy {
         // filter: a slow client keeps a php-fpm worker waiting only once it
         // has sent the whole body or outgrown the buffer.
         let mut request_buffer = ctx.request_buffer.take();
-        if !bodyless {
+        if let Some(measured) = measured {
+            // 📏 This body was read to measure it, so the limit, deadline, and
+            // upload pacer already ran while it was held; hand it over as it
+            // arrived rather than reading it a second time.
+            if !measured.is_empty() {
+                exchange
+                    .send_body(&measured)
+                    .await
+                    .map_err(protocol_error)?;
+            }
+        } else if !bodyless {
             // ⏱️ An HTTP/2 upload that stops halfway would otherwise hold this
             // stream and a php-fpm worker forever; see `h2_body_pause`.
             let h2_pause = Self::h2_body_pause(session, ctx);

@@ -94,6 +94,19 @@ pub(crate) fn resolve_limit(configured: Option<i64>) -> Option<usize> {
     }
 }
 
+/// 📏 The ceiling for a body whose length has to be measured before it is sent.
+///
+/// A FastCGI body that arrived without a `Content-Length` has to be read before
+/// the exchange opens: PHP-FPM reads exactly `CONTENT_LENGTH` bytes from STDIN,
+/// and the number must precede the bytes (#248). A route's own
+/// `request_buffers` narrows the ceiling when it set one — `unlimited`
+/// included, still clamped by [`MAX_BUFFERED_BODY_BYTES`] — and the module
+/// ceiling applies when it did not, so measuring a body is never the one
+/// unbounded body path.
+pub(crate) fn measure_ceiling(buffering: Option<usize>) -> usize {
+    buffering.unwrap_or(MAX_BUFFERED_BODY_BYTES)
+}
+
 /// 🧭 The load-time sentence for a ceiling this server will not honour in full,
 /// or `None` when the configured value is used verbatim.
 pub(crate) fn describe_clamp(configured: Option<i64>) -> Option<String> {

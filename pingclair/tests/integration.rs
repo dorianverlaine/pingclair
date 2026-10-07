@@ -12454,10 +12454,15 @@ async fn test_php_fastcgi_missing_response_page_enters_error_route_once() {
     assert_eq!(response.text().await.unwrap(), "missing-error-page");
 }
 
-/// 🚫 A body without Content-Length is refused with 411, exactly like
-/// Caddy's FastCGI client, because PHP-FPM needs the length before STDIN.
+/// 📏 A chunked body reaches FastCGI with the length this server measured.
+///
+/// PHP-FPM reads exactly `CONTENT_LENGTH` bytes from STDIN, so the number has
+/// to exist before the exchange opens — and chunked framing defines a length by
+/// construction, so the server only has to read it. Refusing the request
+/// invented a refusal the client did not earn; Caddy reached the same
+/// conclusion in 2.9.1 by buffering FastCGI request bodies (#248).
 #[tokio::test]
-async fn test_php_fastcgi_refuses_a_chunked_body() {
+async fn test_php_fastcgi_forwards_a_chunked_body() {
     let responder = MockFastCgi::start();
     let root = tempfile::tempdir().unwrap();
     let root = root.path().to_str().unwrap().replace("\\", "/");
@@ -12485,7 +12490,7 @@ async fn test_php_fastcgi_refuses_a_chunked_body() {
     let mut stream = tokio::net::TcpStream::connect(server.address(0))
         .await
         .unwrap();
-    let request = "POST /index.php HTTP/1.1\r\nHost: chunked\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    let request = "POST /index.php HTTP/1.1\r\nHost: chunked\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
     let _ = tokio::time::timeout(
@@ -12495,12 +12500,146 @@ async fn test_php_fastcgi_refuses_a_chunked_body() {
     .await;
     let text = String::from_utf8_lossy(&response);
     assert!(
-        text.starts_with("HTTP/1.1 411 "),
-        "a chunked FastCGI body must be refused with 411, got:\n{text}"
+        text.starts_with("HTTP/1.1 200 "),
+        "a chunked FastCGI body must reach the responder, got:\n{text}"
+    );
+    let requests = responder.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1, "the responder must receive the request");
+    assert_eq!(
+        requests[0].0.get("CONTENT_LENGTH").map(String::as_str),
+        Some("5"),
+        "the environment must carry the length this server measured"
+    );
+    assert_eq!(requests[0].1, b"hello".to_vec());
+}
+
+/// 📏 An H2 body with no `Content-Length` is measured before the exchange.
+///
+/// HTTP/2 frames a body with DATA, not a header: a request that never declares
+/// a length is ordinary traffic there, and the responder still needs
+/// `CONTENT_LENGTH` before its first STDIN byte (#248).
+#[tokio::test]
+async fn test_php_fastcgi_measures_an_h2_body_without_content_length() {
+    use bytes::Bytes;
+
+    let responder = MockFastCgi::start();
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().to_str().unwrap().replace("\\", "/");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            php_fastcgi 127.0.0.1:{fcgi_port}
+        }}
+        "#,
+        fcgi_port = responder.port
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let downstream = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    let (mut client, connection) = h2::client::handshake(downstream).await.unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(format!("http://{}/index.php", server.address(0)))
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream
+        .send_data(Bytes::from_static(b"hello"), true)
+        .unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let mut body = response.into_body();
+    while let Some(chunk) = body.data().await {
+        chunk.unwrap();
+    }
+    connection_task.abort();
+    let _ = connection_task.await;
+
+    let requests = responder.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1, "the responder must receive the request");
+    assert_eq!(
+        requests[0].0.get("CONTENT_LENGTH").map(String::as_str),
+        Some("5"),
+        "the environment must carry the length this server measured"
+    );
+    assert_eq!(requests[0].1, b"hello".to_vec());
+}
+
+/// 🧱 A lengthless body past its buffering ceiling fails closed.
+///
+/// The length has to exist before the first STDIN byte, so a body that
+/// outgrows what this server will hold cannot reach php-fpm at all: streaming
+/// it would arrive there as `CONTENT_LENGTH: 0` with unknown bytes behind it,
+/// and php-fpm would read an empty body. The refusal is a 413 the client can
+/// act on — and it happens before an upstream slot is spent (#248).
+#[tokio::test]
+async fn test_php_fastcgi_refuses_a_lengthless_body_past_its_ceiling() {
+    let responder = MockFastCgi::start();
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().to_str().unwrap().replace("\\", "/");
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            php_fastcgi 127.0.0.1:{fcgi_port} {{
+                request_buffers 1KiB
+            }}
+        }}
+        "#,
+        fcgi_port = responder.port
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let mut stream = tokio::net::TcpStream::connect(server.address(0))
+        .await
+        .unwrap();
+    let chunk = "x".repeat(2048);
+    let request = format!(
+        "POST /index.php HTTP/1.1\r\nHost: oversized\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+         800\r\n{chunk}\r\n0\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.starts_with("HTTP/1.1 413 "),
+        "a body past the measuring ceiling must be refused, got:\n{text}"
     );
     assert!(
         responder.requests.lock().unwrap().is_empty(),
-        "the responder must never see a body that was refused"
+        "the responder must never see a body this server could not measure"
     );
 }
 
