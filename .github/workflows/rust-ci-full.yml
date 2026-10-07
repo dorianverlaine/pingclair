@@ -36,6 +36,14 @@ jobs:
 
       - uses: ./.github/actions/setup-ci
 
+      - name: Make sure the pinned toolchain has rustfmt and clippy
+        # 🧰 Same reason as `rust-ci.yml`: the builder image is a moving tag,
+        # so the run that bumps the toolchain can still be looking at the
+        # previous image and an auto-installed toolchain has no components.
+        run: |
+          set -euo pipefail
+          rustup component add rustfmt clippy --toolchain "$(just --evaluate rust)"
+
       - uses: ./.github/actions/setup-rust-cache
         with:
           target: x86_64-unknown-linux-gnu
