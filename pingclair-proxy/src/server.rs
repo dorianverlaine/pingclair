@@ -4660,11 +4660,13 @@ impl PingclairProxy {
                     Ok(rendered) => rendered,
                     Err(error) => {
                         tracing::warn!(%error, path, "⚠️ Template rendering failed");
-                        let mut response = ResponseHeader::build(500, Some(2)).unwrap();
-                        Self::apply_local_response_headers(&mut response, ctx)?;
-                        session
-                            .write_response_header(Box::new(response), true)
-                            .await?;
+                        // 🚨 Raised rather than written here: Caddy returns a
+                        // template error to its chain, so `handle_errors` is
+                        // where an operator's 500 page lives. Answering inline
+                        // skipped that route on this transport and produced a
+                        // different 500 from HTTP/3 (#245).
+                        ctx.error_status = Some(500);
+                        ctx.error_message = Some("Template Rendering Failed".to_string());
                         return Ok(true);
                     }
                 };

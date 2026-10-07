@@ -42,6 +42,13 @@ table of the route that *raised* the error — a different route's
 configuration — so the rewrite failed with a `500` and the replacement quietly
 did nothing, on every transport.
 
+A template that fails to render is now raised instead of answered inline, so
+the block's page renders for it. HTTP/1 and HTTP/2 wrote their own bare `500`
+and HTTP/3 returned from deep inside its terminal, both bypassing
+`handle_errors`; HTTP/3 keeps two more such exits — a template file that
+disappears between planning and serving, and a file server that was not built
+— inside its routing loop, where Caddy would have them.
+
 ### 🧩 Two sites on one port, one per interface, are two sites
 
 Two site blocks on the same port were refused as duplicates whenever their

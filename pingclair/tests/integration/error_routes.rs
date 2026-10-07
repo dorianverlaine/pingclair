@@ -493,6 +493,47 @@ async fn test_handle_errors_header_replace_uses_its_own_table() {
     );
 }
 
+/// 🔥 A template that fails to render is raised, so `handle_errors` answers it
+/// like any other 500 (#245).
+#[tokio::test]
+async fn test_a_template_failure_reaches_the_error_route() {
+    let site_root = tempfile::tempdir().expect("site root");
+    std::fs::write(site_root.path().join("broken.html"), "before {{ unclosed").unwrap();
+    let mut server = TestServer::new_pingclairfile(&format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            root * {site_root}
+
+            handle_errors {{
+                respond "error page for {{err.status_code}}" 500
+            }}
+
+            templates
+            file_server
+        }}
+        "#,
+        site_root = site_root.path().display(),
+    ));
+    assert!(server.wait_until_ready().await, "server did not start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/broken.html"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        (response.status().as_u16(), response.text().await.unwrap()),
+        (500, "error page for 500".to_string())
+    );
+}
+
 /// 🔌 Writes one raw HTTP/1.1 request and returns the status and body of the
 /// connection-closing response.
 async fn raw_exchange(address: std::net::SocketAddr, request: &str) -> (u16, String) {

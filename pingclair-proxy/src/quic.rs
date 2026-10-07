@@ -4343,7 +4343,7 @@ async fn handle_request_inner(
                     .await
                 }
 
-                H3Terminal::Templates { root } => {
+                H3Terminal::Templates { root } => 'templates: {
                     let root = root.unwrap_or_else(|| ".".to_string());
                     let relative = effective_uri.split('?').next().unwrap_or("/");
                     // 🛡️ Confined here as well as in the plan that selected this
@@ -4351,19 +4351,25 @@ async fn handle_request_inner(
                     // line that does not depend on the first having run — the same reason
                     // the static file server re-checks a configured index. It used to
                     // join the request path with no `..` check of its own at all.
+                    // 🚨 Every failure below leaves through the block's value
+                    // rather than the function's: an error raised here has to
+                    // meet `handle_errors` like any other, and returning from
+                    // the function skipped the routing loop entirely (#245).
                     let Some(mut file_path) = pingclair_core::percent::resolve_under_root(
                         std::path::Path::new(&root),
                         relative,
                     ) else {
-                        return Err((404, "Not Found"));
+                        break 'templates Err((404, "Not Found"));
                     };
                     if file_path.is_dir() {
                         file_path = file_path.join("index.html");
                     }
-                    let source =
-                        std::fs::read_to_string(&file_path).map_err(|_| (404, "Not Found"))?;
-                    let body = crate::server::render_template(&source, &root)
-                        .map_err(|_| (500, "Template Rendering Failed"))?;
+                    let Ok(source) = std::fs::read_to_string(&file_path) else {
+                        break 'templates Err((404, "Not Found"));
+                    };
+                    let Ok(body) = crate::server::render_template(&source, &root) else {
+                        break 'templates Err((500, "Template Rendering Failed"));
+                    };
                     let mut hdrs = http::HeaderMap::new();
                     hdrs.insert(
                         "content-type",
@@ -4389,7 +4395,7 @@ async fn handle_request_inner(
                     .await
                 }
 
-                H3Terminal::FileServer { error } => {
+                H3Terminal::FileServer { error } => 'file_server: {
                     // 🚨 Inside an error route the file server is that route's own,
                     // and the page goes out with the error's status, as on H1/H2.
                     let maybe_fs = match error {
@@ -4400,7 +4406,10 @@ async fn handle_request_inner(
                         None => state.file_servers.get(route_index).and_then(|f| f.clone()),
                     };
                     let Some(fs) = maybe_fs else {
-                        return Err((503, "File Server Unavailable"));
+                        // 🚨 The block's value, not the function's: the 503 has
+                        // to meet `handle_errors` like every other error the
+                        // terminal raises (#245).
+                        break 'file_server Err((503, "File Server Unavailable"));
                     };
                     let status_for = |own: u16| error.map_or(own, |scope| scope.status);
 
