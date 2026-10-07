@@ -701,6 +701,22 @@ impl TestServer {
     }
 
     async fn wait_until_ready_once(&mut self) -> Readiness {
+        // 📌 Defined here rather than at the top of the file so the reason it
+        // exists sits next to the readiness contract it strengthens.
+        async fn every_reserved_listener_accepts(addresses: &[SocketAddr]) -> bool {
+            for address in addresses {
+                let connected = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    tokio::net::TcpStream::connect(address),
+                )
+                .await;
+                if !matches!(connected, Ok(Ok(_))) {
+                    return false;
+                }
+            }
+            true
+        }
+
         let client = no_proxy_client();
         let url = self.url(0, &self.readiness_path);
         let admin_url = self
@@ -725,7 +741,14 @@ impl TestServer {
                 && response.status().is_success()
                 && let Ok(body) = response.text().await
             {
-                server_ready = body == self.readiness_token;
+                // 🚪 The token proves *this* child answers on the address the
+                // probe used. The other addresses the same server reserved
+                // must accept a connection too before a test uses them: the
+                // load-sensitive failures in #184 both connected to a second
+                // listener and were refused, with the token already matched on
+                // the first.
+                server_ready = body == self.readiness_token
+                    && every_reserved_listener_accepts(&self.server_addresses[0]).await;
             }
             // 🎯 Any completed request used to count as admin readiness, so a
             // 404 from a wrong or half-initialised listener read as ready and
