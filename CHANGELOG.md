@@ -67,17 +67,17 @@ likely to alter what an existing configuration does; each links to its entry
 below, which ends with what to write instead.
 
 - **Static ranges stream when compression is enabled.**
-  → [Static ranges stream when compression is enabled](#static-ranges-stream-when-compression-is-enabled)
+  → [Static ranges stream when compression is enabled](#-static-ranges-stream-when-compression-is-enabled)
 - **Precompressed sidecars have independent validators.**
-  → [Precompressed sidecars have independent validators](#precompressed-sidecars-have-independent-validators)
+  → [Precompressed sidecars have independent validators](#️-precompressed-sidecars-have-independent-validators)
 - **Empty static bodies have a shared entry ceiling.**
-  → [Empty static bodies have a shared entry ceiling](#empty-static-bodies-have-a-shared-entry-ceiling)
+  → [Empty static bodies have a shared entry ceiling](#-empty-static-bodies-have-a-shared-entry-ceiling)
 - **Immediate-flush routes bypass the response cache.**
-  → [Immediate-flush routes bypass the response cache](#immediate-flush-routes-bypass-the-response-cache)
+  → [Immediate-flush routes bypass the response cache](#-immediate-flush-routes-bypass-the-response-cache)
 - **Response cache budgets apply at load and reload.**
-  → [Response cache budgets apply at load and reload](#response-cache-budgets-apply-at-load-and-reload)
+  → [Response cache budgets apply at load and reload](#-response-cache-budgets-apply-at-load-and-reload)
 - **Response cache freshness includes upstream age.**
-  → [Response cache freshness includes upstream age](#response-cache-freshness-includes-upstream-age)
+  → [Response cache freshness includes upstream age](#-response-cache-freshness-includes-upstream-age)
 - **`uri strip_prefix`, `strip_suffix` and `path_regexp` resolve placeholders.**
   A `${1}` group reference in a `path_regexp` replacement is now read as the
   placeholder `{1}`; write `$1`.
@@ -162,33 +162,33 @@ below, which ends with what to write instead.
   bracketed address is refused.** Other `Host` values stop reaching that block.
   → [Bracketed IPv6 site addresses name a site](#-bracketed-ipv6-site-addresses-name-a-site)
 - **Request no-transform disables proxy encoding.** Expect identity responses.
-  → [Proxy encoding respects request no-transform](#proxy-encoding-respects-request-no-transform)
+  → [Proxy encoding respects request no-transform](#️-proxy-encoding-respects-request-no-transform)
 - **Static gzip ETags include quality.** Expect one cache revalidation.
-  → [Static gzip validators include quality](#static-gzip-validators-include-quality)
+  → [Static gzip validators include quality](#️-static-gzip-validators-include-quality)
 - **Static encode matchers see header policy.** Review header-based matchers.
-  → [Static encode matchers see response policy headers](#static-encode-matchers-see-response-policy-headers)
+  → [Static encode matchers see response policy headers](#️-static-encode-matchers-see-response-policy-headers)
 - **H3 compression removes identity digest trailers.** Update digest consumers.
-  → [H3 encoding removes obsolete integrity trailers](#h3-encoding-removes-obsolete-integrity-trailers)
+  → [H3 encoding removes obsolete integrity trailers](#️-h3-encoding-removes-obsolete-integrity-trailers)
 - **Local encoding cache keys survive header policy.** Review downstream cache keys.
-  → [Local header policy preserves encoding Vary](#local-header-policy-preserves-encoding-vary)
+  → [Local header policy preserves encoding Vary](#️-local-header-policy-preserves-encoding-vary)
 - **Disabled encoding rejects blocks.** Remove contradictory encode blocks.
-  → [Encode off rejects blocks](#encode-off-rejects-blocks)
+  → [Encode off rejects blocks](#-encode-off-rejects-blocks)
 - **`encode` blocks now take effect and reject unknown settings.** Review size floors and response matchers.
-  → [Encode blocks take effect](#encode-blocks-take-effect)
+  → [Encode blocks take effect](#️-encode-blocks-take-effect)
 - **Static compression offers exactly the encode list in order.**
-  → [Static compression follows the coding list](#static-compression-follows-the-coding-list)
+  → [Static compression follows the coding list](#️-static-compression-follows-the-coding-list)
 - **Static file responses always send Vary: Accept-Encoding, even without encode.**
-  → [Static responses always vary by encoding](#static-responses-always-vary-by-encoding)
+  → [Static responses always vary by encoding](#️-static-responses-always-vary-by-encoding)
 - **Proxied responses on encode sites send Vary: Accept-Encoding even when served as identity.**
-  → [Proxy encode responses always vary by encoding](#proxy-encode-responses-always-vary-by-encoding)
+  → [Proxy encode responses always vary by encoding](#️-proxy-encode-responses-always-vary-by-encoding)
 - **Re-encoding a proxied response turns its strong ETag into a weak validator.**
-  → [Proxy compression weakens strong etags](#proxy-compression-weakens-strong-etags)
+  → [Proxy compression weakens strong etags](#️-proxy-compression-weakens-strong-etags)
 - **Static compression follows the same content-type allow-list as proxy compression.**
-  → [Static and proxy compression share mime rules](#static-and-proxy-compression-share-mime-rules)
+  → [Static and proxy compression share mime rules](#️-static-and-proxy-compression-share-mime-rules)
 - **Both response paths apply encode gzip levels and use the Caddy default of 5.**
-  → [Compression uses the configured gzip level](#compression-uses-the-configured-gzip-level)
+  → [Compression uses the configured gzip level](#️-compression-uses-the-configured-gzip-level)
 - **Accept-Encoding wildcard acceptance no longer enables an unnamed coding.**
-  → [Wildcard acceptance does not enable compression](#wildcard-acceptance-does-not-enable-compression)
+  → [Wildcard acceptance does not enable compression](#️-wildcard-acceptance-does-not-enable-compression)
 
 
 
@@ -199,19 +199,19 @@ below, which ends with what to write instead.
 
 
 - **Empty startup can load its first HTTP listeners.** TLS listeners and later topology changes still require restart.
-  → [Admin-only startup accepts its first HTTP generation](#admin-only-startup-accepts-its-first-http-generation)
+  → [Admin-only startup accepts its first HTTP generation](#-admin-only-startup-accepts-its-first-http-generation)
 - **Manual TLS requires a named site.** Unnamed and `_` sites are rejected instead of silently ignoring their certificate sources.
-  → [Unnamed manual TLS fails closed](#unnamed-manual-tls-fails-closed)
+  → [Unnamed manual TLS fails closed](#-unnamed-manual-tls-fails-closed)
 - **Empty and stdin startup survive reload signals.** SIGHUP is ignored; SIGUSR1 reports that no file reload source exists.
-  → [Reload signals remain safe without a file](#reload-signals-remain-safe-without-a-file)
+  → [Reload signals remain safe without a file](#-reload-signals-remain-safe-without-a-file)
 - **`-c -` always reads stdin**, even when the working directory contains a directory named `-`.
-  → [Stdin takes precedence over filesystem entries](#stdin-takes-precedence-over-filesystem-entries)
+  → [Stdin takes precedence over filesystem entries](#-stdin-takes-precedence-over-filesystem-entries)
 - **Running without a configuration now starts the admin API.** Supply an explicit path when a missing file must fail startup.
-  → [Run starts empty when no default configuration exists](#run-starts-empty-when-no-default-configuration-exists)
+  → [Run starts empty when no default configuration exists](#-run-starts-empty-when-no-default-configuration-exists)
 - **CLI scripts can use Caddy-style configuration flags.** Explicit adapters override filename extensions.
-  → [Run and validate accept configuration flags](#run-and-validate-accept-configuration-flags)
+  → [Run and validate accept configuration flags](#-run-and-validate-accept-configuration-flags)
 - **Validation now rejects unusable TLS material.** Fix malformed or mismatched manual pairs before deployment.
-  → [Validate loads manual TLS material](#validate-loads-manual-tls-material)
+  → [Validate loads manual TLS material](#-validate-loads-manual-tls-material)
 - **`handle_errors` pages render, and answer proxy and body-size errors.**
   An error route ending in `file_server` serves its page with the error's
   status, and a `502` or `413` now reaches the error routes too.
@@ -309,41 +309,42 @@ below, which ends with what to write instead.
   that relied on it needs its own `client_auth` block.
   → [An exact site's `client_auth` outranks a wildcard](#-an-exact-sites-client_auth-outranks-a-wildcard)
 
-The full list of breaking changes is under [Breaking](#️-breaking); the one
-known defect that ships is under
-[Known defect — WebSocket upgrades under load](#-known-defect--websocket-upgrades-under-load).
+The full list of breaking changes is under [Breaking](#️-breaking); the
+known defects that ship are under
+[Known defect — WebSocket upgrades under load](#-known-defect--websocket-upgrades-under-load)
+and [Other known defects that ship](#-other-known-defects-that-ship).
 
-### Static ranges stream when compression is enabled
+### 🌊 Static ranges stream when compression is enabled
 
 Large ranges on compressible static files now stream in bounded chunks while retaining identity encoding and the correct partial-response headers.
 
 **Upgrade:** No configuration change is needed; concurrent large range requests no longer allocate the complete range.
 
-### Precompressed sidecars have independent validators
+### 🏷️ Precompressed sidecars have independent validators
 
 Precompressed files use their own size and modification time for ETags, with tags distinct from live compression. Sidecars take precedence over cached live-encoded bodies, and conditional requests use the selected sidecar tag.
 
 **Upgrade:** Sidecar ETags change once; clients revalidate their encoded copies. Replacing only a sidecar now invalidates that copy.
 
-### Empty static bodies have a shared entry ceiling
+### 🧱 Empty static bodies have a shared entry ceiling
 
 Static body caches share a 16,384-entry ceiling in addition to their existing byte budgets. Empty files and stale file identities compete for those slots; eviction and teardown return them.
 
 **Upgrade:** No configuration change is needed; sites with many tiny or empty files may see more cache eviction.
 
-### Immediate-flush routes bypass the response cache
+### 🧊 Immediate-flush routes bypass the response cache
 
 Routes with `flush_interval -1` bypass response-cache admission using state computed when configuration loads. The existing SSE content-type safeguard remains in effect.
 
 **Upgrade:** Remove reliance on cached responses from immediate-flush routes; use a separate ordinary route if caching is desired.
 
-### Response cache budgets apply at load and reload
+### 🧊 Response cache budgets apply at load and reload
 
 The process-wide response-cache ceiling is configured before traffic and resized on reload. Shrinking it evicts retained entries immediately; removing caching drains the store. The existing requirement that caching routes agree on `max_size` remains.
 
 **Upgrade:** Use the same `max_size` on every caching route. Reloads now apply a changed ceiling without a restart.
 
-### Response cache freshness includes upstream age
+### ⏳ Response cache freshness includes upstream age
 
 Stored responses account for upstream `Age`, apparent age from `Date`, and upstream response delay under RFC 9111. Cache hits retain that age, and `Expires` supplies a lifetime relative to `Date`. Route TTL remains a fallback and sanitized private headers stay stripped. Validated bodies use the new clock even when the validation forbids storage; extremely old responses bypass caching.
 
@@ -745,78 +746,78 @@ when the configuration loads (#267).
 `Host`; it now answers only `[::1]`. Add a catch-all site (`:80`, `http://`)
 for traffic that relied on it. Caddy parses these addresses the same way
 (from memory, caddyserver/caddy#80).
-### Local header policy preserves encoding Vary
+### 🗜️ Local header policy preserves encoding Vary
 
 🧊 Static responses and generated upstream failures retain `Accept-Encoding`
 after header policy. Upgrade: caches keep identity and compressed variants
 separate even when a `header Vary` directive replaces or removes the field.
 
-### H3 encoding removes obsolete integrity trailers
+### 🗜️ H3 encoding removes obsolete integrity trailers
 
 🧾 Re-encoded H3 responses drop identity digests from undeclared upstream
 trailers while preserving other trailers. Upgrade: clients must validate a
 digest for the encoded bytes, rather than relying on the upstream identity digest.
 
-### Static encode matchers see response policy headers
+### 🗜️ Static encode matchers see response policy headers
 
 🎯 Static encode matchers inspect policy-added, replaced and removed response
 headers before selecting a body or evaluating conditional requests. Directory
 listings use the same policy. Upgrade: review encode matchers that depended on
 policy headers being invisible.
 
-### Static gzip validators include quality
+### 🏷️ Static gzip validators include quality
 
 🏷️ Static gzip strong ETags include the configured quality, so different
 encoded bytes no longer share a validator across reloads or replicas. Upgrade:
 gzip caches revalidate once; identity validators remain stable.
 
-### Proxy encoding respects request no-transform
+### 🗜️ Proxy encoding respects request no-transform
 
 🛡️ Both proxy transports honor `Cache-Control: no-transform` on the request,
 including multiple field lines and case-insensitive directives. Upgrade: these
 clients receive the upstream identity bytes even when they accept compression.
 
-### Encode off rejects blocks
+### 🚫 Encode off rejects blocks
 
 🚫 Explicit `encode off` or `encode none` cannot carry a block that overrides
 the disable. Upgrade: remove the block or explicitly enable its codings.
 
-### Encode blocks take effect
+### 🗜️ Encode blocks take effect
 
 🗜️ `encode { gzip [level]; zstd; minimum_length; match { … } }` now preserves
 its settings instead of silently compiling every block as gzip. Unknown
 sub-directives fail at load time. Upgrade: remove misspelled settings and review
 response matchers and size floors that were previously ignored. Gzip levels are applied by both response paths.
 
-### Static compression follows the coding list
+### 🗜️ Static compression follows the coding list
 
 🗜️ Static compression offers exactly the encode list in order. Upgrade: name each desired coding in encode; brotli remains available only as a precompressed sidecar (#216).
 
-### Static responses always vary by encoding
+### 🗜️ Static responses always vary by encoding
 
 🗜️ Static file responses always send Vary: Accept-Encoding, even without encode. Upgrade: expect shared caches to reserve an encoding-specific key before compressed variants appear (#219).
 
-### Proxy encode responses always vary by encoding
+### 🗜️ Proxy encode responses always vary by encoding
 
 🗜️ Proxied responses on encode sites send Vary: Accept-Encoding even when served as identity. Upgrade: allow caches to distinguish identity clients from clients that accept the configured codings (#226).
 
-### Proxy compression weakens strong etags
+### 🏷️ Proxy compression weakens strong etags
 
 🗜️ Re-encoding a proxied response turns its strong ETag into a weak validator. Upgrade: use weak ETags for cache revalidation; range resumption must use a validator for the actual encoded bytes (#227).
 
-### Static and proxy compression share mime rules
+### 🗜️ Static and proxy compression share mime rules
 
 🗜️ Static compression follows the same content-type allow-list as proxy compression. Upgrade: set gzip_types explicitly to enable additional MIME types; an explicit encode match block replaces the default matcher (#217).
 
-### Compression uses the configured gzip level
+### 🗜️ Compression uses the configured gzip level
 
 🗜️ Both response paths apply encode gzip levels and use the Caddy default of 5. Upgrade: set gzip 1 inside encode for faster compression, or gzip 9 for a smaller body; zstd uses one shared native default of 3 (#223).
 
-### Wildcard acceptance does not enable compression
+### 🗜️ Wildcard acceptance does not enable compression
 
 🗜️ Accept-Encoding wildcard acceptance no longer enables an unnamed coding. Upgrade: send gzip or zstd explicitly; wildcard-only requests receive identity responses (#224).
 
-### Admin-only startup accepts its first HTTP generation
+### 🧰 Admin-only startup accepts its first HTTP generation
 
 On Unix, an admin-only process can load its first plaintext HTTP listener set
 through `/load` (#175). Every socket and route is prepared before publication;
@@ -826,27 +827,27 @@ watch, and later route reloads publish through the existing transaction path.
 Upgrade note: this bootstrap supports plaintext HTTP without PROXY protocol;
 start with a file for TLS/H3, and restart for later listener topology changes.
 
-### Unnamed manual TLS fails closed
+### 🔐 Unnamed manual TLS fails closed
 
 Common configuration validation rejects manual certificate pairs on unnamed,
 empty-name, and `_` sites (#218). Startup and admin loads share this refusal;
 validation no longer approves a certificate source the runtime would ignore.
 Upgrade note: give the site a certificate hostname before configuring manual TLS.
 
-### Reload signals remain safe without a file
+### 🔁 Reload signals remain safe without a file
 
 Empty and stdin startup install the same SIGHUP and SIGUSR1 handlers as file
 startup (#175, #222). SIGHUP is ignored and SIGUSR1 leaves the active document
 serving while reporting that no configuration file is available.
 Upgrade note: reload these processes through the admin API instead of SIGUSR1.
 
-### Stdin takes precedence over filesystem entries
+### 🧰 Stdin takes precedence over filesystem entries
 
 `run` and `validate` resolve `-c -` as stdin before inspecting the filesystem
 (#222), with or without an explicit adapter.
 Upgrade note: use `./-` when you mean a directory literally named `-`.
 
-### Run starts empty when no default configuration exists
+### 🧰 Run starts empty when no default configuration exists
 
 With no path and neither `Pingclairfile` nor `Caddyfile` in the working directory,
 `pingclair run` starts with no HTTP sites and the admin API at `127.0.0.1:2019`,
@@ -857,7 +858,7 @@ Upgrade note: orchestration may start Pingclair before creating a plaintext HTTP
 configuration and load it through the admin API on Unix; supply an explicit file
 path if its absence should stop the process or if TLS/H3 is required.
 
-### Run and validate accept configuration flags
+### 🧰 Run and validate accept configuration flags
 
 `run` and `validate` accept `--config` / `-c` alongside the positional path,
 and `--adapter caddyfile|json` selects the file format explicitly (#222).
@@ -867,7 +868,7 @@ a single file; directory loading keeps its existing per-file format inference.
 Upgrade note: existing positional commands still work; JSON uses Pingclair's
 schema, and an explicit adapter overrides the filename extension.
 
-### Validate loads manual TLS material
+### 🔐 Validate loads manual TLS material
 
 `pingclair validate` reads, parses and matches manual certificates and private
 keys through the same loader as startup, without starting listeners (#218).
@@ -2567,6 +2568,36 @@ this defect does not exist.
 
 No configuration avoids it. From outside, a failure is a connection torn down
 immediately after the `101`, both ends seeing EOF with no error.
+
+### 🐛 Other known defects that ship
+
+Found before the release and deliberately left for the next version, because
+none of them widens what a configuration exposes. Each has an open issue with a
+reproduction; the workaround, where there is one, is in the issue.
+
+- **HTTP/1.1 holds a response that declares its length until the body ends**, so
+  an event stream sent with `Content-Length` arrives in one piece at the end
+  (#247). Streams sent chunked, and every HTTP/2 and HTTP/3 response, are not
+  affected.
+- **Proxy compression may end a gzip body early** when an HTTP/2 upstream sends
+  trailers it did not announce (#225).
+- **An upstream response that announces `Trailer` is answered `502`** (#273).
+- **An HTTP/1.0 client can receive chunked framing** from a proxied route whose
+  upstream sends no length (#277).
+- **After an upgrade, a client that half-closes ends the tunnel**, and bytes the
+  backend still had to send are lost (#274).
+- **An upstream that fails before its first body byte** leaves an HTTP/2 client
+  with a stream reset rather than a `502` (#249).
+- **A backend that truncates every response stays in rotation**; `max_fails`
+  and `fail_duration` are not implemented yet (#262).
+- **A configured `ETag` header is advertised but not used for revalidation**
+  (#265).
+- **An empty path segment (`/a//b`) is collapsed** before forwarding (#275).
+- **`php_fastcgi` answers `411`** to a chunked or bodyless request (#248).
+- **HTTP/3 transport-parameter checks** fail 18 of 77 h3spec cases; the fix
+  belongs in the QUIC library (#282).
+- **A wildcard site's manual certificate** is not served for the names it
+  covers over TCP; `tls internal` is not affected (#285).
 
 ### ⚠️ Breaking
 
