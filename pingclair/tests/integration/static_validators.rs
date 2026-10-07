@@ -227,3 +227,78 @@ async fn test_file_server_skips_a_sidecar_etag_that_is_not_an_entity_tag() {
         ]
     );
 }
+
+/// 🏷️ A configured `ETag` is the validator, not just a label.
+///
+/// RFC 9110 §13.1.2 compares `If-None-Match` against "the entity tag of the
+/// selected representation", and §8.8.3 makes the `ETag` field that tag's
+/// carrier. There is one representation and one tag on the wire, so the tag
+/// the client was given is the tag that decides `304` — revalidating against
+/// it must not answer `200` while some tag the client never saw answers `304`
+/// (#265).
+#[tokio::test]
+async fn test_a_configured_etag_is_the_validator_the_client_revalidates_with() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("file.txt"), "configured-tag").unwrap();
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            root * {root}
+            header Etag "\"quoted-hash-9\""
+            file_server
+
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+        "#,
+        root = root.path().display()
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let served = no_proxy_client()
+        .get(server.url(0, "/file.txt"))
+        .send()
+        .await
+        .unwrap();
+    let advertised = served.headers()["etag"].to_str().unwrap().to_string();
+    assert_eq!(advertised, "\"quoted-hash-9\"");
+    served.bytes().await.unwrap();
+
+    let revalidated = no_proxy_client()
+        .get(server.url(0, "/file.txt"))
+        .header("If-None-Match", &advertised)
+        .send()
+        .await
+        .unwrap();
+    let status = revalidated.status().as_u16();
+    revalidated.bytes().await.unwrap();
+
+    // 🧷 The same tag gates a resumable range: the client's copy is the version
+    // the server described, so the range is honoured rather than ignored.
+    let partial = no_proxy_client()
+        .get(server.url(0, "/file.txt"))
+        .header("Range", "bytes=0-3")
+        .header("If-Range", &advertised)
+        .send()
+        .await
+        .unwrap();
+    let partial_status = partial.status().as_u16();
+    let partial_body = partial.text().await.unwrap();
+    server.stop();
+
+    assert_eq!(
+        status, 304,
+        "the tag the client was given must be the tag that answers 304"
+    );
+    assert_eq!(
+        (partial_status, partial_body.as_str()),
+        (206, "conf"),
+        "If-Range must trust the tag the client was given"
+    );
+}

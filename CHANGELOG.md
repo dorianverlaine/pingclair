@@ -27,6 +27,17 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🏷️ A configured `ETag` is the validator, not just a label
+
+A site that set `ETag` with the `header` directive sent that tag to every
+client, but `If-None-Match` and `If-Range` were still compared against the file
+server's own size-and-mtime tag — so revalidating with the tag the client had
+been given answered `200`, while a tag nobody had ever been sent answered `304`
+(#265). Preconditions now read back the tag the site's own header policy would
+put on the response and use it as the representation's validator, which is what
+RFC 9110 §13.1.2 asks for: one representation, one tag on the wire, and the tag
+the client was given is the one that decides.
+
 ### 🗜️ A compressed response stays decodable when trailers end it
 
 An HTTP/2 origin can end a response with trailing HEADERS, announced or not,
@@ -2621,8 +2632,6 @@ reproduction; the workaround, where there is one, is in the issue.
   backend still had to send are lost (#274). The dependency's upgrade loop
   ends the whole exchange when the request side finishes, and it offers an
   embedder no hook to keep the other direction open.
-- **A configured `ETag` header is advertised but not used for revalidation**
-  (#265).
 - **HTTP/3 transport-parameter checks** fail 18 of 77 h3spec cases; the fix
   belongs in the QUIC library (#282).
 - **A wildcard site's manual certificate** is not served for the names it

@@ -137,8 +137,10 @@ impl FileServer {
             return Ok(None);
         }
         let etag = if request.compares_entity_tags() {
-            self.selected_etag(request, file_path, file_size, meta, accept_encoding)
-                .await?
+            let internal = self
+                .selected_etag(request, file_path, file_size, meta, accept_encoding)
+                .await?;
+            self.declared_etag(request, meta, internal)
         } else {
             meta.etags.for_coding(None).clone()
         };
@@ -151,6 +153,39 @@ impl FileServer {
             })),
             Precondition::Failed => Some(ServedResponse::PreconditionFailed),
         })
+    }
+
+    /// 🏷️ The tag the client will actually be given, after the header policy.
+    ///
+    /// Preconditions are decided here, before the transport's header policy
+    /// runs, but that policy can set `ETag` — and RFC 9110 §13.1.2 compares
+    /// `If-None-Match` against the entity tag of the selected representation,
+    /// whose carrier §8.8.3 makes the `ETag` field. There is one tag on the
+    /// wire, so a configured value *is* the validator: the candidate fields
+    /// below are what the response will carry, and the policy reads back the
+    /// tag it would put on them (#265). A site with no policy, or one that
+    /// leaves `ETag` alone, keeps the derived tag.
+    pub(super) fn declared_etag(
+        &self,
+        request: &FileRequest<'_>,
+        meta: &FileMeta,
+        internal: HeaderValue,
+    ) -> HeaderValue {
+        let Some(policy) = request.response_policy else {
+            return internal;
+        };
+        let mut headers = HeaderMap::with_capacity(5);
+        headers.insert("etag", internal.clone());
+        headers.insert("content-type", meta.content_type.clone());
+        headers.insert("content-length", meta.content_length.clone());
+        headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
+        if let Some(value) = &meta.last_modified {
+            headers.insert("last-modified", value.clone());
+        }
+        if !policy(self.config.status.unwrap_or(200), &mut headers) {
+            return internal;
+        }
+        headers.get("etag").cloned().unwrap_or(internal)
     }
 
     /// 🏷️ Conditions compare against the selected body's validator, including
@@ -170,10 +205,14 @@ impl FileServer {
         meta: &FileMeta,
         accept_encoding: Option<&str>,
     ) -> pingclair_core::error::Result<HeaderValue> {
+        // 🏷️ A range is judged against the identity representation's tag, and
+        // the client knows it as the tag the response carried — the configured
+        // one when the site set `ETag` (#265).
+        let identity_etag = self.declared_etag(request, meta, meta.etags.for_coding(None).clone());
         if let Some(range) = request.range()
             && validators::if_range_holds(
                 request.if_range(),
-                meta.etags.for_coding(None),
+                &identity_etag,
                 meta.last_modified.as_ref(),
                 meta.modified,
                 SystemTime::now(),
@@ -183,7 +222,7 @@ impl FileServer {
                 RangeDecision::Satisfied { .. }
             )
         {
-            return Ok(meta.etags.for_coding(None).clone());
+            return Ok(identity_etag);
         }
         if !self.config.precompressed.is_empty()
             && let Some((sidecar, metadata, encoding)) =

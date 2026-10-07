@@ -343,11 +343,12 @@ impl FileServer {
         // ignored and the whole current file goes out as 200. Honouring the
         // range anyway would hand back bytes that splice onto nothing the
         // client holds. A range response is never compressed, so the tag it is
-        // compared against is the identity one.
+        // compared against is the identity one — as the client knows it, which
+        // is the configured `ETag` when the site set one (#265).
         if let Some(range) = range
             && validators::if_range_holds(
                 request.if_range(),
-                meta.etags.for_coding(None),
+                &self.declared_etag(&request, &meta, meta.etags.for_coding(None).clone()),
                 meta.last_modified.as_ref(),
                 meta.modified,
                 SystemTime::now(),
