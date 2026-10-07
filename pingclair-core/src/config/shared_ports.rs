@@ -205,7 +205,11 @@ impl SharedPortFold {
 /// beside it exactly as it refuses `127.0.0.1`. When there is no `[::]`,
 /// `0.0.0.0` covers the IPv4 addresses and leaves IPv6 ones alone, because an
 /// IPv6 socket does not collide with an IPv4 wildcard.
-fn covering_wildcard(address: &str, wildcards: &[SocketAddr]) -> Option<SocketAddr> {
+///
+/// 🔁 Public because the automatic HTTP companion, which the runtime adds
+/// outside `config.servers`, has to fold by the same rule.
+#[must_use]
+pub fn covering_wildcard(address: &str, wildcards: &[SocketAddr]) -> Option<SocketAddr> {
     let specific = address.parse::<SocketAddr>().ok()?;
     let on_port = || {
         wildcards

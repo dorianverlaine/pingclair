@@ -123,12 +123,30 @@ pub(crate) fn automatic_http_companion(
         matcher: None,
     }];
 
+    // 📍 The companion sits on the interfaces its site sits on, on the HTTP
+    // port, as Caddy's redirect server does (from memory, source not read).
+    // Hard-coding `[::]` put the redirect of a `bind 127.0.0.1` site on every
+    // interface, the one listener of that site `bind` did not reach.
+    let mut sockets: Vec<String> = Vec::with_capacity(1);
+    for address in listen_addrs {
+        let Some((host, _)) = address.rsplit_once(':') else {
+            continue;
+        };
+        let socket = format!("{host}:{http_port}");
+        if !sockets.contains(&socket) {
+            sockets.push(socket);
+        }
+    }
+    if sockets.is_empty() {
+        sockets.push(format!("[::]:{http_port}"));
+    }
+
     Some(pingclair_core::config::ServerConfig {
         name: Some(name),
         names,
-        listen: vec![format!("[::]:{http_port}")],
+        listen: sockets.clone(),
         proxy_protocol_listen: Vec::new(),
-        plaintext_listen: vec![format!("[::]:{http_port}")],
+        plaintext_listen: sockets,
         tls: None,
         routes,
         ..Default::default()
@@ -209,6 +227,63 @@ pub(crate) fn explicit_http_names(
         .collect()
 }
 
+/// 🔁 Every site's automatic HTTP companion, by site index, on the sockets
+/// that will carry it.
+///
+/// A companion listens on the HTTP port of each host its site listens on. One
+/// port is still one socket, though: when a wildcard on the HTTP port already
+/// exists — a configured `[::]:80` site, or the companion of a site with no
+/// `bind` — a companion address it covers is served through it, by the rule
+/// `SharedPortFold` applies to configured sites. Linux binds only one of
+/// `127.0.0.1:80` and `[::]:80`, so two sites with different `bind` hosts would
+/// otherwise fail to start. 📌 Only the redirect is folded, never the bound
+/// site itself, and that is what this configuration did before companions
+/// followed `bind`.
+///
+/// Load path only: startup, reload and the listener policy derivation.
+pub(crate) fn automatic_http_companions(
+    config: &pingclair_core::config::PingclairConfig,
+) -> Vec<Option<pingclair_core::config::ServerConfig>> {
+    let http_port = config.global.http_port;
+    let https_port = config.global.https_port;
+    let explicit_http_names = explicit_http_names(config);
+    let mut companions: Vec<Option<pingclair_core::config::ServerConfig>> = config
+        .servers
+        .iter()
+        .map(|server| {
+            automatic_http_companion(
+                server,
+                config.global.auto_https.clone(),
+                &server.listen_addresses(http_port, https_port),
+                &explicit_http_names,
+                http_port,
+                https_port,
+            )
+        })
+        .collect();
+    let wildcards: Vec<std::net::SocketAddr> = config
+        .servers
+        .iter()
+        .flat_map(|server| server.listen_addresses(http_port, https_port))
+        .chain(companions.iter().flatten().flat_map(|c| c.listen.clone()))
+        .filter_map(|address| address.parse::<std::net::SocketAddr>().ok())
+        .filter(|address| address.ip().is_unspecified())
+        .collect();
+    for companion in companions.iter_mut().flatten() {
+        let mut sockets: Vec<String> = Vec::with_capacity(companion.listen.len());
+        for address in &companion.listen {
+            let socket = pingclair_core::config::covering_wildcard(address, &wildcards)
+                .map_or_else(|| address.clone(), |wildcard| wildcard.to_string());
+            if !sockets.contains(&socket) {
+                sockets.push(socket);
+            }
+        }
+        companion.plaintext_listen.clone_from(&sockets);
+        companion.listen = sockets;
+    }
+    companions
+}
+
 /// 🔌 Puts every site on its `bind` host, then serves each specific address
 /// through the wildcard socket on its port, when there is one (#246).
 ///
@@ -216,9 +291,9 @@ pub(crate) fn explicit_http_names(
 /// both derivations below see the sockets that will exist, one address per
 /// port. 🛡️ The bind step matters for a JSON document, which never passed
 /// through the compiler that applies it to a Pingclairfile. The automatic HTTPS
-/// companion counts as a wildcard on the HTTP port: it is not in
-/// `config.servers`, but it is a socket, and a `127.0.0.1:80` site beside it
-/// would collide with it exactly as with a configured one.
+/// companions count too: they are not in `config.servers`, but they are
+/// sockets, and a `127.0.0.1:80` site beside a companion on `[::]:80` would
+/// collide with it exactly as with a configured one.
 ///
 /// Borrowed when nothing folds, which is every configuration without a shared
 /// port; this runs on the load path only.
@@ -230,27 +305,19 @@ pub(crate) fn bind_and_fold_listeners(
     pingclair_core::config::SharedPortConflict,
 > {
     let config = pingclair_core::config::bind_listeners(config);
-    let http_port = config.global.http_port;
-    let https_port = config.global.https_port;
-    let explicit_http_names = explicit_http_names(&config);
-    let companion_exists = automatic_http_available
-        && config.servers.iter().any(|server| {
-            automatic_http_companion(
-                server,
-                config.global.auto_https.clone(),
-                &server.listen_addresses(http_port, https_port),
-                &explicit_http_names,
-                http_port,
-                https_port,
-            )
-            .is_some()
-        });
-    let runtime_wildcards: Vec<String> = companion_exists
-        .then(|| format!("[::]:{http_port}"))
-        .into_iter()
-        .collect();
+    // 📌 `plan` keeps only the wildcards among these; a companion on a bound
+    // host is a specific address and folds nothing.
+    let runtime_sockets: Vec<String> = if automatic_http_available {
+        automatic_http_companions(&config)
+            .into_iter()
+            .flatten()
+            .flat_map(|companion| companion.listen)
+            .collect()
+    } else {
+        Vec::new()
+    };
 
-    let fold = pingclair_core::config::SharedPortFold::plan(&config, &runtime_wildcards)?;
+    let fold = pingclair_core::config::SharedPortFold::plan(&config, &runtime_sockets)?;
     if fold.folded().is_empty() {
         return Ok(config);
     }
@@ -279,33 +346,26 @@ pub(crate) fn servers_by_bind_address(
 ) -> HashMap<String, Vec<pingclair_core::config::ServerConfig>> {
     let http_port = config.global.http_port;
     let https_port = config.global.https_port;
-    let explicit_http_names = explicit_http_names(config);
+    let companions = if automatic_http_available {
+        automatic_http_companions(config)
+    } else {
+        Vec::new()
+    };
     let mut by_port: HashMap<String, Vec<pingclair_core::config::ServerConfig>> = HashMap::new();
-    for server in &config.servers {
+    for (index, server) in config.servers.iter().enumerate() {
         // 📌 The one derivation `validate_config` also uses; a private copy
         // here once pasted an IPv6 `bind` host without its brackets.
-        let addrs = server.listen_addresses(http_port, https_port);
-        for addr in &addrs {
-            by_port
-                .entry(addr.clone())
-                .or_default()
-                .push(server.clone());
+        for addr in server.listen_addresses(http_port, https_port) {
+            by_port.entry(addr).or_default().push(server.clone());
         }
-        if let Some(companion) = automatic_http_available
-            .then(|| {
-                automatic_http_companion(
-                    server,
-                    config.global.auto_https.clone(),
-                    &addrs,
-                    &explicit_http_names,
-                    http_port,
-                    https_port,
-                )
-            })
-            .flatten()
-        {
-            let addr = format!("[::]:{http_port}");
-            by_port.entry(addr).or_default().push(companion);
+        // 🔁 Each companion right after its site, the order startup uses.
+        if let Some(Some(companion)) = companions.get(index) {
+            for addr in &companion.listen {
+                by_port
+                    .entry(addr.clone())
+                    .or_default()
+                    .push(companion.clone());
+            }
         }
     }
     by_port
@@ -540,6 +600,48 @@ mod tests {
             )
             .is_none(),
             "an explicit port 80 listener must not be overruled"
+        );
+    }
+
+    /// 📍 A companion follows its site onto the bound interface, and is served
+    /// through a wildcard that another site's companion already needs on the
+    /// HTTP port, because Linux binds only one of the two.
+    #[test]
+    fn companions_listen_where_their_sites_do() {
+        let https = |name: &str, bind: Option<&str>| pingclair_core::config::ServerConfig {
+            name: Some(name.to_string()),
+            bind: bind.map(str::to_string),
+            tls: Some(Default::default()),
+            ..Default::default()
+        };
+        let companion_sockets = |servers: Vec<pingclair_core::config::ServerConfig>| {
+            let config = pingclair_core::config::PingclairConfig {
+                servers,
+                ..Default::default()
+            };
+            automatic_http_companions(&config)
+                .into_iter()
+                .map(|companion| companion.map(|companion| companion.listen))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            [
+                companion_sockets(vec![https("a.test", Some("127.0.0.1"))]),
+                companion_sockets(vec![https("a.test", Some("::1"))]),
+                companion_sockets(vec![
+                    https("a.test", Some("127.0.0.1")),
+                    https("b.test", None),
+                ]),
+            ],
+            [
+                vec![Some(vec!["127.0.0.1:80".to_string()])],
+                vec![Some(vec!["[::1]:80".to_string()])],
+                vec![
+                    Some(vec!["[::]:80".to_string()]),
+                    Some(vec!["[::]:80".to_string()]),
+                ],
+            ]
         );
     }
 

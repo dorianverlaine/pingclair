@@ -14,5 +14,5 @@ pub use bind::bind_listeners;
 pub use ip_ranges::{InvalidIpRange, IpRanges};
 pub use loader::ConfigLoader;
 pub use secret::SecretString;
-pub use shared_ports::{FoldedListener, SharedPortConflict, SharedPortFold};
+pub use shared_ports::{FoldedListener, SharedPortConflict, SharedPortFold, covering_wildcard};
 pub use types::*;

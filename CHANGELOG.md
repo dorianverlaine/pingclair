@@ -119,6 +119,9 @@ below, which ends with what to write instead.
 - **`bind` now applies to a site with an explicit address or port.** Such a
   site listens only on its `bind` host; address a `servers` block to that host.
   → [`bind` applies to every listener](#-bind-applies-to-every-listener-of-a-site)
+- **A bound site's automatic HTTP redirect listens on its `bind` host.** It
+  is no longer reachable on other interfaces.
+  → [Redirect listener](#-the-automatic-https-redirect-listens-where-its-site-does)
 - **A site's `listen` directive keeps the address it names.** `listen
   127.0.0.1:8080` binds loopback only; a hostname or an unbracketed IPv6
   address in `listen` is refused.
@@ -514,6 +517,20 @@ reachable on other interfaces; that was the intent of writing `bind`. A
 (`servers 127.0.0.1:8080`), not the wildcard. A bound site beside a wildcard
 site on the same port is refused, as it already was for a site without an
 explicit port.
+
+### 🔁 The automatic HTTPS redirect listens where its site does
+
+The plaintext listener that automatic HTTPS adds for an HTTPS site, which
+redirects to HTTPS and answers ACME HTTP-01, always listened on
+`[::]:<http_port>`, so `example.com { bind 127.0.0.1 }` kept a redirect
+listener on every interface. It now listens on the HTTP port of each host the
+site listens on, as Caddy does. When another site already needs a wildcard on
+the HTTP port, the redirect is served through that one socket, as before,
+because Linux cannot bind both.
+
+📦 **Upgrade:** Clients that reached a bound site's HTTP redirect through
+another interface no longer can; that is what `bind` asked for. Nothing
+changes for sites without `bind`.
 
 ### 🎧 `listen` keeps the address it names
 

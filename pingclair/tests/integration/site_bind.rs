@@ -56,3 +56,50 @@ async fn test_bind_restricts_an_explicit_site_address_to_its_interface() {
         )
     );
 }
+
+/// 🔁 The automatic HTTP→HTTPS redirect of a bound site listens on the bound
+/// interface too.
+///
+/// The plaintext companion used to be hard-coded to `[::]:<http_port>`, so a
+/// `bind 127.0.0.1` HTTPS site kept its redirect listener on every interface.
+#[tokio::test]
+async fn test_bind_restricts_the_automatic_http_redirect_to_its_interface() {
+    let mut server = TestServer::new_pingclairfile(
+        r#"
+        {
+            admin off
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
+            https_port __PINGCLAIR_TEST_HTTPS_PORT__
+        }
+
+        example.test {
+            bind 127.0.0.1
+            tls internal
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "secure"
+        }
+        "#,
+    );
+    assert!(server.wait_until_tls_ready("example.test").await);
+    let http = server.listener_address(0, 1);
+
+    let redirect = raw_get_status_and_location(http, "example.test").await;
+    let elsewhere = tokio::net::TcpStream::connect(SocketAddr::from((
+        std::net::Ipv6Addr::LOCALHOST,
+        http.port(),
+    )))
+    .await
+    .map(|_| ())
+    .map_err(|error| error.kind());
+    assert_eq!(
+        (redirect, elsewhere),
+        (
+            (
+                "HTTP/1.1 308 Permanent Redirect".to_string(),
+                Some("https://example.test/".to_string())
+            ),
+            Err(std::io::ErrorKind::ConnectionRefused)
+        )
+    );
+}

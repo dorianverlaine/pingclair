@@ -10,7 +10,7 @@
 //! addresses that must speak TLS. Nothing is bound here; that is the next
 //! phase, and it needs this whole picture first.
 
-use crate::listen::{automatic_http_companion, explicit_http_names, server_requires_tls};
+use crate::listen::{automatic_http_companions, server_requires_tls};
 use pingclair_proxy::client_auth::PublishedListenerPolicy;
 use pingclair_proxy::server::PingclairProxy;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -42,12 +42,13 @@ pub(super) fn group_by_address(
     // 🔎 Probed once, before any listener is registered: whether an automatic
     // port-80 companion is even possible here. Doing it per site would probe a
     // privileged port repeatedly for one unchanging answer.
-    let auto_https_mode = config.global.auto_https.clone();
     let http_port = config.global.http_port;
     let https_port = config.global.https_port;
-    let explicit_http_names = explicit_http_names(config);
+    // 🔁 Derived for every site at once, because a companion on a bound host
+    // may be served through another site's wildcard on the HTTP port.
+    let mut companions = automatic_http_companions(config);
 
-    for server_config in &config.servers {
+    for (index, server_config) in config.servers.iter().enumerate() {
         tracing::debug!(
             "🚀 Processing ServerConfig: name={:?}, listens={:?}",
             server_config.name,
@@ -62,29 +63,24 @@ pub(super) fn group_by_address(
 
         // 🔁 Automatic HTTPS: give an HTTPS site its plaintext port-80 companion
         // so ACME validation and the HTTP→HTTPS redirect both work unattended.
-        let companion = automatic_http_companion(
-            server_config,
-            auto_https_mode.clone(),
-            &listen_addrs,
-            &explicit_http_names,
-            http_port,
-            https_port,
-        )
-        .filter(|_| {
-            if automatic_http_available {
-                true
-            } else {
-                tracing::warn!(
-                    "🚫 Automatic HTTPS could not take {} for {:?}: HTTP→HTTPS \
+        let companion = companions
+            .get_mut(index)
+            .and_then(Option::take)
+            .filter(|companion| {
+                if automatic_http_available {
+                    true
+                } else {
+                    tracing::warn!(
+                        "🚫 Automatic HTTPS could not take {} for {:?}: HTTP→HTTPS \
                      redirects and ACME HTTP-01 validation are unavailable. \
                      Free the port, run with CAP_NET_BIND_SERVICE, or add an \
                      explicit `listen` for the plaintext port.",
-                    format!("[::]:{http_port}"),
-                    server_config.name
-                );
-                false
-            }
-        });
+                        companion.listen.join(", "),
+                        server_config.name
+                    );
+                    false
+                }
+            });
 
         for addr in listen_addrs {
             if server_requires_tls(server_config, &addr, http_port, https_port) {
@@ -131,8 +127,18 @@ pub(super) fn group_by_address(
             proxy.add_server(server_config.clone());
         }
 
-        if let Some(companion) = companion {
-            let addr = format!("[::]:{http_port}");
+        // 📍 One socket per host the site listens on; see
+        // `automatic_http_companions`.
+        let companion_sockets: Vec<(String, pingclair_core::config::ServerConfig)> = companion
+            .map(|companion| {
+                companion
+                    .listen
+                    .iter()
+                    .map(|addr| (addr.clone(), companion.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (addr, companion) in companion_sockets {
             let listener_policy = listener_security_by_address
                 .get(&addr)
                 .cloned()
