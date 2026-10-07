@@ -38,6 +38,19 @@ before any answer can be produced; the trusted-proxy policy is global and the
 PROXY-protocol tunnel registry is per listener, so none of it needed a site
 (#281).
 
+### 🧩 Caddy's shorthand placeholders resolve, and `*` no longer becomes the body
+
+The Caddyfile adapter read a leading `*` as "no matcher" but left the token in
+the argument list, so `respond * "hello"` answered with the single byte `*`
+and the text an operator wrote never reached the client. It also knew only the
+long placeholder names, so `{header.content-type}`, `{query.p}` and
+`{path.0}` — Caddy's shorthands, and what its own corpus fixture uses —
+resolved to nothing. Both are fixed: the wildcard token is consumed before any
+handler reads its data, and the shorthands resolve with Caddy's semantics
+(`{header.X}` joins repeated fields with a comma, `{query.X}` decodes and
+joins every occurrence, `{path.N}` is a segment 0-based from the left, and
+`{path.dir}`/`{path.file}` are `path.Split`'s halves) (#135).
+
 ### ⏱️ An access record keeps sub-millisecond durations, and says which key is which
 
 `duration_ms` and `ttfb_ms` were whole milliseconds, so every request faster

@@ -561,13 +561,9 @@ pub(super) fn adapt_server(
                     }
                     // 🌐 Caddy's `*` matcher token matches every request and
                     // exists only to disambiguate data arguments from path
-                    // matchers; it must never reach an upstream list.
-                    let wildcard_matcher = handler_d.name == "reverse_proxy"
-                        && handler_d.args.first().is_some_and(|a| a == "*");
-                    if wildcard_matcher {
-                        handler_d.drop_first_arg();
-                    }
-                    if matcher.is_some() {
+                    // matchers; it must never reach a handler's data — an
+                    // upstream list, a response body, or anything else (#135).
+                    if matcher.is_some() || handler_d.args.first().is_some_and(|arg| arg == "*") {
                         if handler_d.args.is_empty() {
                             return Err(AdapterError::ArgumentCount(sub_d.name, 1, 0));
                         }

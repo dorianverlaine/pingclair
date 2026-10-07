@@ -748,7 +748,12 @@ pub(super) fn collect_subroute_elements(
         }
         let matcher = resolve_matcher_token(inner_d, &local)?;
         let mut stripped = inner_d.clone();
-        if matcher.is_some() {
+        // 🌐 `*` is a matcher *token* that names no matcher: Caddy writes
+        // `respond * "text"` to say "the next argument is my data". The
+        // generic rule reads it as "no matcher", so the token itself still has
+        // to be consumed here — it used to reach the handler and become the
+        // body (#135).
+        if matcher.is_some() || stripped.args.first().is_some_and(|arg| arg == "*") {
             stripped.drop_first_arg();
         }
         let handler = adapt_handler(stripped, &local, order)?;

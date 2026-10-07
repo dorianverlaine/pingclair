@@ -6047,14 +6047,48 @@ fn resolve_single_placeholder(
     scheme: &'static str,
     vars: &crate::http_policy::RequestVars,
 ) -> String {
-    // {http.request.header.Header-Name}
-    if let Some(header_name) = name.strip_prefix("http.request.header.") {
-        return req
-            .headers
-            .get(header_name)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+    // 🏷️ Caddy's `{header.X}` shorthand for `{http.request.header.X}`, and the
+    // long form, are one lookup. Every value of a repeated field is joined
+    // with a comma, which is what Caddy reads out of `req.Header`
+    // (`modules/caddyhttp/replacer.go`) and what a client that sent two
+    // `X-Forwarded-Proto` fields expects to see.
+    if let Some(header_name) = name
+        .strip_prefix("http.request.header.")
+        .or_else(|| name.strip_prefix("header."))
+    {
+        let mut joined = String::new();
+        let mut first = true;
+        for value in req.headers.get_all(header_name) {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            if !first {
+                joined.push(',');
+            }
+            first = false;
+            joined.push_str(value);
+        }
+        return joined;
+    }
+    // 🧭 `{query.X}` and `{http.request.uri.query.X}` are one query parameter,
+    // read the way Go's `url.Values` exposes it. The bare `{query}` below is
+    // the whole query string, which is a different thing.
+    if let Some(parameter) = name
+        .strip_prefix("http.request.uri.query.")
+        .or_else(|| name.strip_prefix("query."))
+    {
+        return query_parameter(req.uri.query().unwrap_or_default(), parameter);
+    }
+    // 🧭 `{path.N}` and `{http.request.uri.path.N}` are path segments,
+    // 0-based from the left; `dir` and `file` are Go's `path.Split` halves
+    // (`modules/caddyhttp/replacer.go`). A suffix that is neither is not a
+    // placeholder this resolver knows, so the name is left as written.
+    if let Some(suffix) = name
+        .strip_prefix("http.request.uri.path.")
+        .or_else(|| name.strip_prefix("path."))
+        && let Some(part) = path_part(req.uri.path(), suffix)
+    {
+        return part;
     }
     // 🧰 `{http.vars.<name>}` reads a request-scoped variable set by a
     // `vars` handler or rule; an unset variable is empty, like every other
@@ -6198,6 +6232,10 @@ fn resolve_single_placeholder(
             .map(|target| target.as_str().to_string())
             .unwrap_or_else(|| req.uri.path().to_string()),
         "path" | "http.request.uri.path" => req.uri.path().to_string(),
+        // 🗂️ The bare shorthands for the two halves of `path.Split`; their
+        // long forms were handled above, where the suffix is read.
+        "dir" => path_part(req.uri.path(), "dir").unwrap_or_default(),
+        "file" => path_part(req.uri.path(), "file").unwrap_or_default(),
         _ => {
             // 🚧 Still missing: {dir}, {file}, {file.*}, {re.*}, {env.*},
             // {http.vars.*}, {err.*}.
@@ -6219,6 +6257,79 @@ fn resolve_single_placeholder(
             format!("{{{name}}}")
         }
     }
+}
+
+/// 🧭 One `{path.*}` part: a segment index, the directory, or the file name.
+///
+/// The split mirrors Caddy's: the path is split on `/`, the leading empty
+/// element is dropped, and an index past the end is empty rather than unknown.
+/// Middle empty segments stay, so `/a//b` has three parts.
+fn path_part(path: &str, suffix: &str) -> Option<String> {
+    match suffix {
+        // 🗂️ Go's `path.Split`: everything up to and including the last
+        // slash, and everything after it.
+        "dir" => Some(path.rsplit_once('/').map_or_else(String::new, |(dir, _)| {
+            let mut with_slash = dir.to_string();
+            with_slash.push('/');
+            with_slash
+        })),
+        "file" => Some(
+            path.rsplit_once('/')
+                .map_or_else(|| path.to_string(), |(_, file)| file.to_string()),
+        ),
+        index => {
+            let index: usize = index.parse().ok()?;
+            let mut parts: Vec<&str> = path.split('/').collect();
+            if parts.first() == Some(&"") {
+                parts.remove(0);
+            }
+            Some(parts.get(index).copied().unwrap_or("").to_string())
+        }
+    }
+}
+
+/// 🧭 One query parameter the way Go's `url.Values` exposes it: every
+/// occurrence, percent-decoded, joined with a comma.
+///
+/// 📌 `+` is a space here and not in a path component, and a malformed escape
+/// drops the pair rather than the whole query — both are `url.ParseQuery`'s
+/// behaviour, which `req.URL.Query()` exposes.
+fn query_parameter(query: &str, wanted: &str) -> String {
+    let mut joined = String::new();
+    let mut first = true;
+    for pair in query.split('&') {
+        let (name, raw) = pair.split_once('=').unwrap_or((pair, ""));
+        if decode_query_component(name).as_deref() != Some(wanted) {
+            continue;
+        }
+        let Some(value) = decode_query_component(raw) else {
+            continue;
+        };
+        if !first {
+            joined.push(',');
+        }
+        first = false;
+        joined.push_str(&value);
+    }
+    joined
+}
+
+/// 🔤 Percent-decodes one query component, or `None` when the escape is
+/// malformed.
+fn decode_query_component(raw: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut chars = raw.bytes();
+    while let Some(byte) = chars.next() {
+        match byte {
+            b'+' => bytes.push(b' '),
+            b'%' => {
+                let digits = [chars.next()?, chars.next()?];
+                bytes.push(u8::from_str_radix(std::str::from_utf8(&digits).ok()?, 16).ok()?);
+            }
+            other => bytes.push(other),
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 // MARK: - ProxyHttp Trait
@@ -9803,6 +9914,42 @@ mod forwarded_headers_tests;
 
 #[cfg(test)]
 mod p0_regression_tests;
+
+#[cfg(test)]
+mod placeholder_shorthand_tests {
+    use super::{decode_query_component, path_part, query_parameter};
+
+    /// 🧭 Path parts follow Caddy's split: the leading empty element goes,
+    /// middle empty segments stay, and `dir`/`file` are `path.Split`'s halves.
+    #[test]
+    fn path_parts_match_caddys_split() {
+        assert_eq!(path_part("/a/b", "0").as_deref(), Some("a"));
+        assert_eq!(path_part("/a/b", "1").as_deref(), Some("b"));
+        assert_eq!(path_part("/a/b", "2").as_deref(), Some(""));
+        assert_eq!(path_part("/a//b", "1").as_deref(), Some(""));
+        assert_eq!(path_part("/a/b", "dir").as_deref(), Some("/a/"));
+        assert_eq!(path_part("/a/b", "file").as_deref(), Some("b"));
+        assert_eq!(path_part("/only", "dir").as_deref(), Some("/"));
+        assert_eq!(path_part("relative", "dir").as_deref(), Some(""));
+        assert_eq!(path_part("/a/b", "not-a-part"), None);
+        assert_eq!(path_part("/a/b", "01"), Some("b".to_string()));
+    }
+
+    /// 🧭 Query parameters keep every occurrence, decode escapes, and treat
+    /// `+` as a space — Go's `url.Values`, which is what Caddy reads.
+    #[test]
+    fn query_parameters_match_go_values() {
+        assert_eq!(query_parameter("a=1&a=2&b=3", "a"), "1,2");
+        assert_eq!(query_parameter("b=x+y", "b"), "x y");
+        assert_eq!(query_parameter("a%2Fb=1", "a/b"), "1");
+        assert_eq!(query_parameter("a=1", "missing"), "");
+        assert_eq!(query_parameter("a", "a"), "");
+        // 🚫 A malformed escape drops that pair, as `url.ParseQuery` does.
+        assert_eq!(query_parameter("a=%zz&a=2", "a"), "2");
+        assert_eq!(decode_query_component("a%2Fb").as_deref(), Some("a/b"));
+        assert_eq!(decode_query_component("%zz"), None);
+    }
+}
 
 #[cfg(test)]
 mod streaming_flush_tests {

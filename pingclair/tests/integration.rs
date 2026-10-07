@@ -15934,3 +15934,10 @@ mod client_auth_precedence;
 // 🧭 `uri strip_prefix`, `strip_suffix` and `path_regexp` resolve their operands.
 #[path = "integration/uri_placeholders.rs"]
 mod uri_placeholders;
+
+// MARK: - Caddy's shorthand placeholders
+
+// 🧩 `{header.X}`, `{labels.N}`, `{query.X}`, `{path.N}`, `{re.*}` and the
+// `*` matcher token, from Caddy's own corpus fixture (#135).
+#[path = "integration/shorthand_placeholders.rs"]
+mod shorthand_placeholders;
