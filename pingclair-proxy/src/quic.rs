@@ -634,8 +634,10 @@ struct H3Request {
     path: String,
     /// `:authority` (or `host` header) value, may include a port.
     authority: String,
-    /// Regular (non-pseudo) headers, lower-cased names.
-    headers: Vec<(String, String)>,
+    /// Regular (non-pseudo) headers, as bytes: a field value may legitimately
+    /// carry obs-text (`0x80..=0xFF`), and rebuilding it as a `String` replaced
+    /// those bytes with U+FFFD before they reached the origin (#236).
+    headers: Vec<(http::HeaderName, http::HeaderValue)>,
 }
 
 /// Parse the pseudo-headers of an HTTP/3 request into an [`H3Request`].
@@ -742,9 +744,15 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
             );
             continue;
         }
+        // 🛡️ A name that is not a token, or a value carrying NUL, CR or LF,
+        // makes the field invalid and the message malformed (RFC 9114 §4.1.2).
+        // Both used to be repaired instead: an unparseable name was dropped and
+        // a value's bytes were replaced with U+FFFD before the origin saw them
+        // (#236). Everything else — including obs-text — goes through as the
+        // bytes the client sent.
         headers.push((
-            String::from_utf8_lossy(name).into_owned(),
-            String::from_utf8_lossy(h.value()).into_owned(),
+            http::HeaderName::from_bytes(name).ok()?,
+            http::HeaderValue::from_bytes(h.value()).ok()?,
         ));
     }
 
@@ -776,8 +784,8 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
     // refused above.
     let host = headers
         .iter()
-        .find(|(name, _)| name == "host")
-        .map(|(_, value)| value.as_str());
+        .find(|(name, _)| name == http::header::HOST)
+        .and_then(|(_, value)| value.to_str().ok());
     match (authority.as_deref(), host) {
         (Some(authority), Some(host)) if !authority.eq_ignore_ascii_case(host) => return None,
         (None, Some(host)) => authority = Some(host.to_owned()),
@@ -878,19 +886,26 @@ fn h3_request_header(req: &H3Request, method: http::Method) -> Result<RequestHea
     // 🍃 The fold borrows the one-cookie common case and allocates only for a
     // request that actually split it.
     let mut cookie = crate::http_policy::CookieFold::default();
+    // 🍪 Folding needs every piece as text; one that is not leaves the cookie
+    // lines exactly as the client sent them, as on H1/H2.
+    let fold_cookies = req
+        .headers
+        .iter()
+        .filter(|(name, _)| name == http::header::COOKIE)
+        .all(|(_, value)| value.to_str().is_ok());
     for (name, value) in &req.headers {
-        if name == "cookie" {
-            cookie.push(value);
+        if fold_cookies
+            && name == http::header::COOKIE
+            && let Ok(piece) = value.to_str()
+        {
+            cookie.push(piece);
             continue;
         }
-        let Ok(name) = http::HeaderName::from_bytes(name.as_bytes()) else {
-            continue;
-        };
         // 📋 Appended, not inserted. `insert_header` replaces every value under
         // the name, so a field the client sent twice arrived as whichever copy
         // came last — a list header such as `Accept-Encoding` reached the
         // origin describing something the client never said.
-        header.append_header(name, value.as_str()).ok();
+        header.append_header(name.clone(), value.clone()).ok();
     }
     if let Some(cookie) = cookie.finish() {
         header
@@ -3648,8 +3663,8 @@ async fn handle_request(
     let request_id = resolve_request_id(
         req.headers
             .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("x-request-id"))
-            .map(|(_, value)| value.as_str()),
+            .find(|(name, _)| name.as_str() == "x-request-id")
+            .and_then(|(_, value)| value.to_str().ok()),
     );
     let mut error_state = None;
     let mut matched_route = None;
@@ -3773,8 +3788,8 @@ fn write_h3_access_log(
     let header = |wanted: &str| {
         req.headers
             .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
-            .map(|(_, value)| value.as_str())
+            .find(|(name, _)| name.as_str().eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| value.to_str().unwrap_or(""))
             .unwrap_or("")
     };
     let redacted_referer = crate::redaction::redact_referer(header("referer"));
@@ -5651,8 +5666,9 @@ async fn reverse_proxy_upstream(
     let client_content_length: Option<u64> = req
         .headers
         .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.parse::<u64>().ok());
+        .find(|(name, _)| *name == http::header::CONTENT_LENGTH)
+        .and_then(|(_, value)| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
     let retry_policy = proxy_config
         .as_ref()
         .map(|config| config.retry.clone())
@@ -7615,13 +7631,45 @@ mod tests {
         assert_eq!(req.authority, "example.com:443");
         assert_eq!(
             req.headers,
-            vec![("content-type".to_string(), "text/plain".to_string())]
+            vec![(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/plain")
+            )]
         );
     }
 
     /// 🛡️ An underscore-named field is dropped before routing, exactly like
     /// the H1/H2 filter drops it; the hyphenated spelling beside it survives,
     /// which is what makes the two transports agree (#269).
+    /// 🚫 An invalid field name or value makes the request malformed.
+    ///
+    /// The name used to be dropped with `from_utf8_lossy` and the value
+    /// repaired byte by byte, so a request RFC 9114 §4.1.2 makes malformed
+    /// was served — with the origin seeing different bytes than the client
+    /// sent (#236).
+    #[test]
+    fn parse_h3_request_refuses_invalid_field_bytes() {
+        let request = |name: &'static [u8], value: &'static [u8]| {
+            vec![
+                quiche::h3::Header::new(b":method", b"GET"),
+                quiche::h3::Header::new(b":scheme", b"https"),
+                quiche::h3::Header::new(b":authority", b"example.com"),
+                quiche::h3::Header::new(b":path", b"/"),
+                quiche::h3::Header::new(name, value),
+            ]
+        };
+
+        // 🛡️ A name that is not a token, and a value carrying a control byte,
+        // are both malformed — the reset is `H3_MESSAGE_ERROR`.
+        assert!(parse_h3_request(&request(b"x bad", b"value")).is_none());
+        assert!(parse_h3_request(&request(b"x-probe", b"bad\x01")).is_none());
+
+        // 📋 Obs-text is legal in a field value (RFC 9110 §5.5) and has to
+        // reach the origin as the bytes the client sent, not as U+FFFD.
+        let parsed = parse_h3_request(&request(b"x-probe", b"caf\xe9")).unwrap();
+        assert_eq!(parsed.headers[0].1.as_bytes(), b"caf\xe9");
+    }
+
     #[test]
     fn parse_h3_request_drops_underscore_named_fields() {
         let list = vec![
@@ -7635,7 +7683,10 @@ mod tests {
         let req = parse_h3_request(&list).unwrap();
         assert_eq!(
             req.headers,
-            vec![("x-probe".to_string(), "present".to_string())],
+            vec![(
+                http::header::HeaderName::from_static("x-probe"),
+                http::HeaderValue::from_static("present")
+            )],
             "the underscore spelling is dropped, the hyphenated one kept"
         );
     }
@@ -7871,8 +7922,14 @@ mod tests {
             path: "/resource?q=1".to_string(),
             authority: "example.test".to_string(),
             headers: vec![
-                ("user-agent".to_string(), "probe/1".to_string()),
-                ("x-custom-field".to_string(), "kept".to_string()),
+                (
+                    http::header::USER_AGENT,
+                    http::HeaderValue::from_static("probe/1"),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-custom-field"),
+                    http::HeaderValue::from_static("kept"),
+                ),
             ],
         };
 
@@ -7932,9 +7989,9 @@ mod tests {
             path: "/".to_string(),
             authority: "example.test".to_string(),
             headers: vec![
-                ("cookie".to_string(), "a=1".to_string()),
-                ("cookie".to_string(), "b=2".to_string()),
-                ("cookie".to_string(), "c=3".to_string()),
+                (http::header::COOKIE, http::HeaderValue::from_static("a=1")),
+                (http::header::COOKIE, http::HeaderValue::from_static("b=2")),
+                (http::header::COOKIE, http::HeaderValue::from_static("c=3")),
             ],
         };
 
@@ -7962,8 +8019,14 @@ mod tests {
             path: "/".to_string(),
             authority: "example.test".to_string(),
             headers: vec![
-                ("accept-encoding".to_string(), "gzip".to_string()),
-                ("accept-encoding".to_string(), "br".to_string()),
+                (
+                    http::header::ACCEPT_ENCODING,
+                    http::HeaderValue::from_static("gzip"),
+                ),
+                (
+                    http::header::ACCEPT_ENCODING,
+                    http::HeaderValue::from_static("br"),
+                ),
             ],
         };
 
@@ -7987,7 +8050,10 @@ mod tests {
             method: "GET".to_string(),
             path: "/".to_string(),
             authority: "example.test".to_string(),
-            headers: vec![("host".to_string(), "example.test".to_string())],
+            headers: vec![(
+                http::header::HOST,
+                http::HeaderValue::from_static("example.test"),
+            )],
         };
 
         let header = h3_request_header(&req, http::Method::GET).expect("valid request");
@@ -8474,7 +8540,10 @@ mod tests {
             method: "GET".to_string(),
             path: "/resource".to_string(),
             authority: "shop.example.test".to_string(),
-            headers: vec![("host".to_string(), "shop.example.test".to_string())],
+            headers: vec![(
+                http::header::HOST,
+                http::HeaderValue::from_static("shop.example.test"),
+            )],
         };
         let client_header = h3_request_header(&request, http::Method::GET).unwrap();
         let (body_tx, mut body_rx) = mpsc::channel(1);
@@ -8678,8 +8747,11 @@ mod tests {
             path: "/grpc.health.v1.Health/Check".to_string(),
             authority: "example.test".to_string(),
             headers: vec![
-                ("content-type".to_string(), "application/grpc".to_string()),
-                ("te".to_string(), "trailers".to_string()),
+                (
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("application/grpc"),
+                ),
+                (http::header::TE, http::HeaderValue::from_static("trailers")),
             ],
         };
         let mut client_header =

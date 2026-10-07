@@ -552,10 +552,15 @@ mod response_interception_tests {
 mod h3_duplicate_framing_tests {
     use super::*;
 
-    fn fields(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    fn fields(pairs: &[(&str, &str)]) -> Vec<(http::HeaderName, http::HeaderValue)> {
         pairs
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .map(|(k, v)| {
+                (
+                    http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    http::HeaderValue::from_str(v).unwrap(),
+                )
+            })
             .collect()
     }
 
@@ -2060,20 +2065,20 @@ fn content_length_value_invalid(raw: &[u8]) -> bool {
 /// which is what a split `Cookie` needs — removes that accidental cover, so
 /// the rule has to be stated rather than relied upon.
 pub(crate) fn check_h3_request_framing(
-    headers: &[(String, String)],
+    headers: &[(http::HeaderName, http::HeaderValue)],
 ) -> Result<(), FramingRejection> {
     let mut lengths = 0;
     let mut hosts = 0;
     for (name, value) in headers {
-        if name.eq_ignore_ascii_case("transfer-encoding") {
+        if name == http::header::TRANSFER_ENCODING {
             return Err(FramingRejection::TransferEncodingForbidden);
         }
-        if name.eq_ignore_ascii_case("content-length") {
+        if name == http::header::CONTENT_LENGTH {
             lengths += 1;
             if content_length_value_invalid(value.as_bytes()) {
                 return Err(FramingRejection::MalformedContentLength);
             }
-        } else if name.eq_ignore_ascii_case("host") {
+        } else if name == http::header::HOST {
             hosts += 1;
         }
     }
@@ -2756,18 +2761,18 @@ mod tests {
             vec![("content-length", "5"), ("content-length", "x")],
             vec![("content-length", "5"), ("Content-Length", "6")],
         ] {
-            let list: Vec<(String, String)> = headers
+            let list: Vec<(http::HeaderName, http::HeaderValue)> = headers
                 .iter()
-                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .map(|(name, value)| {
+                    (
+                        http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                        http::HeaderValue::from_str(value).unwrap(),
+                    )
+                })
                 .collect();
             let mut map = http::HeaderMap::new();
             for (name, value) in &list {
-                if let (Ok(name), Ok(value)) = (
-                    http::header::HeaderName::from_bytes(name.as_bytes()),
-                    http::HeaderValue::from_str(value),
-                ) {
-                    map.append(name, value);
-                }
+                map.append(name.clone(), value.clone());
             }
             assert_eq!(
                 check_h3_request_framing(&list),
@@ -2775,18 +2780,6 @@ mod tests {
                 "H3 list framing diverged from the shared rule for {headers:?}"
             );
         }
-    }
-
-    #[test]
-    fn h3_framing_fails_closed_on_values_the_header_map_cannot_carry() {
-        // 🚨 A value that cannot become an `http::HeaderValue` was silently
-        // dropped by the old H3 path, which then accepted the request. The
-        // raw-list variant rejects it instead, matching the H1/H2 rule that
-        // a declared `Content-Length` must be `1*DIGIT`.
-        assert_eq!(
-            check_h3_request_framing(&[("content-length".to_string(), "5\x01".to_string())]),
-            Err(FramingRejection::MalformedContentLength)
-        );
     }
 
     #[test]
