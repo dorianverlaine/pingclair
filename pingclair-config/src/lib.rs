@@ -33,8 +33,8 @@ mod shared_ports;
 mod upstream_weights;
 
 pub use parser::{
-    Ast, CompileError as AnalyzeError, LexError, ParseError, ResolvedVariable, SemanticAnalyzer,
-    SemanticError, Token, VariableResolver, compile as parse_and_analyze, parse, tokenize,
+    Ast, CompileError as AnalyzeError, LexError, ParseError, SemanticAnalyzer, SemanticError,
+    Token, compile as parse_and_analyze, parse, tokenize,
 };
 
 pub use compiler::{CompileError, compile_ast};

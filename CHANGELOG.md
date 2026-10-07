@@ -38,6 +38,15 @@ before any answer can be produced; the trusted-proxy policy is global and the
 PROXY-protocol tunnel registry is per listener, so none of it needed a site
 (#281).
 
+### 🧹 The old `VariableResolver` API is gone
+
+`pingclair-config` exported `VariableResolver` and `ResolvedVariable` for the
+pre-Caddyfile native DSL's `${req.header["X"]}` syntax, and nothing called
+either: the Caddyfile adapter and the runtime replacer are the whole story
+now, and the old resolver was also the last place that gave the retired
+`${remote_ip}` name a meaning. The module and both exports are removed (#201);
+a configuration still spellable today is unaffected.
+
 ### 🧩 Caddy's shorthand placeholders resolve, and `*` no longer becomes the body
 
 The Caddyfile adapter read a leading `*` as "no matcher" but left the token in
