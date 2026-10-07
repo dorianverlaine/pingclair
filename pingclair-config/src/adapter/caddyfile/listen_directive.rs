@@ -286,6 +286,36 @@ mod tests {
         );
     }
 
+    /// 📌 The runtime's `default_bind` step, which exists for JSON documents,
+    /// finds nothing left to do in a compiled Pingclairfile, so a
+    /// Pingclairfile binds exactly what `adapt` shows.
+    #[test]
+    fn compiled_default_bind_needs_no_runtime_step() {
+        let config = compile(
+            "{\n    default_bind 127.0.0.1\n}\n\
+             x.test {\n    listen 0.0.0.0:8080\n    respond \"x\"\n}\n\
+             y.test {\n    listen :9090\n    respond \"y\"\n}\n\
+             z.test {\n    bind ::1\n    respond \"z\"\n}\n\
+             http://w.test {\n    respond \"w\"\n}\n",
+        )
+        .expect("compiles");
+        assert!(matches!(
+            pingclair_core::config::bind_listeners(&config),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// 🚫 A JSON `default_bind` list is refused like the Pingclairfile one.
+    #[test]
+    fn validation_refuses_more_than_one_default_bind() {
+        let mut config = pingclair_core::config::PingclairConfig::default();
+        config.global.default_bind = vec!["127.0.0.1".to_string(), "::1".to_string()];
+        let error = crate::compiler::validate_config(&config)
+            .expect_err("refused")
+            .to_string();
+        assert!(error.contains("names 2 addresses"), "{error}");
+    }
+
     /// 🚫 A second bind address is refused, not dropped.
     #[test]
     fn more_than_one_bind_address_is_refused() {

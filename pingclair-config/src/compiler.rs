@@ -1212,6 +1212,18 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
         });
     }
 
+    // 🚫 One address, as the Pingclairfile adapter insists: each listener sits
+    // on one interface, and taking the first of a JSON list would silently
+    // drop the rest.
+    if let [_, _, ..] = config.global.default_bind.as_slice() {
+        return Err(CompileError::InvalidServer {
+            message: format!(
+                "`default_bind` names {} addresses, and this build binds one. Use one \
+                 address, `[::]` for every interface, or a `bind` per site",
+                config.global.default_bind.len()
+            ),
+        });
+    }
     // 📍 The listener rules judge the sockets that will exist, which for a
     // JSON document with `bind` are not yet the addresses it spells: two sites
     // can only disagree about one socket once their `bind` has put them on it.

@@ -15429,6 +15429,10 @@ mod cache_age;
 #[path = "integration/site_bind.rs"]
 mod site_bind;
 
+// 🛡️ `default_bind` holds for a JSON document posted to the Admin API.
+#[path = "integration/default_bind_json.rs"]
+mod default_bind_json;
+
 // 🎯 An explicit site's name outranks a wildcard's `client_auth` (#259).
 #[path = "integration/client_auth_precedence.rs"]
 mod client_auth_precedence;

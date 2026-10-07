@@ -126,6 +126,9 @@ below, which ends with what to write instead.
 - **`bind` and `default_bind` with more than one address are refused.** Only
   the first was ever used; write one address or one site per interface.
   → [One bind address](#-bind-takes-one-address)
+- **`default_bind` now applies to JSON configurations.** A JSON site with no
+  `bind` and no explicit listen address listens only on `default_bind`.
+  → [`default_bind` in JSON](#-default_bind-applies-to-json-configurations)
 - **FastCGI HEAD and download limits apply on H1/H2.** Expect no HEAD body and
   budget download time according to configured rate limits.
   → [FastCGI body policy](#-fastcgi-bodies-honor-head-and-download-pacing)
@@ -539,6 +542,22 @@ load instead of ignored.
 
 📦 **Upgrade:** Keep one address, use `[::]` for every interface, or write one
 site per interface.
+
+### 🌐 `default_bind` applies to JSON configurations
+
+`global.default_bind` was only honoured for a Pingclairfile: the compiler
+copied it into each site, and a JSON configuration, whether loaded from a file
+or posted to the Admin API, skipped that step, so its sites listened on every
+interface. The global default now applies to JSON too, with the Pingclairfile
+rule: a site gets it when it has no `bind` and every `listen` entry is a bare
+port or `[::]`. A `listen` that names an address, `0.0.0.0` included, keeps
+it. A JSON `default_bind` with more than one address is refused, as it already
+was in a Pingclairfile. Pingclairfile configurations are unchanged.
+
+📦 **Upgrade:** A JSON site that relied on `default_bind` now listens only on
+that address, which is what the option says. To keep a JSON site on every
+interface, give it `"bind": "[::]"` or a `listen` entry with an explicit
+address.
 
 ### 🤐 FastCGI bodies honor HEAD and download pacing
 

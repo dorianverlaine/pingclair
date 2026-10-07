@@ -26,11 +26,18 @@
 //! governs the listener address and a site address only contributes its port
 //! and a `Host` matcher.
 //!
+//! 🌐 `default_bind` is the global fallback for a site that said nothing about
+//! its interface. The Pingclairfile compiler fills it in, but a JSON document —
+//! a file loaded with the JSON adapter, or a body posted to the Admin API —
+//! never passes through that compiler, so [`bind_listeners`] fills it in again
+//! with the same rule before it applies `bind`.
+//!
 //! 📌 Load path only — compilation, validation, startup and reload. Nothing
 //! here runs per request.
 
 use super::{PingclairConfig, ServerConfig, normalize_listen_addr};
 use std::borrow::Cow;
+use std::net::Ipv6Addr;
 
 /// 🌐 The host part of a socket address for a `bind` value.
 ///
@@ -79,6 +86,34 @@ impl ServerConfig {
         }
     }
 
+    /// 🌐 Gives this site the global `default_bind` when it named no
+    /// interface of its own.
+    ///
+    /// "Named no interface" is the rule the Pingclairfile compiler applies to
+    /// the `listen` directive: no `bind`, and every `listen` entry is the
+    /// all-interfaces `[::]` (or a bare `:port`). A site that wrote
+    /// `127.0.0.1:8080` or `0.0.0.0:8080` chose its interface, and the default
+    /// does not move it. Only the first entry is used; `validate_config`
+    /// refuses a list, as the Pingclairfile adapter does.
+    ///
+    /// 📌 A Pingclairfile result is never changed by this: the compiler already
+    /// gave the default to every site this rule picks.
+    pub fn inherit_default_bind(&mut self, default_bind: &[String]) {
+        if self.inherits_default_bind(default_bind) {
+            self.bind = default_bind.first().cloned();
+        }
+    }
+
+    /// 🔎 Whether [`Self::inherit_default_bind`] would change anything.
+    fn inherits_default_bind(&self, default_bind: &[String]) -> bool {
+        self.bind.is_none()
+            && default_bind.first().is_some_and(|bind| !bind.is_empty())
+            && self
+                .listen
+                .iter()
+                .all(|address| is_every_interface(address))
+    }
+
     /// 🔎 Whether [`Self::apply_bind`] would change anything.
     fn bind_changes_listeners(&self) -> bool {
         let Some(host) = self.bind.as_deref().and_then(bind_socket_host) else {
@@ -95,6 +130,21 @@ impl ServerConfig {
     }
 }
 
+/// 🌐 Whether a listen address leaves the interface open: `:8080`, `[::]:8080`
+/// or another spelling of the IPv6 unspecified address.
+///
+/// 🛡️ Anything else counts as a choice, including an address that cannot be
+/// read: validation and the bind report that one, and guessing an interface
+/// for it would bind something nobody wrote.
+fn is_every_interface(address: &str) -> bool {
+    let normalized = normalize_listen_addr(address);
+    normalized
+        .rsplit_once(':')
+        .and_then(|(host, _)| host.strip_prefix('[')?.strip_suffix(']'))
+        .and_then(|host| host.parse::<Ipv6Addr>().ok())
+        .is_some_and(|host| host.is_unspecified())
+}
+
 /// 📍 `address` with its host replaced by `host`, or `None` when its port
 /// cannot be read.
 fn rebind(address: &str, host: &str) -> Option<String> {
@@ -104,22 +154,26 @@ fn rebind(address: &str, host: &str) -> Option<String> {
     Some(format!("{host}:{port}"))
 }
 
-/// 📍 The configuration with every site's listeners on its `bind` host.
+/// 📍 The configuration with `default_bind` filled in and every site's
+/// listeners on its `bind` host.
 ///
-/// Borrowed when no site's `bind` changes anything, which includes every
-/// configuration compiled from a Pingclairfile: the compiler already applied
-/// it. A JSON document is where the owned branch earns its clone.
+/// Borrowed when neither changes anything, which includes every configuration
+/// compiled from a Pingclairfile: the compiler already did both. A JSON
+/// document is where the owned branch earns its clone.
 #[must_use]
 pub fn bind_listeners(config: &PingclairConfig) -> Cow<'_, PingclairConfig> {
+    let default_bind = &config.global.default_bind;
     if !config
         .servers
         .iter()
-        .any(ServerConfig::bind_changes_listeners)
+        .any(|server| server.inherits_default_bind(default_bind) || server.bind_changes_listeners())
     {
         return Cow::Borrowed(config);
     }
     let mut bound = config.clone();
+    let default_bind = &bound.global.default_bind;
     for server in &mut bound.servers {
+        server.inherit_default_bind(default_bind);
         server.apply_bind();
     }
     Cow::Owned(bound)
@@ -173,6 +227,52 @@ mod tests {
         assert_eq!(
             derived.listen_addresses(80, 443),
             vec!["[::1]:80".to_string()]
+        );
+    }
+
+    /// 🛡️ A JSON document's `default_bind` reaches every site that named no
+    /// interface, and no other: a site with its own `bind` keeps it, and a
+    /// site whose `listen` names an address (`0.0.0.0` included) stays there.
+    #[test]
+    fn default_bind_reaches_sites_that_named_no_interface() {
+        let config = PingclairConfig {
+            global: crate::config::GlobalConfig {
+                default_bind: vec!["127.0.0.1".to_string()],
+                ..Default::default()
+            },
+            servers: vec![
+                ServerConfig::default(),
+                ServerConfig {
+                    listen: vec![":8080".to_string(), "[0::0]:8081".to_string()],
+                    ..Default::default()
+                },
+                site("10.0.0.1", &[":8082"]),
+                ServerConfig {
+                    listen: vec!["0.0.0.0:8083".to_string()],
+                    ..Default::default()
+                },
+                ServerConfig {
+                    listen: vec!["[::1]:8084".to_string(), ":8085".to_string()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let bound = bind_listeners(&config);
+        let addresses: Vec<Vec<String>> = bound
+            .servers
+            .iter()
+            .map(|server| server.listen_addresses(80, 443))
+            .collect();
+        assert_eq!(
+            addresses,
+            vec![
+                vec!["127.0.0.1:80".to_string()],
+                vec!["127.0.0.1:8080".to_string(), "127.0.0.1:8081".to_string()],
+                vec!["10.0.0.1:8082".to_string()],
+                vec!["0.0.0.0:8083".to_string()],
+                vec!["[::1]:8084".to_string(), "[::]:8085".to_string()],
+            ]
         );
     }
 
