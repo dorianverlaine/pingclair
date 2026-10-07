@@ -642,7 +642,7 @@ impl AcmeClient {
         }
 
         // 6. Finalize & Download
-        tracing::info!("�️ Finalizing order...");
+        tracing::info!("🏁 Finalizing order...");
         let key_pem = order
             .finalize()
             .await
