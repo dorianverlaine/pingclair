@@ -316,6 +316,11 @@ enum LaunchRecipe {
         template: String,
         nofile_limit: Option<u64>,
     },
+    /// 📄 A `.pingclair` file: the extension decides the language, so this is
+    /// the native frontend's own entry point.
+    Native {
+        template: String,
+    },
 }
 
 /// 🛡️ A real bind defect fails every attempt, so a small bound still reports
@@ -355,6 +360,9 @@ impl TestServer {
                 template,
                 nofile_limit,
             } => Self::launch_pingclairfile(template, *nofile_limit, recipe.clone()),
+            LaunchRecipe::Native { template } => {
+                Self::launch_config_file("config.pingclair", template, None, recipe.clone())
+            }
         }
     }
 
@@ -408,13 +416,30 @@ impl TestServer {
         })
     }
 
+    /// 📄 Starts the real binary from a `.pingclair` file.
+    fn new_native(config_template: &str) -> Self {
+        Self::launch(LaunchRecipe::Native {
+            template: config_template.to_owned(),
+        })
+    }
+
     fn launch_pingclairfile(
         config_template: &str,
         nofile_limit: Option<u64>,
         recipe: LaunchRecipe,
     ) -> Self {
+        Self::launch_config_file("Pingclairfile", config_template, nofile_limit, recipe)
+    }
+
+    /// 🔁 Writes one configuration file and starts the real binary from it.
+    fn launch_config_file(
+        file_name: &str,
+        config_template: &str,
+        nofile_limit: Option<u64>,
+        recipe: LaunchRecipe,
+    ) -> Self {
         let temp_dir = tempfile::tempdir().expect("failed to create the test directory");
-        let config_path = temp_dir.path().join("Pingclairfile");
+        let config_path = temp_dir.path().join(file_name);
         let readiness_id = uuid::Uuid::new_v4();
         let readiness_path = format!("/__pingclair_test_ready_{readiness_id}");
         let readiness_token = format!("pingclair-ready-{readiness_id}");
@@ -4920,6 +4945,126 @@ async fn test_pingclairfile_header_replace_rewrites_an_upstream_value() {
     );
 
     upstream_task.await.unwrap();
+}
+
+/// 🧭 The native language's first real-binary coverage: routes match, fall
+/// through in order, and answer from the same runtime a Caddyfile uses.
+#[tokio::test]
+async fn test_native_routes_serve_real_requests() {
+    let config = r#"
+HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {
+    Site(host: "*") {
+        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {
+            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
+        }
+        Route(when: .path(prefix: "/api")) {
+            Respond(body: "api")
+        }
+        Fallback { Respond(body: "site") }
+    }
+}
+"#;
+    let mut server = TestServer::new_native(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let body = |path: &'static str| {
+        let client = client.clone();
+        let url = server.url(0, path);
+        async move { client.get(url).send().await.unwrap().text().await.unwrap() }
+    };
+    assert_eq!(body("/api/users").await, "api");
+    // 📌 `.path(prefix:)` matches path segments, not raw string prefixes: the
+    // fallback is what `/apiv2` gets, unlike Caddy's `/api/*`.
+    assert_eq!(body("/apiv2").await, "site");
+    assert_eq!(body("/").await, "site");
+}
+
+/// 🗄️ A native reverse proxy reaches an upstream through the real binary.
+#[tokio::test]
+async fn test_native_reverse_proxy_reaches_an_upstream() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nnative")
+            .await
+            .unwrap();
+    });
+
+    let config = format!(
+        r#"
+HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
+    Site(host: "*") {{
+        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
+            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
+        }}
+        Fallback {{ Proxy(to: "{upstream_address}") }}
+    }}
+}}
+"#
+    );
+    let mut server = TestServer::new_native(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/proxied"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "native");
+    upstream_task.await.unwrap();
+}
+
+/// 📊 A native access log reaches the file the configuration named, with the
+/// headers it asked to capture.
+#[tokio::test]
+async fn test_native_access_log_writes_captured_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("access.log");
+    let config = format!(
+        r#"
+HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
+    Site(host: "*") {{
+        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
+            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
+        }}
+        Fallback {{ Respond(body: "ok") }}
+    }}
+}}
+.accessLog(output: .file("{}"), format: .json, headers: [.request("X-Trace")])
+"#,
+        log_path.display()
+    );
+    let mut server = TestServer::new_native(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/logged"))
+        .header("X-Trace", "trace-7")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    // 🔄 The writer is a thread; give it a bounded moment rather than a sleep
+    // long enough to hide a real failure.
+    let mut content = String::new();
+    for _ in 0..50 {
+        content = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if content.contains("trace-7") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(content.contains("\"x-trace\":\"trace-7\""), "{content}");
 }
 
 /// 🗄️ `header_up` takes the same shapes `header_down` does.
