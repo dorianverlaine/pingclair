@@ -213,3 +213,6 @@ async fn incomplete_and_oversized_hellos_close_without_fallback() {
     .await
     .unwrap();
 }
+
+#[path = "layer4_metrics.rs"]
+mod metrics;

@@ -10,6 +10,8 @@ description = "Bounded TCP routing and TLS ClientHello classification"
 
 [dependencies]
 pingclair-core = { path = "../pingclair-core" }
+pingclair-runtime = { path = "../pingclair-runtime" }
+prometheus.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

@@ -2628,6 +2628,8 @@ name = "pingclair-l4"
 version = "0.0.0"
 dependencies = [
  "pingclair-core",
+ "pingclair-runtime",
+ "prometheus",
  "proptest",
  "rustls",
  "tokio",

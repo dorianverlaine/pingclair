@@ -3,6 +3,8 @@
 
 //! 🔌 Load-time routing state and the bounded preread-to-relay connection path.
 
+use crate::metrics::Metrics;
+use crate::observation::{Counted, Observation, Outcome, Phase};
 use crate::{Classification, ClientHello, RelayOptions, classify, relay};
 use pingclair_core::config::{IpRanges, Layer4Server, Layer4TlsMatcher};
 use std::io;
@@ -46,6 +48,7 @@ struct Route {
 
 /// 🧭 Immutable state held for a connection's entire lifetime, including reloads.
 pub struct PreparedListener {
+    metrics: Metrics,
     routes: Vec<Route>,
     blocked: IpRanges,
     needs_tls: bool,
@@ -100,6 +103,10 @@ impl PreparedListener {
             routes.push(Route { matches, upstreams });
         }
         Ok(Self {
+            metrics: Metrics::prepare(
+                &pingclair_core::config::normalize_listen_addr(&config.listen),
+                routes.len(),
+            ),
             routes,
             needs_tls,
             blocked: IpRanges::parse(blocked.to_vec()).map_err(io::Error::other)?,
@@ -117,12 +124,30 @@ impl PreparedListener {
     /// 🌊 Classifies and routes one raw stream without decrypting or constructing HTTP.
     pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
-        mut stream: S,
+        stream: S,
         peer: IpAddr,
     ) -> io::Result<()> {
+        let mut observation = Observation::new(&self.metrics);
+        let result = self.serve_inner(stream, peer, &mut observation).await;
+        observation.finish(&result);
+        result
+    }
+
+    async fn serve_inner<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: S,
+        peer: IpAddr,
+        observation: &mut Observation<'_>,
+    ) -> io::Result<()> {
+        let mut stream = Counted {
+            inner: stream,
+            stats: &mut observation.downstream,
+            written: observation.metrics.map(|m| &m.to_client),
+        };
         if contains_peer(&self.blocked, peer) {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
+        observation.phase = Phase::Preread;
         let mut prefix = Vec::new();
         if self.needs_tls {
             prefix
@@ -138,6 +163,7 @@ impl PreparedListener {
             let mut needed = 1;
             loop {
                 if needed > self.preread_limit {
+                    observation.outcome = Some(Outcome::PrereadOverflow);
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "L4 preread buffer exceeded",
@@ -147,13 +173,20 @@ impl PreparedListener {
                     let read =
                         timeout_at(deadline, stream.read(&mut prefix[length..needed])).await??;
                     if read == 0 {
+                        observation.outcome = Some(Outcome::PrereadEof);
                         return Ok(());
                     }
                     length += read;
                 }
                 match classify(&prefix[..length]) {
                     Classification::NeedMore(size) => needed = size,
-                    Classification::NotTls | Classification::Tls(_) => {
+                    classified @ (Classification::NotTls | Classification::Tls(_)) => {
+                        if matches!(classified, Classification::NotTls)
+                            && prefix[0] == 22
+                            && let Some(metrics) = observation.metrics
+                        {
+                            metrics.declined.inc();
+                        }
                         prefix.truncate(length);
                         break;
                     }
@@ -165,10 +198,12 @@ impl PreparedListener {
             Classification::Tls(hello) => Some(hello),
             Classification::NeedMore(_) | Classification::NotTls => None,
         };
-        let route = self
+        observation.phase = Phase::Routing;
+        let (index, route) = self
             .routes
             .iter()
-            .find(|route| {
+            .enumerate()
+            .find(|(_, route)| {
                 route.matches.is_empty()
                     || route
                         .matches
@@ -176,12 +211,20 @@ impl PreparedListener {
                         .any(|matcher| matcher.matches(hello, peer))
             })
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no L4 route matched"))?;
-        let mut upstream = timeout(
+        observation.route = Some(index);
+        observation.phase = Phase::Connect;
+        let upstream = timeout(
             self.connect_timeout,
             TcpStream::connect(route.upstreams.as_slice()),
         )
         .await??;
         upstream.set_nodelay(true)?;
+        observation.phase = Phase::Relay;
+        let mut upstream = Counted {
+            inner: upstream,
+            stats: &mut observation.upstream,
+            written: observation.metrics.map(|m| &m.to_upstream),
+        };
         relay(&mut stream, &mut upstream, prefix, self.relay).await
     }
 }

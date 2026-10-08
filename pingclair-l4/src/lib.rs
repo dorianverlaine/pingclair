@@ -9,5 +9,7 @@ pub use hello::{Classification, ClientHello, classify};
 mod relay;
 pub use relay::{RelayOptions, relay};
 
+mod metrics;
+mod observation;
 mod session;
 pub use session::PreparedListener;
