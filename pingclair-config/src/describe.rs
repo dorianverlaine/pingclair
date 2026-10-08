@@ -53,7 +53,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         name: "Route",
         kind: Kind::Component,
-        summary: "A conditional route: `when:`/`from:` plus exactly one `Proxy`.",
+        summary: "A conditional route: L4 takes `when:`/`from:` plus one `Proxy`; HTTP takes a typed `when:` condition.",
         example: r#"TCPListener(on: "127.0.0.1:9443") {
     Route(when: .tls(sni: ["example.test"]), from: ["127.0.0.0/8"]) {
         Proxy(to: "127.0.0.1:8443")

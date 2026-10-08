@@ -5,10 +5,10 @@
 
 use crate::attributes::{Attr, resolve_attribute};
 use crate::bindings::Bindings;
-use crate::syntax::{self, Call, Declaration, Value};
+use crate::syntax::{self, Call, Declaration, Position, Value};
 use pingclair_core::config::{
     AdminConfig, HandlerConfig, Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher,
-    ListenerOptions, LogConfig, LogFormat, LogOutput, LogRotation, PingclairConfig,
+    ListenerOptions, LogConfig, LogFormat, LogOutput, LogRotation, Matcher, PingclairConfig,
     ResourceLimitsConfig, RouteConfig, ServerConfig, TlsConfig, normalize_listen_addr,
 };
 
@@ -361,15 +361,34 @@ fn site(
     }
     let host = call.string("host")?;
     let body = call.block()?;
-    let [fallback] = body else {
-        return Err(call
-            .at
-            .error("a Site needs exactly one Fallback until HTTP route conditions land"));
-    };
-    if fallback.name != "Fallback" {
-        return Err(fallback
-            .at
-            .error("HTTP route conditions are not implemented yet; use Fallback"));
+    if body.is_empty() {
+        return Err(call.at.error("a Site needs at least one Route or Fallback"));
+    }
+    let mut routes = Vec::new();
+    let mut seen_fallback = false;
+    for (index, child) in body.iter().enumerate() {
+        match child.name.as_str() {
+            "Route" => {
+                if seen_fallback {
+                    return Err(child.at.error("Fallback must be the last route"));
+                }
+                routes.push(http_route(child)?);
+            }
+            "Fallback" => {
+                if seen_fallback || index + 1 != body.len() {
+                    return Err(child
+                        .at
+                        .error("a Site may have one Fallback, and it comes last"));
+                }
+                seen_fallback = true;
+                routes.push(fallback_route(child)?);
+            }
+            other => {
+                return Err(child.at.error(format!(
+                    "a Site contains Route and Fallback components, not {other}"
+                )));
+            }
+        }
     }
     let (name, names) = if host == "*" {
         (Some("_".to_string()), Vec::new())
@@ -393,7 +412,7 @@ fn site(
         // gzip default on `ServerConfig` only applies to old JSON without the field.
         encodings: Vec::new(),
         limits: options.limits.clone().unwrap_or_default(),
-        routes: vec![fallback_route(fallback)?],
+        routes,
         ..ServerConfig::default()
     })
 }
@@ -611,6 +630,200 @@ fn fallback_route(call: &Call) -> Result<RouteConfig, Error> {
         methods: None,
         matcher: None,
     })
+}
+
+/// 🧭 A conditional HTTP route: `when:` plus exactly one handler.
+fn http_route(call: &Call) -> Result<RouteConfig, Error> {
+    call.labels(&["when"])?;
+    call.no_modifiers()?;
+    let Some(condition) = call.get("when") else {
+        return Err(call
+            .at
+            .error("Route requires when:; use Fallback for an unconditional route"));
+    };
+    let (matcher, primary) = http_condition(condition, call.at)?;
+    let body = call.block()?;
+    let [handler] = body else {
+        return Err(call.at.error("Route requires exactly one handler"));
+    };
+    Ok(RouteConfig {
+        path: primary.unwrap_or_else(|| "/*".to_string()),
+        handler: http_handler(handler)?,
+        methods: None,
+        matcher: Some(matcher),
+    })
+}
+
+/// 🎛️ A typed HTTP condition, lowered onto the shared matcher model.
+fn http_condition(value: &Value, at: Position) -> Result<(Matcher, Option<String>), Error> {
+    let Value::Typed(call) = value else {
+        return Err(at.error("a condition is a typed value such as .path(exact: \"/x\")"));
+    };
+    match call.name.as_str() {
+        "path" => path_condition(call),
+        "host" => {
+            let [(None, Value::Array(items))] = call.args.as_slice() else {
+                return Err(call.at.error("host takes one array of names"));
+            };
+            let mut hosts = Vec::new();
+            for item in items {
+                let Value::String(host) = item else {
+                    return Err(call.at.error("host takes an array of names"));
+                };
+                hosts.push(host.clone());
+            }
+            if hosts.is_empty() {
+                return Err(call.at.error("host needs at least one name"));
+            }
+            Ok((Matcher::Host(hosts), None))
+        }
+        "method" => {
+            if call.args.is_empty() {
+                return Err(call
+                    .at
+                    .error("method needs at least one .get/.post/... value"));
+            }
+            let mut methods = Vec::new();
+            for (label, item) in call.args.as_slice() {
+                if label.is_some() {
+                    return Err(call
+                        .at
+                        .error("method takes unlabeled .get/.post/... values"));
+                }
+                let Value::Typed(value) = item else {
+                    return Err(call
+                        .at
+                        .error("method takes unlabeled .get/.post/... values"));
+                };
+                if !value.args.is_empty() {
+                    return Err(value.at.error("a method value takes no arguments"));
+                }
+                let method = match value.name.as_str() {
+                    "get" => "GET",
+                    "post" => "POST",
+                    "put" => "PUT",
+                    "delete" => "DELETE",
+                    "patch" => "PATCH",
+                    "head" => "HEAD",
+                    "options" => "OPTIONS",
+                    other => {
+                        return Err(value.at.error(format!(
+                            "unknown method '.{other}'; expected .get, .post, .put, .delete, .patch, .head or .options"
+                        )));
+                    }
+                };
+                methods.push(method.to_string());
+            }
+            Ok((Matcher::Method { methods }, None))
+        }
+        "all" | "any" => conjunction_or_disjunction(call),
+        "not" => {
+            let [(None, item)] = call.args.as_slice() else {
+                return Err(call.at.error("not takes one condition"));
+            };
+            let (matcher, _) = http_condition(item, call.at)?;
+            Ok((Matcher::Not(Box::new(matcher)), None))
+        }
+        other => Err(call.at.error(format!(
+            "unknown condition '.{other}'; expected .path, .host, .method, .all, .any or .not"
+        ))),
+    }
+}
+
+/// 📁 The `.path(...)` variants: exact, segment prefix, glob and regex.
+fn path_condition(call: &Call) -> Result<(Matcher, Option<String>), Error> {
+    if let [(None, Value::Typed(regex))] = call.args.as_slice() {
+        if regex.name != "regex" {
+            return Err(regex.at.error(format!(
+                "unknown path condition '.{}'; expected .regex",
+                regex.name
+            )));
+        }
+        let [(None, Value::String(pattern))] = regex.args.as_slice() else {
+            return Err(regex.at.error("regex takes one pattern string"));
+        };
+        return Ok((
+            Matcher::PathRegexp {
+                name: None,
+                pattern: pattern.clone(),
+            },
+            None,
+        ));
+    }
+    call.leaf(&["exact", "prefix", "glob"])?;
+    let mut chosen = Vec::new();
+    for label in ["exact", "prefix", "glob"] {
+        if call.get(label).is_some() {
+            chosen.push(label);
+        }
+    }
+    let [label] = chosen.as_slice() else {
+        return Err(call
+            .at
+            .error("path requires exactly one of exact:, prefix:, glob: or .regex(...)"));
+    };
+    let text = call.string(label)?;
+    if text.is_empty() {
+        return Err(call.at.error(format!("{label} path must not be empty")));
+    }
+    if *label != "glob" && text.contains('*') {
+        return Err(call.at.error(format!(
+            "a {label} path cannot contain '*'; use glob: for wildcard patterns"
+        )));
+    }
+    let (patterns, primary) = if *label == "prefix" {
+        if text != "/" && text.ends_with('/') {
+            return Err(call
+                .at
+                .error("a prefix must not end with '/'; write the parent path instead"));
+        }
+        let patterns = if text == "/" {
+            vec!["/".to_string(), "/*".to_string()]
+        } else {
+            vec![text.clone(), format!("{text}/*")]
+        };
+        // 🧭 The route index needs a pattern that covers the whole subtree;
+        // the matcher above still decides the exact semantics.
+        let primary = if text == "/" {
+            "/*".to_string()
+        } else {
+            format!("{text}*")
+        };
+        (patterns, Some(primary))
+    } else {
+        (vec![text.clone()], Some(text.clone()))
+    };
+    Ok((Matcher::Path { patterns }, primary))
+}
+
+/// 🔗 `.all([...])` and `.any([...])`, folded into an `And`/`Or` tree.
+fn conjunction_or_disjunction(call: &Call) -> Result<(Matcher, Option<String>), Error> {
+    let [(None, Value::Array(items))] = call.args.as_slice() else {
+        return Err(call
+            .at
+            .error(format!("{} takes one array of conditions", call.name)));
+    };
+    if items.is_empty() {
+        return Err(call
+            .at
+            .error(format!("{} needs at least one condition", call.name)));
+    }
+    let and = call.name == "all";
+    let mut folded = None;
+    let mut primary = None;
+    for item in items {
+        let (matcher, item_primary) = http_condition(item, call.at)?;
+        if primary.is_none() {
+            primary = item_primary;
+        }
+        folded = Some(match folded {
+            None => matcher,
+            Some(left) if and => Matcher::And(Box::new(left), Box::new(matcher)),
+            Some(left) => Matcher::Or(Box::new(left), Box::new(matcher)),
+        });
+    }
+    let folded = folded.expect("the array is non-empty");
+    Ok((folded, if and { primary } else { None }))
 }
 
 /// 🧰 HTTP terminal components; `Respond` is the first one implemented.

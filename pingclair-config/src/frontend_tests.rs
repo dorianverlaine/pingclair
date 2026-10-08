@@ -504,6 +504,104 @@ fn tls_and_log_mistakes_fail_closed() {
 }
 
 #[test]
+fn http_conditions_lower_like_their_caddyfile_twins() {
+    let cases = [
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .path(exact: \"/a\")) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\trespond /a \"m\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .host([\"example.com\"])) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@h host example.com\n\trespond @h \"m\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .method(.get, .post)) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@m method GET POST\n\trespond @m \"m\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .path(.regex(\"^/old/(.*)$\"))) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@m path_regexp ^/old/(.*)$\n\trespond @m \"m\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .all([.path(glob: \"/a/*\"), .host([\"example.com\"])])) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@m {\n\t\thost example.com\n\t\tpath /a/*\n\t}\n\trespond @m \"m\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .not(.path(glob: \"/x/*\"))) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@m not path /x/*\n\trespond @m \"m\"\n}\n",
+        ),
+    ];
+    for (native_source, legacy_source) in cases {
+        let native = crate::compile(native_source).unwrap();
+        let legacy = crate::compile(legacy_source).unwrap();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::to_value(legacy).unwrap(),
+            "{native_source}"
+        );
+    }
+}
+
+#[test]
+fn native_only_conditions_lower_to_their_typed_shape() {
+    let config = crate::compile(
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .path(prefix: \"/api\")) { Respond(body: \"m\") } } }",
+    )
+    .unwrap();
+    let route = &config.servers[0].routes[0];
+    assert_eq!(route.path, "/api*");
+    assert_eq!(
+        route.matcher,
+        Some(pingclair_core::config::Matcher::Path {
+            patterns: vec!["/api".to_string(), "/api/*".to_string()]
+        })
+    );
+
+    let config = crate::compile(
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .any([.host([\"a.example\"]), .method(.get)])) { Respond(body: \"m\") } } }",
+    )
+    .unwrap();
+    let route = &config.servers[0].routes[0];
+    assert_eq!(route.path, "/*");
+    assert_eq!(
+        route.matcher,
+        Some(pingclair_core::config::Matcher::Or(
+            Box::new(pingclair_core::config::Matcher::Host(vec![
+                "a.example".to_string()
+            ])),
+            Box::new(pingclair_core::config::Matcher::Method {
+                methods: vec!["GET".to_string()]
+            })
+        ))
+    );
+}
+
+#[test]
+fn http_route_conditions_fail_closed() {
+    let site =
+        |route: &str| format!("HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ {route} }} }}");
+    for route in [
+        "Route(when: .path(exact: \"/a*\")) { Respond(body: \"m\") }",
+        "Route(when: .path(prefix: \"/a/\")) { Respond(body: \"m\") }",
+        "Route(when: .path()) { Respond(body: \"m\") }",
+        "Route(when: .path(exact: \"/a\", glob: \"/b*\")) { Respond(body: \"m\") }",
+        "Route(when: .path(.unknown(\"/a\"))) { Respond(body: \"m\") }",
+        "Route(when: .method(.trace)) { Respond(body: \"m\") }",
+        "Route(when: .method(.get, 5)) { Respond(body: \"m\") }",
+        "Route(when: .host([])) { Respond(body: \"m\") }",
+        "Route(when: .all([])) { Respond(body: \"m\") }",
+        "Route(when: .header(name: \"X\", value: \"y\")) { Respond(body: \"m\") }",
+        "Route { Respond(body: \"m\") }",
+        "Route(when: .path(exact: \"/a\")) { Respond(body: \"m\") Respond(body: \"n\") }",
+        "Fallback { Respond(body: \"f\") } Route(when: .path(exact: \"/a\")) { Respond(body: \"m\") }",
+        "Fallback { Respond(body: \"f\") } Fallback { Respond(body: \"g\") }",
+    ] {
+        let source = site(route);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",
