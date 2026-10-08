@@ -46,6 +46,14 @@ pub(crate) struct Cli {
     pub(crate) command: Commands,
 }
 
+/// 📇 Output format for `describe`.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+pub(crate) enum DescribeFormat {
+    #[default]
+    Text,
+    Json,
+}
+
 #[derive(Subcommand)]
 pub(crate) enum Commands {
     /// Run the server with a configuration file
@@ -336,6 +344,16 @@ pub(crate) enum Commands {
         /// Print a visual diff instead of the formatted output
         #[arg(short, long)]
         diff: bool,
+    },
+
+    /// Describe the native language's components, modifiers, and attributes
+    Describe {
+        /// Name to describe; omit for the full list
+        name: Option<String>,
+
+        /// Output format
+        #[arg(long, value_enum, default_value_t = DescribeFormat::Text)]
+        format: DescribeFormat,
     },
 
     /// Hash a password for basic_auth (bcrypt)

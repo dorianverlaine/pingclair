@@ -28,6 +28,7 @@ mod attributes;
 mod bindings;
 pub mod caddyfile;
 pub mod compiler;
+pub mod describe;
 pub mod frontend;
 mod header_fields;
 mod layer4;

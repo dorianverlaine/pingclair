@@ -13,7 +13,7 @@
 //! knowing before changing one: the quick commands are not a separate server,
 //! they are the same server with a configuration nobody had to write down.
 
-use super::{Cli, Commands};
+use super::{Cli, Commands, DescribeFormat};
 use crate::addr::{host_only, listen_for_site, upstream_hostport};
 use crate::cli::admin::{admin_request, trust_internal_ca};
 use crate::cli::service::manage_system_service;
@@ -1090,6 +1090,18 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             }
             if !overwrite && !already_formatted {
                 std::process::exit(1);
+            }
+        }
+
+        Commands::Describe { name, format } => {
+            let rendered = match format {
+                DescribeFormat::Text => pingclair_config::describe::render_text(name.as_deref()),
+                DescribeFormat::Json => pingclair_config::describe::render_json(name.as_deref()),
+            }
+            .map_err(|error| anyhow::anyhow!("❌ {error}"))?;
+            print!("{rendered}");
+            if !rendered.ends_with('\n') {
+                println!();
             }
         }
 
