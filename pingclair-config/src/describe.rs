@@ -35,6 +35,13 @@ pub struct Entry {
     pub summary: &'static str,
     pub example: &'static str,
     pub refusal: &'static str,
+    /// 🏷️ The argument labels this name accepts, **taken from the parser's own
+    /// list** rather than written out again here.
+    ///
+    /// 📌 The review found the gap this closes: a hand-written catalogue cannot
+    /// promise it lists what the parser accepts. One constant per component,
+    /// read by both sides, is the smallest thing that can.
+    pub labels: &'static [&'static str],
 }
 
 pub const ENTRIES: &[Entry] = &[
@@ -49,6 +56,7 @@ pub const ENTRIES: &[Entry] = &[
         refusal: r#"TCPListener(on: "127.0.0.1:9443") {
     Unknown { Proxy(to: "127.0.0.1:8080") }
 }"#,
+        labels: crate::frontend::tcp::L4_ROUTE_LABELS,
     },
     Entry {
         name: "Route",
@@ -62,6 +70,7 @@ pub const ENTRIES: &[Entry] = &[
         refusal: r#"TCPListener(on: "127.0.0.1:9443") {
     Route(when: .tls(sni: ["example.test"])) { }
 }"#,
+        labels: crate::frontend::tcp::L4_ROUTE_LABELS,
     },
     Entry {
         name: "Fallback",
@@ -73,6 +82,7 @@ pub const ENTRIES: &[Entry] = &[
         refusal: r#"TCPListener(on: "127.0.0.1:9443") {
     Fallback(when: .tls()) { Proxy(to: "127.0.0.1:8080") }
 }"#,
+        labels: &[],
     },
     Entry {
         name: "Proxy",
@@ -84,6 +94,7 @@ pub const ENTRIES: &[Entry] = &[
         refusal: r#"TCPListener(on: "127.0.0.1:9443") {
     Fallback { Proxy(to: 8080) }
 }"#,
+        labels: crate::frontend::http::PROXY_LABELS,
     },
     Entry {
         name: "HTTPListener",
@@ -95,6 +106,7 @@ pub const ENTRIES: &[Entry] = &[
     }
 }"#,
         refusal: r#"HTTPListener(on: ":8080") {}"#,
+        labels: crate::frontend::http::HTTP_LISTENER_LABELS,
     },
     Entry {
         name: "Site",
@@ -108,6 +120,7 @@ pub const ENTRIES: &[Entry] = &[
         refusal: r#"HTTPListener(on: ":8080") {
     Site(host: "example.test") { }
 }"#,
+        labels: crate::frontend::http::SITE_LABELS,
     },
     Entry {
         name: "Respond",
@@ -123,6 +136,7 @@ pub const ENTRIES: &[Entry] = &[
         Fallback { Respond(body: "hello", status: 999999) }
     }
 }"#,
+        labels: crate::frontend::http::RESPOND_LABELS,
     },
     Entry {
         name: "tls",
@@ -136,6 +150,7 @@ pub const ENTRIES: &[Entry] = &[
     Site(host: "localhost") { Fallback { Respond(body: "hello") } }
 }
 .tls(.acme(email: "admin@example.com"))"#,
+        labels: &[],
     },
     Entry {
         name: "ServeFiles",
@@ -151,6 +166,7 @@ pub const ENTRIES: &[Entry] = &[
         Fallback { ServeFiles(browse: true) }
     }
 }"#,
+        labels: crate::frontend::http::FILE_SERVER_LABELS,
     },
     Entry {
         name: "Proxy",
@@ -166,6 +182,7 @@ pub const ENTRIES: &[Entry] = &[
         Fallback { Proxy(to: []) }
     }
 }"#,
+        labels: &[],
     },
     Entry {
         name: "Redirect",
@@ -183,6 +200,7 @@ pub const ENTRIES: &[Entry] = &[
         Fallback { Redirect(to: "/new", status: .moved) }
     }
 }"#,
+        labels: crate::frontend::http::REDIRECT_LABELS,
     },
     Entry {
         name: "Fail",
@@ -198,6 +216,7 @@ pub const ENTRIES: &[Entry] = &[
         Fallback { Fail(status: 999999) }
     }
 }"#,
+        labels: crate::frontend::http::FAIL_LABELS,
     },
     Entry {
         name: "ServeMetrics",
@@ -213,6 +232,7 @@ pub const ENTRIES: &[Entry] = &[
         Fallback { ServeMetrics(unknown: true) }
     }
 }"#,
+        labels: crate::frontend::http::METRICS_LABELS,
     },
     Entry {
         name: "accessLog",
@@ -226,6 +246,7 @@ pub const ENTRIES: &[Entry] = &[
     Site(host: "*") { Fallback { Respond(body: "hello") } }
 }
 .accessLog(output: .socket)"#,
+        labels: crate::frontend::http::ACCESS_LOG_LABELS,
     },
     Entry {
         name: "RequestHeader",
@@ -247,6 +268,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: &[],
     },
     Entry {
         name: "ResponseHeader",
@@ -268,6 +290,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: &[],
     },
     Entry {
         name: "Rewrite",
@@ -289,6 +312,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: crate::frontend::http::REWRITE_LABELS,
     },
     Entry {
         name: "BasicAuth",
@@ -310,6 +334,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: crate::frontend::http::BASIC_AUTH_LABELS,
     },
     Entry {
         name: "RateLimit",
@@ -331,6 +356,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: crate::frontend::http::RATE_LIMIT_LABELS,
     },
     Entry {
         name: "AccessControl",
@@ -352,6 +378,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: crate::frontend::http::ACCESS_CONTROL_LABELS,
     },
     Entry {
         name: "CORS",
@@ -373,6 +400,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: crate::frontend::http::CORS_LABELS,
     },
     Entry {
         name: "SetVariable",
@@ -394,6 +422,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: crate::frontend::http::SET_VARIABLE_LABELS,
     },
     Entry {
         name: "LimitRequestBody",
@@ -415,6 +444,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: crate::frontend::http::LIMIT_BODY_LABELS,
     },
     Entry {
         name: "SkipLog",
@@ -436,6 +466,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: &[],
     },
     Entry {
         name: "Templates",
@@ -456,6 +487,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: crate::frontend::http::TEMPLATES_LABELS,
     },
     Entry {
         name: "ForwardAuth",
@@ -477,6 +509,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: crate::frontend::http::FORWARD_AUTH_LABELS,
     },
     Entry {
         name: "ACMEServer",
@@ -496,6 +529,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: crate::frontend::http::ACME_SERVER_LABELS,
     },
     Entry {
         name: "ErrorRoute",
@@ -518,6 +552,7 @@ pub const ENTRIES: &[Entry] = &[
         Fallback { ServeFiles(root: "./public") }
     }
 }"#,
+        labels: crate::frontend::http::ERROR_ROUTE_LABELS,
     },
     Entry {
         name: "errorPage",
@@ -535,6 +570,7 @@ pub const ENTRIES: &[Entry] = &[
     }
     .errorPage(for: [.serverError], file: "./errors/500.html")
 }"#,
+        labels: crate::frontend::http::ERROR_PAGE_LABELS,
     },
     Entry {
         name: "TryFiles",
@@ -556,6 +592,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: crate::frontend::http::TRY_FILES_LABELS,
     },
     Entry {
         name: "PHPFastCGI",
@@ -575,6 +612,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: &[],
     },
     Entry {
         name: "Intercept",
@@ -609,6 +647,7 @@ pub const ENTRIES: &[Entry] = &[
         }
     }
 }"#,
+        labels: &[],
     },
     Entry {
         name: "encode",
@@ -626,6 +665,7 @@ pub const ENTRIES: &[Entry] = &[
     }
     .encode(.br)
 }"#,
+        labels: &[],
     },
     Entry {
         name: "Admin",
@@ -636,6 +676,7 @@ TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#
         refusal: r#"Admin(listen: "127.0.0.1:2019")
 Admin(listen: "127.0.0.1:2020")
 TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#,
+        labels: &[],
     },
     Entry {
         name: "Metrics",
@@ -645,6 +686,7 @@ TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#
 TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#,
         refusal: r#"Metrics(enabled: 1)
 TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#,
+        labels: &[],
     },
     Entry {
         name: "Shutdown",
@@ -654,6 +696,7 @@ TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#
 TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#,
         refusal: r#"Shutdown(grace: 5)
 TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#,
+        labels: &[],
     },
     Entry {
         name: "limits",
@@ -667,6 +710,7 @@ TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#
     Fallback { Proxy(to: "127.0.0.1:8080") }
 }
 .limits(connections: 0)"#,
+        labels: &[],
     },
     Entry {
         name: "timeouts",
@@ -680,6 +724,7 @@ TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#
     Fallback { Proxy(to: "127.0.0.1:8080") }
 }
 .timeouts(connect: 5)"#,
+        labels: &[],
     },
     Entry {
         name: "halfClose",
@@ -693,6 +738,7 @@ TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#
     Fallback { Proxy(to: "127.0.0.1:8080") }
 }
 .halfClose(enabled: 1)"#,
+        labels: &[],
     },
     Entry {
         name: "Matcher",
@@ -706,6 +752,7 @@ TCPListener(on: "127.0.0.1:9443") {
         refusal: r#"@Matcher
 let secure = "text"
 TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#,
+        labels: &[],
     },
     Entry {
         name: "Secret",
@@ -717,6 +764,7 @@ TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#
         refusal: r#"@Secret
 let backend = Proxy(to: "127.0.0.1:8080")
 TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#,
+        labels: &[],
     },
 ];
 
@@ -785,6 +833,7 @@ pub fn render_json(name: Option<&str>) -> Result<String, String> {
                 "summary": entry.summary,
                 "example": entry.example,
                 "refusal": entry.refusal,
+                "labels": entry.labels,
             }))
             .collect::<Vec<_>>(),
     });
@@ -818,6 +867,59 @@ mod tests {
                 entry.name
             );
         }
+    }
+
+    /// 🏷️ The catalogue cannot silently drop a component's arguments.
+    ///
+    /// 📌 The review's complaint about a hand-written catalogue was that it
+    /// promises a schema it cannot prove. The halves are now one constant: the
+    /// parser validates against the list `describe` prints, so this test only
+    /// has to insist that every component taking arguments was wired to one.
+    #[test]
+    fn every_component_that_takes_arguments_names_them() {
+        for name in [
+            "HTTPListener",
+            "Site",
+            "Respond",
+            "ServeFiles",
+            "Proxy",
+            "Redirect",
+            "Fail",
+            "ServeMetrics",
+            "Rewrite",
+            "BasicAuth",
+            "RateLimit",
+            "AccessControl",
+            "CORS",
+            "SetVariable",
+            "LimitRequestBody",
+            "Templates",
+            "ForwardAuth",
+            "TryFiles",
+            "ACMEServer",
+            "ErrorRoute",
+            "TCPListener",
+            "Route",
+            "errorPage",
+            "accessLog",
+        ] {
+            let entry = find(name).unwrap_or_else(|| panic!("{name} is not described"));
+            assert!(!entry.labels.is_empty(), "{name} names no arguments");
+        }
+        // …and the ones that take none say so by carrying none.
+        for name in ["SkipLog", "Intercept", "Fallback"] {
+            let entry = find(name).unwrap_or_else(|| panic!("{name} is not described"));
+            assert!(entry.labels.is_empty(), "{name} should name no arguments");
+        }
+    }
+
+    #[test]
+    fn the_labels_are_the_parsers_own_lists() {
+        // 🏷️ Not a copy: the same constants the frontend validates against.
+        let proxy = find("Proxy").expect("described");
+        assert_eq!(proxy.labels, crate::frontend::http::PROXY_LABELS);
+        let files = find("ServeFiles").expect("described");
+        assert_eq!(files.labels, crate::frontend::http::FILE_SERVER_LABELS);
     }
 
     #[test]

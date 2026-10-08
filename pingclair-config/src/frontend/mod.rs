@@ -3,8 +3,8 @@
 
 //! 🧭 Pingclair's declarative language lowers directly to shared configuration.
 
-mod http;
-mod tcp;
+pub(crate) mod http;
+pub(crate) mod tcp;
 
 use http::http_listener;
 use tcp::listener;

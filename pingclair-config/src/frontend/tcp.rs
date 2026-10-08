@@ -10,8 +10,14 @@
 
 use super::*;
 
+/// 🏷️ The argument labels a TCP listener accepts.
+pub(crate) const TCP_LISTENER_LABELS: &[&str] = &["on"];
+
+/// 🏷️ The labels an L4 route accepts (`Fallback` takes none).
+pub(crate) const L4_ROUTE_LABELS: &[&str] = &["when", "from"];
+
 pub(super) fn listener(call: &Call) -> Result<Layer4Server, Error> {
-    call.labels(&["on"])?;
+    call.labels(TCP_LISTENER_LABELS)?;
     let mut server = Layer4Server::new(call.string("on")?);
     let mut seen = std::collections::HashSet::new();
     for child in call.block()? {
@@ -73,7 +79,7 @@ pub(super) fn route(call: &Call) -> Result<Layer4Route, Error> {
     if call.name == "Fallback" {
         call.labels(&[])?;
     } else {
-        call.labels(&["when", "from"])?;
+        call.labels(L4_ROUTE_LABELS)?;
         if call.args.is_empty() {
             return Err(call
                 .at

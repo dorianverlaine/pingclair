@@ -5,9 +5,12 @@
 
 use super::*;
 
+/// 🏷️ The argument labels an HTTP listener accepts.
+pub(crate) const HTTP_LISTENER_LABELS: &[&str] = &["on"];
+
 /// 🌐 One plaintext HTTP listener serving one or more sites.
 pub(super) fn http_listener(call: &Call, config: &mut PingclairConfig) -> Result<(), Error> {
-    call.labels(&["on"])?;
+    call.labels(HTTP_LISTENER_LABELS)?;
     let on = call.string("on")?;
     let mut keys = vec![on.clone()];
     let mut addresses = vec![normalize_listen_addr(&on)];
@@ -127,13 +130,16 @@ pub(super) fn http_listener(call: &Call, config: &mut PingclairConfig) -> Result
     Ok(())
 }
 
+/// 🏷️ The argument labels a site accepts.
+pub(crate) const SITE_LABELS: &[&str] = &["host"];
+
 /// 🏠 One virtual host: the host it answers for and the routes it runs.
 fn site(
     call: &Call,
     addresses: &[String],
     options: &HttpListenerOptions,
 ) -> Result<ServerConfig, Error> {
-    call.labels(&["host"])?;
+    call.labels(SITE_LABELS)?;
     let mut encodings = Vec::new();
     let mut error_pages: std::collections::BTreeMap<u16, String> =
         std::collections::BTreeMap::new();
@@ -269,9 +275,12 @@ fn site(
     })
 }
 
+/// 🏷️ The argument labels `parse_error_page` accepts, named once for the parser and `describe`.
+pub(crate) const ERROR_PAGE_LABELS: &[&str] = &["for", "file"];
+
 /// 🚨 `.errorPage(for:, file:)`: the page served for one error status.
 fn parse_error_page(modifier: &Call) -> Result<Vec<(u16, String)>, Error> {
-    modifier.leaf(&["for", "file"])?;
+    modifier.leaf(ERROR_PAGE_LABELS)?;
     let file = modifier.string("file")?;
     let Some(Value::Array(items)) = modifier.get("for") else {
         return Err(modifier.at.error("errorPage takes for: [...]"));
@@ -311,9 +320,12 @@ fn parse_error_page(modifier: &Call) -> Result<Vec<(u16, String)>, Error> {
     Ok(pages)
 }
 
+/// 🏷️ The argument labels `error_route` accepts, named once for the parser and `describe`.
+pub(crate) const ERROR_ROUTE_LABELS: &[&str] = &["for"];
+
 /// 🚨 `ErrorRoute(for:) { … }`: what to answer once a handler raised a status.
 fn error_route(call: &Call) -> Result<ErrorRouteConfig, Error> {
-    call.labels(&["for"])?;
+    call.labels(ERROR_ROUTE_LABELS)?;
     call.no_modifiers()?;
     let (codes, hundreds) = status_selectors(call)?;
     let body = call.block()?;
@@ -508,18 +520,21 @@ fn parse_tls(modifier: &Call) -> Result<TlsConfig, Error> {
     }
 }
 
+/// 🏷️ The argument labels `parse_access_log` accepts, named once for the parser and `describe`.
+pub(crate) const ACCESS_LOG_LABELS: &[&str] = &[
+    "output",
+    "format",
+    "level",
+    "hostnames",
+    "include",
+    "exclude",
+    "sampling",
+    "rotation",
+];
+
 /// 🪵 The `.accessLog(...)` settings this build serves.
 fn parse_access_log(modifier: &Call) -> Result<LogConfig, Error> {
-    modifier.leaf(&[
-        "output",
-        "format",
-        "level",
-        "hostnames",
-        "include",
-        "exclude",
-        "sampling",
-        "rotation",
-    ])?;
+    modifier.leaf(ACCESS_LOG_LABELS)?;
     for unsupported in [
         "level",
         "hostnames",
@@ -600,20 +615,23 @@ fn parse_access_log(modifier: &Call) -> Result<LogConfig, Error> {
     })
 }
 
+/// 🏷️ The argument labels `apply_http_limits` accepts, named once for the parser and `describe`.
+pub(crate) const HTTP_LIMITS_LABELS: &[&str] = &[
+    "headerTimeout",
+    "bodyTimeout",
+    "idleTimeout",
+    "requestTimeout",
+    "maxHeaders",
+    "maxHeaderBytes",
+    "maxConnections",
+    "uploadBytesPerSecond",
+    "downloadBytesPerSecond",
+    "longConnections",
+];
+
 /// 🧱 The listener-level bounds a `.limits(...)` modifier sets.
 fn apply_http_limits(call: &Call, limits: &mut ResourceLimitsConfig) -> Result<(), Error> {
-    call.leaf(&[
-        "headerTimeout",
-        "bodyTimeout",
-        "idleTimeout",
-        "requestTimeout",
-        "maxHeaders",
-        "maxHeaderBytes",
-        "maxConnections",
-        "uploadBytesPerSecond",
-        "downloadBytesPerSecond",
-        "longConnections",
-    ])?;
+    call.leaf(HTTP_LIMITS_LABELS)?;
     if call.get("longConnections").is_some() {
         return Err(call
             .at
@@ -1145,7 +1163,7 @@ fn file_condition(call: &Call) -> Result<Matcher, Error> {
 /// glob candidates are unimplemented in this build (#21) and would have to be
 /// silently treated as a literal `*` in a filename.
 fn file_candidates(call: &Call) -> Result<Vec<String>, Error> {
-    call.leaf(&["candidates", "root", "policy"])?;
+    call.leaf(TRY_FILES_LABELS)?;
     let Some(Value::Array(items)) = call.get("candidates") else {
         return Err(call
             .at
@@ -1300,6 +1318,9 @@ fn file_policy(call: &Call) -> Result<Option<String>, Error> {
 /// 📌 Lowered exactly the way the Caddyfile's `try_files` is — a first-match
 /// group of `file` matcher plus a rewrite to the file the matcher picked. One
 /// implementation, so the two spellings cannot drift (that drift is what #21
+/// 🏷️ The argument labels `try_files` accepts, named once for the parser and `describe`.
+pub(crate) const TRY_FILES_LABELS: &[&str] = &["candidates", "root", "policy"];
+
 /// was, and the fix was to delete the second lookup rather than maintain it).
 fn try_files(call: &Call) -> Result<HandlerConfig, Error> {
     let files = file_candidates(call)?;
@@ -1380,7 +1401,7 @@ fn labeled_string(call: &Call, key: &str) -> Result<String, Error> {
 fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
     match call.name.as_str() {
         "Respond" => {
-            call.leaf(&["body", "status"])?;
+            call.leaf(RESPOND_LABELS)?;
             let status = match call.get("status") {
                 Some(_) => u16::try_from(call.integer("status")?)
                     .map_err(|_| call.at.error("status must fit in 0..=65535"))?,
@@ -1662,9 +1683,12 @@ fn response_matcher(call: &Call) -> Result<Option<ResponseMatcher>, Error> {
     Ok(Some(matcher))
 }
 
+/// 🏷️ The argument labels `templates` accepts, named once for the parser and `describe`.
+pub(crate) const TEMPLATES_LABELS: &[&str] = &["root"];
+
 /// 🧩 `Templates(root:)`: renders the files later components serve.
 fn templates(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&["root"])?;
+    call.leaf(TEMPLATES_LABELS)?;
     let root = if call.get("root").is_some() {
         Some(call.string("root")?)
     } else {
@@ -1673,9 +1697,12 @@ fn templates(call: &Call) -> Result<HandlerConfig, Error> {
     Ok(HandlerConfig::Templates { root })
 }
 
+/// 🏷️ The argument labels `forward_auth` accepts, named once for the parser and `describe`.
+pub(crate) const FORWARD_AUTH_LABELS: &[&str] = &["to", "uri", "copyHeaders"];
+
 /// 🔐 `ForwardAuth(to:, uri:, copyHeaders:)`: one auth round trip up front.
 fn forward_auth(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&["to", "uri", "copyHeaders"])?;
+    call.leaf(FORWARD_AUTH_LABELS)?;
     let upstream = call.string("to")?;
     let uri = call.string("uri")?;
     let mut copy_headers: Vec<ForwardAuthHeaderMap> = Vec::new();
@@ -1734,16 +1761,19 @@ fn forward_auth(call: &Call) -> Result<HandlerConfig, Error> {
 ///
 /// 📌 Written for parity with the Caddyfile spelling: the runtime refuses to
 /// start a site that carries one, so this parses, validates and serialises, and
+/// 🏷️ The argument labels `acme_server` accepts, named once for the parser and `describe`.
+pub(crate) const ACME_SERVER_LABELS: &[&str] = &[
+    "ca",
+    "lifetime",
+    "signWithRoot",
+    "challenges",
+    "allow",
+    "deny",
+];
+
 /// the refusal to run stays where it always was.
 fn acme_server(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&[
-        "ca",
-        "lifetime",
-        "signWithRoot",
-        "challenges",
-        "allow",
-        "deny",
-    ])?;
+    call.leaf(ACME_SERVER_LABELS)?;
     let ca = if call.get("ca").is_some() {
         Some(call.string("ca")?)
     } else {
@@ -1804,9 +1834,12 @@ fn acme_policy(call: &Call, key: &str) -> Result<Option<AcmeServerPolicy>, Error
     Ok(Some(AcmeServerPolicy { domains, ip_ranges }))
 }
 
+/// 🏷️ The argument labels `basic_auth` accepts, named once for the parser and `describe`.
+pub(crate) const BASIC_AUTH_LABELS: &[&str] = &["users", "algorithm", "realm"];
+
 /// 🔐 `BasicAuth(users:, algorithm:, realm:)`: one guard, many credentials.
 fn basic_auth(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&["users", "algorithm", "realm"])?;
+    call.leaf(BASIC_AUTH_LABELS)?;
     let algorithm = match call.get("algorithm") {
         None => BasicAuthAlgorithm::Bcrypt,
         Some(Value::Typed(value)) => {
@@ -1874,9 +1907,12 @@ fn basic_auth(call: &Call) -> Result<HandlerConfig, Error> {
     Ok(HandlerConfig::BasicAuth { realm, credentials })
 }
 
+/// 🏷️ The argument labels `rate_limit` accepts, named once for the parser and `describe`.
+pub(crate) const RATE_LIMIT_LABELS: &[&str] = &["requests", "per", "key", "burst", "dryRun"];
+
 /// ⏱️ `RateLimit(requests:, per:, key:, burst:, dryRun:)`.
 fn rate_limit(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&["requests", "per", "key", "burst", "dryRun"])?;
+    call.leaf(RATE_LIMIT_LABELS)?;
     let Some(_) = call.get("requests") else {
         return Err(call.at.error("RateLimit requires requests:"));
     };
@@ -1956,16 +1992,19 @@ fn rate_limit(call: &Call) -> Result<HandlerConfig, Error> {
     })
 }
 
+/// 🏷️ The argument labels `access_control` accepts, named once for the parser and `describe`.
+pub(crate) const ACCESS_CONTROL_LABELS: &[&str] = &[
+    "allowedIPs",
+    "deniedIPs",
+    "allowedReferers",
+    "deniedReferers",
+    "allowedUserAgents",
+    "deniedUserAgents",
+];
+
 /// 🛡️ `AccessControl(...)`: allow and deny rules ahead of the terminal.
 fn access_control(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&[
-        "allowedIPs",
-        "deniedIPs",
-        "allowedReferers",
-        "deniedReferers",
-        "allowedUserAgents",
-        "deniedUserAgents",
-    ])?;
+    call.leaf(ACCESS_CONTROL_LABELS)?;
     if call.args.is_empty() {
         return Err(call
             .at
@@ -1981,16 +2020,19 @@ fn access_control(call: &Call) -> Result<HandlerConfig, Error> {
     }))
 }
 
+/// 🏷️ The argument labels `cors` accepts, named once for the parser and `describe`.
+pub(crate) const CORS_LABELS: &[&str] = &[
+    "origins",
+    "methods",
+    "headers",
+    "exposedHeaders",
+    "allowCredentials",
+    "maxAge",
+];
+
 /// 🌐 `CORS(origins:, methods:, headers:, exposedHeaders:, allowCredentials:, maxAge:)`.
 fn cors(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&[
-        "origins",
-        "methods",
-        "headers",
-        "exposedHeaders",
-        "allowCredentials",
-        "maxAge",
-    ])?;
+    call.leaf(CORS_LABELS)?;
     let Some(Value::Array(origins)) = call.get("origins") else {
         return Err(call.at.error("CORS requires origins: [...]"));
     };
@@ -2056,9 +2098,12 @@ fn cors(call: &Call) -> Result<HandlerConfig, Error> {
     })
 }
 
+/// 🏷️ The argument labels `set_variable` accepts, named once for the parser and `describe`.
+pub(crate) const SET_VARIABLE_LABELS: &[&str] = &["name", "value"];
+
 /// 🧰 `SetVariable(name:, value:)`: one request-scoped variable.
 fn set_variable(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&["name", "value"])?;
+    call.leaf(SET_VARIABLE_LABELS)?;
     let name = call.string("name")?;
     // 📌 An empty value is a value: it clears a variable a site-level rule
     // set, which is a thing an operator really does write.
@@ -2068,9 +2113,12 @@ fn set_variable(call: &Call) -> Result<HandlerConfig, Error> {
     Ok(HandlerConfig::Vars { values })
 }
 
+/// 🏷️ The argument labels `limit_request_body` accepts, named once for the parser and `describe`.
+pub(crate) const LIMIT_BODY_LABELS: &[&str] = &["max", "readTimeout", "writeTimeout", "set"];
+
 /// 📥 `LimitRequestBody(max:, readTimeout:, writeTimeout:, set:)`.
 fn limit_request_body(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&["max", "readTimeout", "writeTimeout", "set"])?;
+    call.leaf(LIMIT_BODY_LABELS)?;
     if call.args.is_empty() {
         return Err(call.at.error(
             "LimitRequestBody needs at least one of max:, readTimeout:, writeTimeout: or set:",
@@ -2285,9 +2333,12 @@ fn claim_once(
 /// 📌 One operation per component is deliberate. The shared model can carry
 /// several at once and applies them in a fixed order of its own, so a
 /// component that set two would read as the order they were written and mean
+/// 🏷️ The argument labels `rewrite` accepts, named once for the parser and `describe`.
+pub(crate) const REWRITE_LABELS: &[&str] = &["to", "stripPrefix", "stripSuffix", "path", "method"];
+
 /// something else; two components in a row say what they mean.
 fn rewrite(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&["to", "stripPrefix", "stripSuffix", "path", "method"])?;
+    call.leaf(REWRITE_LABELS)?;
     let [(label, value)] = call.args.as_slice() else {
         return Err(call.at.error(
             "Rewrite takes exactly one operation: to:, stripPrefix:, stripSuffix:, path: or method:",
@@ -2332,21 +2383,26 @@ fn rewrite(call: &Call) -> Result<HandlerConfig, Error> {
     })
 }
 
+/// 🏷️ The argument labels `serve_files` accepts, named once for the parser and `describe`.
+pub(crate) const RESPOND_LABELS: &[&str] = &["body", "status"];
+
+pub(crate) const FILE_SERVER_LABELS: &[&str] = &[
+    "root",
+    "browse",
+    "browseLimit",
+    "index",
+    "hide",
+    "precompressed",
+    "status",
+    "passThru",
+    "canonicalUris",
+    "etagFileExtensions",
+    "compress",
+];
+
 /// 📂 `.ServeFiles(root:, browse:, index:)`: the static file handler.
 fn serve_files(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&[
-        "root",
-        "browse",
-        "browseLimit",
-        "index",
-        "hide",
-        "precompressed",
-        "status",
-        "passThru",
-        "canonicalUris",
-        "etagFileExtensions",
-        "compress",
-    ])?;
+    call.leaf(FILE_SERVER_LABELS)?;
     let root = call.string("root")?;
     let browse = if call.get("browse").is_some() {
         call.boolean("browse")?
@@ -2679,11 +2735,14 @@ fn php_fastcgi(call: &Call) -> Result<HandlerConfig, Error> {
     Ok(HandlerConfig::Pipeline { handlers: elements })
 }
 
+/// 🏷️ The argument labels `proxy` accepts, named once for the parser and `describe`.
+pub(crate) const PROXY_LABELS: &[&str] = &["to", "headersUp", "headersDown"];
+
 /// 🌐 `.Proxy(to:)`: the reverse proxy with the build's bare defaults.
 fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
     // 🌐 Identity stays in the call, policy goes in the modifier chain, which
     // is the shape the RFC promised: `Proxy(to: […]).loadBalance(…)`.
-    call.labels(&["to", "headersUp", "headersDown"])?;
+    call.labels(PROXY_LABELS)?;
     if call.body.is_some() {
         return Err(call.at.error(
             "Proxy does not take a block; write its policy as modifiers, as in \
@@ -3073,6 +3132,15 @@ fn upstream_addresses(call: &Call) -> Result<Vec<String>, Error> {
 /// transport. Shared by `Proxy` and `PHPFastCGI`, so the two cannot disagree
 /// about a default neither of them wrote.
 /// 🩺 `.http(path:, …)`: the probe a proxy sends to decide a peer's health.
+/// 🏷️ The argument labels `upstream_tls` accepts, named once for the parser and `describe`.
+pub(crate) const UPSTREAM_TLS_LABELS: &[&str] = &[
+    "serverName",
+    "trustedCACerts",
+    "clientCert",
+    "clientKey",
+    "insecureSkipVerify",
+];
+
 /// 🔒 `.enabled(…)`: the TLS policy a proxy applies to its upstreams.
 fn upstream_tls(value: &Value, at: Position) -> Result<UpstreamTlsConfig, Error> {
     let Value::Typed(tls) = value else {
@@ -3085,13 +3153,7 @@ fn upstream_tls(value: &Value, at: Position) -> Result<UpstreamTlsConfig, Error>
             tls.name
         )));
     }
-    tls.leaf(&[
-        "serverName",
-        "trustedCACerts",
-        "clientCert",
-        "clientKey",
-        "insecureSkipVerify",
-    ])?;
+    tls.leaf(UPSTREAM_TLS_LABELS)?;
     let server_name = if tls.get("serverName").is_some() {
         Some(tls.string("serverName")?)
     } else {
@@ -3135,6 +3197,22 @@ fn upstream_tls(value: &Value, at: Position) -> Result<UpstreamTlsConfig, Error>
     })
 }
 
+/// 🏷️ The argument labels `health_check` accepts, named once for the parser and `describe`.
+pub(crate) const HEALTH_CHECK_LABELS: &[&str] = &[
+    "path",
+    "port",
+    "method",
+    "interval",
+    "timeout",
+    "passes",
+    "fails",
+    "status",
+    "body",
+    "headers",
+    "host",
+    "reuseConnection",
+];
+
 /// 🩺 `.http(path:, …)`: the probe a proxy sends to decide a peer's health.
 fn health_check(value: &Value, at: Position) -> Result<HealthCheckConfig, Error> {
     let Value::Typed(check) = value else {
@@ -3148,20 +3226,7 @@ fn health_check(value: &Value, at: Position) -> Result<HealthCheckConfig, Error>
             check.name
         )));
     }
-    check.leaf(&[
-        "path",
-        "port",
-        "method",
-        "interval",
-        "timeout",
-        "passes",
-        "fails",
-        "status",
-        "body",
-        "headers",
-        "host",
-        "reuseConnection",
-    ])?;
+    check.leaf(HEALTH_CHECK_LABELS)?;
     // 🛣️ The path is the one field with no default worth guessing: probing `/`
     // when the operator meant `/healthz` reports every upstream healthy for the
     // wrong reason.
@@ -3424,9 +3489,12 @@ fn reverse_proxy(
     }
 }
 
+/// 🏷️ The argument labels `redirect` accepts, named once for the parser and `describe`.
+pub(crate) const REDIRECT_LABELS: &[&str] = &["to", "status"];
+
 /// ➡️ `.Redirect(to:, status:)`: the redirect statuses the RFC names.
 fn redirect(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&["to", "status"])?;
+    call.leaf(REDIRECT_LABELS)?;
     let to = call.string("to")?;
     let code = match call.get("status") {
         None => 302,
@@ -3459,9 +3527,12 @@ fn redirect(call: &Call) -> Result<HandlerConfig, Error> {
     })
 }
 
+/// 🏷️ The argument labels `fail` accepts, named once for the parser and `describe`.
+pub(crate) const FAIL_LABELS: &[&str] = &["status", "message"];
+
 /// 🚨 `.Fail(status:, message:)`: raise an error response.
 fn fail(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&["status", "message"])?;
+    call.leaf(FAIL_LABELS)?;
     let status = match call.get("status") {
         None => 500,
         Some(_) => u16::try_from(call.integer("status")?)
@@ -3477,9 +3548,12 @@ fn fail(call: &Call) -> Result<HandlerConfig, Error> {
     Ok(HandlerConfig::Error { status, message })
 }
 
+/// 🏷️ The argument labels `serve_metrics` accepts, named once for the parser and `describe`.
+pub(crate) const METRICS_LABELS: &[&str] = &["disableOpenMetrics"];
+
 /// 📊 `.ServeMetrics()`: answer with the Prometheus endpoint.
 fn serve_metrics(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&["disableOpenMetrics"])?;
+    call.leaf(METRICS_LABELS)?;
     let disable_openmetrics = if call.get("disableOpenMetrics").is_some() {
         call.boolean("disableOpenMetrics")?
     } else {
