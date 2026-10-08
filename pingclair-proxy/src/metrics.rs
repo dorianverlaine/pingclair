@@ -6,20 +6,13 @@
 //! Provides metrics collection for requests, errors, and latency.
 
 use parking_lot::Mutex;
-use prometheus::{
-    Encoder, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
-};
+use prometheus::{Encoder, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, TextEncoder};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Once};
 
 // MARK: - Global Registry
 
-/// Global metrics registry
-pub static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
-
-/// 📊 Whether the running configuration asked to collect metrics.
-static ENABLED: AtomicBool = AtomicBool::new(false);
+pub use pingclair_runtime::metrics::{REGISTRY, enabled};
 
 /// 🧩 Registers collectors only once even when several server paths initialize metrics.
 static REGISTER: Once = Once::new();
@@ -619,7 +612,7 @@ pub fn configure(enabled: bool) {
     if enabled {
         init();
     } else {
-        ENABLED.store(false, Ordering::Release);
+        pingclair_runtime::metrics::configure(false);
     }
 }
 
@@ -627,7 +620,7 @@ pub fn configure(enabled: bool) {
 ///
 /// Registration happens once per process; later calls only flip the switch.
 pub fn init() {
-    ENABLED.store(true, Ordering::Release);
+    pingclair_runtime::metrics::configure(true);
     REGISTER.call_once(|| {
         // 📚 Registering is process-global; duplicate initialization must not
         // rebuild collectors or make a second copy visible at scrape time.
@@ -665,12 +658,6 @@ pub fn init() {
         // dev loop actually exercises this code instead of cfg-ing it away.
         let _ = REGISTRY.register(Box::new(ProcessCollector::new()));
     });
-}
-
-/// 🍃 Reports whether request paths should perform any metric work.
-#[inline]
-pub fn enabled() -> bool {
-    ENABLED.load(Ordering::Acquire)
 }
 
 /// 📥 Increments and returns the active-request gauge used by this request.

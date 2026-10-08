@@ -16,4 +16,5 @@
 //! own thread, behind a bounded queue.
 
 pub mod access_log;
+pub mod metrics;
 pub mod redaction;
