@@ -5067,6 +5067,90 @@ HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
     assert!(content.contains("\"x-trace\":\"trace-7\""), "{content}");
 }
 
+/// 🧭 The native `Intercept` covers the Caddyfile's proxy-scoped
+/// `handle_response`: the same upstream response comes out rewritten the same
+/// way on both.
+#[tokio::test]
+async fn test_native_intercept_rewrites_a_proxied_response_like_handle_response() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\n\
+                      Connection: close\r\n\r\nboom",
+                )
+                .await
+                .unwrap();
+        }
+    });
+
+    // 🧭 Native: the response handlers are a pipeline element wrapping the
+    // proxy that follows it.
+    let native_config = format!(
+        r#"
+HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
+    Site(host: "*") {{
+        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
+            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
+        }}
+        Fallback {{
+            Intercept {{
+                Response(when: .status(.serverError)) {{ CopyResponse(status: 502) }}
+            }}
+            Proxy(to: "{upstream_address}")
+        }}
+    }}
+}}
+"#
+    );
+    // 🗄️ Caddyfile: the same rewriting lives inside the proxy's own
+    // `handle_response` block.
+    let legacy_config = format!(
+        r#"
+http://__PINGCLAIR_TEST_LISTEN__ {{
+    @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+    respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+    reverse_proxy http://{upstream_address} {{
+        @err status 5xx
+        handle_response @err {{
+            copy_response 502
+        }}
+    }}
+}}
+"#
+    );
+    let mut native = TestServer::new_native(&native_config);
+    let mut legacy = TestServer::new_pingclairfile(&legacy_config);
+    assert!(
+        native.wait_until_ready().await,
+        "native server failed to start"
+    );
+    assert!(
+        legacy.wait_until_ready().await,
+        "caddyfile server failed to start"
+    );
+
+    for (label, server) in [("native", &native), ("caddyfile", &legacy)] {
+        let response = no_proxy_client()
+            .get(server.url(0, "/broken"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 502, "{label}");
+        assert_eq!(response.text().await.unwrap(), "boom", "{label}");
+    }
+    upstream_task.await.unwrap();
+}
+
 /// 🗄️ `header_up` takes the same shapes `header_down` does.
 ///
 /// The request half used to know only set and delete — `+Name` reached the
