@@ -105,7 +105,36 @@ fn compile_named_with(
     name: Option<&Path>,
     validate: bool,
 ) -> Result<PingclairConfig, FullCompileError> {
-    if frontend::is_native(source) {
+    // 🗂️ The name decides when it can: `.pingclair` is the native language and
+    // `.caddyfile` is the compatibility layer, so a file that reads as the
+    // other one is refused with the rename it needs. `Pingclairfile`,
+    // `Caddyfile` and standard input have no extension to trust, so the shape
+    // of the text decides for them.
+    let named = name
+        .and_then(|path| path.extension())
+        .and_then(|ext| ext.to_str());
+    let native = match named {
+        Some("pingclair") => true,
+        Some("caddyfile") => false,
+        _ => frontend::is_native(source),
+    };
+    if native && !frontend::is_native(source) {
+        return Err(FullCompileError::Io(format!(
+            "{} is named as a native configuration but does not read as one; write it in the \
+             native language or rename it to `.caddyfile`",
+            name.map(|path| path.display().to_string())
+                .unwrap_or_else(|| "standard input".to_string())
+        )));
+    }
+    if !native && frontend::is_native(source) {
+        return Err(FullCompileError::Io(format!(
+            "{} is named as a Caddyfile but reads as the native language; rename it to \
+             `.pingclair`",
+            name.map(|path| path.display().to_string())
+                .unwrap_or_else(|| "standard input".to_string())
+        )));
+    }
+    if native {
         let config = frontend::adapt(source).map_err(|error| {
             let error = FullCompileError::Native(error);
             match name {
@@ -185,22 +214,59 @@ fn merge_files(
     validate: bool,
 ) -> Result<PingclairConfig, FullCompileError> {
     let mut final_config = pingclair_core::config::PingclairConfig::default();
+    let mut claims = GlobalClaims::default();
 
     for path in paths {
-        let config = compile_file_unvalidated(path.as_ref())?;
+        let source = std::fs::read_to_string(path.as_ref())
+            .map_err(|e| FullCompileError::Io(e.to_string()))?;
+        // 🗂️ A native file says what it declared, so two files naming the same
+        // global option are refused even when the second one spells the value
+        // the default already had.
+        if frontend::is_native(&source) {
+            for name in frontend::declared_globals(&source).map_err(FullCompileError::Native)? {
+                claims.claim(Box::leak(name.into_boxed_str()), path.as_ref())?;
+            }
+        }
+        let config = compile_source_unvalidated(&source, path.as_ref())?;
 
         final_config.debug = final_config.debug || config.debug;
+        // 🌐 One socket may be served by one listener, no matter how many
+        // files declare it: two `HTTPListener(on: ":8080")` blocks in two files
+        // would race for the same address, and the runtime can only bind one.
+        // Merging them would mean deciding how the *options* of two blocks
+        // combine, which nothing here knows how to do.
+        let mut claimed_addresses = std::collections::HashSet::new();
+        for server in &config.servers {
+            for address in server.listen.iter().chain(&server.plaintext_listen) {
+                // 📌 One address, claimed once: `plaintext_listen` repeats what
+                // `listen` already said for a site that terminates no TLS.
+                if !claimed_addresses.insert(address.clone()) {
+                    continue;
+                }
+                claims.claim(
+                    // 📌 Leaked on purpose: the claims map outlives the loop
+                    // and the set is as small as the number of listeners.
+                    Box::leak(format!("listener {address}").into_boxed_str()),
+                    path.as_ref(),
+                )?;
+            }
+        }
         final_config.servers.extend(config.servers);
         final_config.layer4.extend(config.layer4);
 
-        // 🗂️ The last file naming an admin block wins. Two admin listeners is
-        // not a shape the runtime has, so merging them would have to invent an
-        // answer.
+        // 🗂️ Two admin listeners is not a shape the runtime has, so a second
+        // file naming one is refused rather than quietly replacing the first.
         if let Some(admin) = config.admin {
+            claims.claim("admin", path.as_ref())?;
             final_config.admin = Some(admin);
         }
 
-        merge_globals(&mut final_config.global, config.global, path.as_ref())?;
+        merge_globals(
+            &mut final_config.global,
+            config.global,
+            path.as_ref(),
+            &mut claims,
+        )?;
         merge_logging(&mut final_config.logging, config.logging, path.as_ref())?;
     }
 
@@ -216,13 +282,15 @@ fn merge_files(
 ///
 /// Only for the directory path, where the checks belong on the merged result.
 /// Everything else must keep using [`compile_file`].
-fn compile_file_unvalidated(path: &Path) -> Result<PingclairConfig, FullCompileError> {
-    let source = std::fs::read_to_string(path).map_err(|e| FullCompileError::Io(e.to_string()))?;
+fn compile_source_unvalidated(
+    source: &str,
+    path: &Path,
+) -> Result<PingclairConfig, FullCompileError> {
     if path.extension().is_some_and(|ext| ext == "json") {
-        serde_json::from_str(&source)
+        serde_json::from_str(source)
             .map_err(|e| FullCompileError::Io(format!("JSON parse error: {e}")))
     } else {
-        compile_named_with(&source, Some(path), false)
+        compile_named_with(source, Some(path), false)
     }
 }
 
@@ -236,10 +304,39 @@ fn compile_file_unvalidated(path: &Path) -> Result<PingclairConfig, FullCompileE
 /// did nothing, an `http_port` override ignored — while reporting success.
 ///
 /// A comment asking the next developer to remember is not a mechanism. This is.
+/// 🗂️ Which file set which global option.
+///
+/// 📌 "The last file wins" is invisible from either file: nothing in the one
+/// being overridden says the other exists. A global option belongs to one file,
+/// and a second file naming it is refused with both names — across files the
+/// mistake is harder to see than it is inside one.
+#[derive(Default)]
+struct GlobalClaims {
+    owners: std::collections::HashMap<&'static str, String>,
+}
+
+impl GlobalClaims {
+    /// 🗂️ Records that `path` set `key`, or refuses if an earlier file did.
+    fn claim(&mut self, key: &'static str, path: &Path) -> Result<(), FullCompileError> {
+        if let Some(previous) = self.owners.get(key) {
+            return Err(FullCompileError::Compile(pingclair_config_compile_error(
+                format!(
+                    "`{key}` is declared in more than one file ({previous} and {}); write it \
+                     once, in the file that owns it",
+                    path.display()
+                ),
+            )));
+        }
+        self.owners.insert(key, path.display().to_string());
+        Ok(())
+    }
+}
+
 fn merge_globals(
     into: &mut pingclair_core::config::GlobalConfig,
     from: pingclair_core::config::GlobalConfig,
     path: &Path,
+    claims: &mut GlobalClaims,
 ) -> Result<(), FullCompileError> {
     let default = pingclair_core::config::GlobalConfig::default();
     let pingclair_core::config::GlobalConfig {
@@ -275,45 +372,59 @@ fn merge_globals(
     // comparison against the default is how "said something" is detected for
     // the fields that are not `Option`.
     if email.is_some() {
+        claims.claim("email", path)?;
         into.email = email;
     }
     if storage_path.is_some() {
+        claims.claim("storage_path", path)?;
         into.storage_path = storage_path;
     }
     if !pki.is_empty() {
+        claims.claim("pki", path)?;
         into.pki = pki;
     }
     if skip_install_trust {
+        claims.claim("skip_install_trust", path)?;
         into.skip_install_trust = true;
     }
     if ocsp_stapling_off {
+        claims.claim("ocsp_stapling_off", path)?;
         into.ocsp_stapling_off = true;
     }
     if dns.is_some() {
+        claims.claim("dns", path)?;
         into.dns = dns;
     }
     if acme_dns.is_some() {
+        claims.claim("acme_dns", path)?;
         into.acme_dns = acme_dns;
     }
     if !tls_resolvers.is_empty() {
+        claims.claim("tls_resolvers", path)?;
         into.tls_resolvers = tls_resolvers;
     }
     if renewal_window_ratio.is_some() {
+        claims.claim("renewal_window_ratio", path)?;
         into.renewal_window_ratio = renewal_window_ratio;
     }
     if !default_bind.is_empty() {
+        claims.claim("default_bind", path)?;
         into.default_bind = default_bind;
     }
     if preferred_chains.is_some() {
+        claims.claim("preferred_chains", path)?;
         into.preferred_chains = preferred_chains;
     }
     if http_port != default.http_port {
+        claims.claim("http_port", path)?;
         into.http_port = http_port;
     }
     if https_port != default.https_port {
+        claims.claim("https_port", path)?;
         into.https_port = https_port;
     }
     if metrics != default.metrics {
+        claims.claim("metrics", path)?;
         into.metrics = metrics;
     }
     // 📊 Merged rather than overridden, for the same reason two `metrics`
@@ -322,24 +433,30 @@ fn merge_globals(
     // asking for it to be switched off.
     into.metrics_options.merge(&metrics_options);
     if auto_https != default.auto_https {
+        claims.claim("auto_https", path)?;
         into.auto_https = auto_https;
     }
     if local_certs != default.local_certs {
+        claims.claim("local_certs", path)?;
         into.local_certs = local_certs;
     }
     if upstream_keepalive_pool_size.is_some() {
+        claims.claim("upstream_keepalive_pool_size", path)?;
         into.upstream_keepalive_pool_size = upstream_keepalive_pool_size;
     }
     if worker_threads.is_some() {
+        claims.claim("worker_threads", path)?;
         into.worker_threads = worker_threads;
     }
     if dns_refresh_secs != default.dns_refresh_secs {
+        claims.claim("dns_refresh_secs", path)?;
         into.dns_refresh_secs = dns_refresh_secs;
     }
     // 🚰 `None` means "wait forever", so it is a real choice rather than an
     // absent one — but a file that stays silent still must not overwrite a
     // bound that another file set.
     if grace_period_secs.is_some() {
+        claims.claim("grace_period_secs", path)?;
         into.grace_period_secs = grace_period_secs;
     }
 
@@ -356,12 +473,7 @@ fn merge_globals(
     // neither wrote. The second file to state one is refused instead.
     if !client_ip_headers.is_empty() {
         if !into.client_ip_headers.is_empty() && into.client_ip_headers != client_ip_headers {
-            return Err(FullCompileError::Compile(pingclair_config_compile_error(
-                format!(
-                    "`client_ip_headers` is set differently in more than one file (seen again in {})",
-                    path.display()
-                ),
-            )));
+            claims.claim("client_ip_headers", path)?;
         }
         into.client_ip_headers = client_ip_headers;
     }
@@ -374,7 +486,8 @@ fn merge_globals(
         if into.listener_options.contains_key(&address) {
             return Err(FullCompileError::Compile(pingclair_config_compile_error(
                 format!(
-                    "`servers {address} {{ … }}` is declared in more than one file (seen again in {})",
+                    "`servers {address} {{ … }}` is declared in more than one file (seen again \
+                     in {})",
                     path.display()
                 ),
             )));
@@ -452,8 +565,10 @@ fn configuration_paths(dir_path: &Path) -> Result<Vec<std::path::PathBuf>, FullC
         let path = entry.path();
 
         if path.extension() == Some(OsStr::new("pingclair"))
+            || path.extension() == Some(OsStr::new("caddyfile"))
             || path.extension() == Some(OsStr::new("json"))
             || path.file_stem() == Some(OsStr::new("Pingclairfile"))
+            || path.file_stem() == Some(OsStr::new("Caddyfile"))
         {
             config_paths.push(path);
         }
@@ -2583,14 +2698,14 @@ mod directory_merge_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let globals = write(
             dir.path(),
-            "00-globals.pingclair",
+            "00-globals.caddyfile",
             "{\n    http_port 8080\n    https_port 8443\n    metrics\n\
              \x20   trusted_proxies 10.0.0.0/8\n    dns_refresh 90s\n\
              \x20   servers {\n        protocols h1 h2\n    }\n}\n",
         );
         let site = write(
             dir.path(),
-            "10-site.pingclair",
+            "10-site.caddyfile",
             "http://:9000 {\n    respond \"ok\"\n}\n",
         );
 
@@ -2626,12 +2741,12 @@ mod directory_merge_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let channels = write(
             dir.path(),
-            "00-logging.pingclair",
+            "00-logging.caddyfile",
             "{\n    log audit {\n        output stderr\n    }\n}\n",
         );
         let site = write(
             dir.path(),
-            "10-site.pingclair",
+            "10-site.caddyfile",
             "http://:9000 {\n    log audit\n    respond \"ok\"\n}\n",
         );
 

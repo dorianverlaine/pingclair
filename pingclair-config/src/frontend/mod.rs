@@ -98,6 +98,24 @@ pub fn is_native(source: &str) -> bool {
         && rest[name_len..].trim_start().starts_with('(')
 }
 
+/// 🗂️ The global declarations a native file makes, by name.
+///
+/// 📌 The *value* a declaration carries cannot answer this: `Metrics(enabled:
+/// false)` and saying nothing at all compile to the same configuration, so a
+/// merge that compares values cannot tell an explicit `false` from silence.
+/// The syntax can, which is why the merge asks here instead of guessing.
+pub(crate) fn declared_globals(source: &str) -> Result<Vec<String>, Error> {
+    let mut names = Vec::new();
+    for declaration in syntax::parse(source)? {
+        if let Declaration::Component { call, .. } = declaration
+            && !matches!(call.name.as_str(), "TCPListener" | "HTTPListener")
+        {
+            names.push(call.name);
+        }
+    }
+    Ok(names)
+}
+
 pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
     let declarations = syntax::parse(source)?;
     let mut bindings = Bindings::default();
@@ -173,10 +191,10 @@ pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
             }
         }
     }
-    if config.layer4.is_empty() && config.servers.is_empty() {
-        return Err(syntax::Position { line: 1, column: 1 }
-            .error("expected at least one TCPListener or HTTPListener"));
-    }
+    // 📌 A file is allowed to hold nothing but declarations: `Admin`, `Metrics`
+    // and `Shutdown` are options of the server, not of a listener, and a
+    // directory splits them into their own file. Whether the *merged* result
+    // can serve anything is a question for the runtime.
     Ok(config)
 }
 

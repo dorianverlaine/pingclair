@@ -262,7 +262,7 @@ fn layer4_directory_merge_preserves_every_listener() {
     )
     .unwrap();
     std::fs::write(
-        dir.path().join("b.pingclair"),
+        dir.path().join("b.caddyfile"),
         SOURCE.replace(":9443", ":9444"),
     )
     .unwrap();
