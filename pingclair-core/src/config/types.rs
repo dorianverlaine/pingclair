@@ -2030,7 +2030,13 @@ fn default_redirect_code() -> u16 {
     302
 }
 
-fn default_cors_methods() -> Vec<String> {
+/// 🚦 Methods a `CORS` handler allows when it names none.
+///
+/// 📌 Public because the value has two callers: the serde default below and
+/// the native frontend, which builds the handler without going through the
+/// Caddyfile compiler's mapping. One definition means the two cannot drift
+/// into allowing different methods for the same configuration.
+pub fn default_cors_methods() -> Vec<String> {
     vec![
         "GET".into(),
         "POST".into(),
@@ -2040,7 +2046,8 @@ fn default_cors_methods() -> Vec<String> {
     ]
 }
 
-fn default_cors_headers() -> Vec<String> {
+/// 🏷️ Headers a `CORS` handler allows when it names none.
+pub fn default_cors_headers() -> Vec<String> {
     vec![
         "Content-Type".into(),
         "Authorization".into(),
@@ -2048,7 +2055,8 @@ fn default_cors_headers() -> Vec<String> {
     ]
 }
 
-fn default_cors_max_age() -> u64 {
+/// ⏱️ How long a preflight may be cached when the configuration says nothing.
+pub fn default_cors_max_age() -> u64 {
     86400 // 24 hours
 }
 
@@ -2061,7 +2069,8 @@ fn default_error_status() -> u16 {
     500
 }
 
-fn default_auth_realm() -> String {
+/// 🔐 The realm a `BasicAuth` handler shows when the configuration says nothing.
+pub fn default_auth_realm() -> String {
     "Restricted".to_string()
 }
 

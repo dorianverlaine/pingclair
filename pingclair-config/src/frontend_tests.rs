@@ -974,6 +974,230 @@ fn site_codings_that_cannot_mean_anything_fail_closed() {
 }
 
 #[test]
+fn http_guards_lower_like_their_caddyfile_twins() {
+    const BCRYPT: &str = "$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W";
+    const ARGON2: &str = "$argon2id$v=19$m=47104,t=1,p=1$P2nzckEdTZ3bxCiBCkRTyA$xQL3Z32eo5jKl7u5tcIsnEKObYiyNZQQf5/4sAau6Pg";
+    let cases = [
+        (
+            format!(
+                r#"HTTPListener(on: ":8080") {{ Site(host: "*") {{ Fallback {{
+                BasicAuth(users: [.user("alice", hash: "{BCRYPT}")], algorithm: .bcrypt, realm: "Admin Area")
+                Respond(body: "ok")
+            }} }} }}"#
+            ),
+            format!(
+                "http://:8080 {{\n\troute {{\n\t\tbasic_auth bcrypt \"Admin Area\" {{\n\t\t\talice {BCRYPT}\n\t\t}}\n\t\trespond \"ok\"\n\t}}\n}}"
+            ),
+        ),
+        (
+            format!(
+                r#"HTTPListener(on: ":8080") {{ Site(host: "*") {{ Fallback {{
+                BasicAuth(users: [.user("alice", hash: "{ARGON2}")], algorithm: .argon2id)
+                Respond(body: "ok")
+            }} }} }}"#
+            ),
+            format!(
+                "http://:8080 {{\n\troute {{\n\t\tbasic_auth argon2id {{\n\t\t\talice {ARGON2}\n\t\t}}\n\t\trespond \"ok\"\n\t}}\n}}"
+            ),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                RateLimit(requests: 100, per: .minutes(1))
+                Respond(body: "ok")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troute {\n\t\trate_limit 100 1m\n\t\trespond \"ok\"\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                RateLimit(requests: 100, per: .minutes(1), key: .header("X-Tenant-ID"), burst: 10, dryRun: true)
+                Respond(body: "ok")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troute {\n\t\trate_limit 100 1m {\n\t\t\tburst 10\n\t\t\tkey header X-Tenant-ID\n\t\t\tdry_run\n\t\t}\n\t\trespond \"ok\"\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                RateLimit(requests: 100, per: .minutes(1), key: .tenant("X-Tenant-ID"))
+                Respond(body: "ok")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troute {\n\t\trate_limit 100 1m {\n\t\t\tkey tenant X-Tenant-ID\n\t\t}\n\t\trespond \"ok\"\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                AccessControl(allowedIPs: ["10.0.0.0/8"], deniedUserAgents: ["(curl)"])
+                Respond(body: "ok")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troute {\n\t\taccess_control {\n\t\t\tallow_ip 10.0.0.0/8\n\t\t\tdeny_user_agent (curl)\n\t\t}\n\t\trespond \"ok\"\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                CORS(origins: ["https://example.com"], methods: [.get, .post], headers: ["Content-Type"], exposedHeaders: ["X-Total"], allowCredentials: true, maxAge: .seconds(3600))
+                Respond(body: "ok")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troute {\n\t\tcors {\n\t\t\torigins https://example.com\n\t\t\tmethods GET POST\n\t\t\theaders Content-Type\n\t\t\texpose_headers X-Total\n\t\t\tallow_credentials true\n\t\t\tmax_age 3600\n\t\t}\n\t\trespond \"ok\"\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                CORS(origins: ["*"])
+                Respond(body: "ok")
+            } } }"#
+                .to_string(),
+            // 📌 `cors *` would read the `*` as Caddy's matcher token, so the
+            // twin has to name the origin inside the block.
+            "http://:8080 {\n\troute {\n\t\tcors {\n\t\t\torigins *\n\t\t}\n\t\trespond \"ok\"\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                SetVariable(name: "foo", value: "bar")
+                Respond(body: "ok")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troute {\n\t\tvars foo bar\n\t\trespond \"ok\"\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                LimitRequestBody(max: .mebibytes(10), readTimeout: .seconds(5), writeTimeout: .seconds(5), set: "hello")
+                Respond(body: "ok")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troute {\n\t\trequest_body {\n\t\t\tmax_size 10mib\n\t\t\tread_timeout 5s\n\t\t\twrite_timeout 5s\n\t\t\tset \"hello\"\n\t\t}\n\t\trespond \"ok\"\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                SkipLog()
+                Respond(body: "ok")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troute {\n\t\tlog_skip\n\t\trespond \"ok\"\n\t}\n}"
+                .to_string(),
+        ),
+    ];
+    for (native_source, legacy_source) in cases {
+        let native = crate::compile(&native_source).unwrap();
+        let legacy = crate::compile(&legacy_source).unwrap();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::to_value(legacy).unwrap(),
+            "{native_source}"
+        );
+    }
+}
+
+#[test]
+fn http_guards_that_cannot_mean_anything_fail_closed() {
+    const BCRYPT: &str = "$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W";
+    let site = |body: &str| {
+        format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {body} Respond(body: \"ok\") }} }} }}"
+        )
+    };
+    for body in [
+        // 🔐 Credentials are an array of typed users, hashed with the named algorithm.
+        "BasicAuth()",
+        "BasicAuth(users: [])",
+        "BasicAuth(users: [\"alice\"])",
+        "BasicAuth(users: [.member(\"alice\", hash: \"x\")])",
+        "BasicAuth(users: [.user(\"alice\")])",
+        "BasicAuth(users: [.user(\"alice\", hash: \"plaintext\")])",
+        "BasicAuth(users: [.user(\"alice\", hash: 1)])",
+        "BasicAuth(users: [.user(\"alice\", hash: \"$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W\"), .user(\"alice\", hash: \"$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W\")])",
+        "BasicAuth(users: [.user(\"alice\", hash: \"$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W\")], algorithm: .sha256)",
+        "BasicAuth(users: [.user(\"alice\", hash: \"$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W\")], realm: 1)",
+        // ⏱️ A window is whole seconds, and the key is a typed source.
+        "RateLimit()",
+        "RateLimit(per: .minutes(1))",
+        "RateLimit(requests: 1)",
+        "RateLimit(requests: 0, per: .minutes(1))",
+        "RateLimit(requests: 1, per: .milliseconds(1500))",
+        "RateLimit(requests: 1, per: .milliseconds(500))",
+        "RateLimit(requests: 1, per: .minutes(1), key: .unknown)",
+        "RateLimit(requests: 1, per: .minutes(1), key: .tenant)",
+        "RateLimit(requests: 1, per: .minutes(1), key: .ip(\"X-A\"))",
+        "RateLimit(requests: 1, per: .minutes(1), burst: \"10\")",
+        "RateLimit(requests: 1, per: .minutes(1), dryRun: 1)",
+        // 🛡️ A guard with no rule guards nothing.
+        "AccessControl()",
+        "AccessControl(allowedIPs: [])",
+        "AccessControl(allowedIps: [\"10.0.0.0/8\"])",
+        "AccessControl(allowedUserAgents: \"curl\")",
+        // 🌐 Origins are required; methods are typed verbs.
+        "CORS()",
+        "CORS(origins: [])",
+        "CORS(origins: [\"*\"], methods: [])",
+        "CORS(origins: [\"*\"], methods: [\"GET\"])",
+        "CORS(origins: [\"*\"], headers: [])",
+        "CORS(origins: [\"*\"], maxAge: .milliseconds(1500))",
+        "CORS(origins: [\"*\"], allowCredentials: 1)",
+        // 🧰 A variable needs both halves.
+        "SetVariable(name: \"foo\")",
+        "SetVariable(value: \"bar\")",
+        "SetVariable(name: 1, value: \"bar\")",
+        // 📥 A body limit with nothing in it limits nothing.
+        "LimitRequestBody()",
+        "LimitRequestBody(set: \"\")",
+        "LimitRequestBody(set: 1)",
+        "LimitRequestBody(max: .seconds(1))",
+        // 🙈 SkipLog takes nothing at all.
+        "SkipLog(1)",
+        "SkipLog(enabled: true)",
+    ] {
+        let source = site(body);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+    // 🔑 A bcrypt hash under `.argon2id` is refused by the algorithm check,
+    // which is the one refusal whose message has to name the algorithm.
+    let error = crate::compile(&site(&format!(
+        "BasicAuth(users: [.user(\"alice\", hash: \"{BCRYPT}\")], algorithm: .argon2id)"
+    )))
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("argon2id"), "{error}");
+}
+
+#[test]
+fn guards_compose_in_writing_order() {
+    let config = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Route(when: .path(prefix: "/admin")) {
+            BasicAuth(users: [.user("alice", hash: "$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W")])
+            RateLimit(requests: 10, per: .seconds(1), key: .ip)
+            SetVariable(name: "area", value: "admin")
+            Proxy(to: "127.0.0.1:9000")
+        } } }"#,
+    )
+    .unwrap();
+    let route = &config.servers[0].routes[0];
+    assert!(route.matcher.is_some());
+    let HandlerConfig::Pipeline { handlers } = &route.handler else {
+        panic!("expected a pipeline");
+    };
+    assert!(matches!(
+        handlers[0].handler,
+        HandlerConfig::BasicAuth { .. }
+    ));
+    assert!(matches!(
+        handlers[1].handler,
+        HandlerConfig::RateLimit { .. }
+    ));
+    assert!(matches!(handlers[2].handler, HandlerConfig::Vars { .. }));
+    assert!(matches!(
+        handlers[3].handler,
+        HandlerConfig::ReverseProxy(_)
+    ));
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",

@@ -3533,7 +3533,12 @@ fn compile_handler_element(
 /// never from the hash text: prefix-guessing is what let an `$argon2id$`
 /// string become a literal password. Anything that is not a valid hash of
 /// the declared kind is refused, so plaintext cannot be configured at all.
-fn compile_basic_auth_credential(
+/// 🔐 Checks one credential's hash against its declared algorithm.
+///
+/// 📌 Shared with the native frontend: a plaintext password written in either
+/// spelling has to fail at load, and only one function should decide what a
+/// well-formed hash looks like.
+pub(crate) fn compile_basic_auth_credential(
     username: &str,
     password: &str,
     algorithm: CoreBasicAuthAlgorithm,

@@ -7,11 +7,12 @@ use crate::attributes::{Attr, resolve_attribute};
 use crate::bindings::Bindings;
 use crate::syntax::{self, Call, Declaration, Position, Value};
 use pingclair_core::config::{
-    AdminConfig, CircuitBreakerConfig, Encoding, HandlerConfig, HandlerElement, HeaderReplacement,
-    IpRanges, Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher, ListenerOptions,
-    LoadBalanceConfig, LogConfig, LogFormat, LogOutput, LogRotation, Matcher, MatcherCondition,
-    OverloadConfig, PRIVATE_RANGES, PingclairConfig, ProxyUpstream, ResourceLimitsConfig,
-    RetryConfig, ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig, UpstreamTlsConfig,
+    AccessControlConfig, AdminConfig, BasicAuthAlgorithm, CircuitBreakerConfig, Encoding,
+    HandlerConfig, HandlerElement, HeaderReplacement, IpRanges, Layer4Matcher, Layer4Route,
+    Layer4Server, Layer4TlsMatcher, ListenerOptions, LoadBalanceConfig, LogConfig, LogFormat,
+    LogOutput, LogRotation, Matcher, MatcherCondition, OverloadConfig, PRIVATE_RANGES,
+    PingclairConfig, ProxyUpstream, RateLimitKey, ResourceLimitsConfig, RetryConfig,
+    ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig, UpstreamTlsConfig,
     normalize_listen_addr,
 };
 
@@ -1126,11 +1127,330 @@ fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
         "RequestHeader" => request_headers(call),
         "ResponseHeader" => response_headers(call),
         "Rewrite" => rewrite(call),
+        "BasicAuth" => basic_auth(call),
+        "RateLimit" => rate_limit(call),
+        "AccessControl" => access_control(call),
+        "CORS" => cors(call),
+        "SetVariable" => set_variable(call),
+        "LimitRequestBody" => limit_request_body(call),
+        "SkipLog" => skip_log(call),
         _ => Err(call.at.error(
             "unknown HTTP component; expected a terminal (Respond, ServeFiles, Proxy, Redirect, \
-             Fail, ServeMetrics) or middleware (RequestHeader, ResponseHeader, Rewrite)",
+             Fail, ServeMetrics) or middleware (RequestHeader, ResponseHeader, Rewrite, \
+             BasicAuth, RateLimit, AccessControl, CORS, SetVariable, LimitRequestBody, SkipLog)",
         )),
     }
+}
+
+/// 🔐 `BasicAuth(users:, algorithm:, realm:)`: one guard, many credentials.
+fn basic_auth(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&["users", "algorithm", "realm"])?;
+    let algorithm = match call.get("algorithm") {
+        None => BasicAuthAlgorithm::Bcrypt,
+        Some(Value::Typed(value)) => {
+            if !value.args.is_empty() {
+                return Err(value.at.error("an algorithm takes no arguments"));
+            }
+            match value.name.as_str() {
+                "bcrypt" => BasicAuthAlgorithm::Bcrypt,
+                "argon2id" => BasicAuthAlgorithm::Argon2id,
+                other => {
+                    return Err(value.at.error(format!(
+                        "unknown algorithm '.{other}'; expected .bcrypt or .argon2id"
+                    )));
+                }
+            }
+        }
+        Some(_) => return Err(call.at.error("algorithm takes .bcrypt or .argon2id")),
+    };
+    let realm = if call.get("realm").is_some() {
+        call.string("realm")?
+    } else {
+        pingclair_core::config::default_auth_realm()
+    };
+    let Some(Value::Array(users)) = call.get("users") else {
+        return Err(call
+            .at
+            .error("users takes an array of .user(\"name\", hash: \"…\") values"));
+    };
+    if users.is_empty() {
+        return Err(call.at.error("users needs at least one entry"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut credentials = Vec::new();
+    for user in users {
+        let Value::Typed(user) = user else {
+            return Err(call
+                .at
+                .error("users takes .user(\"name\", hash: \"…\") values"));
+        };
+        if user.name != "user" {
+            return Err(user
+                .at
+                .error("users takes .user(\"name\", hash: \"…\") values"));
+        }
+        let [(None, Value::String(name)), rest @ ..] = user.args.as_slice() else {
+            return Err(user.at.error(".user takes a name and hash: \"…\""));
+        };
+        if rest.len() != 1 {
+            return Err(user.at.error(".user takes a name and hash: \"…\""));
+        }
+        if !seen.insert(name.clone()) {
+            return Err(user.at.error(format!("'{name}' appears twice in users")));
+        }
+        // 🔑 The hash is checked against the declared algorithm here, exactly
+        // as the Caddyfile path does: a plaintext password must fail at load,
+        // never at the first login attempt.
+        let credential = crate::compiler::compile_basic_auth_credential(
+            name,
+            &labeled_string(user, "hash")?,
+            algorithm,
+        )
+        .map_err(|error| user.at.error(error.to_string()))?;
+        credentials.push(credential);
+    }
+    Ok(HandlerConfig::BasicAuth { realm, credentials })
+}
+
+/// ⏱️ `RateLimit(requests:, per:, key:, burst:, dryRun:)`.
+fn rate_limit(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&["requests", "per", "key", "burst", "dryRun"])?;
+    let Some(_) = call.get("requests") else {
+        return Err(call.at.error("RateLimit requires requests:"));
+    };
+    let requests = call.integer("requests")?;
+    if requests == 0 {
+        return Err(call.at.error("requests must be at least 1"));
+    }
+    let Some(_) = call.get("per") else {
+        return Err(call
+            .at
+            .error("RateLimit requires per:, such as per: .minutes(1)"));
+    };
+    let window_ms = call.measure("per", false)?;
+    if window_ms % 1000 != 0 {
+        return Err(call.at.error("a rate limit window is whole seconds"));
+    }
+    let window_secs = window_ms / 1000;
+    if window_secs == 0 {
+        return Err(call.at.error("a rate limit window is at least one second"));
+    }
+    let key = match call.get("key") {
+        None => RateLimitKey::Ip,
+        Some(Value::Typed(value)) => {
+            let argument = |value: &Call| -> Result<String, Error> {
+                let [(None, Value::String(name))] = value.args.as_slice() else {
+                    return Err(value
+                        .at
+                        .error(format!(".{} takes one quoted header name", value.name)));
+                };
+                Ok(name.clone())
+            };
+            match value.name.as_str() {
+                kind @ ("ip" | "global" | "route" | "apiKey") => {
+                    value.leaf(&[])?;
+                    match kind {
+                        "ip" => RateLimitKey::Ip,
+                        "global" => RateLimitKey::Global,
+                        "route" => RateLimitKey::Route,
+                        _ => RateLimitKey::ApiKey,
+                    }
+                }
+                "header" => RateLimitKey::Header(argument(value)?),
+                "tenant" => RateLimitKey::Tenant(argument(value)?),
+                other => {
+                    return Err(value.at.error(format!(
+                        "unknown rate limit key '.{other}'; expected .ip, .global, .route, \
+                         .apiKey, .header(\"X-Name\") or .tenant(\"X-Name\")"
+                    )));
+                }
+            }
+        }
+        Some(_) => {
+            return Err(call
+                .at
+                .error("key takes a typed value such as .ip or .header(\"X-Tenant-ID\")"));
+        }
+    };
+    let burst = if call.get("burst").is_some() {
+        call.integer("burst")?
+    } else {
+        0
+    };
+    let dry_run = if call.get("dryRun").is_some() {
+        call.boolean("dryRun")?
+    } else {
+        false
+    };
+    Ok(HandlerConfig::RateLimit {
+        requests,
+        window_secs,
+        // 🔑 Kept for documents written before the key was a field; the key
+        // itself is what the runtime reads.
+        by_ip: matches!(key, RateLimitKey::Ip),
+        burst,
+        key: Some(key),
+        dry_run,
+    })
+}
+
+/// 🛡️ `AccessControl(...)`: allow and deny rules ahead of the terminal.
+fn access_control(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&[
+        "allowedIPs",
+        "deniedIPs",
+        "allowedReferers",
+        "deniedReferers",
+        "allowedUserAgents",
+        "deniedUserAgents",
+    ])?;
+    if call.args.is_empty() {
+        return Err(call
+            .at
+            .error("AccessControl needs at least one rule; a rule-less guard guards nothing"));
+    }
+    Ok(HandlerConfig::AccessControl(AccessControlConfig {
+        allowed_ips: call.strings("allowedIPs")?,
+        denied_ips: call.strings("deniedIPs")?,
+        allowed_referers: call.strings("allowedReferers")?,
+        denied_referers: call.strings("deniedReferers")?,
+        allowed_user_agents: call.strings("allowedUserAgents")?,
+        denied_user_agents: call.strings("deniedUserAgents")?,
+    }))
+}
+
+/// 🌐 `CORS(origins:, methods:, headers:, exposedHeaders:, allowCredentials:, maxAge:)`.
+fn cors(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&[
+        "origins",
+        "methods",
+        "headers",
+        "exposedHeaders",
+        "allowCredentials",
+        "maxAge",
+    ])?;
+    let Some(Value::Array(origins)) = call.get("origins") else {
+        return Err(call.at.error("CORS requires origins: [...]"));
+    };
+    let mut allowed_origins = Vec::new();
+    for origin in origins {
+        let Value::String(origin) = origin else {
+            return Err(call.at.error("origins takes quoted origins"));
+        };
+        allowed_origins.push(origin.clone());
+    }
+    if allowed_origins.is_empty() {
+        return Err(call.at.error("origins needs at least one origin"));
+    }
+    let allowed_methods = match call.get("methods") {
+        None => pingclair_core::config::default_cors_methods(),
+        Some(Value::Array(methods)) => {
+            if methods.is_empty() {
+                return Err(call.at.error("methods must not be empty"));
+            }
+            let mut names = Vec::new();
+            for method in methods {
+                let Value::Typed(value) = method else {
+                    return Err(call
+                        .at
+                        .error("methods takes unlabeled .get/.post/... values"));
+                };
+                names.push(method_name(value)?.to_string());
+            }
+            names
+        }
+        Some(_) => {
+            return Err(call
+                .at
+                .error("methods takes an array of .get/.post/... values"));
+        }
+    };
+    let allowed_headers = match call.get("headers") {
+        None => pingclair_core::config::default_cors_headers(),
+        Some(_) => call.strings("headers")?,
+    };
+    let exposed_headers = call.strings("exposedHeaders")?;
+    let allow_credentials = if call.get("allowCredentials").is_some() {
+        call.boolean("allowCredentials")?
+    } else {
+        false
+    };
+    let max_age = if call.get("maxAge").is_some() {
+        let max_age_ms = call.measure("maxAge", false)?;
+        if max_age_ms % 1000 != 0 {
+            return Err(call.at.error("maxAge is whole seconds"));
+        }
+        max_age_ms / 1000
+    } else {
+        pingclair_core::config::default_cors_max_age()
+    };
+    Ok(HandlerConfig::Cors {
+        allowed_origins,
+        allowed_methods,
+        allowed_headers,
+        exposed_headers,
+        allow_credentials,
+        max_age,
+    })
+}
+
+/// 🧰 `SetVariable(name:, value:)`: one request-scoped variable.
+fn set_variable(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&["name", "value"])?;
+    let name = call.string("name")?;
+    // 📌 An empty value is a value: it clears a variable a site-level rule
+    // set, which is a thing an operator really does write.
+    let value = call.string("value")?;
+    let mut values = std::collections::BTreeMap::new();
+    values.insert(name, value);
+    Ok(HandlerConfig::Vars { values })
+}
+
+/// 📥 `LimitRequestBody(max:, readTimeout:, writeTimeout:, set:)`.
+fn limit_request_body(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&["max", "readTimeout", "writeTimeout", "set"])?;
+    if call.args.is_empty() {
+        return Err(call.at.error(
+            "LimitRequestBody needs at least one of max:, readTimeout:, writeTimeout: or set:",
+        ));
+    }
+    let max_size = if call.get("max").is_some() {
+        Some(call.measure("max", true)?)
+    } else {
+        None
+    };
+    let read_timeout_ms = if call.get("readTimeout").is_some() {
+        Some(call.measure("readTimeout", false)?)
+    } else {
+        None
+    };
+    let write_timeout_ms = if call.get("writeTimeout").is_some() {
+        Some(call.measure("writeTimeout", false)?)
+    } else {
+        None
+    };
+    let set = match call.get("set") {
+        None => None,
+        Some(Value::String(body)) if body.is_empty() => {
+            return Err(call
+                .at
+                .error("set: \"\" would replace the body with nothing; leave set: out instead"));
+        }
+        Some(Value::String(body)) => Some(body.clone()),
+        Some(_) => return Err(call.at.error("set requires a quoted string")),
+    };
+    Ok(HandlerConfig::RequestBody {
+        max_size,
+        read_timeout_ms,
+        write_timeout_ms,
+        set,
+    })
+}
+
+/// 🙈 `SkipLog()`: this request is left out of the access log.
+fn skip_log(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&[])?;
+    Ok(HandlerConfig::LogSkip)
 }
 
 /// 🏷️ The header operations one component carries, in writing order.

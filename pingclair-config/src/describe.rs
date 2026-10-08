@@ -291,6 +291,153 @@ pub const ENTRIES: &[Entry] = &[
 }"#,
     },
     Entry {
+        name: "BasicAuth",
+        kind: Kind::Component,
+        summary: "Password-protected routes: `BasicAuth(users:, algorithm:, realm:)`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Route(when: .path(prefix: "/admin")) {
+            BasicAuth(users: [.user("alice", hash: "$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W")])
+            Respond(body: "welcome")
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            BasicAuth(users: [.user("alice", hash: "plaintext-password")])
+            Respond(body: "welcome")
+        }
+    }
+}"#,
+    },
+    Entry {
+        name: "RateLimit",
+        kind: Kind::Component,
+        summary: "A request budget: `RateLimit(requests:, per:, key:, burst:, dryRun:)`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Route(when: .path(prefix: "/api")) {
+            RateLimit(requests: 100, per: .minutes(1), key: .ip, burst: 10)
+            Proxy(to: "127.0.0.1:9000")
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            RateLimit(requests: 0, per: .minutes(1))
+            Respond(body: "hello")
+        }
+    }
+}"#,
+    },
+    Entry {
+        name: "AccessControl",
+        kind: Kind::Component,
+        summary: "Allow and deny rules by address, referer, or user agent.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Route(when: .path(prefix: "/internal")) {
+            AccessControl(allowedIPs: ["10.0.0.0/8"], deniedUserAgents: ["(curl)"])
+            Respond(body: "inside")
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            AccessControl()
+            Respond(body: "hello")
+        }
+    }
+}"#,
+    },
+    Entry {
+        name: "CORS",
+        kind: Kind::Component,
+        summary: "Cross-origin policy: `CORS(origins:, methods:, headers:, …)`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Route(when: .path(prefix: "/api")) {
+            CORS(origins: ["https://example.com"], methods: [.get, .post], allowCredentials: true)
+            Proxy(to: "127.0.0.1:9000")
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            CORS(origins: ["https://example.com"], methods: ["GET"])
+            Respond(body: "hello")
+        }
+    }
+}"#,
+    },
+    Entry {
+        name: "SetVariable",
+        kind: Kind::Component,
+        summary: "One request-scoped variable: `SetVariable(name:, value:)`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Route(when: .path(prefix: "/api")) {
+            SetVariable(name: "tier", value: "free")
+            Proxy(to: "127.0.0.1:9000")
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            SetVariable(name: "tier")
+            Respond(body: "hello")
+        }
+    }
+}"#,
+    },
+    Entry {
+        name: "LimitRequestBody",
+        kind: Kind::Component,
+        summary: "One route's body ceiling and deadlines: `LimitRequestBody(max:, …)`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Route(when: .path(exact: "/upload")) {
+            LimitRequestBody(max: .mebibytes(10), readTimeout: .seconds(30))
+            Respond(body: "stored")
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            LimitRequestBody(set: "")
+            Respond(body: "hello")
+        }
+    }
+}"#,
+    },
+    Entry {
+        name: "SkipLog",
+        kind: Kind::Component,
+        summary: "Leaves this request out of the access log.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Route(when: .path(exact: "/health")) {
+            SkipLog()
+            Respond(body: "ok")
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            SkipLog(enabled: true)
+            Respond(body: "hello")
+        }
+    }
+}"#,
+    },
+    Entry {
         name: "encode",
         kind: Kind::Modifier,
         summary: "The codings a site offers, most preferred first: `.encode(.zstd, .gzip)`.",
