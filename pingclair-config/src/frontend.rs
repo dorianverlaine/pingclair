@@ -7,13 +7,13 @@ use crate::attributes::{Attr, resolve_attribute};
 use crate::bindings::Bindings;
 use crate::syntax::{self, Call, Declaration, Position, Value};
 use pingclair_core::config::{
-    AccessControlConfig, AdminConfig, BasicAuthAlgorithm, CircuitBreakerConfig, Encoding,
-    HandlerConfig, HandlerElement, HeaderReplacement, IpRanges, Layer4Matcher, Layer4Route,
-    Layer4Server, Layer4TlsMatcher, ListenerOptions, LoadBalanceConfig, LogConfig, LogFormat,
-    LogOutput, LogRotation, Matcher, MatcherCondition, OverloadConfig, PRIVATE_RANGES,
-    PingclairConfig, ProxyUpstream, RateLimitKey, ResourceLimitsConfig, RetryConfig,
-    ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig, UpstreamTlsConfig,
-    normalize_listen_addr,
+    AccessControlConfig, AcmeServerConfig, AcmeServerPolicy, AdminConfig, BasicAuthAlgorithm,
+    CircuitBreakerConfig, Encoding, ForwardAuthConfig, ForwardAuthHeaderMap, HandlerConfig,
+    HandlerElement, HeaderReplacement, IpRanges, Layer4Matcher, Layer4Route, Layer4Server,
+    Layer4TlsMatcher, ListenerOptions, LoadBalanceConfig, LogConfig, LogFormat, LogOutput,
+    LogRotation, Matcher, MatcherCondition, OverloadConfig, PRIVATE_RANGES, PingclairConfig,
+    ProxyUpstream, RateLimitKey, ResourceLimitsConfig, RetryConfig, ReverseProxyConfig,
+    RouteConfig, ServerConfig, TlsConfig, UpstreamTlsConfig, normalize_listen_addr,
 };
 
 /// 📍 Reports location and expected structure without echoing configuration values.
@@ -725,13 +725,13 @@ fn http_route(call: &Call) -> Result<RouteConfig, Error> {
 /// become a pipeline the runtime walks front to back.
 fn route_handler(body: &[Call], at: Position) -> Result<HandlerConfig, Error> {
     let Some((last, middleware)) = body.split_last() else {
-        return Err(at.error(
-            "a route needs at least one component; end it with Respond, ServeFiles, Proxy, Redirect, Fail or ServeMetrics",
-        ));
+        return Err(at.error(format!(
+            "a route needs at least one component; end it with {TERMINALS}"
+        )));
     };
     if !is_terminal(&last.name) {
         return Err(last.at.error(format!(
-            "a route must end with a component that answers the request: Respond, ServeFiles, Proxy, Redirect, Fail or ServeMetrics; {} only changes it",
+            "a route must end with a component that answers the request: {TERMINALS}; {} only changes it",
             last.name
         )));
     }
@@ -753,11 +753,14 @@ fn route_handler(body: &[Call], at: Position) -> Result<HandlerConfig, Error> {
     Ok(HandlerConfig::Pipeline { handlers })
 }
 
+/// 🅿️ The components that answer a request, named once for every refusal.
+const TERMINALS: &str = "Respond, ServeFiles, Proxy, Redirect, Fail, ServeMetrics or ACMEServer";
+
 /// 🅿️ Whether a component writes a response, and therefore ends a route.
 fn is_terminal(name: &str) -> bool {
     matches!(
         name,
-        "Respond" | "ServeFiles" | "Proxy" | "Redirect" | "Fail" | "ServeMetrics"
+        "Respond" | "ServeFiles" | "Proxy" | "Redirect" | "Fail" | "ServeMetrics" | "ACMEServer"
     )
 }
 
@@ -1134,12 +1137,158 @@ fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
         "SetVariable" => set_variable(call),
         "LimitRequestBody" => limit_request_body(call),
         "SkipLog" => skip_log(call),
+        "Templates" => templates(call),
+        "ForwardAuth" => forward_auth(call),
+        "ACMEServer" => acme_server(call),
         _ => Err(call.at.error(
             "unknown HTTP component; expected a terminal (Respond, ServeFiles, Proxy, Redirect, \
-             Fail, ServeMetrics) or middleware (RequestHeader, ResponseHeader, Rewrite, \
-             BasicAuth, RateLimit, AccessControl, CORS, SetVariable, LimitRequestBody, SkipLog)",
+             Fail, ServeMetrics, ACMEServer) or middleware (RequestHeader, ResponseHeader, \
+             Rewrite, BasicAuth, RateLimit, AccessControl, CORS, SetVariable, LimitRequestBody, \
+             SkipLog, Templates, ForwardAuth)",
         )),
     }
+}
+
+/// 🧩 `Templates(root:)`: renders the files later components serve.
+fn templates(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&["root"])?;
+    let root = if call.get("root").is_some() {
+        Some(call.string("root")?)
+    } else {
+        None
+    };
+    Ok(HandlerConfig::Templates { root })
+}
+
+/// 🔐 `ForwardAuth(to:, uri:, copyHeaders:)`: one auth round trip up front.
+fn forward_auth(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&["to", "uri", "copyHeaders"])?;
+    let upstream = call.string("to")?;
+    let uri = call.string("uri")?;
+    let mut copy_headers: Vec<ForwardAuthHeaderMap> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let copied: &[Value] = match call.get("copyHeaders") {
+        None => &[],
+        Some(Value::Array(items)) => {
+            if items.is_empty() {
+                return Err(call
+                    .at
+                    .error("copyHeaders must not be empty; leave it out instead"));
+            }
+            items
+        }
+        Some(_) => {
+            return Err(call.at.error(
+                "copyHeaders takes an array of field names and .rename(\"From\", to: \"To\") values",
+            ));
+        }
+    };
+    for item in copied {
+        let (from, to) = match item {
+            Value::String(field) => (field.clone(), None),
+            Value::Typed(rename) if rename.name == "rename" => {
+                let [(None, Value::String(from)), rest @ ..] = rename.args.as_slice() else {
+                    return Err(rename.at.error(".rename takes a field name and to: \"…\""));
+                };
+                if rest.len() != 1 {
+                    return Err(rename.at.error(".rename takes a field name and to: \"…\""));
+                }
+                (from.clone(), Some(labeled_string(rename, "to")?))
+            }
+            _ => {
+                return Err(call.at.error(
+                    "copyHeaders takes field names and .rename(\"From\", to: \"To\") values",
+                ));
+            }
+        };
+        if !seen.insert(from.clone()) {
+            return Err(call.at.error(format!("'{from}' is copied twice")));
+        }
+        copy_headers.push(ForwardAuthHeaderMap { from, to });
+    }
+    let config = ForwardAuthConfig {
+        upstream,
+        uri,
+        copy_headers,
+        upstream_tls: None,
+    };
+    Ok(HandlerConfig::ReverseProxy(Box::new(
+        config.as_reverse_proxy_subrequest(),
+    )))
+}
+
+/// 🏛️ `ACMEServer(ca:, lifetime:, signWithRoot:, challenges:, allow:, deny:)`.
+///
+/// 📌 Written for parity with the Caddyfile spelling: the runtime refuses to
+/// start a site that carries one, so this parses, validates and serialises, and
+/// the refusal to run stays where it always was.
+fn acme_server(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&[
+        "ca",
+        "lifetime",
+        "signWithRoot",
+        "challenges",
+        "allow",
+        "deny",
+    ])?;
+    let ca = if call.get("ca").is_some() {
+        Some(call.string("ca")?)
+    } else {
+        None
+    };
+    let lifetime_secs = if call.get("lifetime").is_some() {
+        let millis = call.measure("lifetime", false)?;
+        if millis == 0 || millis % 1000 != 0 {
+            return Err(call.at.error("lifetime is at least one whole second"));
+        }
+        Some(millis / 1000)
+    } else {
+        None
+    };
+    let sign_with_root = if call.get("signWithRoot").is_some() {
+        call.boolean("signWithRoot")?
+    } else {
+        false
+    };
+    let challenges = match call.get("challenges") {
+        None => None,
+        Some(_) => Some(call.strings("challenges")?),
+    };
+    Ok(HandlerConfig::AcmeServer(Box::new(AcmeServerConfig {
+        ca,
+        lifetime_secs,
+        sign_with_root,
+        challenges,
+        allow: acme_policy(call, "allow")?,
+        deny: acme_policy(call, "deny")?,
+    })))
+}
+
+/// 🧭 One `allow:`/`deny:` policy: the names and networks a server issues for.
+fn acme_policy(call: &Call, key: &str) -> Result<Option<AcmeServerPolicy>, Error> {
+    let Some(value) = call.get(key) else {
+        return Ok(None);
+    };
+    let Value::Typed(policy) = value else {
+        return Err(call
+            .at
+            .error(format!("{key} takes .policy(domains:, ipRanges:)")));
+    };
+    if policy.name != "policy" {
+        return Err(policy.at.error(format!(
+            "unknown {key} policy '.{}'; expected .policy(domains:, ipRanges:)",
+            policy.name
+        )));
+    }
+    policy.leaf(&["domains", "ipRanges"])?;
+    let domains = policy.strings("domains")?;
+    let ip_ranges = policy.strings("ipRanges")?;
+    if domains.is_empty() && ip_ranges.is_empty() {
+        return Err(policy
+            .at
+            .error("a policy needs at least one domain or IP range"));
+    }
+    Ok(Some(AcmeServerPolicy { domains, ip_ranges }))
 }
 
 /// 🔐 `BasicAuth(users:, algorithm:, realm:)`: one guard, many credentials.
@@ -1928,6 +2077,7 @@ impl Call {
             (false, "milliseconds") => 1,
             (false, "seconds") => 1000,
             (false, "minutes") => 60_000,
+            (false, "hours") => 3_600_000,
             _ => return Err(value.at.error("unknown unit or wrong unit type")),
         };
         number

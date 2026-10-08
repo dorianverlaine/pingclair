@@ -438,6 +438,66 @@ pub const ENTRIES: &[Entry] = &[
 }"#,
     },
     Entry {
+        name: "Templates",
+        kind: Kind::Component,
+        summary: "Renders the files later components serve: `Templates(root:)`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            Templates(root: "./public")
+            ServeFiles(root: "./public")
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            Templates()
+        }
+    }
+}"#,
+    },
+    Entry {
+        name: "ForwardAuth",
+        kind: Kind::Component,
+        summary: "One auth round trip before the route continues: `ForwardAuth(to:, uri:, copyHeaders:)`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Route(when: .path(prefix: "/app")) {
+            ForwardAuth(to: "127.0.0.1:9001", uri: "/verify", copyHeaders: ["X-User"])
+            Proxy(to: "127.0.0.1:9000")
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            ForwardAuth(to: "127.0.0.1:9001")
+            Respond(body: "hello")
+        }
+    }
+}"#,
+    },
+    Entry {
+        name: "ACMEServer",
+        kind: Kind::Component,
+        summary: "A site that answers ACME requests: `ACMEServer(ca:, lifetime:, allow:, deny:, …)`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            ACMEServer(ca: "local", lifetime: .hours(12), allow: .policy(domains: ["internal.example"]))
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            ACMEServer(allow: .policy(domains: []))
+        }
+    }
+}"#,
+    },
+    Entry {
         name: "encode",
         kind: Kind::Modifier,
         summary: "The codings a site offers, most preferred first: `.encode(.zstd, .gzip)`.",

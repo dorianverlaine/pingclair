@@ -1198,6 +1198,91 @@ fn guards_compose_in_writing_order() {
 }
 
 #[test]
+fn composed_components_lower_like_their_caddyfile_twins() {
+    let cases = [
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                Templates()
+                ServeFiles(root: "/tmp/pub")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troute {\n\t\ttemplates\n\t\tfile_server {\n\t\t\troot /tmp/pub\n\t\t}\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                Templates(root: "/tmp/pub")
+                ServeFiles(root: "/tmp/pub")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troot * /tmp/pub\n\troute {\n\t\ttemplates\n\t\tfile_server\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                ForwardAuth(to: "127.0.0.1:9001", uri: "/verify", copyHeaders: ["X-User", .rename("X-Role", to: "X-Auth-Role")])
+                Respond(body: "ok")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troute {\n\t\tforward_auth 127.0.0.1:9001 {\n\t\t\turi /verify\n\t\t\tcopy_headers X-User X-Role>X-Auth-Role\n\t\t}\n\t\trespond \"ok\"\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                ACMEServer(ca: "local", lifetime: .hours(12), signWithRoot: true, challenges: ["http-01"], allow: .policy(domains: ["internal.example"]))
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\tacme_server {\n\t\tca local\n\t\tlifetime 12h\n\t\tsign_with_root\n\t\tchallenges http-01\n\t\tallow {\n\t\t\tdomains internal.example\n\t\t}\n\t}\n}"
+                .to_string(),
+        ),
+    ];
+    for (native_source, legacy_source) in cases {
+        let native = crate::compile(&native_source).unwrap();
+        let legacy = crate::compile(&legacy_source).unwrap();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::to_value(legacy).unwrap(),
+            "{native_source}"
+        );
+    }
+}
+
+#[test]
+fn composed_components_that_cannot_mean_anything_fail_closed() {
+    let site = |body: &str| {
+        format!("HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {body} }} }} }}")
+    };
+    for body in [
+        // 🧩 Templates renders what follows, so the route still needs a terminal.
+        "Templates()",
+        "Templates(root: 1)",
+        "Templates(unknown: \"/tmp\")",
+        // 🔐 The gateway, its URI and its copied headers are all explicit.
+        "ForwardAuth(to: \"127.0.0.1:9001\") Respond(body: \"ok\")",
+        "ForwardAuth(uri: \"/verify\") Respond(body: \"ok\")",
+        "ForwardAuth(to: \"127.0.0.1:9001\", uri: \"/verify\", copyHeaders: []) Respond(body: \"ok\")",
+        "ForwardAuth(to: \"127.0.0.1:9001\", uri: \"/verify\", copyHeaders: \"X-User\") Respond(body: \"ok\")",
+        "ForwardAuth(to: \"127.0.0.1:9001\", uri: \"/verify\", copyHeaders: [.copy(\"X-User\")]) Respond(body: \"ok\")",
+        "ForwardAuth(to: \"127.0.0.1:9001\", uri: \"/verify\", copyHeaders: [.rename(\"X-Role\")]) Respond(body: \"ok\")",
+        "ForwardAuth(to: \"127.0.0.1:9001\", uri: \"/verify\", copyHeaders: [.rename(\"X-Role\", to: \"X-Auth-Role\", extra: 1)]) Respond(body: \"ok\")",
+        "ForwardAuth(to: \"127.0.0.1:9001\", uri: \"/verify\", copyHeaders: [\"X-User\", \"X-User\"]) Respond(body: \"ok\")",
+        "ForwardAuth(to: \"127.0.0.1:9001\", uri: \"/verify\", transport: \"http\") Respond(body: \"ok\")",
+        // 🏛️ An ACME server names what it issues; empty answers are refused.
+        "ACMEServer(lifetime: .milliseconds(500))",
+        "ACMEServer(lifetime: .seconds(0))",
+        "ACMEServer(challenges: [])",
+        "ACMEServer(allow: .policy())",
+        "ACMEServer(allow: [\"internal.example\"])",
+        "ACMEServer(deny: .only(domains: [\"x\"]))",
+        "ACMEServer(signWithRoot: 1)",
+        "ACMEServer(ca: 1)",
+    ] {
+        let source = site(body);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",
