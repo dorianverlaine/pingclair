@@ -155,7 +155,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         name: "Proxy",
         kind: Kind::Component,
-        summary: "Reverse proxy: `Proxy(to: \"host:port\")` or a list.",
+        summary: "Reverse proxy: `Proxy(to:, headersUp:, headersDown:)` with one address or a list.",
         example: r#"HTTPListener(on: ":8080") {
     Site(host: "*") {
         Fallback { Proxy(to: ["127.0.0.1:9000", "127.0.0.1:9001"]) }

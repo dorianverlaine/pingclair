@@ -73,8 +73,16 @@
                   "strategy": ""
                 },
                 "health_check": null,
-                "headers_up": {},
+                "headers_up": {
+                  "Host": "app.internal"
+                },
                 "headers_down": {},
+                "headers_down_default": {
+                  "X-Served-By": "pingclair"
+                },
+                "headers_up_remove": [
+                  "Cookie"
+                ],
                 "flush_interval": null,
                 "read_timeout": null,
                 "write_timeout": null,

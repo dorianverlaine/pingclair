@@ -1832,6 +1832,56 @@ fn php_fastcgi_that_cannot_mean_anything_fail_closed() {
 }
 
 #[test]
+fn proxy_header_lists_lower_like_their_caddyfile_twins() {
+    // 🏷️ The actions are the components' own vocabulary, carried by the proxy
+    // instead of by a component, so `header_up Host x` and
+    // `RequestHeader(.set("Host", "x"))` mean the same thing.
+    let native = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+            Proxy(
+                to: "127.0.0.1:9000",
+                headersUp: [.set("Host", "app.internal"), .remove("Cookie"), .replace("X-Trace", pattern: "f(.)o", with: "b$1r")],
+                headersDown: [.append("X-Served-By", "pingclair"), .setIfAbsent("X-Def", "1"), .remove("Server")]
+            )
+        } } }"#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "http://:8080 {\n\treverse_proxy 127.0.0.1:9000 {\n\t\theader_up Host app.internal\n\t\theader_up -Cookie\n\t\theader_up X-Trace f(.)o b$1r\n\t\theader_down +X-Served-By pingclair\n\t\theader_down ?X-Def 1\n\t\theader_down -Server\n\t}\n}",
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(native).unwrap(),
+        serde_json::to_value(legacy).unwrap()
+    );
+}
+
+#[test]
+fn proxy_header_lists_that_cannot_mean_anything_fail_closed() {
+    let site = |handler: &str| {
+        format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {handler} }} }} }}"
+        )
+    };
+    for handler in [
+        // 🏷️ The lists are arrays of actions, and they are not empty.
+        "Proxy(to: \"127.0.0.1:9000\", headersUp: [])",
+        "Proxy(to: \"127.0.0.1:9000\", headersUp: \".set(\\\"X\\\", \\\"1\\\")\")",
+        "Proxy(to: \"127.0.0.1:9000\", headersUp: [.unknown(\"X\")])",
+        // ❓ The request side has nothing to inspect, so `setIfAbsent` is a
+        // response action on the downstream half only.
+        "Proxy(to: \"127.0.0.1:9000\", headersUp: [.setIfAbsent(\"X-Def\", \"1\")])",
+        // 🚫 And the shared rules still hold: one field, one `.set`.
+        "Proxy(to: \"127.0.0.1:9000\", headersUp: [.set(\"X\", \"1\"), .set(\"X\", \"2\")])",
+        "Proxy(to: \"127.0.0.1:9000\", headersDown: [.replace(\"X-Rep\", pattern: \"f(.)o\")])",
+        "Proxy(to: \"127.0.0.1:9000\", headersDown: [.remove()])",
+    ] {
+        let source = site(handler);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",

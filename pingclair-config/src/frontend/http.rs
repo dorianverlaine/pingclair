@@ -2138,27 +2138,39 @@ fn header_ops(call: &Call, response_side: bool) -> Result<HeaderOps, Error> {
         )));
     }
     call.no_modifiers()?;
-    let actions = if call.args.is_empty() {
+    if call.args.is_empty() {
         return Err(call.at.error(format!(
             "{} needs at least one action such as .set(\"X-Name\", \"value\")",
             call.name
         )));
-    } else {
-        &call.args
-    };
+    }
+    header_ops_from(&call.args, &call.name, call.at, response_side)
+}
+
+/// 🏷️ Reads one list of header actions, whoever is holding it.
+///
+/// 📌 Two holders: the `RequestHeader`/`ResponseHeader` components, whose own
+/// arguments *are* the list, and a proxy's `headersUp:`/`headersDown:`, which
+/// carry it as a labelled array. One reader, so an action means the same thing
+/// in both places — the Caddyfile has one `applyHeaderOp` for the same reason.
+fn header_ops_from(
+    actions: &[(Option<String>, Value)],
+    name: &str,
+    at: Position,
+    response_side: bool,
+) -> Result<HeaderOps, Error> {
     let mut ops = HeaderOps::default();
     let mut claimed = std::collections::HashSet::new();
     for (label, value) in actions {
         let (None, Value::Typed(action)) = (label, value) else {
-            return Err(call.at.error(format!(
-                "{} takes unlabeled actions such as .set(\"X-Name\", \"value\")",
-                call.name
+            return Err(at.error(format!(
+                "{name} takes unlabeled actions such as .set(\"X-Name\", \"value\")"
             )));
         };
         match action.name.as_str() {
             "set" => {
                 let (field, value) = header_pair(action)?;
-                claim_once(&mut claimed, &field, call)?;
+                claim_once(&mut claimed, &field, name, at)?;
                 ops.set.insert(field, value);
             }
             "setIfAbsent" => {
@@ -2168,7 +2180,7 @@ fn header_ops(call: &Call, response_side: bool) -> Result<HeaderOps, Error> {
                     ));
                 }
                 let (field, value) = header_pair(action)?;
-                claim_once(&mut claimed, &field, call)?;
+                claim_once(&mut claimed, &field, name, at)?;
                 ops.set_if_absent.insert(field, value);
             }
             // 📋 Repeating this action is the point: two cookies are two
@@ -2232,12 +2244,12 @@ fn header_pair(action: &Call) -> Result<(String, String), Error> {
 fn claim_once(
     claimed: &mut std::collections::HashSet<String>,
     field: &str,
-    call: &Call,
+    name: &str,
+    at: Position,
 ) -> Result<(), Error> {
     if !claimed.insert(field.to_string()) {
-        return Err(call.at.error(format!(
-            "'{field}' is set twice in one {}; one field takes one .set or .setIfAbsent",
-            call.name
+        return Err(at.error(format!(
+            "'{field}' is set twice in one {name}; one field takes one .set or .setIfAbsent"
         )));
     }
     Ok(())
@@ -2644,11 +2656,44 @@ fn php_fastcgi(call: &Call) -> Result<HandlerConfig, Error> {
 
 /// 🌐 `.Proxy(to:)`: the reverse proxy with the build's bare defaults.
 fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&["to"])?;
+    call.leaf(&["to", "headersUp", "headersDown"])?;
     let upstreams = upstream_addresses(call)?;
-    Ok(HandlerConfig::ReverseProxy(Box::new(reverse_proxy(
-        upstreams, None,
-    ))))
+    let up = header_list(call, "headersUp", false)?;
+    let down = header_list(call, "headersDown", true)?;
+    let mut config = reverse_proxy(upstreams, None);
+    config.headers_up = up.set;
+    config.headers_up_add = up.add;
+    config.headers_up_remove = up.remove;
+    config.headers_up_replace = up.replace;
+    config.headers_down = down.set;
+    config.headers_down_add = down.add;
+    config.headers_down_remove = down.remove;
+    config.headers_down_replace = down.replace;
+    config.headers_down_default = down.set_if_absent;
+    Ok(HandlerConfig::ReverseProxy(Box::new(config)))
+}
+
+/// 🏷️ One of a proxy's header lists, read with the components' own reader.
+fn header_list(call: &Call, key: &str, response_side: bool) -> Result<HeaderOps, Error> {
+    let Some(value) = call.get(key) else {
+        return Ok(HeaderOps::default());
+    };
+    let Value::Array(items) = value else {
+        return Err(call.at.error(format!(
+            "{key} takes an array of actions such as [.set(\"X-Name\", \"value\")]"
+        )));
+    };
+    if items.is_empty() {
+        return Err(call
+            .at
+            .error(format!("{key} must not be empty; leave it out instead")));
+    }
+    // 📎 An array's entries carry no labels of their own, which is exactly the
+    // shape `header_ops_from` reads: the label slot is what says "this action
+    // is named", and a named action here is a mistake it already refuses.
+    let actions: Vec<(Option<String>, Value)> =
+        items.iter().cloned().map(|item| (None, item)).collect();
+    header_ops_from(&actions, key, call.at, response_side)
 }
 
 /// 🔌 The addresses an upstream list names.
