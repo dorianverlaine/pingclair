@@ -11,7 +11,7 @@ nginx source and tested behavior decide semantics when early issue prose differs
 - L4 transport belongs in a separate `pingclair-l4` crate, without an HTTP
   proxy dependency. Precompute routes and peer networks when provisioning.
 - Keep one immutable snapshot per connection. The top-level `pingclair` runtime
-  owns prebound Pingora listeners, effective HTTP/Admin overlap checks, route
+  owns prebound TCP listeners registered as Pingora services, effective HTTP/Admin overlap checks, route
   publication and shutdown drain. Blocked peers are refused before preread.
 - Route reloads affect new connections; listener topology or limits require
   restart. Failed preparation publishes nothing. Static upstream names resolve
@@ -151,3 +151,24 @@ an internal allocation failure. Normal completion, client EOF/I/O termination
 and idle/preread timeout use `200`; the explicit `outcome` distinguishes them.
 The meanings of session byte fields and durations follow
 [nginx stream logging](https://nginx.org/en/docs/stream/ngx_stream_log_module.html).
+
+## 🚦 Connection admission
+
+`max_connections` accepts an integer from 1 through 4096 and defaults to 1024
+per listener. A shared process ceiling of 4096 also applies. Both quotas cover
+preread, upstream dialing and forwarding, and persist across route reloads.
+Changing a listener quota requires restart. Excess accepted sockets close before
+spawning a session task or allocating preread buffers; no permit wait queue exists.
+The kernel accept backlog remains governed by the operating system.
+
+L4 owns its TCP accept loop inside a Pingora service because Pingora 0.9.0
+`services::listening::Service::run_endpoint` spawns before calling `ServerApp`.
+Checking admission only in that callback would leave task creation unbounded.
+Accept errors back off for one second, interruptible by shutdown. Accepted work
+enters the shared drain counter before spawning; cancellation drops both permits.
+
+`l4_admission_rejections_total{listener}` counts refusals when metrics are enabled.
+These pre-session refusals do not produce access-log records or completed-session
+metrics. Limits are session counts, not socket counts: an established tunnel uses
+a downstream and an upstream socket. Deployment limits must fit the host's memory
+and file descriptor budget; the defaults do not establish measured capacity.

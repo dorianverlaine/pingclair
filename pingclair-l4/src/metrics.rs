@@ -12,6 +12,7 @@ use std::sync::LazyLock;
 
 struct Collectors {
     completed: IntCounterVec,
+    rejected: IntCounterVec,
     active: IntGaugeVec,
     preread: IntCounterVec,
     connect: IntCounterVec,
@@ -23,6 +24,11 @@ static COLLECTORS: LazyLock<Collectors> = LazyLock::new(|| {
     let counters =
         |name, help, labels: &[&str]| IntCounterVec::new(Opts::new(name, help), labels).unwrap();
     let collectors = Collectors {
+        rejected: counters(
+            "l4_admission_rejections_total",
+            "TCP connections refused before session allocation.",
+            &["listener"],
+        ),
         completed: counters(
             "l4_connections_total",
             "Completed TCP sessions by configured route and outcome.",
@@ -64,6 +70,7 @@ static COLLECTORS: LazyLock<Collectors> = LazyLock::new(|| {
     for collector in [
         Box::new(collectors.completed.clone()) as Box<dyn prometheus::core::Collector>,
         Box::new(collectors.active.clone()),
+        Box::new(collectors.rejected.clone()),
         Box::new(collectors.preread.clone()),
         Box::new(collectors.connect.clone()),
         Box::new(collectors.bytes.clone()),
@@ -79,6 +86,7 @@ static COLLECTORS: LazyLock<Collectors> = LazyLock::new(|| {
 pub(crate) struct Metrics {
     completed: Vec<[IntCounter; Outcome::ALL.len()]>,
     pub active: IntGauge,
+    pub rejected: IntCounter,
     pub duration: Histogram,
     pub to_client: IntCounter,
     pub to_upstream: IntCounter,
@@ -106,6 +114,7 @@ impl Metrics {
                 })
                 .collect(),
             active: c.active.with_label_values(&[listener]),
+            rejected: c.rejected.with_label_values(&[listener]),
             duration: c.duration.with_label_values(&[listener]),
             to_client: c.bytes.with_label_values(&[listener, "upstream_to_client"]),
             to_upstream: c.bytes.with_label_values(&[listener, "client_to_upstream"]),

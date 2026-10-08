@@ -44,6 +44,7 @@ boring.workspace = true
 
 pingora-core = { workspace = true, features = ["connection_filter"] }
 pingora-proxy.workspace = true
+pingora-runtime.workspace = true
 rustls.workspace = true
 
 clap.workspace = true

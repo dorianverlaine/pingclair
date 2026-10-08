@@ -219,3 +219,6 @@ mod metrics;
 
 #[path = "layer4_logs.rs"]
 mod logs;
+
+#[path = "layer4_admission.rs"]
+mod admission;

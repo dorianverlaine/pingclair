@@ -51,6 +51,7 @@ struct Route {
 /// 🧭 Immutable state held for a connection's entire lifetime, including reloads.
 pub struct PreparedListener {
     metrics: Metrics,
+    max_connections: usize,
     listener: String,
     logger: Option<Arc<AccessLogger>>,
     log_config: Option<pingclair_core::config::LogConfig>,
@@ -75,6 +76,12 @@ impl PreparedListener {
         blocked: &[String],
         previous: Option<&Self>,
     ) -> io::Result<Self> {
+        if config.max_connections == 0 || config.max_connections > 4096 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid L4 connection limit",
+            ));
+        }
         if config.preread_buffer_size == 0 || config.proxy_buffer_size == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -125,6 +132,7 @@ impl PreparedListener {
         };
         Ok(Self {
             metrics: Metrics::prepare(&listener, routes.len()),
+            max_connections: config.max_connections,
             listener,
             logger,
             log_config: config.log.clone(),
@@ -140,6 +148,18 @@ impl PreparedListener {
                 half_close: config.proxy_half_close,
             },
         })
+    }
+
+    /// 🚦 Returns the listener quota captured before accepting any sockets.
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    /// 📊 Counts pre-session refusals without allocating an access-log entry.
+    pub fn record_admission_rejection(&self) {
+        if pingclair_runtime::metrics::enabled() {
+            self.metrics.rejected.inc();
+        }
     }
 
     /// 🌊 Classifies and routes one raw stream without decrypting or constructing HTTP.

@@ -39,6 +39,9 @@ fn validate_declarations(config: &PingclairConfig) -> CompileResult<()> {
     }
     let mut listeners = Vec::new();
     for server in &config.layer4 {
+        if server.max_connections == 0 || server.max_connections > 4096 {
+            return Err(invalid("layer4 max_connections must be between 1 and 4096"));
+        }
         if let Some(log) = &server.log {
             if !log.request_headers.is_empty()
                 || !log.response_headers.is_empty()

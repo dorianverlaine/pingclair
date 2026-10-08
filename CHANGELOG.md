@@ -16,6 +16,11 @@ fact.
 
 ### 🔌 Layer 4 TCP routing for 0.3 alpha
 
+L4 listeners now enforce `max_connections` (default 1024, range 1–4096),
+with a shared process ceiling of 4096. Excess connections close before session
+task or preread buffer allocation. Quotas survive route reloads; changing a
+listener quota requires restart. Admission refusals have a dedicated metric.
+
 Global `layer4` blocks can forward TCP by ClientHello SNI/ALPN and peer IP.
 The independent classifier preserves TLS bytes; bounded bidirectional buffers
 preserve backpressure, and `proxy_timeout` measures inactivity. Preread timeout

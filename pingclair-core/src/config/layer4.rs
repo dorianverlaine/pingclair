@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 pub struct Layer4Server {
     /// 📍 An IP socket address, with `:port` denoting a wildcard.
     pub listen: String,
+    /// 🚦 Maximum admitted sessions, including preread and upstream connection time.
+    #[serde(default = "max_connections")]
+    pub max_connections: usize,
     /// ⏱️ One deadline for classification, in milliseconds.
     #[serde(default = "preread_timeout")]
     pub preread_timeout_ms: u64,
@@ -71,6 +74,10 @@ pub struct Layer4TlsMatcher {
     pub alpn: Vec<String>,
 }
 
+fn max_connections() -> usize {
+    1024
+}
+
 fn preread_timeout() -> u64 {
     30_000
 }
@@ -89,6 +96,7 @@ impl Layer4Server {
     pub fn new(listen: String) -> Self {
         Self {
             listen,
+            max_connections: max_connections(),
             preread_timeout_ms: preread_timeout(),
             preread_buffer_size: buffer_size(),
             proxy_connect_timeout_ms: connect_timeout(),

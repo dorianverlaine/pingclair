@@ -29,6 +29,8 @@ production deployment.
 🔌 The 0.3 alpha branch supports TCP forwarding with TLS ClientHello SNI/ALPN
 and source-IP routing. TLS passes through unchanged; it is not terminated.
 Opt-in connection access logs and `l4_*` metrics report traffic and session outcomes.
+L4 admission defaults to 1024 sessions per listener (`max_connections`) and
+a fixed process ceiling of 4096 sessions, including preread and upstream dialing.
 See the [L4 boundaries](docs/guardrails/layer4.md) for syntax and current limits.
 
 ## ✨ Highlights

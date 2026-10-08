@@ -39,6 +39,7 @@ unsafe_op_in_unsafe_fn = "warn"
 # Pingora core
 pingora = "0.9"
 pingora-core = "0.9"
+pingora-runtime = "0.9"
 pingora-proxy = "0.9"
 pingora-http = "0.9"
 pingora-load-balancing = "0.9"

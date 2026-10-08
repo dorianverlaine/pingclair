@@ -2543,6 +2543,7 @@ dependencies = [
  "pingora",
  "pingora-core",
  "pingora-proxy",
+ "pingora-runtime",
  "rcgen",
  "reqwest",
  "rustls",

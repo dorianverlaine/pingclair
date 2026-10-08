@@ -122,6 +122,11 @@ pub(super) fn adapt(d: &Directive) -> Result<Vec<Layer4Server>> {
                 return Err(invalid(item, "option does not accept a block"));
             }
             match item.name.as_str() {
+                "max_connections" => {
+                    server.max_connections = expect_one_argument(item)?
+                        .parse()
+                        .map_err(|_| invalid(item, "expected a positive connection count"))?;
+                }
                 "preread_timeout" => server.preread_timeout_ms = duration(item)?,
                 "proxy_connect_timeout" => server.proxy_connect_timeout_ms = duration(item)?,
                 "proxy_timeout" => server.proxy_timeout_ms = duration(item)?,

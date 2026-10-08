@@ -7,6 +7,7 @@ use pingclair_core::config::{Layer4Matcher, Layer4Route, Layer4Server, Layer4Tls
 const SOURCE: &str = r#"{
     layer4 {
         :9443 {
+            max_connections 17
             preread_timeout 1m2s3ms
             preread_buffer_size 16k
             proxy_connect_timeout 2
@@ -36,6 +37,7 @@ fn layer4_adapts_complete_structure_and_round_trips_json() {
     let expected = Layer4Server {
         listen: ":9443".into(),
         log: None,
+        max_connections: 17,
         preread_timeout_ms: 62_003,
         preread_buffer_size: 16_384,
         proxy_connect_timeout_ms: 2_000,
@@ -346,4 +348,16 @@ fn layer4_logging_uses_the_existing_dialect_and_common_validation() {
     assert!(crate::compile(&SOURCE.replace("proxy_timeout 10m", "log audit")).is_err());
     assert!(crate::compile(&SOURCE.replace("proxy_timeout 10m", "log\nlog")).is_err());
     assert!(crate::compile(&SOURCE.replace("proxy_timeout 10m", "log")).is_ok());
+}
+
+#[test]
+fn layer4_rejects_invalid_admission_limits_in_dsl_and_json() {
+    for value in [0, 4097] {
+        let source = SOURCE.replace("max_connections 17", &format!("max_connections {value}"));
+        let config = crate::adapt(&source).unwrap();
+        assert!(validate_declarations(&config).is_err());
+        let decoded: PingclairConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert!(validate_declarations(&decoded).is_err());
+    }
 }
