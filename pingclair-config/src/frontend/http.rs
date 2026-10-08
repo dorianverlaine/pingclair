@@ -190,9 +190,15 @@ fn site(
             // the runtime keeps them in the order they were written.
             "ErrorRoute" => {
                 let route = error_route(child)?;
-                // 📎 Only a route that can answer shadows a page; one that
-                // stops at middleware leaves the page in place.
-                if child.block()?.iter().any(is_terminal) {
+                // 📎 Only a route that *always* answers shadows a page. One
+                // that stops at middleware leaves the page in place, and one
+                // that may answer — a file server that lets a miss through —
+                // leaves the page exactly where a miss lands.
+                if child
+                    .block()?
+                    .iter()
+                    .any(|component| answers(component) == Answers::Always)
+                {
                     answered_codes.extend(route.codes.iter().copied());
                     answered_hundreds.extend(route.hundreds.iter().copied());
                 }
@@ -715,19 +721,14 @@ fn route_elements(
             "a route needs at least one component; end it with {TERMINALS}"
         )));
     };
-    // 🐘 `PHPFastCGI` may end a route even though it is listed as middleware: it
-    // answers for the extensions it split off and stands down for everything
-    // else, which is exactly how `php_fastcgi` alone behaves in a Caddyfile. A
-    // file server written after it takes the rest.
-    let answers = is_terminal(last) || last.name == "PHPFastCGI";
-    if ending == Ending::Terminal && !answers {
+    if ending == Ending::Terminal && answers(last) == Answers::Never {
         return Err(last.at.error(format!(
             "a route must end with a component that answers the request: {TERMINALS}; {} only changes it",
             last.name
         )));
     }
     for child in middleware {
-        if is_terminal(child) {
+        if answers(child) == Answers::Always {
             return Err(child.at.error(format!(
                 "{} answers the request on its own, so the components after it can never run",
                 child.name
@@ -744,15 +745,36 @@ fn route_elements(
 /// 🅿️ The components that answer a request, named once for every refusal.
 const TERMINALS: &str = "Respond, ServeFiles, Proxy, Redirect, Fail, ServeMetrics or ACMEServer";
 
-/// 🅿️ Whether a component writes a response, and therefore ends a route.
-fn is_terminal(call: &Call) -> bool {
-    if call.name == "ServeFiles" && matches!(call.get("passThru"), Some(Value::Bool(true))) {
-        return false;
+/// 🅿️ What a component does to the control flow, read from its own options.
+///
+/// 📌 A name is not enough, and the review found the case that proves it:
+/// `ServeFiles(passThru: true)` answers when the file exists and hands the
+/// request on when it does not, so a component written after it *is* reachable
+/// — and a route may also end there, because a miss falls through to whatever
+/// the site does with an unanswered request. The old name-based rule refused
+/// the first and the second was refused as "middleware". `PHPFastCGI` is the
+/// same shape for the extensions it proxies, which is why it used to need a
+/// special case; it is one of the `Maybe`s now.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Answers {
+    /// Always writes a response: nothing after it can run.
+    Always,
+    /// Answers for some requests and stands down for the rest.
+    Maybe,
+    /// Only changes the request, or the response of what follows.
+    Never,
+}
+
+fn answers(call: &Call) -> Answers {
+    match call.name.as_str() {
+        // ➡️ A file server that lets a miss through is a step, not an answer.
+        "ServeFiles" if matches!(call.get("passThru"), Some(Value::Bool(true))) => Answers::Maybe,
+        // 🐘 Answers for the extensions it split off, stands down otherwise.
+        "PHPFastCGI" => Answers::Maybe,
+        "Respond" | "ServeFiles" | "Proxy" | "Redirect" | "Fail" | "ServeMetrics"
+        | "ACMEServer" => Answers::Always,
+        _ => Answers::Never,
     }
-    matches!(
-        call.name.as_str(),
-        "Respond" | "ServeFiles" | "Proxy" | "Redirect" | "Fail" | "ServeMetrics" | "ACMEServer"
-    )
 }
 
 /// 🎛️ Whether a typed value names an HTTP condition.

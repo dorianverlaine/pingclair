@@ -2074,6 +2074,41 @@ fn a_secret_value_cannot_reach_the_configuration_yet() {
 }
 
 #[test]
+fn a_step_that_may_answer_is_not_a_dead_end() {
+    // 🅿️ `ServeFiles(passThru: true)` answers when the file exists and hands
+    // the request on when it does not, so what follows it is reachable — the
+    // review found the Caddyfile accepted this shape while the native language
+    // refused it. Three readings, one per control-flow kind.
+    let site = |body: &str| {
+        format!("HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {body} }} }} }}")
+    };
+    // ➡️ A step that may answer, then the thing that answers a miss.
+    crate::compile(&site(
+        "ServeFiles(root: \"./public\", passThru: true) Respond(body: \"fallback\")",
+    ))
+    .unwrap();
+    // ➡️ …and a route may end there: a miss is answered by whatever the site
+    // does with an unanswered request.
+    crate::compile(&site("ServeFiles(root: \"./public\", passThru: true)")).unwrap();
+    // 🐘 The same reading covers the FastCGI expansion, which is why it no
+    // longer needs a rule of its own.
+    crate::compile(&site("PHPFastCGI(to: \"127.0.0.1:9000\")")).unwrap();
+    // 📌 An explicit `passThru: false` is the always-answering file server,
+    // which is a perfectly good way to end a route.
+    crate::compile(&site("ServeFiles(root: \"./public\", passThru: false)")).unwrap();
+    // 🚫 Something that always answers still ends the route, and middleware
+    // alone still does not.
+    for body in [
+        "Respond(body: \"x\") ServeFiles(root: \"./public\", passThru: true)",
+        "Respond(body: \"x\") Respond(body: \"y\")",
+        "RequestHeader(.set(\"X-A\", \"1\"))",
+    ] {
+        let source = site(body);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",

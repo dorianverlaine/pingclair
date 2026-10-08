@@ -45,12 +45,17 @@ HTTPListener(on: "127.0.0.1:18080") {{ Site(host: "*") {{ Route(when: {expressio
 }
 
 #[test]
-fn conditional_file_serving_requires_and_accepts_a_successor() {
+fn conditional_file_serving_accepts_a_successor_and_may_end_a_route() {
     let files = r#"ServeFiles(root: "./public", passThru: true)"#;
+    // ➡️ A step that may answer: what follows it runs when the file is a miss.
     assert!(
         pingclair_config::compile(&site(&format!("{files} Respond(body: \"fallback\")"))).is_ok()
     );
-    assert!(pingclair_config::compile(&site(files)).is_err());
+    // ➡️ …and a route may end there, because a miss is answered by whatever
+    // the site does with an unanswered request. Refusing this was the review's
+    // third finding: the Caddyfile accepts the same shape.
+    assert!(pingclair_config::compile(&site(files)).is_ok());
+    // 🚫 Something that always answers still ends the route.
     assert!(
         pingclair_config::compile(&site(
             r#"ServeFiles(root: "./public") Respond(body: "unreachable")"#
