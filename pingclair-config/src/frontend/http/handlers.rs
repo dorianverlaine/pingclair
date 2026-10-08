@@ -6,6 +6,7 @@
 use super::*;
 
 use super::conditions::{file_candidate, file_candidates, file_policy};
+use pingclair_core::config::CacheConfig;
 
 /// 🗂️ `TryFiles(candidates:, root:, policy:)`: rewrite to the first candidate
 /// that exists, then stand down so the next component serves it.
@@ -1473,6 +1474,7 @@ fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
             }
             "timeouts" => proxy_timeouts(modifier, &mut config)?,
             "retry" => proxy_retry(modifier, &mut config)?,
+            "cache" => config.cache = Some(Box::new(proxy_cache(modifier)?)),
             "flush" => {
                 let value = single_value(modifier, "flush")?;
                 config.flush_interval = Some(match &value {
@@ -1512,7 +1514,7 @@ fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
             other => {
                 return Err(modifier.at.error(format!(
                     "unknown Proxy modifier '.{other}'; expected .loadBalance, .healthCheck, \
-                     .upstreamTLS, .timeouts, .retry, .flush or .versions"
+                     .upstreamTLS, .timeouts, .retry, .cache, .flush or .versions"
                 )));
             }
         }
@@ -1739,6 +1741,40 @@ fn proxy_retry(modifier: &Call, config: &mut ReverseProxyConfig) -> Result<(), E
         config.fail_duration_ms = Some(modifier.measure("failDuration", false)?);
     }
     Ok(())
+}
+
+/// 🗄️ `.cache(ttl:, maxSize:)`: store fresh upstream responses for a while.
+///
+/// 📌 `ttl` is required — picking a lifetime for someone else's content is the
+/// operator's decision — while `maxSize` defaults to the shared modest ceiling
+/// so that turning caching on cannot, by itself, get a server OOM-killed.
+fn proxy_cache(modifier: &Call) -> Result<CacheConfig, Error> {
+    modifier.leaf(&["ttl", "maxSize"])?;
+    if modifier.get("ttl").is_none() {
+        return Err(modifier
+            .at
+            .error("cache needs ttl:, as in .cache(ttl: .seconds(30))"));
+    }
+    let millis = modifier.measure("ttl", false)?;
+    if millis == 0 || millis % 1000 != 0 {
+        return Err(modifier.at.error("cache ttl is at least one whole second"));
+    }
+    let max_size_bytes = if modifier.get("maxSize").is_some() {
+        let bytes = modifier.measure("maxSize", true)?;
+        if bytes == 0 {
+            return Err(modifier
+                .at
+                .error("maxSize must not be zero; remove .cache(...) to turn caching off"));
+        }
+        usize::try_from(bytes)
+            .map_err(|_| modifier.at.error("maxSize exceeds the platform range"))?
+    } else {
+        pingclair_core::config::default_cache_max_size_bytes()
+    };
+    Ok(CacheConfig {
+        ttl_secs: millis / 1000,
+        max_size_bytes,
+    })
 }
 
 /// 🌐 The one unlabelled value a modifier takes.

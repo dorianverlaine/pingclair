@@ -19,6 +19,9 @@ HTTPListener(on: ":8080") {
                 failDuration: .seconds(30),
             )
             .timeouts(connect: .seconds(5), read: .minutes(2))
+            // 🗄️ Store fresh upstream responses for a while; the ceiling is
+            // process-wide and shared by every cached route.
+            .cache(ttl: .seconds(30), maxSize: .mebibytes(128))
         }
         Fallback { ServeFiles(root: "./public") }
     }

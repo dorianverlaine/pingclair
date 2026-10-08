@@ -1807,6 +1807,59 @@ fn proxy_header_lists_lower_like_their_caddyfile_twins() {
     assert_eq!(twin(native), twin(legacy));
 }
 
+/// 🗄️ `.cache(...)` lowers exactly like the Caddyfile's `cache` block.
+#[test]
+fn proxy_cache_lowers_like_its_caddyfile_twin() {
+    let native = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+            Proxy(to: "127.0.0.1:9000").cache(ttl: .seconds(30), maxSize: .mebibytes(128))
+        } } }"#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "http://:8080 {\n\treverse_proxy 127.0.0.1:9000 {\n\t\tcache {\n\t\t\tttl 30s\n\t\t\tmax_size 134217728\n\t\t}\n\t}\n}",
+    )
+    .unwrap();
+    assert_eq!(twin(native), twin(legacy));
+
+    // 📏 The ceiling defaults in `pingclair-core`, so the two spellings can
+    // never drift to different numbers.
+    let native = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+            Proxy(to: "127.0.0.1:9000").cache(ttl: .seconds(30))
+        } } }"#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "http://:8080 {\n\treverse_proxy 127.0.0.1:9000 {\n\t\tcache {\n\t\t\tttl 30s\n\t\t}\n\t}\n}",
+    )
+    .unwrap();
+    assert_eq!(twin(native), twin(legacy));
+}
+
+#[test]
+fn proxy_cache_mistakes_fail_closed() {
+    let site = |modifier: &str| {
+        format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ Proxy(to: \"127.0.0.1:9000\"){modifier} }} }} }}"
+        )
+    };
+    for modifier in [
+        ".cache()",
+        ".cache(maxSize: .mebibytes(1))",
+        ".cache(ttl: 30)",
+        ".cache(ttl: .seconds(0))",
+        ".cache(ttl: .seconds(1.5))",
+        ".cache(ttl: .seconds(30), maxSize: 0)",
+        ".cache(ttl: .seconds(30), maxSize: .bytes(0))",
+        ".cache(ttl: .seconds(30), unknown: 1)",
+        ".cache(ttl: .seconds(30)).cache(ttl: .seconds(60))",
+    ] {
+        let source = site(modifier);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
 #[test]
 fn proxy_header_lists_that_cannot_mean_anything_fail_closed() {
     let site = |handler: &str| {

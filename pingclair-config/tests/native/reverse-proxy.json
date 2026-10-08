@@ -106,7 +106,10 @@
                   "client_key": null,
                   "insecure_skip_verify": false
                 },
-                "cache": null
+                "cache": {
+                  "ttl_secs": 30,
+                  "max_size_bytes": 134217728
+                }
               }
             ]
           },

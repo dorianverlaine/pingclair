@@ -324,7 +324,9 @@ fn configures_acme_server(handler: &pingclair_core::config::HandlerConfig) -> bo
         HandlerConfig::HandlePath { handlers, .. } => handlers
             .iter()
             .any(|element| configures_acme_server(&element.handler)),
-        HandlerConfig::HandleErrors { errors } => errors.values().flatten().any(configures_acme_server),
+        HandlerConfig::HandleErrors { errors } => {
+            errors.values().flatten().any(configures_acme_server)
+        }
         _ => false,
     }
 }
@@ -376,11 +378,7 @@ mod tests {
         for source in cases {
             let config = pingclair_config::compile(source)
                 .expect("the shape is valid configuration; only serving it is refused");
-            assert_eq!(
-                acme_server_sites(&config),
-                ["ca.example.test"],
-                "{source}"
-            );
+            assert_eq!(acme_server_sites(&config), ["ca.example.test"], "{source}");
         }
     }
 
