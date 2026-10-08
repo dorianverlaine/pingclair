@@ -60,7 +60,21 @@ pub(super) enum Value {
     Array(Vec<Value>),
     Typed(Call),
     Component(Call),
-    Reference { name: String, at: Position },
+    Reference {
+        name: String,
+        at: Position,
+    },
+    /// 🔐 A value that came out of an `@Secret` binding.
+    ///
+    /// 📌 Synthetic: the parser never produces one, so a formatter printing
+    /// source never sees it. It exists so that the *origin* of a value travels
+    /// with it — an alias, an array element and a nested call all keep the
+    /// mark, which is what lets the frontend refuse a secret that would be
+    /// written into the configuration instead of protecting nothing.
+    Secret {
+        value: Box<Value>,
+        at: Position,
+    },
 }
 #[derive(PartialEq)]
 enum Token {

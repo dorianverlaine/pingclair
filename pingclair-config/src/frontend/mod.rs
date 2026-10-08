@@ -35,6 +35,42 @@ pub struct Error {
     pub(crate) message: String,
 }
 
+/// 🔐 Refuses a `@Secret` value anywhere the configuration would record it.
+///
+/// 📌 v1 has no field that holds a secret, so every position a secret can reach
+/// is a position it would be written into — the configuration, the admin JSON,
+/// a reload, a log that dumps any of them. The attribute promises "never
+/// shown"; the way to keep that promise without a taint-tracking pass is to
+/// refuse the use, not to mask it afterwards. A field that *does* hold a secret
+/// (a DNS-01 token, say) will accept these explicitly when it lands, and this
+/// is the check that has to learn about it.
+fn reject_secret_values(call: &Call) -> Result<(), Error> {
+    for (_, value) in &call.args {
+        reject_secret(value)?;
+    }
+    for child in call.body.iter().flatten() {
+        reject_secret_values(child)?;
+    }
+    for modifier in &call.modifiers {
+        reject_secret_values(modifier)?;
+    }
+    Ok(())
+}
+
+/// 🔐 The value half of the same walk.
+fn reject_secret(value: &Value) -> Result<(), Error> {
+    match value {
+        Value::Secret { at, .. } => Err(at.error(
+            "a @Secret value cannot be used yet: no field in this build holds a secret, so \
+             using it would write the value into the configuration and everything that dumps \
+             it. Declare it with a plain binding until a secret-accepting field lands",
+        )),
+        Value::Array(items) => items.iter().try_for_each(reject_secret),
+        Value::Typed(call) | Value::Component(call) => reject_secret_values(call),
+        _ => Ok(()),
+    }
+}
+
 /// 🧭 Recognizes native declarations without guessing from a file extension.
 pub fn is_native(source: &str) -> bool {
     let mut rest = source.trim_start();
@@ -87,7 +123,12 @@ pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
                     };
                     return Err(attribute.at.error(format!("{name} applies to bindings")));
                 }
-                bindings.expand_call(call)?
+                let call = bindings.expand_call(call)?;
+                // 🔐 Before anything reads a value: a secret that reaches the
+                // configuration would be written into it, into the admin JSON
+                // and into every log that dumps either.
+                reject_secret_values(&call)?;
+                call
             }
         };
         if call.name == "Pingclair" {

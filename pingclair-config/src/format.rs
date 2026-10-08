@@ -333,6 +333,9 @@ impl Printer {
             Value::Number(number) => self.text(&number.to_string()),
             Value::Bool(flag) => self.text(if *flag { "true" } else { "false" }),
             Value::Reference { name, .. } => self.text(name),
+            // 🔐 Synthetic, so a formatter never meets one; printing the
+            // value it carries keeps the two spellings in step if it ever does.
+            Value::Secret { value, .. } => self.value(value),
             Value::Typed(call) => {
                 self.text(".");
                 self.call(call);

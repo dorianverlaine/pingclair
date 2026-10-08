@@ -2024,6 +2024,56 @@ fn upstream_tls_that_cannot_mean_anything_fail_closed() {
 }
 
 #[test]
+fn a_secret_value_cannot_reach_the_configuration_yet() {
+    // 🔐 The attribute promises "never shown". Until a field exists that can
+    // *hold* a secret, every use of one would be written into the
+    // configuration, the admin JSON and any log that dumps either — so the
+    // use is refused, and the refusal does not repeat the value.
+    const SENTINEL: &str = "review-sentinel-not-a-real-secret";
+    let shapes = [
+        format!(
+            "@Secret\nlet token = \"{SENTINEL}\"\nHTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ Proxy(to: \"127.0.0.1:9000\", headersUp: [.set(\"X-Review\", token)]) }} }} }}\n"
+        ),
+        format!(
+            "@Secret\nlet headers = [.set(\"X-Review\", \"{SENTINEL}\")]\nHTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ Proxy(to: \"127.0.0.1:9000\", headersUp: headers) }} }} }}\n"
+        ),
+        format!(
+            "@Secret\nlet token = \"{SENTINEL}\"\nlet alias = token\nHTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ Proxy(to: \"127.0.0.1:9000\", headersUp: [.set(\"X-Review\", alias)]) }} }} }}\n"
+        ),
+        // 🏛️ A component binding carries the mark too: the refusal happens at
+        // the use, wherever the value was stored on the way there.
+        format!(
+            "@Secret\nlet token = \"{SENTINEL}\"\nlet site = Site(host: \"*\") {{ Fallback {{ Proxy(to: \"127.0.0.1:9000\", headersUp: [.set(\"X-Review\", token)]) }} }}\nHTTPListener(on: \":8080\") {{ site }}\n"
+        ),
+    ];
+    for source in shapes {
+        let error = crate::compile(&source)
+            .expect_err("a used @Secret value must be refused")
+            .to_string();
+        assert!(
+            !error.contains(SENTINEL),
+            "the refusal repeated the secret: {error}"
+        );
+        assert!(error.contains("@Secret"), "{error}");
+        assert!(error.contains("line "), "{error}");
+    }
+    // 📌 Declaring one and using it for nothing is still allowed: the
+    // attribute marks a value, and finding unused declarations is a lint, not
+    // a load error.
+    crate::compile(&format!(
+        "@Secret\nlet token = \"{SENTINEL}\"\nHTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ Respond(body: \"ok\") }} }} }}\n"
+    ))
+    .unwrap();
+    // 🚫 And a condition cannot be a secret at all.
+    assert!(
+        crate::compile(&format!(
+            "@Matcher\nlet cond = .path(exact: \"/a\")\n@Secret\nlet token = \"{SENTINEL}\"\nHTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Route(when: token) {{ Respond(body: \"ok\") }} }} }}\n"
+        ))
+        .is_err()
+    );
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",

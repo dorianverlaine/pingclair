@@ -24,6 +24,9 @@ struct Bound {
     nodes: usize,
     bytes: usize,
     matcher: bool,
+    /// 🔐 Whether this binding was declared `@Secret`, which is what decides
+    /// whether a *use* of it is allowed at all.
+    secret: bool,
 }
 
 enum Fragment {
@@ -94,6 +97,7 @@ impl Bindings {
                 nodes,
                 bytes,
                 matcher: matcher.is_some(),
+                secret: secret.is_some(),
             },
         );
         Ok(())
@@ -102,20 +106,30 @@ impl Bindings {
     fn expand_value(&mut self, value: &Value) -> Result<Value, Error> {
         match value {
             Value::Reference { name, at } => {
-                let (value, nodes, bytes) = match self.resolved.get(name) {
+                let (value, nodes, bytes, secret) = match self.resolved.get(name) {
                     Some(Bound {
                         fragment: Fragment::Value(value),
                         nodes,
                         bytes,
+                        secret,
                         ..
-                    }) => (value.clone(), *nodes, *bytes),
+                    }) => (value.clone(), *nodes, *bytes, *secret),
                     Some(_) => {
                         return Err(at.error("expected a value; this binding names a component"));
                     }
                     None => return Err(self.unresolved(name, *at)),
                 };
                 self.charge(*at, nodes, bytes)?;
-                Ok(value)
+                // 🔐 The mark travels with the value from here on: every
+                // position that receives it can tell where it came from.
+                Ok(if secret {
+                    Value::Secret {
+                        value: Box::new(value),
+                        at: *at,
+                    }
+                } else {
+                    value
+                })
             }
             Value::Array(values) => Ok(Value::Array(
                 values
@@ -191,6 +205,16 @@ impl Bindings {
         match value {
             Value::Reference { name, at } => {
                 match self.resolved.get(name) {
+                    // 🚫 A condition is read, matched and reported; a value
+                    // whose origin says "do not show this" has no business
+                    // there, and the matcher check below would accept it.
+                    Some(Bound {
+                        matcher: true,
+                        secret: true,
+                        ..
+                    }) => {
+                        return Err(at.error("a condition cannot be a @Secret binding"));
+                    }
                     Some(Bound { matcher: true, .. }) => {}
                     Some(_) => {
                         return Err(
@@ -287,6 +311,9 @@ fn count_value(value: &Value, nodes: &mut usize, bytes: &mut usize) {
         }
         Value::Typed(call) | Value::Component(call) => count_call(call, nodes, bytes),
         Value::Reference { name, .. } => *bytes += name.len(),
+        // 🔐 The wrapper costs nothing of its own: what has to be counted is
+        // the value it carries, which is where the bytes are.
+        Value::Secret { value, .. } => count_value(value, nodes, bytes),
         Value::Number(_) | Value::Bool(_) => {}
     }
 }
