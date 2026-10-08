@@ -731,12 +731,23 @@ pub fn find(name: &str) -> Option<&'static Entry> {
 fn select(name: Option<&str>) -> Result<Vec<&'static Entry>, String> {
     match name {
         None => Ok(ENTRIES.iter().collect()),
-        Some(name) => match find(name) {
-            Some(entry) => Ok(vec![entry]),
-            None => Err(format!(
-                "unknown component '{name}'; run `pingclair describe` for the full list"
-            )),
-        },
+        Some(name) => {
+            let entries: Vec<_> = ENTRIES
+                .iter()
+                .filter(|entry| {
+                    entry.name == name
+                        || (entry.kind == Kind::Attribute
+                            && name.strip_prefix('@') == Some(entry.name))
+                })
+                .collect();
+            if entries.is_empty() {
+                Err(format!(
+                    "unknown component '{name}'; run `pingclair describe` for the full list"
+                ))
+            } else {
+                Ok(entries)
+            }
+        }
     }
 }
 

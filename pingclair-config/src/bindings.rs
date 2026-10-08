@@ -70,6 +70,7 @@ impl Bindings {
         }
         let fragment = match value {
             Value::Component(call) => Fragment::Component(self.expand_call(call)?),
+            other if matcher.is_some() => Fragment::Value(self.expand_condition(other)?),
             other => Fragment::Value(self.expand_value(other)?),
         };
         if let Some(at) = matcher
@@ -187,18 +188,36 @@ impl Bindings {
     }
 
     fn expand_condition(&mut self, value: &Value) -> Result<Value, Error> {
-        if let Value::Reference { name, at } = value {
-            match self.resolved.get(name) {
-                Some(Bound { matcher: true, .. }) => {}
-                Some(_) => {
-                    return Err(
-                        at.error("when: requires an @Matcher binding or an inline condition")
-                    );
+        match value {
+            Value::Reference { name, at } => {
+                match self.resolved.get(name) {
+                    Some(Bound { matcher: true, .. }) => {}
+                    Some(_) => {
+                        return Err(
+                            at.error("when: requires an @Matcher binding or an inline condition")
+                        );
+                    }
+                    None => return Err(self.unresolved(name, *at)),
                 }
-                None => return Err(self.unresolved(name, *at)),
+                self.expand_value(value)
             }
+            Value::Typed(call) if matches!(call.name.as_str(), "all" | "any" | "not") => {
+                let mut expanded = call.clone();
+                for (_, value) in &mut expanded.args {
+                    *value = match &*value {
+                        Value::Array(values) => Value::Array(
+                            values
+                                .iter()
+                                .map(|value| self.expand_condition(value))
+                                .collect::<Result<_, _>>()?,
+                        ),
+                        value => self.expand_condition(value)?,
+                    };
+                }
+                Ok(Value::Typed(expanded))
+            }
+            _ => self.expand_value(value),
         }
-        self.expand_value(value)
     }
 
     fn charge(&mut self, at: Position, nodes: usize, bytes: usize) -> Result<(), Error> {

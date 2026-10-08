@@ -195,7 +195,7 @@ fn site(
                 if child
                     .block()?
                     .iter()
-                    .any(|component| is_terminal(&component.name))
+                    .any(|component| is_terminal(component))
                 {
                     answered_codes.extend(route.codes.iter().copied());
                     answered_hundreds.extend(route.hundreds.iter().copied());
@@ -723,7 +723,7 @@ fn route_elements(
     // answers for the extensions it split off and stands down for everything
     // else, which is exactly how `php_fastcgi` alone behaves in a Caddyfile. A
     // file server written after it takes the rest.
-    let answers = is_terminal(&last.name) || last.name == "PHPFastCGI";
+    let answers = is_terminal(last) || last.name == "PHPFastCGI";
     if ending == Ending::Terminal && !answers {
         return Err(last.at.error(format!(
             "a route must end with a component that answers the request: {TERMINALS}; {} only changes it",
@@ -731,7 +731,7 @@ fn route_elements(
         )));
     }
     for child in middleware {
-        if is_terminal(&child.name) {
+        if is_terminal(child) {
             return Err(child.at.error(format!(
                 "{} answers the request on its own, so the components after it can never run",
                 child.name
@@ -749,9 +749,12 @@ fn route_elements(
 const TERMINALS: &str = "Respond, ServeFiles, Proxy, Redirect, Fail, ServeMetrics or ACMEServer";
 
 /// 🅿️ Whether a component writes a response, and therefore ends a route.
-fn is_terminal(name: &str) -> bool {
+fn is_terminal(call: &Call) -> bool {
+    if call.name == "ServeFiles" && matches!(call.get("passThru"), Some(Value::Bool(true))) {
+        return false;
+    }
     matches!(
-        name,
+        call.name.as_str(),
         "Respond" | "ServeFiles" | "Proxy" | "Redirect" | "Fail" | "ServeMetrics" | "ACMEServer"
     )
 }

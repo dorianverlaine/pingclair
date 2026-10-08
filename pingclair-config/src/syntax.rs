@@ -343,27 +343,26 @@ impl Parser {
                 if self.peek() == &Token::End {
                     return Err(self.error("unterminated argument list"));
                 }
-                let label = if let Token::Word(word) = self.peek() {
-                    if word != "true" && word != "false" {
-                        let Item {
-                            token: Token::Word(label),
-                            ..
-                        } = self.next()
-                        else {
-                            unreachable!()
-                        };
-                        self.expect(':')?;
-                        Some(label)
+                // 🏷️ An identifier is a label only when followed by a colon.
+                // Otherwise it is an ordinary immutable value reference.
+                let (label, value) = if matches!(self.peek(), Token::Word(word) if word != "true" && word != "false")
+                {
+                    let item = self.next();
+                    let Token::Word(name) = item.token else {
+                        unreachable!()
+                    };
+                    if self.take(':') {
+                        (Some(name), self.value(depth + 1)?)
                     } else {
-                        None
+                        (None, Value::Reference { name, at: item.at })
                     }
                 } else {
-                    None
+                    (None, self.value(depth + 1)?)
                 };
                 if label.is_some() && args.iter().any(|(old, _)| old == &label) {
                     return Err(at.error("duplicate argument label"));
                 }
-                args.push((label, self.value(depth + 1)?));
+                args.push((label, value));
                 if self.take(')') {
                     break;
                 }
