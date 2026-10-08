@@ -1807,6 +1807,62 @@ fn proxy_header_lists_lower_like_their_caddyfile_twins() {
     assert_eq!(twin(native), twin(legacy));
 }
 
+/// 🌐 `dynamic:` lowers exactly like the Caddyfile's `dynamic` directive.
+#[test]
+fn proxy_dynamic_upstreams_lower_like_their_caddyfile_twins() {
+    let native = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+            Proxy(dynamic: .a("backend.internal", port: 8080, refresh: .seconds(30), resolvers: ["1.1.1.1"], dialTimeout: .seconds(2), versions: .ipv4))
+        } } }"#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "http://:8080 {\n\treverse_proxy {\n\t\tdynamic a backend.internal 8080 {\n\t\t\trefresh 30s\n\t\t\tresolvers 1.1.1.1\n\t\t\tdial_timeout 2s\n\t\t\tversions ipv4\n\t\t}\n\t}\n}",
+    )
+    .unwrap();
+    assert_eq!(twin(native), twin(legacy));
+
+    let native = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+            Proxy(dynamic: .srv("example.com", service: "https", proto: .tcp, grace: .seconds(30)))
+        } } }"#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "http://:8080 {\n\treverse_proxy {\n\t\tdynamic srv example.com {\n\t\t\tservice https\n\t\t\tproto tcp\n\t\t\tgrace_period 30s\n\t\t}\n\t}\n}",
+    )
+    .unwrap();
+    assert_eq!(twin(native), twin(legacy));
+}
+
+#[test]
+fn proxy_dynamic_mistakes_fail_closed() {
+    let site = |handler: &str| {
+        format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {handler} }} }} }}"
+        )
+    };
+    for handler in [
+        "Proxy()",
+        "Proxy(to: \"127.0.0.1:9000\", dynamic: .a(\"x\", port: 80))",
+        "Proxy(dynamic: \"x\")",
+        "Proxy(dynamic: .b(\"x\"))",
+        "Proxy(dynamic: .a(\"x\"))",
+        "Proxy(dynamic: .a(port: 80))",
+        "Proxy(dynamic: .a(\"x\", port: 0))",
+        "Proxy(dynamic: .a(\"x\", port: 80, refresh: .seconds(0)))",
+        "Proxy(dynamic: .a(\"x\", port: 80, resolvers: []))",
+        "Proxy(dynamic: .a(\"x\", port: 80, versions: .ip))",
+        "Proxy(dynamic: .a(\"x\", port: 80, unknown: 1))",
+        "Proxy(dynamic: .srv(\"x\", service: \"https\"))",
+        "Proxy(dynamic: .srv(\"x\", proto: .tcp))",
+        "Proxy(dynamic: .srv(\"x\", unknown: 1))",
+    ] {
+        let source = site(handler);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
 /// 🗄️ `.cache(...)` lowers exactly like the Caddyfile's `cache` block.
 #[test]
 fn proxy_cache_lowers_like_its_caddyfile_twin() {

@@ -465,12 +465,8 @@ fn expect_bare_case(case: &Call, what: &str) -> Result<(), Error> {
 }
 
 /// ⏱️ A typed duration value (`.seconds(30)`, `.minutes(2)`, `.hours(1)`,
-/// `.milliseconds(500)`) as whole seconds.
-///
-/// 📌 Sub-second values round up, the way the Caddyfile adapter rounds its own
-/// sub-second durations: rounding down would turn "wait a moment" into "do
-/// not wait".
-pub(super) fn duration_secs(value: &Value, what: &str, at: Position) -> Result<u64, Error> {
+/// `.milliseconds(500)`) in milliseconds.
+pub(super) fn duration_millis(value: &Value, what: &str, at: Position) -> Result<u64, Error> {
     let Value::Typed(unit) = value else {
         return Err(at.error(format!(
             "{what} takes a duration with an explicit unit such as .seconds(30) or .minutes(2)"
@@ -487,14 +483,16 @@ pub(super) fn duration_secs(value: &Value, what: &str, at: Position) -> Result<u
             .at
             .error(format!("{what} takes one unsigned integer inside its unit")));
     };
-    let seconds = match unit.name.as_str() {
-        "milliseconds" => number.div_ceil(1000),
-        "seconds" => *number,
+    let millis = match unit.name.as_str() {
+        "milliseconds" => *number,
+        "seconds" => number
+            .checked_mul(1_000)
+            .ok_or_else(|| unit.at.error("duration exceeds the supported range"))?,
         "minutes" => number
-            .checked_mul(60)
+            .checked_mul(60_000)
             .ok_or_else(|| unit.at.error("duration exceeds the supported range"))?,
         "hours" => number
-            .checked_mul(3600)
+            .checked_mul(3_600_000)
             .ok_or_else(|| unit.at.error("duration exceeds the supported range"))?,
         other => {
             return Err(unit.at.error(format!(
@@ -502,7 +500,16 @@ pub(super) fn duration_secs(value: &Value, what: &str, at: Position) -> Result<u
             )));
         }
     };
-    Ok(seconds)
+    Ok(millis)
+}
+
+/// ⏱️ The same duration in whole seconds.
+///
+/// 📌 Sub-second values round up, the way the Caddyfile adapter rounds its own
+/// sub-second durations: rounding down would turn "wait a moment" into "do
+/// not wait".
+pub(super) fn duration_secs(value: &Value, what: &str, at: Position) -> Result<u64, Error> {
+    Ok(duration_millis(value, what, at)?.div_ceil(1_000))
 }
 
 impl Call {

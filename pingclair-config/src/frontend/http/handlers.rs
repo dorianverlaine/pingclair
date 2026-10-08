@@ -6,7 +6,9 @@
 use super::*;
 
 use super::conditions::{file_candidate, file_candidates, file_policy};
-use pingclair_core::config::CacheConfig;
+use pingclair_core::config::{
+    CacheConfig, DynamicAddrUpstream, DynamicSrvUpstream, DynamicUpstreamConfig,
+};
 
 /// 🗂️ `TryFiles(candidates:, root:, policy:)`: rewrite to the first candidate
 /// that exists, then stand down so the next component serves it.
@@ -1429,7 +1431,7 @@ fn php_fastcgi(call: &Call) -> Result<HandlerConfig, Error> {
 }
 
 /// 🏷️ The argument labels `proxy` accepts, named once for the parser and `describe`.
-pub(crate) const PROXY_LABELS: &[&str] = &["to", "headersUp", "headersDown"];
+pub(crate) const PROXY_LABELS: &[&str] = &["to", "dynamic", "headersUp", "headersDown"];
 
 /// 🌐 `.Proxy(to:)`: the reverse proxy with the build's bare defaults.
 fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
@@ -1442,7 +1444,28 @@ fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
              `.loadBalance(.roundRobin)`",
         ));
     }
-    let upstreams = upstream_values(call)?;
+    // 🌐 The upstream's identity stays in the call, and there is exactly one
+    // source: a list of addresses, or one DNS-backed source.
+    let dynamic = match (call.get("to").is_some(), call.get("dynamic")) {
+        (true, Some(_)) => {
+            return Err(call.at.error(
+                "Proxy takes one upstream source: to: [...] or dynamic: .a(...)／.srv(...), \
+                 not both",
+            ));
+        }
+        (false, None) => {
+            return Err(call.at.error(
+                "Proxy needs an upstream source: to: [...] or dynamic: .a(...)／.srv(...)",
+            ));
+        }
+        (false, Some(value)) => Some(proxy_dynamic(value, call.at)?),
+        (true, None) => None,
+    };
+    let upstreams = if dynamic.is_some() {
+        Vec::new()
+    } else {
+        upstream_values(call)?
+    };
     let up = header_list(call, "headersUp", false)?;
     let down = header_list(call, "headersDown", true)?;
     let mut config = reverse_proxy(
@@ -1450,6 +1473,7 @@ fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
         None,
     );
     config.upstream_options = upstreams;
+    config.dynamic_upstream = dynamic.map(Box::new);
     let mut chosen_policy = None;
     let mut seen = std::collections::HashSet::new();
     for modifier in &call.modifiers {
@@ -1775,6 +1799,226 @@ fn proxy_cache(modifier: &Call) -> Result<CacheConfig, Error> {
         ttl_secs: millis / 1000,
         max_size_bytes,
     })
+}
+
+/// 🌐 `dynamic: .a(...)` / `dynamic: .srv(...)`: DNS-backed upstream discovery.
+///
+/// 📌 The source is upstream identity, like `to:`, so it stays in the call
+/// rather than in a modifier; `refresh:` and `resolvers:` live inside the
+/// source because they mean nothing for a static address list.
+fn proxy_dynamic(value: &Value, at: Position) -> Result<DynamicUpstreamConfig, Error> {
+    let Value::Typed(source) = value else {
+        return Err(at.error("dynamic takes .a(...) or .srv(...)"));
+    };
+    match source.name.as_str() {
+        "a" => Ok(DynamicUpstreamConfig::A(dynamic_address(source)?)),
+        "srv" => Ok(DynamicUpstreamConfig::Srv(dynamic_service(source)?)),
+        other => Err(source.at.error(format!(
+            "unknown dynamic source `.{other}`; expected .a(...) for address records or \
+             .srv(...) for service records"
+        ))),
+    }
+}
+
+/// 📜 `.a("backend.internal", port:, refresh:, resolvers:, dialTimeout:, versions:)`.
+fn dynamic_address(source: &Call) -> Result<DynamicAddrUpstream, Error> {
+    let mut name: Option<String> = None;
+    let mut port: Option<u16> = None;
+    let mut refresh_secs: Option<u64> = None;
+    let mut resolvers = Vec::new();
+    let mut dial_timeout_ms: Option<u64> = None;
+    let mut versions: Option<String> = None;
+    let mut seen = std::collections::HashSet::new();
+    for (label, value) in &source.args {
+        let Some(label) = label.as_deref() else {
+            if name.is_some() {
+                return Err(source
+                    .at
+                    .error(".a takes one hostname, e.g. .a(\"backend.internal\", port: 8080)"));
+            }
+            let Value::String(text) = value else {
+                return Err(source.at.error(".a takes one quoted hostname"));
+            };
+            if text.is_empty() {
+                return Err(source.at.error(".a takes a non-empty hostname"));
+            }
+            name = Some(text.clone());
+            continue;
+        };
+        if !seen.insert(label) {
+            return Err(source
+                .at
+                .error(format!(".a setting `{label}` is written twice")));
+        }
+        match label {
+            "port" => port = Some(port_number(value, "port", source.at)?),
+            "refresh" => {
+                let seconds = duration_secs(value, "refresh", source.at)?;
+                if seconds == 0 {
+                    return Err(source.at.error("refresh must be at least one second"));
+                }
+                refresh_secs = Some(seconds);
+            }
+            "resolvers" => {
+                resolvers = crate::frontend::log::string_list(value, "resolvers", source.at)?;
+            }
+            "dialTimeout" => {
+                dial_timeout_ms = Some(duration_millis(value, "dialTimeout", source.at)?);
+            }
+            "versions" => versions = Some(version_filter(value, source.at)?),
+            other => {
+                return Err(source.at.error(format!(
+                    "unknown .a setting `{other}`; expected port, refresh, resolvers, \
+                     dialTimeout or versions"
+                )));
+            }
+        }
+    }
+    let name = name.ok_or_else(|| {
+        source
+            .at
+            .error(".a takes one hostname, e.g. .a(\"backend.internal\", port: 8080)")
+    })?;
+    let port = port.ok_or_else(|| {
+        source
+            .at
+            .error(".a needs port:, e.g. .a(\"backend.internal\", port: 8080)")
+    })?;
+    Ok(DynamicAddrUpstream {
+        name,
+        port,
+        refresh_secs,
+        resolvers,
+        dial_timeout_ms,
+        fallback_delay_ms: None,
+        versions,
+    })
+}
+
+/// 🧾 `.srv("example.com", service:, proto:, refresh:, resolvers:, dialTimeout:, grace:)`.
+fn dynamic_service(source: &Call) -> Result<DynamicSrvUpstream, Error> {
+    let mut name: Option<String> = None;
+    let mut service: Option<String> = None;
+    let mut proto: Option<String> = None;
+    let mut refresh_secs: Option<u64> = None;
+    let mut resolvers = Vec::new();
+    let mut dial_timeout_ms: Option<u64> = None;
+    let mut grace_period_ms: Option<u64> = None;
+    let mut seen = std::collections::HashSet::new();
+    for (label, value) in &source.args {
+        let Some(label) = label.as_deref() else {
+            if name.is_some() {
+                return Err(source.at.error(
+                    ".srv takes one SRV name, e.g. .srv(\"example.com\", service: \"https\", \
+                     proto: .tcp)",
+                ));
+            }
+            let Value::String(text) = value else {
+                return Err(source.at.error(".srv takes one quoted SRV name"));
+            };
+            if text.is_empty() {
+                return Err(source.at.error(".srv takes a non-empty SRV name"));
+            }
+            name = Some(text.clone());
+            continue;
+        };
+        if !seen.insert(label) {
+            return Err(source
+                .at
+                .error(format!(".srv setting `{label}` is written twice")));
+        }
+        match label {
+            "service" => {
+                let Value::String(text) = value else {
+                    return Err(source.at.error("service takes a quoted service label"));
+                };
+                if text.is_empty() {
+                    return Err(source.at.error("service must not be empty"));
+                }
+                service = Some(text.clone());
+            }
+            "proto" => {
+                let Value::Typed(proto_value) = value else {
+                    return Err(source.at.error("proto takes .tcp or .udp"));
+                };
+                proto_value.leaf(&[])?;
+                proto = Some(match proto_value.name.as_str() {
+                    "tcp" => "tcp".to_string(),
+                    "udp" => "udp".to_string(),
+                    other => {
+                        return Err(proto_value
+                            .at
+                            .error(format!("unknown proto `.{other}`; expected .tcp or .udp")));
+                    }
+                });
+            }
+            "refresh" => {
+                let seconds = duration_secs(value, "refresh", source.at)?;
+                if seconds == 0 {
+                    return Err(source.at.error("refresh must be at least one second"));
+                }
+                refresh_secs = Some(seconds);
+            }
+            "resolvers" => {
+                resolvers = crate::frontend::log::string_list(value, "resolvers", source.at)?;
+            }
+            "dialTimeout" => {
+                dial_timeout_ms = Some(duration_millis(value, "dialTimeout", source.at)?);
+            }
+            "grace" => grace_period_ms = Some(duration_millis(value, "grace", source.at)?),
+            other => {
+                return Err(source.at.error(format!(
+                    "unknown .srv setting `{other}`; expected service, proto, refresh, \
+                     resolvers, dialTimeout or grace"
+                )));
+            }
+        }
+    }
+    let name = name.ok_or_else(|| {
+        source
+            .at
+            .error(".srv takes one SRV name, e.g. .srv(\"example.com\")")
+    })?;
+    // 🚫 One of `service`/`proto` without the other would silently look the
+    // bare `name` up instead of `_service._proto.name`.
+    if service.is_some() != proto.is_some() {
+        return Err(source.at.error(
+            "service and proto go together: write both, or neither to look up the name as given",
+        ));
+    }
+    Ok(DynamicSrvUpstream {
+        name,
+        service,
+        proto,
+        refresh_secs,
+        resolvers,
+        dial_timeout_ms,
+        fallback_delay_ms: None,
+        grace_period_ms,
+    })
+}
+
+/// 🧭 `versions: .ipv4` / `.ipv6` for a dynamic address source.
+fn version_filter(value: &Value, at: Position) -> Result<String, Error> {
+    let Value::Typed(filter) = value else {
+        return Err(at.error("versions takes .ipv4 or .ipv6"));
+    };
+    filter.leaf(&[])?;
+    match filter.name.as_str() {
+        "ipv4" => Ok("ipv4".to_string()),
+        "ipv6" => Ok("ipv6".to_string()),
+        other => Err(filter.at.error(format!(
+            "unknown version filter `.{other}`; expected .ipv4 or .ipv6"
+        ))),
+    }
+}
+
+/// 🔌 A port number for `.a(..., port:)`.
+fn port_number(value: &Value, setting: &str, at: Position) -> Result<u16, Error> {
+    match value {
+        Value::Number(port) if (1..=65535).contains(port) => Ok(*port as u16),
+        _ => Err(at.error(format!("{setting} takes a port between 1 and 65535"))),
+    }
 }
 
 /// 🌐 The one unlabelled value a modifier takes.

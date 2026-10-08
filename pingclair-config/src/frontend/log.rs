@@ -521,7 +521,7 @@ fn byte_size(value: &Value, at: Position) -> Result<u64, Error> {
 }
 
 /// 🧷 A non-empty array of non-empty quoted strings.
-fn string_list(value: &Value, label: &str, at: Position) -> Result<Vec<String>, Error> {
+pub(super) fn string_list(value: &Value, label: &str, at: Position) -> Result<Vec<String>, Error> {
     let Value::Array(items) = value else {
         return Err(at.error(format!("{label} takes an array of quoted strings")));
     };

@@ -124,6 +124,72 @@
           }
         },
         {
+          "path": "/discovered",
+          "handler": {
+            "type": "reverse_proxy",
+            "upstreams": [],
+            "dynamic_upstream": {
+              "Srv": {
+                "name": "backend.example.test",
+                "service": "https",
+                "proto": "tcp",
+                "refresh_secs": 30,
+                "grace_period_ms": 30000
+              }
+            },
+            "upstream_options": [],
+            "load_balance": {
+              "strategy": ""
+            },
+            "health_check": null,
+            "headers_up": {},
+            "headers_down": {},
+            "flush_interval": null,
+            "read_timeout": null,
+            "write_timeout": null,
+            "connect_timeout": null,
+            "first_byte_timeout": null,
+            "between_reads_timeout": null,
+            "retry": {
+              "max_attempts": 16,
+              "total_timeout_ms": null,
+              "backoff_ms": 0
+            },
+            "overload": {
+              "max_in_flight": null,
+              "max_pending": 0,
+              "pending_timeout_ms": 1000,
+              "upstream_max_connections": null
+            },
+            "circuit_breaker": {
+              "consecutive_failures": null,
+              "error_rate_percent": null,
+              "minimum_requests": 20,
+              "window_requests": 100,
+              "open_duration_ms": 30000,
+              "half_open_requests": 1,
+              "failure_statuses": []
+            },
+            "upstream_tls": {
+              "enable": false,
+              "server_name": null,
+              "trusted_ca_certs": [],
+              "client_cert": null,
+              "client_key": null,
+              "insecure_skip_verify": false
+            },
+            "cache": null
+          },
+          "methods": null,
+          "matcher": {
+            "path": {
+              "patterns": [
+                "/discovered"
+              ]
+            }
+          }
+        },
+        {
           "path": "/*",
           "handler": {
             "type": "file_server",

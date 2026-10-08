@@ -23,6 +23,18 @@ HTTPListener(on: ":8080") {
             // process-wide and shared by every cached route.
             .cache(ttl: .seconds(30), maxSize: .mebibytes(128))
         }
+
+        // 🌐 DNS-discovered upstreams: the peers come from the service records
+        // of one name, refreshed on their own schedule.
+        Route(when: .path(exact: "/discovered")) {
+            Proxy(dynamic: .srv(
+                "backend.example.test",
+                service: "https",
+                proto: .tcp,
+                refresh: .seconds(30),
+                grace: .seconds(30),
+            ))
+        }
         Fallback { ServeFiles(root: "./public") }
     }
 }
