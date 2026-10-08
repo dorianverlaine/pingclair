@@ -3013,7 +3013,7 @@ fn health_check(value: &Value, at: Position) -> Result<HealthCheckConfig, Error>
                     // and why this reads differently from the response
                     // matchers that keep the digit.
                     Value::Typed(class) => {
-                        let hundred = u16::from(status_class(class)?) * 100;
+                        let hundred = status_class(class)? * 100;
                         codes.extend(hundred..=hundred + 99);
                         continue;
                     }
