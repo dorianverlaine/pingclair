@@ -3605,6 +3605,113 @@ async fn test_cors_and_access_control_end_to_end() {
     assert_eq!(response.status(), 403);
 }
 
+/// 🛡️ A guard written with a `not` matcher must stay quiet on the requests
+/// its own matcher exempts, even though the guard is copied into the route
+/// that answers them — the hoist has to keep the element matcher (issue
+/// #314).
+#[tokio::test]
+async fn test_negated_access_control_keeps_its_exemption() {
+    let config = r#"
+        {
+            admin off
+            auto_https off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            @exempt path /exempt*
+            respond @exempt "exempt"
+
+            @guarded not path /exempt*
+            access_control @guarded {
+                deny_user_agent (?i)blockedbot
+            }
+            respond "ok"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let exempt = client
+        .get(server.url(0, "/exempt/token"))
+        .header("User-Agent", "BlockedBot/1.0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        exempt.status(),
+        200,
+        "`not path /exempt*` must exempt the route its own matcher names"
+    );
+    assert_eq!(exempt.text().await.unwrap(), "exempt");
+
+    let guarded = client
+        .get(server.url(0, "/other"))
+        .header("User-Agent", "BlockedBot/1.0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        guarded.status(),
+        403,
+        "the guard still answers inside its own scope"
+    );
+}
+
+/// 🚦 The same shape for the limiter: exempt requests must not charge the
+/// guarded route's bucket, and the bucket must still refuse when it fills
+/// (issue #314).
+#[tokio::test]
+async fn test_negated_rate_limit_keeps_its_exemption() {
+    let config = r#"
+        {
+            admin off
+            auto_https off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle /api* {
+                @guarded not path /api/special*
+                rate_limit @guarded 1 60s
+                respond "api"
+            }
+            respond "ok"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🎟️ Both exempt requests must answer, because the guard never charged
+    // them; a build that ignores the matcher refuses the second one.
+    for _ in 0..2 {
+        let exempt = client
+            .get(server.url(0, "/api/special/x"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            exempt.status(),
+            200,
+            "an exempt request must not be rate-limited"
+        );
+    }
+
+    // 🚫 The guarded route's own bucket is untouched by those requests: its
+    // first request is allowed and its second is refused, so the exemption
+    // did not simply turn the limiter off.
+    let first = client.get(server.url(0, "/api/x")).send().await.unwrap();
+    assert_eq!(first.status(), 200);
+    let second = client.get(server.url(0, "/api/x")).send().await.unwrap();
+    assert_eq!(second.status(), 429);
+}
+
 #[tokio::test]
 async fn test_regex_rewrite_reaches_the_rewritten_static_path() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -4812,6 +4919,84 @@ async fn test_pingclairfile_header_replace_rewrites_an_upstream_value() {
         "the replacement must run against what the upstream actually sent"
     );
 
+    upstream_task.await.unwrap();
+}
+
+/// 🗄️ `header_up` takes the same shapes `header_down` does.
+///
+/// The request half used to know only set and delete — `+Name` reached the
+/// origin as a field literally named `+Name`, `?Name` turned every request
+/// into a 500 (an invalid field name the transport rejected, with the client
+/// paying for it), and the three-argument rewrite was refused (#311). One
+/// implementation now serves both directives; this drives the three remaining
+/// shapes through a real upstream and reads back the head it received.
+#[tokio::test]
+async fn test_pingclairfile_header_up_shapes_reach_the_origin() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let head = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        let body = String::from_utf8_lossy(&head).to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            reverse_proxy http://{upstream_address} {{
+                header_up +X-Append two
+                header_up -X-Remove
+                header_up X-Rewrite old new
+            }}
+        }}
+    "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/probe"))
+        .header("X-Append", "one")
+        .header("X-Remove", "gone")
+        .header("X-Rewrite", "old value")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let seen = response.text().await.unwrap().to_ascii_lowercase();
+    assert!(
+        seen.contains("x-append: one\r\nx-append: two\r\n"),
+        "the client's value and the appended one must both arrive: {seen}"
+    );
+    assert!(
+        !seen.contains("x-remove"),
+        "a removed field must not reach the origin: {seen}"
+    );
+    assert!(
+        seen.contains("x-rewrite: new value\r\n"),
+        "the rewrite must run against what the client sent: {seen}"
+    );
     upstream_task.await.unwrap();
 }
 

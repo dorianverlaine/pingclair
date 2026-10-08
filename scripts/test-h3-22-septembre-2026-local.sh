@@ -253,6 +253,11 @@ https://${primary_host}:${h3_port} {
 	request_body {
 		max_size 1MiB
 	}
+	# 🧾 The header ceiling this matrix checks a 431 against, and the record
+	# the refusal must leave in the log (#308).
+	limits {
+		max_header_bytes 4096
+	}
 	handle /ready {
 		respond "ready" 200
 	}
@@ -522,6 +527,16 @@ fi
 tpl_escape="$(h3 "${primary_host}" -o /dev/null -w '%{http_code}' -sS \
     "https://${primary_host}:${h3_port}/tpl/%2e%2e%2f%2e%2e%2fetc%2fpasswd")"
 check_eq "escaped traversal refused on the H3 templates path" "404" "${tpl_escape}"
+
+log ""
+log "🧾 Header-limit refusal — H3 builds this answer itself, and must record it"
+# 🧾 H1/H2 leave Pingora's early-filter line as a side effect; the H3 path
+# builds its own 431 and used to leave nothing in the log at all (#308).
+limit_status="$(h3 "${primary_host}" -o /dev/null -w '%{http_code}' -sS \
+    -H "X-Pad: $(printf 'x%.0s' {1..8192})" "https://${primary_host}:${h3_port}/who")"
+check_eq "an oversized header block is refused with 431 over H3" "431" "${limit_status}"
+limit_records="$(grep -c 'request headers exceed configured limits' "${run_dir}/pingclair.log" || true)"
+check_eq "the refusal is recorded once" "1" "${limit_records}"
 
 log ""
 log "═══════════════════════════════════════════"

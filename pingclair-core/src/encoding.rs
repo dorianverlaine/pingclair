@@ -228,6 +228,34 @@ pub fn negotiate<'a>(accept_encoding: &str, offered: &[&'a str]) -> Option<&'a s
     negotiate_by(accept_encoding, offered, |coding| coding).copied()
 }
 
+/// 🛡️ Whether a `Cache-Control` field carries `no-transform`.
+///
+/// Read over every field line and every comma-separated token, because
+/// RFC 9110 §5.3 lets a list arrive either way. The directive is defined for
+/// both sides: RFC 9111 §5.2.1 makes it a request directive (the client wants
+/// the bytes it would have received untransformed, which is what a signed
+/// download or a hash check depends on) and §5.2.2.6 binds the intermediary
+/// when a response carries it too.
+pub fn forbids_transform(headers: &http::HeaderMap) -> bool {
+    headers
+        .get_all(http::header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .any(|token| token.eq_ignore_ascii_case("no-transform"))
+}
+
+/// 🛡️ Whether a request's `Cache-Control` still permits transforming its
+/// response.
+///
+/// The proxy path has asked this since compression existed; the static file
+/// server did not, so the same URL was compressed or left alone depending on
+/// which handler answered (#309).
+pub fn request_allows_encoding(headers: &http::HeaderMap) -> bool {
+    !forbids_transform(headers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,6 +289,37 @@ mod tests {
         // 🥇 Equal quality falls back to the server's order.
         assert_eq!(negotiate("gzip, zstd", BOTH), Some("zstd"));
         assert_eq!(negotiate("gzip, zstd", &["gzip", "zstd"]), Some("gzip"));
+    }
+
+    /// 🛡️ `no-transform` is read from every spelling the field allows.
+    #[test]
+    fn no_transform_is_read_from_every_cache_control_line() {
+        let allows = |lines: &[&str]| {
+            let mut headers = http::HeaderMap::new();
+            for line in lines {
+                headers.append(
+                    http::header::CACHE_CONTROL,
+                    http::HeaderValue::from_str(line).unwrap(),
+                );
+            }
+            request_allows_encoding(&headers)
+        };
+        for lines in [
+            &["no-transform"][..],
+            &["max-age=60", "no-transform"][..],
+            &["max-age=60, no-transform"][..],
+            &[" NO-TRANSFORM "][..],
+        ] {
+            assert!(!allows(lines), "{lines:?} must forbid the transform");
+        }
+        for lines in [
+            &[][..],
+            &["max-age=60"][..],
+            &["no-transformation"][..],
+            &["max-age=60", "public"][..],
+        ] {
+            assert!(allows(lines), "{lines:?} must leave encoding allowed");
+        }
     }
 
     #[test]

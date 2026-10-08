@@ -138,3 +138,32 @@ async fn h3_respond_204_carries_no_content() {
         (204, Vec::new(), 0)
     );
 }
+
+/// 🧭 A local body carries Caddy's default type on HTTP/3 too.
+///
+/// `respond` and `error` assemble their own header list on this path, and the
+/// `text/plain; charset=utf-8` default the H1/H2 builders apply was missing
+/// here: one route carried the field on two transports and nothing at all on
+/// the third (#306).
+#[tokio::test]
+async fn h3_local_bodies_carry_the_default_content_type() {
+    let respond = spawn_h3_from_pingclairfile(":443 {\n respond \"hello\"\n}").await;
+    let response = h3_get(respond, "/").await.unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        fields(&response, "content-type"),
+        vec!["text/plain; charset=utf-8"],
+        "respond must carry Caddy's default Content-Type on HTTP/3: {:?}",
+        response.headers
+    );
+
+    let raised = spawn_h3_from_pingclairfile(":443 {\n error \"boom\" 500\n}").await;
+    let response = h3_get(raised, "/").await.unwrap();
+    assert_eq!(response.status, 500);
+    assert_eq!(
+        fields(&response, "content-type"),
+        vec!["text/plain; charset=utf-8"],
+        "error must carry Caddy's default Content-Type on HTTP/3: {:?}",
+        response.headers
+    );
+}

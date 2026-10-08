@@ -20,8 +20,13 @@
 //! it should run ahead of, keeping its matcher as a step guard. Which routes
 //! it reaches is decided here, once:
 //!
-//! - **Unmatched site middleware** (`header X-Site on`) goes ahead of every
-//!   answering route, as it did before this module existed.
+//! - **Unmatched site middleware** (`header X-Site on`) goes ahead of an
+//!   answering route when the directive order puts it first, exactly like a
+//!   matched line. `redir`, which the order puts ahead of `basic_auth`,
+//!   answers without asking for credentials whether or not either line
+//!   carries a matcher — the site-wide guard used to be copied ahead of
+//!   every route unconditionally, so the same URL was a 308 with no
+//!   `basic_auth` and a 401 with one (#310).
 //! - **Matched middleware** (`basic_auth /secret { … }`) goes ahead of an
 //!   answering route when the directive order puts it first — a lower rank
 //!   than the directive that answers. `redir`, which the order puts ahead of
@@ -107,13 +112,17 @@ pub(super) fn compose_site_routes(
             .as_ref()
             .and_then(|matcher| sort_path(matcher, matchers));
         let steps = sorted(
-            site.iter().chain(
-                scoped
-                    .iter()
-                    .map(|(_, step)| step)
-                    .filter(|step| step.key.rank() < answering)
-                    .filter(|step| may_rewrite || !never_both(route_path, &step.element, matchers)),
-            ),
+            site.iter()
+                .filter(|step| step.key.rank() < answering)
+                .chain(
+                    scoped
+                        .iter()
+                        .map(|(_, step)| step)
+                        .filter(|step| step.key.rank() < answering)
+                        .filter(|step| {
+                            may_rewrite || !never_both(route_path, &step.element, matchers)
+                        }),
+                ),
         );
         if steps.is_empty() {
             continue;

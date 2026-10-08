@@ -38,6 +38,14 @@ use tokio::sync::{broadcast, watch};
 #[cfg(unix)]
 use crate::systemd::notify_systemd_stopping;
 
+/// ⏱️ How long a shutdown that served a request gives the transports to put
+/// queued bytes on the wire before the process exits.
+///
+/// One scheduling round of the connection tasks is normally enough, and this
+/// bound is the room a loaded machine needs for it. It is deliberately not the
+/// configured grace period: that sleeps even when nothing is left to do.
+const FLUSH_BUDGET: Duration = Duration::from_millis(100);
+
 /// 🛑 Listens for every way to ask this process to stop, from startup on.
 ///
 /// The signal handlers are installed here, on the background runtime, before
@@ -170,6 +178,17 @@ pub(crate) async fn drain_then_exit(
     // because a QUIC client is not told when a process exits and would wait
     // out its idle timeout instead.
     let stopped = pingclair_proxy::drain::stop(grace).await;
+    // 🧼 The count reaches zero when the proxy has *handed* the response to
+    // its transport, which is not the same as the bytes being on the wire:
+    // an HTTP/1 response is written synchronously, while the HTTP/2 codec
+    // queues frames for its connection task to flush — and TLS buffers one
+    // layer more. This process exits from a different runtime, so without
+    // this the connection could close with the response still in userspace
+    // (#313). A shutdown that served nothing pays nothing; one that did pays
+    // this bound, far below any configured grace period.
+    if running > 0 {
+        tokio::time::sleep(FLUSH_BUDGET).await;
+    }
     if stopped.cut > 0 {
         tracing::warn!(
             "⏱️ Grace period of {}s ended with {} request(s) still running; they were cut",

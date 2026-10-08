@@ -192,6 +192,7 @@ pub(crate) struct EnvironmentInput<'a> {
 pub(crate) fn prepare_request_header(
     request: &RequestHeader,
     headers_up: &BTreeMap<String, String>,
+    headers_up_add: &BTreeMap<String, Vec<String>>,
     headers_up_remove: &[String],
     verified_client_ip: Option<&str>,
     scheme: &'static str,
@@ -210,10 +211,80 @@ pub(crate) fn prepare_request_header(
             .insert_header(name.clone(), resolved.as_ref())
             .map_err(|_| ())?;
     }
+    // 📋 `header_up +Name` appends every value in order, the same shape the
+    // HTTP path gives it (#311).
+    for (name, templates) in headers_up_add {
+        for template in templates {
+            let resolved = crate::server::resolve_caddy_placeholders(
+                template,
+                request,
+                verified_client_ip,
+                scheme,
+                request_vars,
+            );
+            prepared
+                .append_header(name.clone(), resolved.as_ref())
+                .map_err(|_| ())?;
+        }
+    }
     for name in headers_up_remove {
         prepared.remove_header(name.as_str());
     }
     Ok(prepared)
+}
+
+/// 🔁 Applies `header_up >Name find replacement` to a prepared request.
+///
+/// The pattern comes from the route's compiled table — a `header_up` rewrite
+/// searches with a regex exactly as the response side does, and pays the
+/// per-request build only when the pattern itself carries a placeholder
+/// (#311).
+pub(crate) fn apply_request_replacements(
+    prepared: &mut RequestHeader,
+    replacements: &[pingclair_core::config::HeaderReplacement],
+    state: &crate::server::ProxyState,
+    route_index: usize,
+    verified_client_ip: Option<&str>,
+    scheme: &'static str,
+    request_vars: &RequestVars,
+) -> Result<(), ()> {
+    for replacement in replacements {
+        let Some((regex, resolved_replacement)) = crate::server::compiled_header_replacement(
+            state,
+            route_index,
+            None,
+            replacement,
+            prepared,
+            verified_client_ip,
+            scheme,
+            request_vars,
+        ) else {
+            continue;
+        };
+        let existing: Vec<String> = prepared
+            .headers
+            .get_all(&replacement.field)
+            .iter()
+            .filter_map(|value| value.to_str().ok().map(str::to_owned))
+            .collect();
+        if existing.is_empty() {
+            continue;
+        }
+        let _ = prepared.remove_header(&replacement.field);
+        for value in existing {
+            let rewritten = regex.replace_all(&value, resolved_replacement.as_str());
+            if prepared
+                .append_header(replacement.field.clone(), rewritten.as_ref())
+                .is_err()
+            {
+                tracing::warn!(
+                    header = %replacement.field,
+                    "🚫 header_up replacement produced an invalid value"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 🧾 The CGI environment, name to value.
@@ -665,6 +736,7 @@ mod tests {
         let prepared = prepare_request_header(
             &request,
             &headers_up,
+            &BTreeMap::new(),
             &[],
             Some("192.0.2.4"),
             "https",

@@ -2813,6 +2813,26 @@ async fn h3_raise_status(
     .await
 }
 
+/// 🧭 The `Content-Type` a local body carries by default on every transport.
+///
+/// Caddy answers `respond` and `error` with `text/plain; charset=utf-8` unless
+/// the configuration names another type, and the HTTP/1.1 and HTTP/2 paths
+/// have applied that rule since they were written. HTTP/3 builds its own
+/// header map, and it never did: the same route served a typed body on two
+/// transports and an untyped one on the third (#306).
+fn default_local_headers(mut headers: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    if !headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("content-type"))
+    {
+        headers.insert(
+            "Content-Type".to_string(),
+            "text/plain; charset=utf-8".to_string(),
+        );
+    }
+    headers
+}
+
 /// 🧩 Executes non-terminal middleware before selecting an H3 terminal handler.
 #[async_recursion::async_recursion]
 #[allow(clippy::too_many_arguments)]
@@ -3361,7 +3381,7 @@ async fn plan_h3_handler_with_connector(
             Ok(H3Plan::Terminal(H3Terminal::Respond {
                 status: *status,
                 body,
-                headers: headers.clone(),
+                headers: default_local_headers(headers.clone()),
             }))
         }
         // 🚨 A static error answers with its status and message on HTTP/3
@@ -3420,7 +3440,7 @@ async fn plan_h3_handler_with_connector(
                         H3Plan::Continue => H3Plan::Terminal(H3Terminal::Respond {
                             status: *status,
                             body: body.clone(),
-                            headers: BTreeMap::new(),
+                            headers: default_local_headers(BTreeMap::new()),
                         }),
                         // 🚨 A `file_server` anywhere in the error route serves
                         // that route's page, with the raised status — the
@@ -3440,7 +3460,7 @@ async fn plan_h3_handler_with_connector(
             Ok(H3Plan::Terminal(H3Terminal::Respond {
                 status: *status,
                 body,
-                headers: BTreeMap::new(),
+                headers: default_local_headers(BTreeMap::new()),
             }))
         }
         // 🧭 Resolved here rather than at send time so H3 and H1/H2 expand the
@@ -3968,6 +3988,10 @@ async fn handle_request_inner(
             // routing never enters `handle_errors` on any transport (#288);
             // `send_error_response` still applies a configured
             // `error_page 431`, exactly as H1/H2 do.
+            // 🧾 The same record the H1/H2 refusal writes: this path builds
+            // the 431 itself, and before the record existed a QUIC refusal
+            // left nothing in the log at all (#308).
+            crate::header_limits::log_refusal("h3", breach.detail().as_deref());
             send_error_response(
                 resp_tx,
                 stream_id,
@@ -4092,30 +4116,61 @@ async fn handle_request_inner(
         raised = Some(413);
     }
 
-    // 🛡️ HTTP/3 enforces the same compiled access policy before authentication or dispatch.
-    if raised.is_none()
-        && !state.allows_access(route_index, &verified_client_ip_text, &header.headers)
-    {
-        return Err((403, "Forbidden"));
+    // 🛡️ HTTP/3 enforces the same compiled access policy before authentication
+    // or dispatch, re-checking each guard's element matcher exactly as H1/H2
+    // does (issue #314).
+    if raised.is_none() {
+        let access = {
+            let mut guard_request = MatcherRequest {
+                path: path_only,
+                method: req.method.as_str(),
+                headers: &header.headers,
+                host: &host_bare,
+                addresses,
+                protocol: "https",
+                vars: Some(request_vars.values_mut()),
+            };
+            state.allows_access(route_index, &verified_client_ip_text, &mut guard_request)
+        };
+        match access {
+            Ok(true) => {}
+            Ok(false) => return Err((403, "Forbidden")),
+            // 🚨 A `=code` fallback in a guard matcher raises its status like
+            // any other early rejection, so the error routes can answer it.
+            Err(code) => raised = Some(code),
+        }
     }
 
-    // 🚦 HTTP/3 charges the same exact limiter and identity source as H1 and H2.
-    if raised.is_none()
-        && let Some(limiter) = state
-            .rate_limiters
-            .get(route_index)
-            .and_then(|l| l.as_ref())
-    {
-        let decision = limiter.check_request(&verified_client_ip_text, &header.headers);
-        for (name, value) in decision.info.to_headers() {
-            response_policy.set(name, value);
-        }
-        if decision.reject {
-            // 🚫 Raised like any other early rejection so the answer carries
-            // a body that explains it (RFC 6585 §4) or the site's configured
-            // error page. The `Retry-After` and `RateLimit` fields set above
-            // live in the response policy, which the error path applies.
-            return Err((429, "Too Many Requests"));
+    // 🚦 HTTP/3 charges the same exact limiters and identity source as H1 and
+    // H2, and only for the guards whose matchers accept the request.
+    if raised.is_none() {
+        let charged = {
+            let mut guard_request = MatcherRequest {
+                path: path_only,
+                method: req.method.as_str(),
+                headers: &header.headers,
+                host: &host_bare,
+                addresses,
+                protocol: "https",
+                vars: Some(request_vars.values_mut()),
+            };
+            state.charge_rate_limits(route_index, &verified_client_ip_text, &mut guard_request)
+        };
+        match charged {
+            Ok(verdict) => {
+                for (name, value) in verdict.headers {
+                    response_policy.set(name, value);
+                }
+                if verdict.reject {
+                    // 🚫 Raised like any other early rejection so the answer
+                    // carries a body that explains it (RFC 6585 §4) or the
+                    // site's configured error page. The `Retry-After` and
+                    // `RateLimit` fields set above live in the response policy,
+                    // which the error path applies.
+                    return Err((429, "Too Many Requests"));
+                }
+            }
+            Err(code) => raised = Some(code),
         }
     }
 
@@ -5264,10 +5319,21 @@ async fn fastcgi_upstream(
         }
     };
 
-    let prepared_request = crate::fastcgi::prepare_request_header(
+    let mut prepared_request = crate::fastcgi::prepare_request_header(
         request_header,
         &proxy_config.headers_up,
+        &proxy_config.headers_up_add,
         &proxy_config.headers_up_remove,
+        Some(verified_client_ip),
+        "https",
+        request_vars,
+    )
+    .map_err(|()| (500, "FastCGI Upstream Header Is Invalid"))?;
+    crate::fastcgi::apply_request_replacements(
+        &mut prepared_request,
+        &proxy_config.headers_up_replace,
+        state,
+        route_index,
         Some(verified_client_ip),
         "https",
         request_vars,
@@ -6576,7 +6642,7 @@ async fn reverse_proxy_upstream(
     // instead of installed (#264).
     let bodiless = client_header.method == http::Method::HEAD;
     let encode_decision =
-        if crate::response_encoding::request_allows_encoding(&client_header.headers)
+        if pingclair_core::encoding::request_allows_encoding(&client_header.headers)
             && intercept_file.is_none()
             && intercept_replacement.is_none()
             && !immediate_stream
@@ -8916,6 +8982,102 @@ mod tests {
         assert!(policy.set_headers().any(|(name, value)| {
             name == "access-control-allow-origin" && value == "https://app.example"
         }));
+    }
+
+    /// 🧭 A local body carries `text/plain; charset=utf-8` on HTTP/3 too.
+    ///
+    /// `respond` and `error` build their own header maps on this path, and
+    /// the default Caddy applies to those bodies was only wired into the
+    /// HTTP/1.1 and HTTP/2 builders: one route carried the field on two
+    /// transports and no field at all on the third (#306). A configured
+    /// `Content-Type` still wins, exactly as it does on H1/H2.
+    #[tokio::test]
+    async fn h3_local_bodies_default_to_text_plain() {
+        let default_expected = Some("text/plain; charset=utf-8");
+        let cases = [
+            (
+                "respond",
+                HandlerConfig::Respond {
+                    status: 200,
+                    body: Some("hello".to_string()),
+                    headers: BTreeMap::new(),
+                },
+            ),
+            (
+                "error",
+                HandlerConfig::Error {
+                    status: 500,
+                    message: None,
+                },
+            ),
+        ];
+
+        for (name, handler) in cases {
+            let state = proxy_state(handler.clone());
+            let mut request = RequestHeader::build(http::Method::GET, b"/", None).unwrap();
+            let mut uri = "/".to_string();
+            let mut policy = ResponseHeaderPolicy::default();
+            let plan = plan_h3_handler(
+                &handler,
+                &state,
+                0,
+                &mut request,
+                &mut uri,
+                &mut policy,
+                "203.0.113.7",
+                None,
+                None,
+                &mut crate::http_policy::RequestVars::default(),
+                &mut None,
+                &mut RequestBodyPlan::default(),
+            )
+            .await
+            .unwrap();
+
+            let H3Plan::Terminal(H3Terminal::Respond { headers, .. }) = plan else {
+                panic!("{name} must terminate with a local response");
+            };
+            assert_eq!(
+                headers.get("Content-Type").map(String::as_str),
+                default_expected,
+                "{name} must carry Caddy's default Content-Type on HTTP/3"
+            );
+        }
+
+        // 🎛️ The operator's own type is the answer when they write one.
+        let handler = HandlerConfig::Respond {
+            status: 200,
+            body: Some("{}".to_string()),
+            headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+        };
+        let state = proxy_state(handler.clone());
+        let mut request = RequestHeader::build(http::Method::GET, b"/", None).unwrap();
+        let mut uri = "/".to_string();
+        let mut policy = ResponseHeaderPolicy::default();
+        let plan = plan_h3_handler(
+            &handler,
+            &state,
+            0,
+            &mut request,
+            &mut uri,
+            &mut policy,
+            "203.0.113.7",
+            None,
+            None,
+            &mut crate::http_policy::RequestVars::default(),
+            &mut None,
+            &mut RequestBodyPlan::default(),
+        )
+        .await
+        .unwrap();
+        let H3Plan::Terminal(H3Terminal::Respond { headers, .. }) = plan else {
+            panic!("a configured respond must terminate with a local response");
+        };
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/json"),
+            "a configured Content-Type must not be replaced by the default"
+        );
     }
 
     #[tokio::test]

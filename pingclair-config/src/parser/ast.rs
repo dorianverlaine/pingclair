@@ -869,17 +869,21 @@ pub struct ProxyConfig {
     /// Flush interval
     pub flush_interval: Option<FlushInterval>,
 
-    /// Headers to add to upstream request
-    pub header_up: BTreeMap<String, Expr>,
-
-    /// 🚫 Header names to take off the upstream request, which is what
-    /// Caddy's `header_up -Name` means.
+    /// 🗄️ Headers to write on the upstream request, collected from
+    /// `header_up`.
     ///
-    /// A list of names rather than a sentinel value in `header_up`: that map
-    /// is keyed by header name, so a deletion has no pair to be written as,
-    /// and an empty value would send `Name:` to the origin rather than remove
-    /// it — the silent-succeed failure this repository keeps finding.
-    pub header_up_remove: Vec<String>,
+    /// 🧩 The same op set `header_down` builds, because the reference gives
+    /// both directives the same shapes: a set, `+Name` append, `-Name`
+    /// removal, and the three-argument `>Name find replacement` rewrite. The
+    /// two directives used to be parsed apart, and the request half grew only
+    /// set and delete — the `+`/`?` spellings went upstream as literal header
+    /// names (a `?` one turned every request into a 500) and `>` was refused
+    /// (#311).
+    ///
+    /// ❓ `?Name` is the one shape the reference refuses on requests, because
+    /// a default cannot be decided without the message; the shared parser
+    /// refuses it with that sentence rather than sending the name verbatim.
+    pub header_up: HeadersConfig,
 
     /// 🗄️ Headers to write on the response on its way back to the client,
     /// collected from `header_down`.
@@ -1374,8 +1378,7 @@ impl ProxyConfig {
             max_fails: None,
             fail_duration_ms: None,
             flush_interval: None,
-            header_up: BTreeMap::new(),
-            header_up_remove: Vec::new(),
+            header_up: HeadersConfig::default(),
             header_down: HeadersConfig::default(),
             transport: None,
             cache: None,

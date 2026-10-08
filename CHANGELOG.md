@@ -49,6 +49,96 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🛡️ A guard written with a `not` matcher keeps its exemption
+
+`compose_site_routes` copies a scoped line into every answering route it could
+run ahead of, and it stays conservative when it cannot prove two matchers
+disjoint: `not path /ready-*` and `path /ready-xyz` are not, so the guard
+landed on the exempt route too. The dispatch-time handlers re-checked their
+element matcher there; `access_control` and `rate_limit`, which are hoisted
+into per-route tables at load and enforced before dispatch, did not — the
+table kept the compiled policy and dropped the matcher that scoped it. Both
+tables now carry the element matcher, and a request is refused or charged only
+by the guards whose matcher accepts it, on all three transports (#314).
+
+### 🚰 An HTTP/2 response in flight across SIGTERM reaches the client
+
+The in-flight count reaches zero when the proxy has handed the response to its
+transport, which is not the same as the bytes being on the wire: HTTP/1 writes
+synchronously, while the HTTP/2 codec queues frames for its connection task
+and the TLS layer buffers one more. The process left in between, so a stream
+the origin had already answered was closed with its response still in
+userspace — five runs out of seven in the black-box suite. A shutdown that
+served a request now gives the transports a bounded moment to flush before the
+process exits; one that served nothing pays nothing (#313).
+
+### 🗄️ `header_up` takes the same shapes as `header_down`
+
+The reference gives both directives one set of shapes — `X v` sets, `+X v`
+appends, `-X` removes, and a three-argument line rewrites — and the two halves
+had drifted: the request side knew only set and delete. A `+Name` line reached
+the origin as a field literally named `+Name`, a `?Name` line became an
+invalid field name that turned every request into a 500, and the rewrite was
+refused as an argument-count mistake. Both directives now share the parser the
+`header` directive already used, and the request side is applied by the same
+applier a site's `request_header` uses, FastCGI included. `?` is refused at
+load with the reference's own reason — a request default cannot be decided —
+which is the one shape upstream does not take either (#311).
+
+### 🛡️ A site-wide guard keeps its place in the directive order
+
+`redir` ranks ahead of `basic_auth` in the order table, and the reference
+answers that redirect without asking for credentials. An unmatched
+`basic_auth` was copied ahead of *every* answering route, though — including
+the matched `redir` beside it — so adding the guard to a site turned the same
+308 into a 401. Unmatched site middleware now follows the rule matched
+middleware already followed: it goes ahead of an answering route when the
+directive order puts it first, which is what the module's own documentation
+promised (#310).
+
+### 🛡️ A static file honors `no-transform` on both sides
+
+`Cache-Control: no-transform` is a directive about bytes: a client sends it so
+the body it receives is the one a signature or a hash was computed over, and
+RFC 9111 binds an intermediary when a response carries it. The proxy path has
+honored both since compression existed; the static file server honored
+neither, so a file could come back gzip-encoded to a client that asked for its
+exact bytes — and a site that set the header on its own responses could answer
+`Cache-Control: no-transform` beside `Content-Encoding: gzip`, contradicting
+itself. Both the request directive and the response one now gate static
+encoding, through the same predicate the proxy uses (#309).
+
+### 🧾 Every header-limit refusal leaves a record, on every transport
+
+An oversized header block was answered `431` on all three transports, but only
+the TCP ones left a trace: the H1/H2 refusal happens inside Pingora's early
+filter, so its record was that library's incidental line, and the HTTP/3 path
+builds its refusal itself and wrote nothing at all. An operator scraping logs
+for refusals saw every one except the QUIC ones. The refusal now writes one
+stable record where it is decided, with the transport as a field and the
+sentence H1/H2 already carried, so an existing search keeps working (#308).
+
+### 🔇 Enabling the cache no longer asks for a dictionary it cannot take
+
+The first stored response made `pingora-cache` warn that no header-compression
+dictionary was configured, naming two `set_compression_dict_*` APIs that
+nothing in a Pingclairfile can reach. The dictionary is an optional
+optimisation — without it the same zstd frame is written, with less shared
+context — so the warning asked the operator to do something impossible. It is
+re-levelled to `debug` in the log bridge: visible under `--verbose` or
+`RUST_LOG` for anyone debugging the cache, absent from a log where it is noise
+that cannot be acted on (#307).
+
+### 🧭 A local body keeps its default `Content-Type` on HTTP/3
+
+Caddy answers `respond` and `error` with `text/plain; charset=utf-8` unless
+the configuration names another type, and the HTTP/1.1 and HTTP/2 paths have
+applied that rule since they were written. HTTP/3 builds its own header list
+and never did, so the same route served a typed body on two transports and an
+untyped one on the third. The H3 terminal for both directives now applies the
+same default, and a configured `Content-Type` still wins, exactly as it does
+on H1/H2 (#306).
+
 ### 🔻 A client that gives up no longer evicts a backend
 
 The health record kept after a connection was made belongs to the origin, and

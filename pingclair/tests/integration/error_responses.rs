@@ -9,6 +9,7 @@
 //! other.
 
 use super::{TestServer, no_proxy_client};
+use std::time::Duration;
 
 /// 🚦 A site that admits one request per minute per `X-Client` value.
 fn rate_limited_site(extra: &str) -> String {
@@ -110,6 +111,46 @@ async fn test_rate_limit_rejection_uses_the_configured_error_page() {
     assert_eq!(rejected.headers()["content-type"], "text/html");
     assert!(rejected.headers().contains_key("retry-after"));
     assert_eq!(rejected.text().await.unwrap(), "<p>slow down</p>");
+}
+
+/// 🧾 Every refused header block leaves one record, on every transport.
+///
+/// The H1/H2 refusal happens inside Pingora's early filter, so the only trace
+/// of it was Pingora's own incidental line — and the H3 path builds its
+/// refusal itself and left nothing at all (#308). This is the stable record;
+/// the H3 leg of the same contract is checked by
+/// `scripts/test-h3-22-septembre-2026-local.sh`.
+#[tokio::test]
+async fn test_a_header_limit_refusal_leaves_a_record() {
+    let mut server = TestServer::new_pingclairfile(&header_limited_site(""));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let refused = client
+        .get(server.url(0, "/"))
+        .header("X-Big", "x".repeat(2000))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 431);
+
+    // 🕰️ The writer thread owns the sink, so the record lands shortly after.
+    let mut logged = false;
+    for _ in 0..50 {
+        logged = std::fs::read_to_string(&server.stdout_path)
+            .unwrap_or_default()
+            .contains("⛔ request headers exceed configured limits");
+        if logged {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    server.stop();
+
+    assert!(
+        logged,
+        "a refused header block must leave one record on every transport"
+    );
 }
 
 /// 🧾 A site whose request header section may total at most 1 KiB.

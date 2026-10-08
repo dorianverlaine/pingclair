@@ -530,3 +530,39 @@ async fn test_routes_sharing_a_url_keep_separate_cache_entries() {
         "both routes' entries were purged"
     );
 }
+
+/// 🗜️ A stored response does not warn about a dictionary nobody can set.
+///
+/// `pingora-cache`'s header serde warns once per process, on the first stored
+/// response, that no compression dictionary is configured — and names two
+/// `set_compression_dict_*` APIs this build never calls, so the instruction
+/// cannot be followed from any Pingclairfile (#307). The record is re-levelled
+/// to `debug` in the log bridge, where `--verbose` and `RUST_LOG` still show
+/// it; this drives a real cached exchange and asserts the operator's log stays
+/// quiet while the store really happens.
+#[tokio::test]
+async fn test_a_stored_response_does_not_warn_about_a_dictionary() {
+    let (origin, hits) = spawn_status_origin().await;
+    let mut server = TestServer::new_pingclairfile(&cache_pingclairfile(origin, "60s"));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🩺 The control: the response is genuinely stored, or the assertion below
+    // would also pass against a cache that never stores anything.
+    assert_eq!(
+        origin_hits_for_two_requests(&server, &client, &hits, "/200/max-age").await,
+        1,
+        "the response must be stored for this test to mean anything"
+    );
+
+    // 🕰️ The writer thread owns the sink; a warning that was going to be
+    // written has landed by the time this slice passes.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let log = std::fs::read_to_string(&server.stdout_path).unwrap_or_default();
+    server.stop();
+
+    assert!(
+        !log.contains("no header compression dictionary"),
+        "a working cache must not ask the operator for an API no configuration can reach: {log}"
+    );
+}

@@ -19,6 +19,22 @@ use std::borrow::Cow;
 
 use pingclair_core::config::ResourceLimitsConfig;
 
+/// 🧾 The one record a header-limit refusal writes, on every transport.
+///
+/// The H1/H2 refusal happens inside Pingora's early filter, so the only trace
+/// of it was Pingora's own incidental line — and the H3 path builds its
+/// refusal itself and left no trace at all, so an operator scraping logs saw
+/// every refusal except the QUIC ones (#308). This is the stable record: the
+/// transport is a field rather than a different message, and the text matches
+/// the sentence H1/H2 already carried, so an existing search keeps working.
+pub fn log_refusal(transport: &'static str, detail: Option<&str>) {
+    tracing::warn!(
+        transport,
+        detail = detail.unwrap_or_default(),
+        "⛔ request headers exceed configured limits"
+    );
+}
+
 /// 🚫 Why a request's header section was refused.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum HeaderLimitBreach<'a> {

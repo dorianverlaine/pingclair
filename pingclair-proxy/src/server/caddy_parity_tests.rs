@@ -120,11 +120,28 @@ fn proxy_state_exposes_the_same_compiled_access_gate_to_every_protocol() {
     let mut headers = http::HeaderMap::new();
     headers.insert(http::header::USER_AGENT, "Browser/1.0".parse().unwrap());
 
-    assert!(state.allows_access(0, "10.2.3.4", &headers));
-    assert!(!state.allows_access(0, "192.0.2.1", &headers));
+    let verdict = |route: usize, ip: &str, headers: &http::HeaderMap| {
+        let mut vars = BTreeMap::new();
+        let mut request = MatcherRequest {
+            path: "/",
+            method: "GET",
+            headers,
+            host: "example.test",
+            addresses: RequestAddresses {
+                client_ip: None,
+                remote_ip: None,
+            },
+            protocol: "http",
+            vars: Some(&mut vars),
+        };
+        state.allows_access(route, ip, &mut request)
+    };
+
+    assert_eq!(verdict(0, "10.2.3.4", &headers), Ok(true));
+    assert_eq!(verdict(0, "192.0.2.1", &headers), Ok(false));
     headers.insert(http::header::USER_AGENT, "BlockedBot/1.0".parse().unwrap());
-    assert!(!state.allows_access(0, "10.2.3.4", &headers));
-    assert!(state.allows_access(99, "192.0.2.1", &headers));
+    assert_eq!(verdict(0, "10.2.3.4", &headers), Ok(false));
+    assert_eq!(verdict(99, "192.0.2.1", &headers), Ok(true));
 }
 
 #[test]

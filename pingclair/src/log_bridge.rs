@@ -47,6 +47,20 @@ const ROUTINE_RECORDS: &[(&str, &str, log::Level)] = &[
         "failed to acquire reusable stream",
         log::Level::Debug,
     ),
+    // 🗜️ `pingora-cache 0.9.0`, `meta.rs:969`, read 2026-10-08: the header
+    // serde warns, once per process, that no compression dictionary was
+    // configured, and names the two `set_compression_dict_*` APIs that would
+    // set one. The dictionary is an optional optimisation — without it the
+    // same zstd frame is written, only with less shared context — and nothing
+    // in a Pingclairfile can supply one, so the instruction cannot be
+    // followed (#307). Re-levelled to `debug`: visible under `--verbose` or
+    // `RUST_LOG` for anyone debugging the cache, absent from an operator's
+    // log where it is noise they cannot act on.
+    (
+        "pingora_cache::meta",
+        "no header compression dictionary loaded - use set_compression_dict_content() or set_compression_dict_path() to set one",
+        log::Level::Debug,
+    ),
 ];
 
 /// 🔁 A `log::Log` that forwards to `tracing`, re-levelling routine records.

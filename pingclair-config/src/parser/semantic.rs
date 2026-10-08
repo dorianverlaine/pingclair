@@ -164,7 +164,7 @@ impl SemanticAnalyzer {
                         if let Directive::Headers(ref headers) = directive {
                             // Convert headers to header_up
                             for (k, v) in &headers.set {
-                                expanded_headers.insert(k.clone(), Expr::String(v.clone()));
+                                expanded_headers.insert(k.clone(), v.clone());
                             }
                         }
                         // Handle header_up from expanded macro
@@ -178,7 +178,7 @@ impl SemanticAnalyzer {
                 }
 
                 // Merge expanded headers
-                proxy.header_up.extend(expanded_headers);
+                proxy.header_up.set.extend(expanded_headers);
             }
             Handler::Pipeline(handlers) => {
                 for element in handlers.iter_mut() {
