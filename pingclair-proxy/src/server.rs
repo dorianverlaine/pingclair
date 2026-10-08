@@ -6496,6 +6496,15 @@ impl ProxyHttp for PingclairProxy {
         let detail = breach.as_ref().and_then(|breach| breach.detail());
         ctx.state = Some(state);
         if breach.is_some() {
+            // 🧾 The same record the H3 refusal writes, so an operator's
+            // search finds every header-limit refusal and not only the TCP
+            // ones (#308). Pingora's own early-filter line is an incidental
+            // this one does not depend on.
+            let transport = match request.version {
+                http::Version::HTTP_2 => "h2",
+                _ => "h1",
+            };
+            crate::header_limits::log_refusal(transport, detail.as_deref());
             ctx.error_detail = detail;
             ctx.refused_before_routing = true;
             session.as_mut().set_keepalive(None);

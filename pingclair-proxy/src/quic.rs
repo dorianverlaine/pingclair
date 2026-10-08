@@ -3988,6 +3988,10 @@ async fn handle_request_inner(
             // routing never enters `handle_errors` on any transport (#288);
             // `send_error_response` still applies a configured
             // `error_page 431`, exactly as H1/H2 do.
+            // 🧾 The same record the H1/H2 refusal writes: this path builds
+            // the 431 itself, and before the record existed a QUIC refusal
+            // left nothing in the log at all (#308).
+            crate::header_limits::log_refusal("h3", breach.detail().as_deref());
             send_error_response(
                 resp_tx,
                 stream_id,
