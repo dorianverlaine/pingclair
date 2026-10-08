@@ -17,12 +17,13 @@ use crate::syntax::{self, Call, Declaration, Position, Value};
 use pingclair_core::config::{
     AccessControlConfig, AcmeServerConfig, AcmeServerPolicy, AdminConfig, BasicAuthAlgorithm,
     CircuitBreakerConfig, Encoding, ErrorRouteConfig, FastCgiTransportConfig, ForwardAuthConfig,
-    ForwardAuthHeaderMap, HandlerConfig, HandlerElement, HeaderReplacement, IpRanges,
-    Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher, ListenerOptions, LoadBalanceConfig,
-    LogConfig, LogFormat, LogOutput, LogRotation, Matcher, MatcherCondition, OverloadConfig,
-    PRIVATE_RANGES, PingclairConfig, ProxyUpstream, RateLimitKey, ResourceLimitsConfig,
-    ResponseHandlerConfig, ResponseMatcher, RetryConfig, ReverseProxyConfig, RouteConfig,
-    ServerConfig, TlsConfig, UpstreamTlsConfig, normalize_listen_addr,
+    ForwardAuthHeaderMap, HandlerConfig, HandlerElement, HeaderReplacement, HealthCheckConfig,
+    IpRanges, Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher, ListenerOptions,
+    LoadBalanceConfig, LogConfig, LogFormat, LogOutput, LogRotation, Matcher, MatcherCondition,
+    OverloadConfig, PRIVATE_RANGES, PingclairConfig, ProxyUpstream, RateLimitKey,
+    ResourceLimitsConfig, ResponseHandlerConfig, ResponseMatcher, RetryConfig, ReverseProxyConfig,
+    RouteConfig, ServerConfig, TlsConfig, UpstreamHttpVersions, UpstreamTlsConfig,
+    normalize_listen_addr,
 };
 
 /// 📍 Reports location and expected structure without echoing configuration values.

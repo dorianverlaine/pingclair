@@ -2672,6 +2672,8 @@ fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
         "betweenReadsTimeout",
         "readTimeout",
         "writeTimeout",
+        "versions",
+        "healthCheck",
     ])?;
     let upstreams = upstream_addresses(call)?;
     let up = header_list(call, "headersUp", false)?;
@@ -2825,6 +2827,31 @@ fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
             _ => config.write_timeout = Some(millis),
         }
     }
+    // 🔢 Which HTTP versions the upstream may be spoken to in. Only the three
+    // reachable states exist, because a fourth spelling would promise a
+    // combination the upstream stack cannot produce.
+    if let Some(value) = call.get("versions") {
+        let Value::Typed(versions) = value else {
+            return Err(call.at.error("versions takes .http11, .h2 or .h2AndHttp11"));
+        };
+        versions.leaf(&[])?;
+        config.upstream_versions = Some(match versions.name.as_str() {
+            "http11" => UpstreamHttpVersions::Http11,
+            "h2" => UpstreamHttpVersions::H2,
+            "h2AndHttp11" => UpstreamHttpVersions::H2AndHttp11,
+            other => {
+                return Err(versions.at.error(format!(
+                    "unknown upstream version set '.{other}'; expected .http11, .h2 or \
+                     .h2AndHttp11"
+                )));
+            }
+        });
+    }
+    // 🩺 Active health checks: one probe endpoint per upstream, and the
+    // thresholds that decide when a peer leaves and rejoins rotation.
+    if let Some(value) = call.get("healthCheck") {
+        config.health_check = Some(Box::new(health_check(value, call.at)?));
+    }
     config.headers_up = up.set;
     config.headers_up_add = up.add;
     config.headers_up_remove = up.remove;
@@ -2888,6 +2915,226 @@ fn upstream_addresses(call: &Call) -> Result<Vec<String>, Error> {
 /// 🌐 The proxy the build's bare defaults describe, with an optional FastCGI
 /// transport. Shared by `Proxy` and `PHPFastCGI`, so the two cannot disagree
 /// about a default neither of them wrote.
+/// 🩺 `.http(path:, …)`: the probe a proxy sends to decide a peer's health.
+fn health_check(value: &Value, at: Position) -> Result<HealthCheckConfig, Error> {
+    let Value::Typed(check) = value else {
+        return Err(
+            at.error("healthCheck takes .http(path: \"/healthz\", interval: .seconds(10), …)")
+        );
+    };
+    if check.name != "http" {
+        return Err(check.at.error(format!(
+            "unknown health check '.{}'; expected .http(path:, …)",
+            check.name
+        )));
+    }
+    check.leaf(&[
+        "path",
+        "port",
+        "method",
+        "interval",
+        "timeout",
+        "passes",
+        "fails",
+        "status",
+        "body",
+        "headers",
+        "host",
+        "reuseConnection",
+    ])?;
+    // 🛣️ The path is the one field with no default worth guessing: probing `/`
+    // when the operator meant `/healthz` reports every upstream healthy for the
+    // wrong reason.
+    let path = check.string("path")?;
+    let method = match check.get("method") {
+        None => "GET".to_string(),
+        Some(Value::Typed(method)) => method_name(method)?.to_string(),
+        Some(_) => return Err(check.at.error("method takes a value such as .get")),
+    };
+    // 🚫 A probe may only read: the runtime refuses anything that could carry a
+    // body, so accepting `.post` here would be a configuration that loads and
+    // cannot run.
+    if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        return Err(check
+            .at
+            .error("a health probe may only read; expected .get, .head or .options"));
+    }
+    let interval = if check.get("interval").is_some() {
+        whole_seconds(check, "interval")?
+    } else {
+        10
+    };
+    let timeout = if check.get("timeout").is_some() {
+        whole_seconds(check, "timeout")?
+    } else {
+        5
+    };
+    let port = if check.get("port").is_some() {
+        Some(
+            u16::try_from(check.integer("port")?)
+                .map_err(|_| check.at.error("a port must be between 1 and 65535"))?,
+        )
+    } else {
+        None
+    };
+    let positive = |key: &str| -> Result<u32, Error> {
+        let value = u32::try_from(check.integer(key)?)
+            .map_err(|_| check.at.error(format!("{key} must fit in 0..=4294967295")))?;
+        if value == 0 {
+            return Err(check.at.error(format!("{key} must be at least 1")));
+        }
+        Ok(value)
+    };
+    let consecutive_success = if check.get("passes").is_some() {
+        positive("passes")?
+    } else {
+        1
+    };
+    let consecutive_failure = if check.get("fails").is_some() {
+        Some(positive("fails")?)
+    } else {
+        None
+    };
+    // ✅ Codes and classes, the same two things the response matchers take.
+    let expected_statuses = match check.get("status") {
+        None => vec![200],
+        Some(Value::Array(items)) => {
+            if items.is_empty() {
+                return Err(check.at.error("status needs at least one code or class"));
+            }
+            let mut codes = Vec::new();
+            for item in items {
+                let code = match item {
+                    Value::Number(code) => u16::try_from(*code)
+                        .map_err(|_| check.at.error("status must fit in 0..=65535"))?,
+                    // ✅ The health checker stores exact codes, so a class is
+                    // expanded here rather than kept as its leading digit —
+                    // which is what the Caddyfile's `health_status 2xx` does,
+                    // and why this reads differently from the response
+                    // matchers that keep the digit.
+                    Value::Typed(class) => {
+                        let hundred = u16::from(status_class(class)?) * 100;
+                        codes.extend(hundred..=hundred + 99);
+                        continue;
+                    }
+                    _ => return Err(check.at.error("status takes codes and class values")),
+                };
+                if !codes.contains(&code) {
+                    codes.push(code);
+                }
+            }
+            codes
+        }
+        Some(_) => return Err(check.at.error("status takes an array such as [.success]")),
+    };
+    let expected_body = if check.get("body").is_some() {
+        Some(check.string("body")?)
+    } else {
+        None
+    };
+    let host = if check.get("host").is_some() {
+        Some(check.string("host")?)
+    } else {
+        None
+    };
+    let reuse_connection = if check.get("reuseConnection").is_some() {
+        check.boolean("reuseConnection")?
+    } else {
+        false
+    };
+    // 🏷️ The probe's own headers, written with the same actions as everywhere
+    // else; only the two that write a value make sense here, since a probe has
+    // no incoming message to edit.
+    let mut headers: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    if let Some(value) = check.get("headers") {
+        let Value::Array(items) = value else {
+            return Err(check
+                .at
+                .error("headers takes an array such as [.set(\"X-Probe\", \"1\")]"));
+        };
+        if items.is_empty() {
+            return Err(check
+                .at
+                .error("headers must not be empty; leave it out instead"));
+        }
+        for item in items {
+            let Value::Typed(action) = item else {
+                return Err(check
+                    .at
+                    .error("headers takes .set(…) and .append(…) values"));
+            };
+            match action.name.as_str() {
+                "set" | "append" => {
+                    let [(None, Value::String(name)), (None, Value::String(text))] =
+                        action.args.as_slice()
+                    else {
+                        return Err(action
+                            .at
+                            .error(format!(".{} takes a quoted name and value", action.name)));
+                    };
+                    let values = headers.entry(name.clone()).or_default();
+                    // 📌 `.set` replaces, `.append` adds — the same reading the
+                    // components give the two words.
+                    if action.name == "set" {
+                        values.clear();
+                    }
+                    values.push(text.clone());
+                }
+                other => {
+                    return Err(action.at.error(format!(
+                        "unknown probe header action '.{other}'; expected .set or .append"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(HealthCheckConfig {
+        path,
+        interval,
+        timeout,
+        threshold: consecutive_failure.unwrap_or(3),
+        method,
+        host,
+        headers,
+        expected_statuses,
+        expected_body,
+        port,
+        consecutive_success,
+        consecutive_failure,
+        reuse_connection,
+        max_response_body_bytes: pingclair_core::config::default_health_body_limit(),
+        slow_start_ms: 0,
+    })
+}
+
+/// ⏲️ One of a health check's deadlines, in whole seconds.
+fn whole_seconds(call: &Call, key: &str) -> Result<u64, Error> {
+    let millis = call.measure(key, false)?;
+    if millis == 0 || millis % 1000 != 0 {
+        return Err(call.at.error(format!("{key} is at least one whole second")));
+    }
+    Ok(millis / 1000)
+}
+
+/// ✅ The one-digit class a status selector names.
+fn status_class(class: &Call) -> Result<u16, Error> {
+    class.leaf(&[])?;
+    Ok(match class.name.as_str() {
+        "informational" => 1,
+        "success" => 2,
+        "redirect" => 3,
+        "clientError" => 4,
+        "serverError" => 5,
+        other => {
+            return Err(class.at.error(format!(
+                "unknown status class '.{other}'; expected .informational, .success, .redirect, \
+                 .clientError or .serverError"
+            )));
+        }
+    })
+}
+
 fn reverse_proxy(
     upstreams: Vec<String>,
     fastcgi: Option<Box<FastCgiTransportConfig>>,

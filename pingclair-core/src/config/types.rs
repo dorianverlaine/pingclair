@@ -3174,7 +3174,7 @@ fn default_health_success_threshold() -> u32 {
     1
 }
 
-fn default_health_body_limit() -> usize {
+pub fn default_health_body_limit() -> usize {
     64 * 1024
 }
 

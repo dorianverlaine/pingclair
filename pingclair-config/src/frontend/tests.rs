@@ -1972,6 +1972,77 @@ fn proxy_tuning_that_cannot_mean_anything_fail_closed() {
 }
 
 #[test]
+fn proxy_health_checks_and_versions_lower_like_their_caddyfile_twins() {
+    let native = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+            Proxy(
+                to: "127.0.0.1:9000",
+                versions: .h2,
+                healthCheck: .http(
+                    path: "/healthz",
+                    port: 8080,
+                    interval: .seconds(10),
+                    timeout: .seconds(2),
+                    passes: 2,
+                    fails: 3,
+                    status: [.success],
+                    body: "ready",
+                    headers: [.append("X-Probe", "1"), .append("X-Probe", "2")]
+                )
+            )
+        } } }"#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "http://:8080 {\n\treverse_proxy 127.0.0.1:9000 {\n\t\thealth_uri /healthz\n\t\thealth_port 8080\n\t\thealth_interval 10s\n\t\thealth_timeout 2s\n\t\thealth_passes 2\n\t\thealth_fails 3\n\t\thealth_status 2xx\n\t\thealth_body ready\n\t\thealth_headers {\n\t\t\tX-Probe 1\n\t\t\tX-Probe 2\n\t\t}\n\t\ttransport http {\n\t\t\tversions 2\n\t\t}\n\t}\n}",
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(native).unwrap(),
+        serde_json::to_value(legacy).unwrap()
+    );
+}
+
+#[test]
+fn health_checks_that_cannot_mean_anything_fail_closed() {
+    let site = |handler: &str| {
+        format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {handler} }} }} }}"
+        )
+    };
+    for handler in [
+        // 🩺 The probe is `.http(path: …)`, and the path is not guessable.
+        "Proxy(to: \"127.0.0.1:9000\", healthCheck: \"/healthz\")",
+        "Proxy(to: \"127.0.0.1:9000\", healthCheck: .tcp(path: \"/x\"))",
+        "Proxy(to: \"127.0.0.1:9000\", healthCheck: .http())",
+        "Proxy(to: \"127.0.0.1:9000\", healthCheck: .http(path: \"/x\", unknown: 1))",
+        // 🚫 A probe only reads: the runtime refuses a method that could carry
+        // a body, so this language refuses it where the line is.
+        "Proxy(to: \"127.0.0.1:9000\", healthCheck: .http(path: \"/x\", method: .post))",
+        // ⏲️ Deadlines are whole seconds; thresholds are at least one.
+        "Proxy(to: \"127.0.0.1:9000\", healthCheck: .http(path: \"/x\", interval: .milliseconds(500)))",
+        "Proxy(to: \"127.0.0.1:9000\", healthCheck: .http(path: \"/x\", timeout: 5))",
+        "Proxy(to: \"127.0.0.1:9000\", healthCheck: .http(path: \"/x\", passes: 0))",
+        "Proxy(to: \"127.0.0.1:9000\", healthCheck: .http(path: \"/x\", fails: 0))",
+        "Proxy(to: \"127.0.0.1:9000\", healthCheck: .http(path: \"/x\", port: 70000))",
+        // ✅ Statuses are codes and classes.
+        "Proxy(to: \"127.0.0.1:9000\", healthCheck: .http(path: \"/x\", status: []))",
+        "Proxy(to: \"127.0.0.1:9000\", healthCheck: .http(path: \"/x\", status: [.unknown]))",
+        "Proxy(to: \"127.0.0.1:9000\", healthCheck: .http(path: \"/x\", status: 200))",
+        // 🏷️ Probe headers write a value; a probe has no message to edit.
+        "Proxy(to: \"127.0.0.1:9000\", healthCheck: .http(path: \"/x\", headers: []))",
+        "Proxy(to: \"127.0.0.1:9000\", healthCheck: .http(path: \"/x\", headers: [.remove(\"X\")]))",
+        // 🔢 Versions are one of the three reachable sets.
+        "Proxy(to: \"127.0.0.1:9000\", versions: \"2\")",
+        "Proxy(to: \"127.0.0.1:9000\", versions: .http3)",
+        "Proxy(to: \"127.0.0.1:9000\", versions: .h2(1))",
+    ] {
+        let source = site(handler);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",
