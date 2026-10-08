@@ -46,7 +46,7 @@ struct Item {
 }
 
 /// 🛡️ Limits apply before allocating tokens or descending through recursive values.
-pub(super) fn parse(source: &str) -> Result<Call, super::Error> {
+pub(super) fn parse(source: &str) -> Result<Vec<Call>, super::Error> {
     let start = Position { line: 1, column: 1 };
     if source.len() > 1024 * 1024 {
         return Err(start.error("configuration exceeds 1 MiB"));
@@ -139,11 +139,11 @@ pub(super) fn parse(source: &str) -> Result<Call, super::Error> {
     let mut parser = Parser {
         items: items.into_iter().peekable(),
     };
-    let root = parser.call(0, true)?;
-    if parser.peek() != &Token::End {
-        return Err(parser.error("expected end of configuration"));
+    let mut declarations = Vec::new();
+    while parser.peek() != &Token::End {
+        declarations.push(parser.call(0, true)?);
     }
-    Ok(root)
+    Ok(declarations)
 }
 struct Parser {
     items: std::iter::Peekable<std::vec::IntoIter<Item>>,

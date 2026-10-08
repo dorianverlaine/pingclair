@@ -16,11 +16,13 @@ fact.
 
 ### 🧩 Native configuration language for 0.3 alpha
 
-`Pingclair(version: 1)` selects the new declarative frontend. TCP listeners,
-routes and proxies compose through typed arguments and listener modifiers,
-then use the existing common validation and runtime. Existing Caddy-style files
-remain supported during migration. Admin accepts `text/pingclair`; native input
-is refused by `fmt` until a comment-preserving formatter exists.
+Native declarations sit at the top level; the frontend is selected by the
+`.pingclair` extension or the declaration shape, and the `Pingclair(version: 1)`
+header is no longer used. TCP listeners, routes and proxies compose through
+typed arguments and listener modifiers, then use the existing common validation
+and runtime. Existing Caddy-style files remain supported during migration.
+Admin accepts `text/pingclair`; native input is refused by `fmt` until a
+comment-preserving formatter exists.
 
 ### 🔌 Layer 4 TCP routing for 0.3 alpha
 

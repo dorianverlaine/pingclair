@@ -5,17 +5,15 @@ use super::*;
 
 const SOURCE: &str = r#"
 // 🧩 Typed components compose into a single validated configuration.
-Pingclair(version: 1) {
-    TCPListener(on: "127.0.0.1:9443") {
-        Route(when: .tls(sni: ["example.test"], alpn: ["h2"]), from: ["127.0.0.0/8"]) {
-            Proxy(to: "127.0.0.1:8443")
-        }
-        Fallback { Proxy(to: "127.0.0.1:8080") }
+TCPListener(on: "127.0.0.1:9443") {
+    Route(when: .tls(sni: ["example.test"], alpn: ["h2"]), from: ["127.0.0.0/8"]) {
+        Proxy(to: "127.0.0.1:8443")
     }
-    .limits(connections: 128, preread: .kibibytes(16), relay: .bytes(1024))
-    .timeouts(connect: .seconds(5), idle: .minutes(5))
-    .halfClose(enabled: true)
+    Fallback { Proxy(to: "127.0.0.1:8080") }
 }
+.limits(connections: 128, preread: .kibibytes(16), relay: .bytes(1024))
+.timeouts(connect: .seconds(5), idle: .minutes(5))
+.halfClose(enabled: true)
 "#;
 
 #[test]
@@ -58,8 +56,8 @@ fn native_components_lower_to_the_existing_validated_model() {
 #[test]
 fn malformed_or_ambiguous_composition_is_rejected_without_falling_back() {
     for (old, new) in [
-        ("version: 1", "version: 2"),
-        ("version: 1", "version: 1, version: 1"),
+        ("TCPListener(on:", "Listener(on:"),
+        ("connections: 128", "connections: 128, connections: 128"),
         ("connections: 128", "connections: 0"),
         ("connect: .seconds(5)", "connect: 5"),
         ("connect: .seconds(5)", "connect: .kibibytes(5)"),
@@ -96,10 +94,10 @@ fn diagnostics_name_the_file_without_echoing_literal_values() {
     assert!(error.contains("edge.pingclair") && error.contains("line "));
     assert!(!error.contains("do-not-print-this"));
     for source in [
-        "Pingclair(",
-        "Pingclair(version: [",
-        "Pingclair(version: 1) {",
-        "Pingclair(version: 1) {} garbage",
+        "Metrics(",
+        "TCPListener(",
+        "TCPListener(on: [",
+        "TCPListener(on: \"127.0.0.1:9443\") { Fallback { Proxy(to: \"127.0.0.1:8080\") } } garbage",
     ] {
         assert!(crate::compile(source).is_err());
     }
@@ -115,7 +113,7 @@ fn adaptation_and_validation_remain_distinct() {
 #[test]
 fn nested_values_and_large_sources_are_bounded() {
     let nested = format!(
-        "Pingclair(version: {}0{}) {{}}",
+        "Metrics(enabled: {}0{})",
         "[".repeat(1000),
         "]".repeat(1000)
     );
@@ -126,6 +124,51 @@ fn nested_values_and_large_sources_are_bounded() {
             .to_string()
             .contains("1 MiB")
     );
+}
+
+#[test]
+fn headerless_declarations_are_detected_and_composed() {
+    let source = r#"
+        // 🧩 Comments are skipped before detection.
+        Metrics(enabled: true)
+        Shutdown(grace: .seconds(5))
+        Admin(listen: "127.0.0.1:2019")
+        TCPListener(on: ":9443") {
+            Fallback { Proxy(to: "127.0.0.1:8080") }
+        }
+    "#;
+    assert!(is_native(source));
+    let config = crate::compile(source).unwrap();
+    assert!(config.global.metrics);
+    assert_eq!(config.global.grace_period_secs, Some(5));
+    assert_eq!(config.admin.unwrap().listen, "127.0.0.1:2019");
+    assert_eq!(config.layer4.len(), 1);
+}
+
+#[test]
+fn the_removed_version_header_is_refused_with_a_direction() {
+    let source = r#"Pingclair(version: 1) {
+        TCPListener(on: ":9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }
+    }"#;
+    assert!(is_native(source));
+    let error = adapt(source).unwrap_err().to_string();
+    assert!(
+        error.contains("header") && error.contains("top level"),
+        "{error}"
+    );
+}
+
+#[test]
+fn caddy_shaped_sources_are_not_native() {
+    for source in [
+        "{\n    email admin@example.com\n}",
+        "example.com {\n    respond \"hi\"\n}",
+        ":8080 {\n    file_server\n}",
+        "respond \"hi\" 200",
+        "",
+    ] {
+        assert!(!is_native(source), "detected {source:?} as native");
+    }
 }
 
 proptest::proptest! {

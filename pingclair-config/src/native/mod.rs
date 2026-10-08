@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-//! 🧭 Pingclair's versioned declarative language lowers directly to shared configuration.
+//! 🧭 Pingclair's declarative language lowers directly to shared configuration.
 
 mod syntax;
 use pingclair_core::config::{
@@ -18,7 +18,7 @@ pub struct Error {
     message: String,
 }
 
-/// 🧭 Reserves the explicit language header without guessing from a file extension.
+/// 🧭 Recognizes native declarations without guessing from a file extension.
 pub fn is_native(source: &str) -> bool {
     let mut rest = source.trim_start();
     while let Some(comment) = rest.strip_prefix("//") {
@@ -27,26 +27,25 @@ pub fn is_native(source: &str) -> bool {
             .map_or("", |(_, tail)| tail)
             .trim_start();
     }
-    rest.strip_prefix("Pingclair").is_some_and(|tail| {
-        tail.is_empty() || tail.starts_with(|c: char| c.is_whitespace() || matches!(c, '(' | '{'))
-    })
+    let name_len = rest
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        .count();
+    name_len > 0
+        && rest.as_bytes()[0].is_ascii_alphabetic()
+        && rest[name_len..].trim_start().starts_with('(')
 }
 
 pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
-    let root = syntax::parse(source)?;
-    if root.name != "Pingclair" {
-        return Err(root.at.error("expected Pingclair(version: 1)"));
-    }
-    root.labels(&["version"])?;
-    root.no_modifiers()?;
-    if root.integer("version")? != 1 {
-        return Err(root
-            .at
-            .error("unsupported configuration language version; expected 1"));
-    }
+    let declarations = syntax::parse(source)?;
     let mut config = PingclairConfig::default();
     let mut seen = std::collections::HashSet::new();
-    for call in root.block()? {
+    for call in &declarations {
+        if call.name == "Pingclair" {
+            return Err(call.at.error(
+                "the Pingclair(version: ...) header was removed; declare components at the top level",
+            ));
+        }
         if call.name != "TCPListener" && !seen.insert(&call.name) {
             return Err(call.at.error("duplicate global declaration"));
         }
@@ -82,7 +81,9 @@ pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
         }
     }
     if config.layer4.is_empty() {
-        return Err(root.at.error("expected at least one TCPListener"));
+        return Err(
+            syntax::Position { line: 1, column: 1 }.error("expected at least one TCPListener")
+        );
     }
     Ok(config)
 }
