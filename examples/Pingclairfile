@@ -16,4 +16,4 @@ HTTPListener(on: ":8080") {
     .encode(.zstd, .gzip)
     .errorPage(for: [.status(404)], file: "./public/index.html")
 }
-.accessLog(output: .file("/tmp/pingclair-access.log"), format: .console)
+.accessLog(output: .file("/tmp/pingclair-access.log"), format: .text)

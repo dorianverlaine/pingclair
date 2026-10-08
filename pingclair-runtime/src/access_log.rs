@@ -450,7 +450,23 @@ pub struct AccessLogger {
     namespaces: NamespaceFilter,
     /// 🎲 Optional rate policy. `None` is the common case and costs one branch.
     sampling: Option<SamplingWindow>,
+    /// 🚦 The lowest record severity this logger keeps.
+    ///
+    /// Access records are informational, the way upstream writes them, so a
+    /// level above that silences the log rather than selecting a subset —
+    /// which is exactly what an operator asking for `error` is saying.
+    level: u8,
 }
+
+/// 🚦 Severities, ordered so "at least this" is one comparison.
+const LEVEL_TRACE: u8 = 0;
+const LEVEL_DEBUG: u8 = 1;
+const LEVEL_INFO: u8 = 2;
+const LEVEL_WARN: u8 = 3;
+const LEVEL_ERROR: u8 = 4;
+
+/// 📝 Every access record is written at info, matching upstream.
+const ACCESS_RECORD_LEVEL: u8 = LEVEL_INFO;
 
 // MARK: - Host selection
 
@@ -1245,6 +1261,25 @@ impl AccessLogger {
             _ => None,
         };
 
+        // 🚦 `level` filters records by severity. An unknown name is refused
+        // rather than treated as the default: a level that silently becomes
+        // `info` hides the mistake until someone wonders why the log they
+        // meant to silence is still growing.
+        let level = match config.level.as_deref() {
+            None => LEVEL_INFO,
+            Some("trace") => LEVEL_TRACE,
+            Some("debug") => LEVEL_DEBUG,
+            Some("info") => LEVEL_INFO,
+            Some("warn") => LEVEL_WARN,
+            Some("error") => LEVEL_ERROR,
+            Some(other) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown log level `{other}`"),
+                ));
+            }
+        };
+
         Ok(Some(Self {
             format: config.format.clone(),
             exclude: config.exclude_fields.clone(),
@@ -1262,6 +1297,7 @@ impl AccessLogger {
             include_tls: config.include_tls,
             namespaces: NamespaceFilter::new(config.include.clone(), config.exclude.clone()),
             sampling: config.sampling.map(SamplingWindow::new),
+            level,
         }))
     }
 
@@ -1282,6 +1318,10 @@ impl AccessLogger {
     /// that cannot be written must never take down the request that produced
     /// the line.
     pub fn log(&self, entry: &AccessEntry<'_>) {
+        // 🚦 Records are informational; a logger set above that keeps none.
+        if ACCESS_RECORD_LEVEL < self.level {
+            return;
+        }
         // 🎲 Decided before the line is formatted, because formatting is the
         // expensive part and a sampled entry is one nobody will ever read.
         if let Some(sampling) = &self.sampling
@@ -1648,6 +1688,7 @@ mod tests {
             include_tls: false,
             namespaces: NamespaceFilter::default(),
             sampling: None,
+            level: LEVEL_INFO,
         }
     }
 
@@ -2111,6 +2152,62 @@ mod tests {
     #[test]
     fn no_log_config_yields_no_logger() {
         assert!(AccessLogger::from_config(None).unwrap().is_none());
+    }
+
+    /// 🚦 An access record is informational: a logger set above `info` keeps
+    /// nothing, and one set at or below it keeps everything.
+    #[test]
+    fn a_level_above_info_silences_the_access_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        let mut cfg = LogConfig {
+            output: LogOutput::File(path.to_str().unwrap().to_string()),
+            format: LogFormat::Text,
+            level: Some("error".to_string()),
+            exclude_fields: vec![],
+            rotation: Default::default(),
+            request_headers: vec![],
+            response_headers: vec![],
+            include_tls: false,
+            hostnames: vec![],
+            include: vec![],
+            exclude: vec![],
+            sampling: None,
+        };
+        let logger = AccessLogger::from_config(Some(&cfg)).unwrap().unwrap();
+        logger.log(&entry());
+        logger.flush();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+
+        cfg.level = Some("info".to_string());
+        let logger = AccessLogger::from_config(Some(&cfg)).unwrap().unwrap();
+        logger.log(&entry());
+        logger.flush();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("GET"));
+    }
+
+    /// 🚫 A level that silently becomes the default would hide the mistake
+    /// until someone wonders why the log they meant to silence still grows.
+    #[test]
+    fn an_unknown_level_is_refused_at_startup() {
+        let cfg = LogConfig {
+            output: LogOutput::Stdout,
+            format: LogFormat::Text,
+            level: Some("verbose".to_string()),
+            exclude_fields: vec![],
+            rotation: Default::default(),
+            request_headers: vec![],
+            response_headers: vec![],
+            include_tls: false,
+            hostnames: vec![],
+            include: vec![],
+            exclude: vec![],
+            sampling: None,
+        };
+        let error = AccessLogger::from_config(Some(&cfg))
+            .err()
+            .expect("an unknown level must not load");
+        assert!(error.to_string().contains("unknown log level"), "{error}");
     }
 
     #[test]

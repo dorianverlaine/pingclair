@@ -302,11 +302,17 @@
         "level": null,
         "exclude_fields": [],
         "rotation": {
-          "compress": false
+          "max_size_bytes": 104857600,
+          "keep": 7,
+          "compress": true
         },
-        "request_headers": [],
-        "response_headers": [],
-        "include_tls": false
+        "request_headers": [
+          "user-agent"
+        ],
+        "response_headers": [
+          "content-type"
+        ],
+        "include_tls": true
       },
       "client_max_body_size": 0,
       "limits": {

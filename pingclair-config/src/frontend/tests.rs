@@ -503,7 +503,6 @@ fn tls_and_log_mistakes_fail_closed() {
         ".tls(.internal).tls(.internal)",
         ".accessLog(output: .socket)",
         ".accessLog(output: .file(1))",
-        ".accessLog(level: .info)",
     ] {
         let source = format!("{prefix}{modifier}");
         assert!(crate::compile(&source).is_err(), "accepted {source:?}");

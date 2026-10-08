@@ -16,6 +16,7 @@ pub(crate) use handlers::{
 };
 pub(crate) use tls::TLS_LABELS;
 
+use super::log::{LogScope, parse_log};
 use super::*;
 use conditions::http_condition;
 use handlers::http_handler;
@@ -114,7 +115,7 @@ pub(super) fn http_listener(call: &Call, config: &mut PingclairConfig) -> Result
                 options.tls = Some(parsed.config);
                 options.ocsp_stapling_off |= parsed.ocsp_stapling_off;
             }
-            "accessLog" => options.log = Some(parse_access_log(modifier)?),
+            "accessLog" => options.log = Some(parse_log(modifier, LogScope::HttpAccess)?),
             _ => return Err(modifier.at.error("unknown HTTPListener modifier")),
         }
     }
@@ -536,100 +537,9 @@ struct HttpListenerOptions {
     ocsp_stapling_off: bool,
 }
 
-/// 🏷️ The argument labels `parse_access_log` accepts, named once for the parser and `describe`.
-pub(crate) const ACCESS_LOG_LABELS: &[&str] = &[
-    "output",
-    "format",
-    "level",
-    "hostnames",
-    "include",
-    "exclude",
-    "sampling",
-    "rotation",
-];
-
-/// 🪵 The `.accessLog(...)` settings this build serves.
-fn parse_access_log(modifier: &Call) -> Result<LogConfig, Error> {
-    modifier.leaf(ACCESS_LOG_LABELS)?;
-    for unsupported in [
-        "level",
-        "hostnames",
-        "include",
-        "exclude",
-        "sampling",
-        "rotation",
-    ] {
-        if modifier.get(unsupported).is_some() {
-            return Err(modifier.at.error(format!(
-                "{unsupported} in an access log is not implemented yet"
-            )));
-        }
-    }
-    let output = match modifier.get("output") {
-        None => LogOutput::Stdout,
-        Some(Value::Typed(value)) => match value.name.as_str() {
-            "stdout" => {
-                value.leaf(&[])?;
-                LogOutput::Stdout
-            }
-            "stderr" => {
-                value.leaf(&[])?;
-                LogOutput::Stderr
-            }
-            "file" => {
-                let [(None, Value::String(path))] = value.args.as_slice() else {
-                    return Err(value.at.error("file takes one quoted path"));
-                };
-                LogOutput::File(path.clone())
-            }
-            other => {
-                return Err(value.at.error(format!(
-                    "unknown log output '.{other}'; expected .stdout, .stderr or .file"
-                )));
-            }
-        },
-        Some(_) => {
-            return Err(modifier
-                .at
-                .error("output takes .stdout, .stderr or .file(...)"));
-        }
-    };
-    let format = match modifier.get("format") {
-        None => LogFormat::Text,
-        Some(Value::Typed(value)) => match value.name.as_str() {
-            "console" => {
-                value.leaf(&[])?;
-                LogFormat::Text
-            }
-            "json" => {
-                value.leaf(&[])?;
-                LogFormat::Json
-            }
-            other => {
-                return Err(value.at.error(format!(
-                    "unknown log format '.{other}'; expected .console or .json"
-                )));
-            }
-        },
-        Some(_) => {
-            return Err(modifier.at.error("format takes .console or .json"));
-        }
-    };
-    Ok(LogConfig {
-        output,
-        format,
-        level: None,
-        exclude_fields: Vec::new(),
-        rotation: LogRotation::default(),
-        request_headers: Vec::new(),
-        response_headers: Vec::new(),
-        include_tls: false,
-        hostnames: Vec::new(),
-        include: Vec::new(),
-        exclude: Vec::new(),
-        sampling: None,
-    })
-}
+/// 🏷️ The argument labels `.accessLog` accepts, named once for the parser and
+/// `describe`.
+pub(crate) use super::log::ACCESS_LOG_LABELS;
 
 /// 🏷️ The argument labels `apply_http_limits` accepts, named once for the parser and `describe`.
 pub(crate) const HTTP_LIMITS_LABELS: &[&str] = &[

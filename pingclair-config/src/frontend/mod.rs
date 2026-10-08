@@ -4,6 +4,7 @@
 //! 🧭 Pingclair's declarative language lowers directly to shared configuration.
 
 pub(crate) mod http;
+pub(crate) mod log;
 pub(crate) mod tcp;
 
 use http::http_listener;
@@ -222,13 +223,13 @@ pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
                     return Err(call.at.error("Log needs output:, level:, or both"));
                 }
                 let output = match call.get("output") {
-                    Some(value) => parse_log_output(value, call.at)?,
+                    Some(value) => log::log_output(value, call.at)?,
                     // 📌 The unnamed global logger writes to stdout unless told
                     // otherwise, which is the same default the Caddyfile has.
                     None => LogOutput::Stdout,
                 };
                 let level = match call.get("level") {
-                    Some(value) => Some(parse_log_level(value, call.at)?),
+                    Some(value) => Some(log::log_level(value, call.at)?),
                     None => None,
                 };
                 config.logging.default = Some(process_log(output, level));
@@ -422,59 +423,6 @@ fn parse_header_names(value: &Value, at: Position) -> Result<Vec<String>, Error>
     Ok(names)
 }
 
-/// 🪵 One process-log destination.
-fn parse_log_output(value: &Value, at: Position) -> Result<LogOutput, Error> {
-    let Value::Typed(case) = value else {
-        return Err(at.error("output takes .stdout, .stderr or .file(\"…\")"));
-    };
-    match case.name.as_str() {
-        "stdout" => {
-            expect_bare_case(case, ".stdout")?;
-            Ok(LogOutput::Stdout)
-        }
-        "stderr" => {
-            expect_bare_case(case, ".stderr")?;
-            Ok(LogOutput::Stderr)
-        }
-        "file" => {
-            if case.body.is_some() || !case.modifiers.is_empty() {
-                return Err(case.at.error(".file does not take a block or modifiers"));
-            }
-            let [(None, Value::String(path))] = case.args.as_slice() else {
-                return Err(case.at.error(".file takes one quoted path"));
-            };
-            if path.is_empty() {
-                return Err(case.at.error(".file takes a non-empty path"));
-            }
-            Ok(LogOutput::File(path.clone()))
-        }
-        other => Err(case.at.error(format!(
-            "unknown output `.{other}`; expected .stdout, .stderr or .file(\"…\")"
-        ))),
-    }
-}
-
-/// 🚦 One process-log level.
-fn parse_log_level(value: &Value, at: Position) -> Result<&'static str, Error> {
-    let Value::Typed(case) = value else {
-        return Err(at.error("level takes .trace, .debug, .info, .warn or .error"));
-    };
-    let level = match case.name.as_str() {
-        "trace" => "trace",
-        "debug" => "debug",
-        "info" => "info",
-        "warn" => "warn",
-        "error" => "error",
-        other => {
-            return Err(case.at.error(format!(
-                "unknown level `.{other}`; expected .trace, .debug, .info, .warn or .error"
-            )));
-        }
-    };
-    expect_bare_case(case, "a log level")?;
-    Ok(level)
-}
-
 /// 🪵 A process logger with the model's defaults for everything but output and
 /// level; the log batch extends this declaration along the same fields.
 fn process_log(output: LogOutput, level: Option<&str>) -> LogConfig {
@@ -514,6 +462,47 @@ fn expect_bare_case(case: &Call, what: &str) -> Result<(), Error> {
         return Err(case.at.error(format!("{what} takes no arguments")));
     }
     Ok(())
+}
+
+/// ⏱️ A typed duration value (`.seconds(30)`, `.minutes(2)`, `.hours(1)`,
+/// `.milliseconds(500)`) as whole seconds.
+///
+/// 📌 Sub-second values round up, the way the Caddyfile adapter rounds its own
+/// sub-second durations: rounding down would turn "wait a moment" into "do
+/// not wait".
+pub(super) fn duration_secs(value: &Value, what: &str, at: Position) -> Result<u64, Error> {
+    let Value::Typed(unit) = value else {
+        return Err(at.error(format!(
+            "{what} takes a duration with an explicit unit such as .seconds(30) or .minutes(2)"
+        )));
+    };
+    if unit.body.is_some() {
+        return Err(unit.at.error(format!("{what} does not take a block")));
+    }
+    if !unit.modifiers.is_empty() {
+        return Err(unit.at.error(format!("{what} does not take modifiers")));
+    }
+    let [(None, Value::Number(number))] = unit.args.as_slice() else {
+        return Err(unit
+            .at
+            .error(format!("{what} takes one unsigned integer inside its unit")));
+    };
+    let seconds = match unit.name.as_str() {
+        "milliseconds" => number.div_ceil(1000),
+        "seconds" => *number,
+        "minutes" => number
+            .checked_mul(60)
+            .ok_or_else(|| unit.at.error("duration exceeds the supported range"))?,
+        "hours" => number
+            .checked_mul(3600)
+            .ok_or_else(|| unit.at.error("duration exceeds the supported range"))?,
+        other => {
+            return Err(unit.at.error(format!(
+                "unknown unit `.{other}`; expected .milliseconds, .seconds, .minutes or .hours"
+            )));
+        }
+    };
+    Ok(seconds)
 }
 
 impl Call {
@@ -613,6 +602,8 @@ impl Call {
 
 #[cfg(test)]
 mod globals_tests;
+#[cfg(test)]
+mod log_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

@@ -546,42 +546,6 @@ fn parse_ratio(value: &Value, at: Position) -> Result<f64, Error> {
     Ok(ratio)
 }
 
-/// ⏱️ A DNS timer written as `.seconds(30)`, `.minutes(2)`, `.hours(1)` or
-/// `.milliseconds(500)`, normalised to the whole seconds the model stores.
-///
-/// 📌 Sub-second values round up, the way the Caddyfile adapter rounds
-/// `dns_ttl 500ms` to one second: rounding down would turn "wait a moment"
-/// into "do not wait".
-fn duration_secs(value: &Value, setting: &str, at: Position) -> Result<u64, Error> {
-    let Value::Typed(unit) = value else {
-        return Err(at.error(format!(
-            "{setting} takes a duration with an explicit unit such as .minutes(2) or .seconds(30)"
-        )));
-    };
-    expect_positional(unit, setting)?;
-    let [(None, Value::Number(number))] = unit.args.as_slice() else {
-        return Err(unit.at.error(format!(
-            "{setting} takes one unsigned integer inside its unit"
-        )));
-    };
-    let seconds = match unit.name.as_str() {
-        "milliseconds" => number.div_ceil(1000),
-        "seconds" => *number,
-        "minutes" => number
-            .checked_mul(60)
-            .ok_or_else(|| unit.at.error("duration exceeds the supported range"))?,
-        "hours" => number
-            .checked_mul(3600)
-            .ok_or_else(|| unit.at.error("duration exceeds the supported range"))?,
-        other => {
-            return Err(unit.at.error(format!(
-                "unknown unit `.{other}`; expected .milliseconds, .seconds, .minutes or .hours"
-            )));
-        }
-    };
-    Ok(seconds)
-}
-
 /// 🧷 A non-empty quoted string, with the error pointing at the `.tls(...)`.
 fn non_empty_string(value: &Value, setting: &str, at: Position) -> Result<String, Error> {
     match value {

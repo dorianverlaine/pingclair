@@ -238,11 +238,17 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         name: "accessLog",
         kind: Kind::Modifier,
-        summary: "The listener's access log: `output` and `format`.",
+        summary: "The listener's access log: output, encoder, level, captured headers, \
+                  hostnames, source filters, field pruning, sampling and rotation.",
         example: r#"HTTPListener(on: ":8080") {
     Site(host: "*") { Fallback { Respond(body: "hello") } }
 }
-.accessLog(output: .file("/tmp/access.log"), format: .json)"#,
+.accessLog(
+    output: .file("/tmp/access.log"),
+    format: .json,
+    headers: [.request("Authorization"), .tls],
+    rotation: .roll(size: .mebibytes(100), keep: 7, compress: true),
+)"#,
         refusal: r#"HTTPListener(on: ":8080") {
     Site(host: "*") { Fallback { Respond(body: "hello") } }
 }

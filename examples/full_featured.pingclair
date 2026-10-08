@@ -95,7 +95,12 @@ HTTPListener(on: ":8443") {
 .tls(.automatic(email: "admin@example.test"), defaultSNI: "www.example.test", renewalWindow: .ratio(0.1))
 .protocols([.http1, .http2])
 .limits(maxConnections: 4096, headerTimeout: .seconds(30))
-.accessLog(output: .file("/tmp/pingclair-access.log"), format: .console)
+.accessLog(
+    output: .file("/tmp/pingclair-access.log"),
+    format: .text,
+    headers: [.request("User-Agent"), .response("Content-Type"), .tls],
+    rotation: .roll(size: .mebibytes(100), keep: 7, compress: true),
+)
 
 // 🔀 A plaintext listener that redirects, and nothing else.
 HTTPListener(on: ":8080") {
