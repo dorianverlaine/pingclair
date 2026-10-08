@@ -314,6 +314,6 @@ fn count_value(value: &Value, nodes: &mut usize, bytes: &mut usize) {
         // 🔐 The wrapper costs nothing of its own: what has to be counted is
         // the value it carries, which is where the bytes are.
         Value::Secret { value, .. } => count_value(value, nodes, bytes),
-        Value::Number(_) | Value::Bool(_) => {}
+        Value::Number(_) | Value::Decimal(_) | Value::Bool(_) => {}
     }
 }

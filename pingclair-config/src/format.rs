@@ -331,6 +331,7 @@ impl Printer {
                 self.text(&rendered);
             }
             Value::Number(number) => self.text(&number.to_string()),
+            Value::Decimal(number) => self.text(number),
             Value::Bool(flag) => self.text(if *flag { "true" } else { "false" }),
             Value::Reference { name, .. } => self.text(name),
             // 🔐 Synthetic, so a formatter never meets one; printing the
@@ -391,6 +392,19 @@ mod tests {
         let formatted = format(source).unwrap();
         assert_eq!(formatted, expected);
         assert_eq!(format(&formatted).unwrap(), formatted);
+    }
+
+    /// 🧮 The decimal literal is data, not arithmetic: it round-trips exactly
+    /// as written, and every integer reader still refuses it.
+    #[test]
+    fn a_decimal_literal_round_trips_and_stays_out_of_integer_readers() {
+        let formatted = format("let ratio = 0.10\n").expect("the binding formats");
+        assert!(formatted.contains("0.10"), "{formatted}");
+        assert_eq!(format(&formatted).unwrap(), formatted);
+
+        let error = crate::compile("Shutdown(grace: .seconds(1.5))")
+            .expect_err("a decimal is not a duration");
+        assert!(error.to_string().contains("unsigned integer"), "{error}");
     }
 
     #[test]

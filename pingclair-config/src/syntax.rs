@@ -56,6 +56,12 @@ pub(super) enum Declaration {
 pub(super) enum Value {
     String(String),
     Number(u64),
+    /// 🧮 A decimal literal, the only non-integer number the lexer produces.
+    ///
+    /// 📌 The text is kept exactly as written so the formatter echoes the
+    /// source; the one reader that wants a fraction (`.ratio(...)`) parses it.
+    /// There is still no floating-point arithmetic anywhere in the language.
+    Decimal(String),
     Bool(bool),
     Array(Vec<Value>),
     Typed(Call),
@@ -81,6 +87,7 @@ enum Token {
     Word(String),
     String(String),
     Number(u64),
+    Decimal(String),
     Mark(char),
     End,
 }
@@ -161,11 +168,28 @@ pub(super) fn parse(source: &str) -> Result<Vec<Declaration>, crate::frontend::E
                 if word.ends_with('_') || word.contains("__") {
                     return Err(here.error("invalid integer separator"));
                 }
-                Token::Number(
-                    word.replace('_', "")
-                        .parse()
-                        .map_err(|_| here.error("integer exceeds supported range"))?,
-                )
+                // 🧮 `0.1` is a decimal literal — still a literal, not
+                // arithmetic. Only the `Ratio` reader consumes one; every
+                // integer reader refuses it by asking for `Value::Number`.
+                if chars.peek().is_some_and(|(_, c)| *c == '.') {
+                    chars.next();
+                    at.column += 1;
+                    let mut fraction = String::new();
+                    while chars.peek().is_some_and(|(_, c)| c.is_ascii_digit()) {
+                        fraction.push(chars.next().unwrap().1);
+                        at.column += 1;
+                    }
+                    if fraction.is_empty() {
+                        return Err(here.error("a decimal literal needs digits after the dot"));
+                    }
+                    Token::Decimal(format!("{}.{}", word.replace('_', ""), fraction))
+                } else {
+                    Token::Number(
+                        word.replace('_', "")
+                            .parse()
+                            .map_err(|_| here.error("integer exceeds supported range"))?,
+                    )
+                }
             } else if "(){}[],:.=@".contains(ch) {
                 Token::Mark(ch)
             } else {
@@ -448,6 +472,7 @@ impl Parser {
         match item.token {
             Token::String(value) => Ok(Value::String(value)),
             Token::Number(value) => Ok(Value::Number(value)),
+            Token::Decimal(value) => Ok(Value::Decimal(value)),
             Token::Word(value) if value == "true" || value == "false" => {
                 Ok(Value::Bool(value == "true"))
             }
