@@ -2674,6 +2674,7 @@ fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
         "writeTimeout",
         "versions",
         "healthCheck",
+        "upstreamTLS",
     ])?;
     let upstreams = upstream_addresses(call)?;
     let up = header_list(call, "headersUp", false)?;
@@ -2852,6 +2853,12 @@ fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
     if let Some(value) = call.get("healthCheck") {
         config.health_check = Some(Box::new(health_check(value, call.at)?));
     }
+    // 🔒 The upstream's own TLS: the Caddyfile's `transport http { tls … }`,
+    // which is per-route policy rather than a global switch — a private CA
+    // here *replaces* the system trust store for this route alone.
+    if let Some(value) = call.get("upstreamTLS") {
+        config.upstream_tls = Box::new(upstream_tls(value, call.at)?);
+    }
     config.headers_up = up.set;
     config.headers_up_add = up.add;
     config.headers_up_remove = up.remove;
@@ -2915,6 +2922,69 @@ fn upstream_addresses(call: &Call) -> Result<Vec<String>, Error> {
 /// 🌐 The proxy the build's bare defaults describe, with an optional FastCGI
 /// transport. Shared by `Proxy` and `PHPFastCGI`, so the two cannot disagree
 /// about a default neither of them wrote.
+/// 🩺 `.http(path:, …)`: the probe a proxy sends to decide a peer's health.
+/// 🔒 `.enabled(…)`: the TLS policy a proxy applies to its upstreams.
+fn upstream_tls(value: &Value, at: Position) -> Result<UpstreamTlsConfig, Error> {
+    let Value::Typed(tls) = value else {
+        return Err(at.error("upstreamTLS takes .enabled(serverName:, …)"));
+    };
+    if tls.name != "enabled" {
+        return Err(tls.at.error(format!(
+            "unknown upstream TLS '.{}'; expected .enabled(serverName:, trustedCACerts:, \
+             clientCert:, clientKey:, insecureSkipVerify:)",
+            tls.name
+        )));
+    }
+    tls.leaf(&[
+        "serverName",
+        "trustedCACerts",
+        "clientCert",
+        "clientKey",
+        "insecureSkipVerify",
+    ])?;
+    let server_name = if tls.get("serverName").is_some() {
+        Some(tls.string("serverName")?)
+    } else {
+        None
+    };
+    let trusted_ca_certs = tls.strings("trustedCACerts")?;
+    // 🎫 Both halves or neither: an upstream must never see an anonymous
+    // handshake because a client certificate was named without its key.
+    let (client_cert, client_key) = match (tls.get("clientCert"), tls.get("clientKey")) {
+        (None, None) => (None, None),
+        (Some(_), Some(_)) => (
+            Some(tls.string("clientCert")?),
+            Some(tls.string("clientKey")?),
+        ),
+        _ => {
+            return Err(tls
+                .at
+                .error("clientCert and clientKey are one setting; name both or neither"));
+        }
+    };
+    let insecure_skip_verify = if tls.get("insecureSkipVerify").is_some() {
+        tls.boolean("insecureSkipVerify")?
+    } else {
+        false
+    };
+    // 🚫 Naming a private CA *and* skipping verification asks for two
+    // different things: the first says "trust exactly these", the second says
+    // "trust anything".
+    if insecure_skip_verify && !trusted_ca_certs.is_empty() {
+        return Err(tls
+            .at
+            .error("insecureSkipVerify and trustedCACerts are alternatives; pick one"));
+    }
+    Ok(UpstreamTlsConfig {
+        enable: true,
+        server_name,
+        trusted_ca_certs,
+        client_cert,
+        client_key,
+        insecure_skip_verify,
+    })
+}
+
 /// 🩺 `.http(path:, …)`: the probe a proxy sends to decide a peer's health.
 fn health_check(value: &Value, at: Position) -> Result<HealthCheckConfig, Error> {
     let Value::Typed(check) = value else {

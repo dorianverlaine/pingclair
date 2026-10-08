@@ -2043,6 +2043,63 @@ fn health_checks_that_cannot_mean_anything_fail_closed() {
 }
 
 #[test]
+fn upstream_tls_lowers_like_its_caddyfile_twin() {
+    let native = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+            Proxy(
+                to: "https://10.0.0.10:8443",
+                upstreamTLS: .enabled(
+                    serverName: "app.internal",
+                    trustedCACerts: ["./ca.pem"],
+                    clientCert: "./c.pem",
+                    clientKey: "./k.pem"
+                )
+            )
+        } } }"#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "http://:8080 {\n\treverse_proxy https://10.0.0.10:8443 {\n\t\ttransport http {\n\t\t\ttls\n\t\t\ttls_server_name app.internal\n\t\t\ttls_trusted_ca_certs ./ca.pem\n\t\t\ttls_client_auth ./c.pem ./k.pem\n\t\t}\n\t}\n}",
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(native).unwrap(),
+        serde_json::to_value(legacy).unwrap()
+    );
+}
+
+#[test]
+fn upstream_tls_that_cannot_mean_anything_fail_closed() {
+    let site = |handler: &str| {
+        format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {handler} }} }} }}"
+        )
+    };
+    for handler in [
+        "Proxy(to: \"127.0.0.1:9000\", upstreamTLS: \"enabled\")",
+        "Proxy(to: \"127.0.0.1:9000\", upstreamTLS: .disabled)",
+        "Proxy(to: \"127.0.0.1:9000\", upstreamTLS: .enabled(unknown: 1))",
+        // 🎫 Both halves or neither.
+        "Proxy(to: \"127.0.0.1:9000\", upstreamTLS: .enabled(clientCert: \"./c.pem\"))",
+        "Proxy(to: \"127.0.0.1:9000\", upstreamTLS: .enabled(clientKey: \"./k.pem\"))",
+        // 🚫 Trusting exactly one CA and trusting anything are different asks.
+        "Proxy(to: \"127.0.0.1:9000\", upstreamTLS: .enabled(trustedCACerts: [\"./ca.pem\"], insecureSkipVerify: true))",
+        "Proxy(to: \"127.0.0.1:9000\", upstreamTLS: .enabled(trustedCACerts: \"./ca.pem\"))",
+        "Proxy(to: \"127.0.0.1:9000\", upstreamTLS: .enabled(serverName: 1))",
+        "Proxy(to: \"127.0.0.1:9000\", upstreamTLS: .enabled(insecureSkipVerify: 1))",
+    ] {
+        let source = site(handler);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+    // 📌 A bare `.enabled` is the Caddyfile's bare `tls`: system roots, no SNI
+    // override, which is a legitimate configuration.
+    crate::compile(&site(
+        "Proxy(to: \"https://10.0.0.10:8443\", upstreamTLS: .enabled)",
+    ))
+    .unwrap();
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",
