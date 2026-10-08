@@ -27,6 +27,18 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🛡️ A guard written with a `not` matcher keeps its exemption
+
+`compose_site_routes` copies a scoped line into every answering route it could
+run ahead of, and it stays conservative when it cannot prove two matchers
+disjoint: `not path /ready-*` and `path /ready-xyz` are not, so the guard
+landed on the exempt route too. The dispatch-time handlers re-checked their
+element matcher there; `access_control` and `rate_limit`, which are hoisted
+into per-route tables at load and enforced before dispatch, did not — the
+table kept the compiled policy and dropped the matcher that scoped it. Both
+tables now carry the element matcher, and a request is refused or charged only
+by the guards whose matcher accepts it, on all three transports (#314).
+
 ### 🚰 An HTTP/2 response in flight across SIGTERM reaches the client
 
 The in-flight count reaches zero when the proxy has handed the response to its

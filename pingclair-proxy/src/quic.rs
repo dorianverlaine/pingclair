@@ -4116,30 +4116,61 @@ async fn handle_request_inner(
         raised = Some(413);
     }
 
-    // 🛡️ HTTP/3 enforces the same compiled access policy before authentication or dispatch.
-    if raised.is_none()
-        && !state.allows_access(route_index, &verified_client_ip_text, &header.headers)
-    {
-        return Err((403, "Forbidden"));
+    // 🛡️ HTTP/3 enforces the same compiled access policy before authentication
+    // or dispatch, re-checking each guard's element matcher exactly as H1/H2
+    // does (issue #314).
+    if raised.is_none() {
+        let access = {
+            let mut guard_request = MatcherRequest {
+                path: path_only,
+                method: req.method.as_str(),
+                headers: &header.headers,
+                host: &host_bare,
+                addresses,
+                protocol: "https",
+                vars: Some(request_vars.values_mut()),
+            };
+            state.allows_access(route_index, &verified_client_ip_text, &mut guard_request)
+        };
+        match access {
+            Ok(true) => {}
+            Ok(false) => return Err((403, "Forbidden")),
+            // 🚨 A `=code` fallback in a guard matcher raises its status like
+            // any other early rejection, so the error routes can answer it.
+            Err(code) => raised = Some(code),
+        }
     }
 
-    // 🚦 HTTP/3 charges the same exact limiter and identity source as H1 and H2.
-    if raised.is_none()
-        && let Some(limiter) = state
-            .rate_limiters
-            .get(route_index)
-            .and_then(|l| l.as_ref())
-    {
-        let decision = limiter.check_request(&verified_client_ip_text, &header.headers);
-        for (name, value) in decision.info.to_headers() {
-            response_policy.set(name, value);
-        }
-        if decision.reject {
-            // 🚫 Raised like any other early rejection so the answer carries
-            // a body that explains it (RFC 6585 §4) or the site's configured
-            // error page. The `Retry-After` and `RateLimit` fields set above
-            // live in the response policy, which the error path applies.
-            return Err((429, "Too Many Requests"));
+    // 🚦 HTTP/3 charges the same exact limiters and identity source as H1 and
+    // H2, and only for the guards whose matchers accept the request.
+    if raised.is_none() {
+        let charged = {
+            let mut guard_request = MatcherRequest {
+                path: path_only,
+                method: req.method.as_str(),
+                headers: &header.headers,
+                host: &host_bare,
+                addresses,
+                protocol: "https",
+                vars: Some(request_vars.values_mut()),
+            };
+            state.charge_rate_limits(route_index, &verified_client_ip_text, &mut guard_request)
+        };
+        match charged {
+            Ok(verdict) => {
+                for (name, value) in verdict.headers {
+                    response_policy.set(name, value);
+                }
+                if verdict.reject {
+                    // 🚫 Raised like any other early rejection so the answer
+                    // carries a body that explains it (RFC 6585 §4) or the
+                    // site's configured error page. The `Retry-After` and
+                    // `RateLimit` fields set above live in the response policy,
+                    // which the error path applies.
+                    return Err((429, "Too Many Requests"));
+                }
+            }
+            Err(code) => raised = Some(code),
         }
     }
 

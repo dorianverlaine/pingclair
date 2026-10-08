@@ -3602,6 +3602,113 @@ async fn test_cors_and_access_control_end_to_end() {
     assert_eq!(response.status(), 403);
 }
 
+/// 🛡️ A guard written with a `not` matcher must stay quiet on the requests
+/// its own matcher exempts, even though the guard is copied into the route
+/// that answers them — the hoist has to keep the element matcher (issue
+/// #314).
+#[tokio::test]
+async fn test_negated_access_control_keeps_its_exemption() {
+    let config = r#"
+        {
+            admin off
+            auto_https off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            @exempt path /exempt*
+            respond @exempt "exempt"
+
+            @guarded not path /exempt*
+            access_control @guarded {
+                deny_user_agent (?i)blockedbot
+            }
+            respond "ok"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let exempt = client
+        .get(server.url(0, "/exempt/token"))
+        .header("User-Agent", "BlockedBot/1.0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        exempt.status(),
+        200,
+        "`not path /exempt*` must exempt the route its own matcher names"
+    );
+    assert_eq!(exempt.text().await.unwrap(), "exempt");
+
+    let guarded = client
+        .get(server.url(0, "/other"))
+        .header("User-Agent", "BlockedBot/1.0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        guarded.status(),
+        403,
+        "the guard still answers inside its own scope"
+    );
+}
+
+/// 🚦 The same shape for the limiter: exempt requests must not charge the
+/// guarded route's bucket, and the bucket must still refuse when it fills
+/// (issue #314).
+#[tokio::test]
+async fn test_negated_rate_limit_keeps_its_exemption() {
+    let config = r#"
+        {
+            admin off
+            auto_https off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle /api* {
+                @guarded not path /api/special*
+                rate_limit @guarded 1 60s
+                respond "api"
+            }
+            respond "ok"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🎟️ Both exempt requests must answer, because the guard never charged
+    // them; a build that ignores the matcher refuses the second one.
+    for _ in 0..2 {
+        let exempt = client
+            .get(server.url(0, "/api/special/x"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            exempt.status(),
+            200,
+            "an exempt request must not be rate-limited"
+        );
+    }
+
+    // 🚫 The guarded route's own bucket is untouched by those requests: its
+    // first request is allowed and its second is refused, so the exemption
+    // did not simply turn the limiter off.
+    let first = client.get(server.url(0, "/api/x")).send().await.unwrap();
+    assert_eq!(first.status(), 200);
+    let second = client.get(server.url(0, "/api/x")).send().await.unwrap();
+    assert_eq!(second.status(), 429);
+}
+
 #[tokio::test]
 async fn test_regex_rewrite_reaches_the_rewritten_static_path() {
     let temp_dir = tempfile::tempdir().unwrap();

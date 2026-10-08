@@ -644,8 +644,9 @@ pub struct ProxyState {
             >,
         >,
     >,
-    /// Rate limiters per route
-    pub rate_limiters: Vec<Option<Arc<crate::rate_limit::RateLimiter>>>,
+    /// 🚦 Token limiters per route, each with the element matcher it was
+    /// written under; see [`HoistedGuard`].
+    rate_limiters: Vec<Vec<HoistedGuard<Arc<crate::rate_limit::RateLimiter>>>>,
     /// 🚦 Admission and circuit state per reverse-proxy route.
     pub(crate) route_protections: Vec<Option<Arc<RouteProtection>>>,
 
@@ -654,8 +655,9 @@ pub struct ProxyState {
     pub(crate) hash_key_sources: Vec<Option<HashKeySource>>,
     /// 🔐 Compiled upstream TLS trust and identity per reverse-proxy route.
     pub(crate) upstream_tls: Vec<RouteUpstreamTls>,
-    /// Pre-compiled per-route access policies.
-    access_controls: Vec<Option<Arc<RouteAccessControl>>>,
+    /// 🛡️ Compiled access policies per route, each with the element matcher
+    /// it was written under; see [`HoistedGuard`].
+    access_controls: Vec<Vec<HoistedGuard<Arc<RouteAccessControl>>>>,
     /// Pre-compiled regular expressions used by route rewrite handlers.
     route_regexes: Vec<HashMap<String, Arc<Regex>>>,
     /// 📥 Per route, the widest `request_body` limit it could grant.
@@ -908,6 +910,46 @@ impl RouteAccessControl {
                 .iter()
                 .any(|regex| regex.is_match(user_agent))
     }
+}
+
+/// 🛡️ A policy hoisted out of a route's handler tree at load, keeping the
+/// element matcher it was written under.
+///
+/// `compose_site_routes` copies a scoped line into every answering route it
+/// could run ahead of, and it leaves a route out only when it can prove the
+/// two matchers disjoint — `not path /ready-*` and `path /ready-xyz` are not,
+/// so the copy lands on the exempt route too. That copy used to be enforced
+/// unconditionally, so the guard refused exactly the requests its own matcher
+/// exempted (issue #314). The matcher is therefore part of the hoisted policy
+/// and is re-checked per request, the same verdict dispatch would have asked
+/// before running the element.
+#[derive(Clone)]
+struct HoistedGuard<T> {
+    /// `None` when the element carried no matcher: then the guard applies to
+    /// every request that reaches the route.
+    matcher: Option<CompiledMatcher>,
+    policy: T,
+}
+
+impl<T> HoistedGuard<T> {
+    /// 🎯 The element matcher's verdict for this request, in the same
+    /// vocabulary the dispatch-time element check uses.
+    fn verdict(&self, request: &mut MatcherRequest<'_>) -> MatcherVerdict {
+        match &self.matcher {
+            Some(compiled) => evaluate_verdict(compiled, request),
+            None => MatcherVerdict::Match,
+        }
+    }
+}
+
+/// 🚦 The outcome of charging one route's hoisted rate limiters.
+#[derive(Debug, Default)]
+pub(crate) struct RateLimitVerdict {
+    /// 📈 The `RateLimit-*` fields of every limiter that ran, in element
+    /// order; a later limiter's field wins when two describe the same one.
+    pub headers: Vec<(String, String)>,
+    /// 🚫 Whether any limiter refused the request (RFC 6585 §4).
+    pub reject: bool,
 }
 
 fn referer_host(referer: &str) -> Option<&str> {
@@ -1410,18 +1452,42 @@ impl ProxyState {
             }
             file_servers.push(file_server);
 
-            // Check for rate limit config
-            if let Some(rl_config) = find_rate_limit_config(&route.handler, &route.path) {
-                use crate::rate_limit::RateLimiter;
-                rate_limiters.push(Some(RateLimiter::new(rl_config)));
+            // 🚦 Every hoisted guard keeps its element matcher: a scoped line
+            // is copied into each route it *could* affect, and the matcher is
+            // what keeps that copy quiet on the routes it exempts (#314).
+            let route_precompile = router
+                .compiled_route(route_index)
+                .map(|compiled| &compiled.matcher_precompile);
+            let mut rate_guards = Vec::new();
+            collect_rate_limit_guards(
+                &route.handler,
+                route_precompile,
+                &route.path,
+                &mut rate_guards,
+            );
+            if !rate_guards.is_empty() {
                 tracing::info!("🚦 Initialized rate limiter for route {}", route.path);
-            } else {
-                rate_limiters.push(None);
             }
+            rate_limiters.push(
+                rate_guards
+                    .into_iter()
+                    .map(|(matcher, config)| HoistedGuard {
+                        matcher,
+                        policy: crate::rate_limit::RateLimiter::new(config),
+                    })
+                    .collect(),
+            );
 
+            let mut access_guards = Vec::new();
+            collect_access_control_guards(&route.handler, route_precompile, &mut access_guards);
             access_controls.push(
-                find_access_control_config(&route.handler)
-                    .map(|config| Arc::new(RouteAccessControl::from_config(config))),
+                access_guards
+                    .into_iter()
+                    .map(|(matcher, config)| HoistedGuard {
+                        matcher,
+                        policy: Arc::new(RouteAccessControl::from_config(config)),
+                    })
+                    .collect(),
             );
 
             let mut compiled = HashMap::new();
@@ -1614,17 +1680,74 @@ impl ProxyState {
             .cloned()
     }
 
-    /// 🛡️ Applies the route's compiled access policy to a verified client.
+    /// 🛡️ This route's hoisted access guards, in element order.
+    fn access_guards(&self, route_index: usize) -> &[HoistedGuard<Arc<RouteAccessControl>>] {
+        self.access_controls
+            .get(route_index)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// 🚦 This route's hoisted rate limiters, in element order.
+    fn rate_limit_guards(
+        &self,
+        route_index: usize,
+    ) -> &[HoistedGuard<Arc<crate::rate_limit::RateLimiter>>] {
+        self.rate_limiters
+            .get(route_index)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// 🛡️ Applies this route's hoisted access guards to a verified client.
+    ///
+    /// `Ok(false)` refuses the request (403), and `Err(code)` is a matcher
+    /// fallback the caller raises like any dispatch-time element verdict.
+    /// Guards answer in element order, and a guard whose element matcher does
+    /// not accept the request is skipped rather than applied — the copy
+    /// `compose_site_routes` left on an exempt route stays quiet (issue #314).
     pub(crate) fn allows_access(
         &self,
         route_index: usize,
-        remote_ip: &str,
-        headers: &http::HeaderMap,
-    ) -> bool {
-        self.access_controls
-            .get(route_index)
-            .and_then(|policy| policy.as_ref())
-            .is_none_or(|policy| policy.allows(remote_ip, headers))
+        verified_client_ip: &str,
+        request: &mut MatcherRequest<'_>,
+    ) -> Result<bool, u16> {
+        for guard in self.access_guards(route_index) {
+            match guard.verdict(request) {
+                MatcherVerdict::Match => {
+                    if !guard.policy.allows(verified_client_ip, request.headers) {
+                        return Ok(false);
+                    }
+                }
+                MatcherVerdict::NoMatch => {}
+                MatcherVerdict::Error(code) => return Err(code),
+            }
+        }
+        Ok(true)
+    }
+
+    /// 🚦 Charges every hoisted limiter whose element matcher accepts the
+    /// request, in element order, and reports the header fields each one
+    /// produced plus whether any refused the request.
+    pub(crate) fn charge_rate_limits(
+        &self,
+        route_index: usize,
+        verified_client_ip: &str,
+        request: &mut MatcherRequest<'_>,
+    ) -> Result<RateLimitVerdict, u16> {
+        let mut verdict = RateLimitVerdict::default();
+        for guard in self.rate_limit_guards(route_index) {
+            match guard.verdict(request) {
+                MatcherVerdict::Match => {
+                    let decision = guard
+                        .policy
+                        .check_request(verified_client_ip, request.headers);
+                    verdict.headers.extend(decision.info.to_headers());
+                    verdict.reject |= decision.reject;
+                }
+                MatcherVerdict::NoMatch => {}
+                MatcherVerdict::Error(code) => return Err(code),
+            }
+        }
+        Ok(verdict)
     }
 
     /// 📥 The most permissive body limit this route's `request_body` handlers
@@ -7419,9 +7542,30 @@ impl ProxyHttp for PingclairProxy {
             // an upstream connection. This keeps denied traffic out of every
             // later request path and makes the policy apply uniformly to all
             // terminal handler types.
-            if !state.allows_access(index, remote_ip, &session.req_header().headers) {
-                Self::write_simple_response(session, ctx, 403, "Forbidden").await?;
-                return Ok(true);
+            //
+            // 🎯 Each guard re-checks the element matcher it was hoisted
+            // under, so a copy compose_site_routes left on a route the matcher
+            // does not actually cover stays quiet (issue #314).
+            let access = {
+                let path = session.req_header().uri.path();
+                let host = crate::http_policy::request_host(crate::http_policy::request_authority(
+                    session.req_header(),
+                ));
+                let mut guard_request = guard_matcher_request(session, host.as_ref(), ctx, path);
+                state.allows_access(index, remote_ip, &mut guard_request)
+            };
+            match access {
+                Ok(true) => {}
+                Ok(false) => {
+                    Self::write_simple_response(session, ctx, 403, "Forbidden").await?;
+                    return Ok(true);
+                }
+                // 🚨 A `=code` fallback in a guard matcher raises its status,
+                // exactly like the same verdict inside dispatch.
+                Err(code) => {
+                    self.serve_error_page(session, ctx, code).await?;
+                    return Ok(true);
+                }
             }
 
             // 🚫 Rejects declared request trailers because Pingora currently discards H1 trailers.
@@ -7432,19 +7576,33 @@ impl ProxyHttp for PingclairProxy {
                 return Ok(true);
             }
 
-            // 🚦 Charges the configured exact token bucket before handler dispatch.
-            if let Some(limiter) = state.rate_limiters.get(index).and_then(|l| l.as_ref()) {
-                let decision = limiter.check_request(remote_ip, &session.req_header().headers);
-                for (name, value) in decision.info.to_headers() {
-                    ctx.response_headers.set(name, value);
+            // 🚦 Charges the exact token bucket of every guard that accepts
+            // the request, before handler dispatch.
+            let rate_limit = {
+                let path = session.req_header().uri.path();
+                let host = crate::http_policy::request_host(crate::http_policy::request_authority(
+                    session.req_header(),
+                ));
+                let mut guard_request = guard_matcher_request(session, host.as_ref(), ctx, path);
+                state.charge_rate_limits(index, remote_ip, &mut guard_request)
+            };
+            match rate_limit {
+                Ok(verdict) => {
+                    for (name, value) in verdict.headers {
+                        ctx.response_headers.set(name, value);
+                    }
+                    if verdict.reject {
+                        // 🚫 Answered through the error-page path so the client
+                        // gets a body that explains the rejection (RFC 6585 §4),
+                        // or the site's configured page, instead of a bare status.
+                        // The `Retry-After` and `RateLimit` fields set above ride
+                        // along in `ctx.response_headers`.
+                        self.serve_error_page(session, ctx, 429).await?;
+                        return Ok(true);
+                    }
                 }
-                if decision.reject {
-                    // 🚫 Answered through the error-page path so the client
-                    // gets a body that explains the rejection (RFC 6585 §4),
-                    // or the site's configured page, instead of a bare status.
-                    // The `Retry-After` and `RateLimit` fields set above ride
-                    // along in `ctx.response_headers`.
-                    self.serve_error_page(session, ctx, 429).await?;
+                Err(code) => {
+                    self.serve_error_page(session, ctx, code).await?;
                     return Ok(true);
                 }
             }
@@ -9395,7 +9553,6 @@ impl ProxyHttp for PingclairProxy {
 
 // MARK: - Helper Functions
 
-/// Recursively find a rate limit config in a handler tree
 /// Find the first `ReverseProxy` config in a handler tree, recursing
 /// through `Pipeline`/`Handle`/`HandlePath` wrappers.
 ///
@@ -9403,7 +9560,7 @@ impl ProxyHttp for PingclairProxy {
 /// whose handler is a `Pipeline([ReverseProxy])`, not a bare `ReverseProxy`.
 /// Without this recursion the reverse proxy nested in that pipeline would
 /// get no load balancer and every request to it would fail with
-/// ConnectNoRoute. Mirrors [`find_rate_limit_config`].
+/// ConnectNoRoute.
 pub(crate) fn find_reverse_proxy_config(handler: &HandlerConfig) -> Option<&ReverseProxyConfig> {
     match handler {
         HandlerConfig::ReverseProxy(config) if config.subrequest.is_none() => Some(config),
@@ -9485,15 +9642,56 @@ fn build_weighted_upstreams(
     (primary, backup, dynamic_templates)
 }
 
-fn find_access_control_config(handler: &HandlerConfig) -> Option<&AccessControlConfig> {
+/// 🧰 The matcher view of the current request, used to re-check a hoisted
+/// guard's element matcher the way dispatch would have.
+fn guard_matcher_request<'a>(
+    session: &'a Session,
+    host: &'a str,
+    ctx: &'a mut RequestContext,
+    path: &'a str,
+) -> MatcherRequest<'a> {
+    MatcherRequest {
+        path,
+        method: session.req_header().method.as_str(),
+        headers: &session.req_header().headers,
+        host,
+        addresses: RequestAddresses {
+            client_ip: ctx.verified_client_ip,
+            remote_ip: ctx.remote_ip,
+        },
+        protocol: ctx.request_scheme,
+        vars: Some(ctx.request_vars.values_mut()),
+    }
+}
+
+/// 🛡️ Collects every `access_control` element in a route's handler tree, in
+/// element order, each with the matcher that guards it.
+///
+/// The precompile node mirrors the handler tree, so the two are walked
+/// together: what a guard's element matcher says per request is exactly what
+/// dispatch would have asked before running the element (issue #314).
+fn collect_access_control_guards<'a>(
+    handler: &'a HandlerConfig,
+    precompile: Option<&MatcherPrecompile>,
+    out: &mut Vec<(Option<CompiledMatcher>, &'a AccessControlConfig)>,
+) {
     match handler {
-        HandlerConfig::AccessControl(config) => Some(config),
+        HandlerConfig::AccessControl(config) => out.push((
+            precompile.and_then(|node| node.element_matcher.clone()),
+            config,
+        )),
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::FirstMatch { handlers }
-        | HandlerConfig::HandlePath { handlers, .. } => handlers
-            .iter()
-            .find_map(|element| find_access_control_config(&element.handler)),
-        _ => None,
+        | HandlerConfig::HandlePath { handlers, .. } => {
+            for (index, element) in handlers.iter().enumerate() {
+                collect_access_control_guards(
+                    &element.handler,
+                    precompile.and_then(|node| node.children.get(index)),
+                    out,
+                );
+            }
+        }
+        _ => {}
     }
 }
 
@@ -9950,10 +10148,17 @@ fn find_file_server_config(handler: &HandlerConfig) -> Option<&HandlerConfig> {
     }
 }
 
-fn find_rate_limit_config(
+/// 🚦 Collects every `rate_limit` element in a route's handler tree, in
+/// element order, each with the matcher that guards it.
+///
+/// Same mirror walk as [`collect_access_control_guards`], for the same reason
+/// (issue #314).
+fn collect_rate_limit_guards(
     handler: &HandlerConfig,
+    precompile: Option<&MatcherPrecompile>,
     route: &str,
-) -> Option<crate::rate_limit::RateLimitConfig> {
+    out: &mut Vec<(Option<CompiledMatcher>, crate::rate_limit::RateLimitConfig)>,
+) {
     match handler {
         HandlerConfig::RateLimit {
             requests,
@@ -9962,29 +10167,34 @@ fn find_rate_limit_config(
             burst,
             key,
             dry_run,
-        } => Some(crate::rate_limit::RateLimitConfig {
-            requests_per_window: *requests,
-            window: std::time::Duration::from_secs(*window_secs),
-            key: key.clone().unwrap_or(if *by_ip {
-                pingclair_core::config::RateLimitKey::Ip
-            } else {
-                pingclair_core::config::RateLimitKey::Global
-            }),
-            burst: *burst,
-            dry_run: *dry_run,
-            route: route.to_string(),
-        }),
+        } => out.push((
+            precompile.and_then(|node| node.element_matcher.clone()),
+            crate::rate_limit::RateLimitConfig {
+                requests_per_window: *requests,
+                window: std::time::Duration::from_secs(*window_secs),
+                key: key.clone().unwrap_or(if *by_ip {
+                    pingclair_core::config::RateLimitKey::Ip
+                } else {
+                    pingclair_core::config::RateLimitKey::Global
+                }),
+                burst: *burst,
+                dry_run: *dry_run,
+                route: route.to_string(),
+            },
+        )),
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
-            for element in handlers {
-                if let Some(config) = find_rate_limit_config(&element.handler, route) {
-                    return Some(config);
-                }
+            for (index, element) in handlers.iter().enumerate() {
+                collect_rate_limit_guards(
+                    &element.handler,
+                    precompile.and_then(|node| node.children.get(index)),
+                    route,
+                    out,
+                );
             }
-            None
         }
-        _ => None,
+        _ => {}
     }
 }
 
