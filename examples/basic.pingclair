@@ -1,6 +1,11 @@
-# 🧭 Basic Pingclair DSL example.
-# A simple static file server
+// 🧭 The smallest useful configuration.
+//
+// 📌 A `let` binding is substituted where it is used, and a Site's body is an
+// ordered list of Route, ErrorRoute and Fallback components.
+let host = "example.test"
 
-localhost {
-    file_server
+HTTPListener(on: ":8080") {
+    Site(host: host) {
+        Fallback { Respond(body: "hello from Pingclair") }
+    }
 }

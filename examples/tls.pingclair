@@ -1,0 +1,23 @@
+// 🔐 Two listeners that terminate TLS, with the knobs the language has today.
+//
+// 📌 `.tls(.internal)` signs with the local authority and needs no files, which
+// is what every example and test in this repository uses: `.files(certificate:,
+// key:)` is the spelling for real certificates, and validation reads those two
+// paths at load time.
+HTTPListener(on: ":8443") {
+    Site(host: "secure.example.test") {
+        Fallback { ServeFiles(root: "./public") }
+    }
+    .encode(.zstd, .gzip)
+}
+.tls(.internal)
+.protocols([.http1, .http2])
+.limits(headerTimeout: .seconds(30), maxConnections: 4096)
+
+HTTPListener(on: ":9443") {
+    Site(host: "acme.example.test") {
+        Fallback { Respond(body: "issued by ACME") }
+    }
+}
+.tls(.automatic(email: "admin@example.test"))
+.accessLog(output: .file("/tmp/pingclair-tls-access.log"), format: .json)

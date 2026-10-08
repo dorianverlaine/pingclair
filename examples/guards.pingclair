@@ -1,0 +1,38 @@
+// 🛡️ The guard components: who may come in, how often, and what they may see.
+//
+// 📌 Guards are middleware, so the route still ends in the component that
+// answers. A rejected request is answered by the guard itself.
+HTTPListener(on: ":8080") {
+    Site(host: "app.example.test") {
+        Route(when: .path(prefix: "/admin")) {
+            BasicAuth(users: [.user("alice", hash: "$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W")], realm: "Admin Area")
+            ServeFiles(root: "./admin")
+        }
+        Route(when: .path(prefix: "/api")) {
+            CORS(
+                origins: ["https://app.example.test"],
+                methods: [.get, .post],
+                allowCredentials: true,
+                maxAge: .seconds(600),
+            )
+            RateLimit(
+                requests: 100,
+                per: .minutes(1),
+                key: .header("X-Tenant-ID"),
+                burst: 20,
+            )
+            SetVariable(name: "tier", value: "free")
+            LimitRequestBody(max: .mebibytes(10), readTimeout: .seconds(30))
+            Proxy(to: "10.0.0.10:8080")
+        }
+        Route(when: .path(prefix: "/internal")) {
+            AccessControl(allowedIPs: ["10.0.0.0/8"], deniedUserAgents: ["(curl)"])
+            Respond(body: "intranet only")
+        }
+        Route(when: .path(exact: "/health")) {
+            SkipLog()
+            Respond(body: "ok")
+        }
+        Fallback { Fail(status: 404, message: "not found") }
+    }
+}

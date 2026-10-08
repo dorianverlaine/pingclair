@@ -1,0 +1,97 @@
+# Full-featured example — every directive below compiles, and the file is a
+# valid Caddyfile: nothing here is spelled a way the format does not spell it.
+# Simpler starting points: Pingclairfile.example, basic.pingclair.
+#
+# 📌 `pingclair validate` still rejects this file, and correctly so: it checks
+# that the TLS certificate paths below exist, and they are illustrative paths
+# on a machine that is not yours. Point `tls` at real files, or switch it to
+# `tls auto`, and it validates.
+
+# Global options block
+{
+    # ACME account email (Let's Encrypt)
+    email admin@example.com
+
+    # Automatic HTTPS: on | off | disable_redirects
+    auto_https off
+
+    # Admin API on 127.0.0.1:2019, protected by a Bearer token.
+    # Without a token the API only accepts loopback connections.
+    admin 127.0.0.1:2019 your-secret-key-here
+
+    # 📊 Collect Prometheus metrics, served at the admin API's /metrics.
+    # Collection is off unless this line is present, as in Caddy.
+    metrics
+
+    # 🛡️ Only proxies you operate may supply client identity headers.
+    # Changes to this global policy currently require a restart.
+    # trusted_proxies 10.0.0.0/8 2001:db8::/32
+}
+
+# Main site. The port belongs in the site address, exactly as upstream writes
+# it — a separate listen directive would be a second place to keep in agreement
+# with the first.
+example.com:8080 {
+    # 📂 The site root. `file_server` accepts a `root` of its own, but setting
+    # it here instead is what lets `try_files` and the file server agree about
+    # where the site lives — they both read this one.
+    root * ./public
+
+    # Manual certificate + HTTP/3 (QUIC). Use `tls auto` for ACME instead.
+    tls {
+        cert /etc/pingclair/certs/example.com.pem
+        key /etc/pingclair/certs/example.com.key
+        http3
+    }
+
+    # Response compression. Argument order is the server's preference when
+    # more than one coding is acceptable to the client, so zstd comes first.
+    # Brotli is deliberately absent: the proxy has no streaming Brotli
+    # encoder, and `encode br` is a compile error rather than a silent
+    # downgrade to gzip.
+    encode zstd gzip
+    # 🗜️ Reverse-proxy gzip uses these exact or wildcard MIME patterns.
+    gzip_types text/* application/json application/*+json application/x-ndjson
+
+    # Response headers: set, append with +, remove with -
+    header {
+        X-Frame-Options "DENY"
+        X-Content-Type-Options "nosniff"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        -X-Powered-By
+    }
+
+    # 🔐 The admin area uses a bcrypt hash; replace this demonstration hash.
+    # Its example plaintext is "change-me". The arguments are the hash
+    # algorithm and the realm, in that order; accounts go in the block, one
+    # `<username> <hashed_password>` per line.
+    handle /admin/* {
+        basic_auth bcrypt "Admin Area" {
+            admin "$2y$12$iKzVHkDoCr2oz1DAOzX9wec0yf3A.FZM3SmsP9dYHmhE2O.3TSpSW"
+        }
+        respond "Welcome to the admin area"
+    }
+
+    # API backend. flush_interval -1 enables per-chunk streaming, which
+    # keeps SSE / LLM-style endpoints responsive through the proxy.
+    handle /api/* {
+        reverse_proxy localhost:3000 localhost:3001 {
+            header_up X-Forwarded-Host {host}
+            flush_interval -1
+            transport http {
+                read_timeout 300s
+                write_timeout 300s
+            }
+        }
+    }
+
+    # Custom response for a health-check endpoint
+    handle /healthz {
+        respond "ok"
+    }
+
+    # Static files for everything else
+    file_server {
+        index index.html
+    }
+}

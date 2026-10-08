@@ -1,0 +1,32 @@
+// 🚨 The two error surfaces.
+//
+// 📌 They answer different questions. `ErrorRoute` runs when a handler raised a
+// status, and it can name a whole class; `.errorPage` answers one exact status
+// with a file. A body that stops at middleware shapes the answer the runtime
+// already built.
+HTTPListener(on: ":8080") {
+    Site(host: "example.test") {
+        Route(when: .path(prefix: "/api")) { Proxy(to: "10.0.0.10:8080") }
+
+        Route(when: .path(exact: "/forbidden")) { Fail(status: 403) }
+
+        // 🥇 Error routes are tried in order and the first one whose selector
+        // matches owns the status. A route that answers shadows the error page
+        // for the same status, and the loader refuses that pair rather than
+        // shipping a page nobody can reach.
+        ErrorRoute(for: [.status(404)]) {
+            ResponseHeader(.set("X-Error-Page", "pingclair"))
+            Rewrite(to: "/404.html")
+            ServeFiles(root: "./errors")
+        }
+        ErrorRoute(for: [.serverError]) {
+            SkipLog()
+            Respond(status: 500, body: "something broke")
+        }
+        Fallback { ServeFiles(root: "./public") }
+    }
+    // 📌 A page answers a status no error route claims. One exact status per
+    // entry: the model keeps a page per code, so a class belongs in an
+    // ErrorRoute instead.
+    .errorPage(for: [.status(403)], file: "./errors/403.html")
+}

@@ -1,0 +1,26 @@
+// 🎛️ Every condition the language has, one route each.
+//
+// 📌 Conditions are values, so a `let` binding can name a group once and every
+// route that needs it reads the same thing. `.path(prefix:)` matches the path
+// and everything under it, unlike a raw `*` glob.
+@Matcher
+let api = .path(prefix: "/api")
+
+HTTPListener(on: ":8080") {
+    Site(host: "example.test") {
+        Route(when: api) { Respond(body: "path") }
+        Route(when: .host(["a.example.test", "b.example.test"])) { Respond(body: "host") }
+        Route(when: .method(.get, .post)) { Respond(body: "method") }
+        Route(when: .header(name: "X-Debug", value: "1")) { Respond(body: "header") }
+        Route(when: .header(.regex(name: "Authorization", pattern: "^Bearer .+$"))) { Respond(body: "bearer") }
+        Route(when: .query(name: "tenant", exists: true)) { Respond(body: "query") }
+        Route(when: .protocol(.http2)) { Respond(body: "h2") }
+        Route(when: .clientIP([.privateRanges])) { Respond(body: "intranet") }
+        Route(when: .remoteIP(["203.0.113.0/24"])) { Respond(body: "peer") }
+        Route(when: .variable(name: "tier", values: ["paid"])) { Respond(body: "tier") }
+        Route(when: .all([.path(prefix: "/admin"), .method(.delete)])) { Respond(status: 202, body: "both") }
+        Route(when: .any([.path(exact: "/health"), .path(exact: "/ready")])) { Respond(body: "up") }
+        Route(when: .not(.host(["blocked.example.test"]))) { Respond(body: "anything else") }
+        Fallback { Fail(status: 404, message: "nothing matched") }
+    }
+}

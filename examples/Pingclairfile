@@ -1,0 +1,19 @@
+// 🧭 A deployment-shaped Pingclairfile: one listener, one site, files from disk.
+//
+// 📌 This is the shape `pingclair run` looks for in a working directory. The
+// corpus around it is one feature per file; `examples/README.md` explains the
+// rule for keeping them honest.
+Metrics(enabled: true)
+
+HTTPListener(on: ":8080") {
+    Site(host: "static.example.test") {
+        Route(when: .path(prefix: "/assets")) {
+            ResponseHeader(.set("Cache-Control", "public, max-age=3600"))
+            ServeFiles(root: "./public/assets")
+        }
+        Fallback { ServeFiles(root: "./public", index: ["index.html"]) }
+    }
+    .encode(.zstd, .gzip)
+    .errorPage(for: [.status(404)], file: "./public/index.html")
+}
+.accessLog(output: .file("/tmp/pingclair-access.log"), format: .console)

@@ -11,12 +11,21 @@
 //!
 //! This covers two surfaces:
 //!
-//! - every file under `examples/`
+//! - every file under `examples/` (including `examples/caddyfile/`)
 //! - every fenced ```pingclair or ```caddyfile block in the READMEs and `docs/`
 //!
 //! A block that is deliberately invalid — showing what *not* to write — should
 //! be fenced as `text` rather than `pingclair`, which is also how a reader
 //! tells the two apart.
+//!
+//! # 📚 The example corpus has three rules
+//!
+//! The examples are the language's style reference, so the test enforces more
+//! than "it compiles": a `.pingclair` file has to *be* native syntax, a
+//! `caddyfile/` file has to be the dialect that directory is named after, and
+//! every example has to be in the formatter's canonical shape. The extension
+//! naming the language is the one convention a reader should be able to trust
+//! without opening the file.
 
 use std::path::{Path, PathBuf};
 
@@ -42,11 +51,41 @@ fn files_in(directory: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// 📂 Every configuration file below a directory, at any depth.
+///
+/// Only the names that carry a language: an example's images and prose live
+/// under the same tree, and compiling a README is nobody's idea of a test.
+fn configurations_under(directory: &Path) -> Vec<PathBuf> {
+    let mut found = files_in(directory);
+    let mut nested = Vec::new();
+    for entry in std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+    {
+        if entry.path().is_dir() {
+            nested.extend(configurations_under(&entry.path()));
+        }
+    }
+    nested.sort();
+    found.extend(nested);
+    found
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| matches!(extension, "pingclair" | "caddyfile" | "example"))
+                || path.file_name().is_some_and(|name| name == "Pingclairfile")
+        })
+        .collect()
+}
+
 #[test]
 fn every_shipped_example_still_compiles() {
     // Setup scenarios
     let root = workspace_root();
-    let examples = files_in(&root.join("examples"));
+    let examples_dir = root.join("examples");
+    let examples = configurations_under(&examples_dir);
     assert!(
         !examples.is_empty(),
         "no examples found — this test would pass vacuously"
@@ -66,6 +105,54 @@ fn every_shipped_example_still_compiles() {
         broken.is_empty(),
         "shipped examples no longer compile:\n  {}",
         broken.join("\n  ")
+    );
+
+    // 🗂️ Which language each file is written in, by the name it is filed under.
+    let native_example = |path: &Path| {
+        path.parent() == Some(examples_dir.as_path())
+            && (path.file_name().is_some_and(|name| name == "Pingclairfile")
+                || path.extension().is_some_and(|ext| ext == "pingclair"))
+    };
+    let caddyfile_example = |path: &Path| {
+        path.parent() == Some(examples_dir.join("caddyfile").as_path())
+            && path.extension().is_some_and(|ext| ext == "caddyfile")
+    };
+    let mut misfiled = Vec::new();
+    for path in &examples {
+        let Ok(source) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let native = pingclair_config::frontend::is_native(&source);
+        if native_example(path) && !native {
+            misfiled.push(format!(
+                "{}: named as a native example but not written in the native language",
+                path.display()
+            ));
+        }
+        if caddyfile_example(path) && native {
+            misfiled.push(format!(
+                "{}: filed under caddyfile/ but written in the native language",
+                path.display()
+            ));
+        }
+        // 🖋️ The corpus is the style guide, so the native files are in the
+        // formatter's canonical shape. The formatter reads the native language
+        // only; a Caddyfile is formatted the way its own dialect says.
+        if native {
+            match pingclair_config::format::format(&source) {
+                Ok(formatted) if formatted == source => {}
+                Ok(_) => misfiled.push(format!(
+                    "{}: not in canonical form; run `pingclair fmt --overwrite`",
+                    path.display()
+                )),
+                Err(error) => misfiled.push(format!("{}: {error}", path.display())),
+            }
+        }
+    }
+    assert!(
+        misfiled.is_empty(),
+        "the example corpus drifted:\n  {}",
+        misfiled.join("\n  ")
     );
 }
 

@@ -1,0 +1,38 @@
+// 🧩 Components whose arguments configure another subsystem.
+//
+// 📌 `ForwardAuth` makes one round trip before the route continues: a 2xx copies
+// the named headers onto the request and the route goes on; anything else is
+// answered directly, which is why it is a guard and not a proxy.
+HTTPListener(on: ":8080") {
+    Site(host: "app.example.test") {
+        Route(when: .path(prefix: "/app")) {
+            ForwardAuth(to: "127.0.0.1:9001", uri: "/verify", copyHeaders: ["X-User", "X-Role", .rename("X-Tenant", to: "X-Auth-Tenant")])
+            Rewrite(stripPrefix: "/app")
+            SetVariable(name: "auth", value: "gateway")
+            Proxy(to: "127.0.0.1:9000")
+        }
+        Fallback {
+            Templates(root: "./public")
+            ServeFiles(root: "./public")
+        }
+    }
+    .encode(.gzip)
+}
+
+// 🏛️ An ACME server is accepted the way the compatibility layer accepts it:
+// it parses and validates, and `pingclair run` refuses to start with one
+// because this build does not issue certificates to other clients.
+HTTPListener(on: ":8443") {
+    Site(host: "ca.example.test") {
+        Fallback {
+            ACMEServer(
+                ca: "local",
+                lifetime: .hours(12),
+                signWithRoot: true,
+                challenges: ["http-01"],
+                allow: .policy(domains: ["internal.example.test"], ipRanges: ["10.0.0.0/8"]),
+            )
+        }
+    }
+}
+.tls(.internal)

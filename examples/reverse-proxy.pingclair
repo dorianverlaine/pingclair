@@ -1,0 +1,16 @@
+// 🔀 A reverse proxy: header surgery on the way out, a rewrite, and two
+// upstreams in rotation.
+//
+// 📌 Components run in the order they are written and the last one answers, so
+// this route reads top to bottom as the request's journey.
+HTTPListener(on: ":8080") {
+    Site(host: "app.example.test") {
+        Route(when: .path(prefix: "/api")) {
+            RequestHeader(.set("X-Request-Start", "pingclair"), .append("X-Forwarded-Proto", "http"), .remove("Cookie"))
+            Rewrite(stripPrefix: "/api")
+            ResponseHeader(.setIfAbsent("X-Served-By", "pingclair"))
+            Proxy(to: ["10.0.0.10:8080", "10.0.0.11:8080"])
+        }
+        Fallback { ServeFiles(root: "./public") }
+    }
+}

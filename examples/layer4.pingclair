@@ -1,0 +1,13 @@
+// 🔌 Layer 4: raw TCP with TLS passthrough, routed by SNI without terminating.
+//
+// 📌 `TCPListener` never decrypts. The ClientHello is read, matched and
+// replayed to the upstream, so the certificate and the session belong to the
+// server behind this one.
+TCPListener(on: ":443") {
+    Route(when: .tls(sni: ["tunnel.example.test"], alpn: ["h2"])) { Proxy(to: "10.0.0.20:8443") }
+    Route(from: ["10.0.0.0/8"]) { Proxy(to: "10.0.0.21:9000") }
+    Fallback { Proxy(to: "10.0.0.22:443") }
+}
+.limits(connections: 4096, preread: .kibibytes(16), relay: .kibibytes(64))
+.timeouts(preread: .seconds(30), connect: .seconds(5), idle: .minutes(5))
+.halfClose(enabled: true)

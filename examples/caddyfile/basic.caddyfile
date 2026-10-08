@@ -1,0 +1,6 @@
+# 🧭 Basic Pingclair DSL example.
+# A simple static file server
+
+localhost {
+    file_server
+}
