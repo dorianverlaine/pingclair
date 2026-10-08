@@ -7,9 +7,10 @@ use crate::attributes::{Attr, resolve_attribute};
 use crate::bindings::Bindings;
 use crate::syntax::{self, Call, Declaration, Position, Value};
 use pingclair_core::config::{
-    AdminConfig, HandlerConfig, Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher,
-    ListenerOptions, LogConfig, LogFormat, LogOutput, LogRotation, Matcher, PingclairConfig,
-    ResourceLimitsConfig, RouteConfig, ServerConfig, TlsConfig, normalize_listen_addr,
+    AdminConfig, HandlerConfig, IpRanges, Layer4Matcher, Layer4Route, Layer4Server,
+    Layer4TlsMatcher, ListenerOptions, LogConfig, LogFormat, LogOutput, LogRotation, Matcher,
+    MatcherCondition, PRIVATE_RANGES, PingclairConfig, ResourceLimitsConfig, RouteConfig,
+    ServerConfig, TlsConfig, normalize_listen_addr,
 };
 
 /// 📍 Reports location and expected structure without echoing configuration values.
@@ -724,8 +725,17 @@ fn http_condition(value: &Value, at: Position) -> Result<(Matcher, Option<String
             let (matcher, _) = http_condition(item, call.at)?;
             Ok((Matcher::Not(Box::new(matcher)), None))
         }
+        "header" => header_or_query_condition(call, true),
+        "query" => header_or_query_condition(call, false),
+        "protocol" => protocol_condition(call),
+        "clientIP" => address_condition(call, true),
+        "remoteIP" => address_condition(call, false),
+        "variable" => variable_condition(call),
+        "file" => Err(call
+            .at
+            .error("the file matcher needs its typed-candidate design; it follows in its own batch")),
         other => Err(call.at.error(format!(
-            "unknown condition '.{other}'; expected .path, .host, .method, .all, .any or .not"
+            "unknown condition '.{other}'; expected .path, .host, .method, .header, .query, .protocol, .clientIP, .remoteIP, .variable, .file, .all, .any or .not"
         ))),
     }
 }
@@ -824,6 +834,155 @@ fn conjunction_or_disjunction(call: &Call) -> Result<(Matcher, Option<String>), 
     }
     let folded = folded.expect("the array is non-empty");
     Ok((folded, if and { primary } else { None }))
+}
+
+/// 🏷️ `.header(...)` and `.query(...)`: one name and one typed predicate.
+fn header_or_query_condition(
+    call: &Call,
+    is_header: bool,
+) -> Result<(Matcher, Option<String>), Error> {
+    let noun = if is_header { "header" } else { "query" };
+    if is_header && let [(None, Value::Typed(regex))] = call.args.as_slice() {
+        if regex.name != "regex" {
+            return Err(regex.at.error(format!(
+                "unknown header condition '.{}'; expected .regex",
+                regex.name
+            )));
+        }
+        regex.leaf(&["name", "pattern"])?;
+        return Ok((
+            Matcher::HeaderRegexp {
+                name: None,
+                field: regex.string("name")?,
+                pattern: regex.string("pattern")?,
+            },
+            None,
+        ));
+    }
+    call.leaf(&[
+        "name",
+        "value",
+        "exists",
+        "startsWith",
+        "endsWith",
+        "contains",
+    ])?;
+    let name = call.string("name")?;
+    let mut predicates = Vec::new();
+    for label in ["value", "exists", "startsWith", "endsWith", "contains"] {
+        if call.get(label).is_some() {
+            predicates.push(label);
+        }
+    }
+    let [predicate] = predicates.as_slice() else {
+        return Err(call.at.error(format!(
+            "{noun} needs exactly one predicate: value:, exists:, startsWith:, endsWith: or contains:"
+        )));
+    };
+    let condition = match *predicate {
+        "value" => MatcherCondition::Equals(call.string("value")?),
+        "exists" => {
+            if !call.boolean("exists")? {
+                return Err(call.at.error(format!(
+                    "exists: false needs .not(...); write .not(.{noun}(name: \"…\", exists: true))"
+                )));
+            }
+            MatcherCondition::Exists
+        }
+        "startsWith" => MatcherCondition::StartsWith(call.string("startsWith")?),
+        "endsWith" => MatcherCondition::EndsWith(call.string("endsWith")?),
+        "contains" => MatcherCondition::Contains(call.string("contains")?),
+        _ => unreachable!(),
+    };
+    let matcher = if is_header {
+        Matcher::Header { name, condition }
+    } else {
+        Matcher::Query { name, condition }
+    };
+    Ok((matcher, None))
+}
+
+/// 🌐 `.protocol(.http1, .http2, .http3)`: which protocols the route accepts.
+fn protocol_condition(call: &Call) -> Result<(Matcher, Option<String>), Error> {
+    if call.args.is_empty() {
+        return Err(call
+            .at
+            .error("protocol needs at least one of .http1, .http2 or .http3"));
+    }
+    let mut names: Vec<String> = Vec::new();
+    for (label, item) in call.args.as_slice() {
+        if label.is_some() {
+            return Err(call
+                .at
+                .error("protocol takes unlabeled .http1/.http2/.http3 values"));
+        }
+        let Value::Typed(value) = item else {
+            return Err(call
+                .at
+                .error("protocol takes unlabeled .http1/.http2/.http3 values"));
+        };
+        if !value.args.is_empty() {
+            return Err(value.at.error("a protocol value takes no arguments"));
+        }
+        let name = match value.name.as_str() {
+            "http1" | "http2" | "http3" => value.name.clone(),
+            other => {
+                return Err(value.at.error(format!(
+                    "unknown protocol '.{other}'; expected .http1, .http2 or .http3"
+                )));
+            }
+        };
+        if names.contains(&name) {
+            return Err(value.at.error("duplicate protocol entry"));
+        }
+        names.push(name);
+    }
+    Ok((Matcher::Protocol(names), None))
+}
+
+/// 🔌 `.clientIP([...])` and `.remoteIP([...])`, with `.privateRanges`.
+fn address_condition(call: &Call, client: bool) -> Result<(Matcher, Option<String>), Error> {
+    let noun = if client { "clientIP" } else { "remoteIP" };
+    let [(None, Value::Array(items))] = call.args.as_slice() else {
+        return Err(call.at.error(format!(
+            "{noun} takes one array of CIDRs, optionally including .privateRanges"
+        )));
+    };
+    if items.is_empty() {
+        return Err(call.at.error(format!("{noun} needs at least one range")));
+    }
+    let mut ranges = Vec::new();
+    for item in items {
+        match item {
+            Value::String(range) => ranges.push(range.clone()),
+            Value::Typed(value) if value.name == "privateRanges" && value.args.is_empty() => {
+                ranges.extend(PRIVATE_RANGES.iter().map(|range| (*range).to_string()));
+            }
+            _ => {
+                return Err(call
+                    .at
+                    .error(format!("{noun} takes CIDR strings or .privateRanges")));
+            }
+        }
+    }
+    let ranges = IpRanges::parse(ranges).map_err(|error| call.at.error(error.to_string()))?;
+    let matcher = if client {
+        Matcher::ClientIp(ranges)
+    } else {
+        Matcher::RemoteIp(ranges)
+    };
+    Ok((matcher, None))
+}
+
+/// 📦 `.variable(name:, values:)`: a request-scoped variable match.
+fn variable_condition(call: &Call) -> Result<(Matcher, Option<String>), Error> {
+    call.leaf(&["name", "values"])?;
+    let name = call.string("name")?;
+    let values = call.strings("values")?;
+    if values.is_empty() {
+        return Err(call.at.error("variable needs at least one value"));
+    }
+    Ok((Matcher::Vars { name, values }, None))
 }
 
 /// 🧰 HTTP terminal components; `Respond` is the first one implemented.

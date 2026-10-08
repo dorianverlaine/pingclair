@@ -590,11 +590,107 @@ fn http_route_conditions_fail_closed() {
         "Route(when: .method(.get, 5)) { Respond(body: \"m\") }",
         "Route(when: .host([])) { Respond(body: \"m\") }",
         "Route(when: .all([])) { Respond(body: \"m\") }",
-        "Route(when: .header(name: \"X\", value: \"y\")) { Respond(body: \"m\") }",
         "Route { Respond(body: \"m\") }",
         "Route(when: .path(exact: \"/a\")) { Respond(body: \"m\") Respond(body: \"n\") }",
         "Fallback { Respond(body: \"f\") } Route(when: .path(exact: \"/a\")) { Respond(body: \"m\") }",
         "Fallback { Respond(body: \"f\") } Fallback { Respond(body: \"g\") }",
+    ] {
+        let source = site(route);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
+fn http_header_query_and_protocol_conditions_match_their_twins() {
+    let cases = [
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .header(name: \"X-Foo\", value: \"bar\")) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@m header X-Foo bar\n\trespond @m \"m\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .header(name: \"X-Foo\", exists: true)) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@m header X-Foo *\n\trespond @m \"m\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .header(name: \"X-Foo\", startsWith: \"bar\")) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@m header X-Foo bar*\n\trespond @m \"m\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .header(name: \"X-Foo\", endsWith: \"bar\")) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@m header X-Foo *bar\n\trespond @m \"m\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .header(name: \"X-Foo\", contains: \"bar\")) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@m header X-Foo *bar*\n\trespond @m \"m\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .header(.regex(name: \"X-Foo\", pattern: \"^b.*$\"))) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@m header_regexp X-Foo ^b.*$\n\trespond @m \"m\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .query(name: \"debug\", value: \"1\")) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@m query debug=1\n\trespond @m \"m\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .protocol(.http1, .http3)) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@m protocol http1 http3\n\trespond @m \"m\"\n}\n",
+        ),
+    ];
+    for (native_source, legacy_source) in cases {
+        let native = crate::compile(native_source).unwrap();
+        let legacy = crate::compile(legacy_source).unwrap();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::to_value(legacy).unwrap(),
+            "{native_source}"
+        );
+    }
+}
+
+#[test]
+fn http_address_and_variable_conditions_match_their_twins() {
+    let cases = [
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .clientIP([\"127.0.0.1/32\"])) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@m client_ip 127.0.0.1/32\n\trespond @m \"m\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .remoteIP([.privateRanges])) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@m remote_ip private_ranges\n\trespond @m \"m\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .variable(name: \"foo\", values: [\"bar\"])) { Respond(body: \"m\") } } }",
+            "http://:8080 {\n\t@m vars foo bar\n\trespond @m \"m\"\n}\n",
+        ),
+    ];
+    for (native_source, legacy_source) in cases {
+        let native = crate::compile(native_source).unwrap();
+        let legacy = crate::compile(legacy_source).unwrap();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::to_value(legacy).unwrap(),
+            "{native_source}"
+        );
+    }
+}
+
+#[test]
+fn the_rest_of_the_conditions_fail_closed() {
+    let site =
+        |route: &str| format!("HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ {route} }} }}");
+    for route in [
+        "Route(when: .header(name: \"X\", value: \"v\", contains: \"c\")) { Respond(body: \"m\") }",
+        "Route(when: .header(name: \"X\")) { Respond(body: \"m\") }",
+        "Route(when: .header(name: \"X\", exists: false)) { Respond(body: \"m\") }",
+        "Route(when: .query(name: \"debug\", exists: false)) { Respond(body: \"m\") }",
+        "Route(when: .protocol()) { Respond(body: \"m\") }",
+        "Route(when: .protocol(.http4)) { Respond(body: \"m\") }",
+        "Route(when: .protocol(.http1, .http1)) { Respond(body: \"m\") }",
+        "Route(when: .clientIP([])) { Respond(body: \"m\") }",
+        "Route(when: .clientIP([\"not-a-cidr\"])) { Respond(body: \"m\") }",
+        "Route(when: .remoteIP([.privateRange])) { Respond(body: \"m\") }",
+        "Route(when: .variable(name: \"foo\", values: [])) { Respond(body: \"m\") }",
+        "Route(when: .file(try: [\"x\"])) { Respond(body: \"m\") }",
     ] {
         let source = site(route);
         assert!(crate::compile(&source).is_err(), "accepted {source:?}");
