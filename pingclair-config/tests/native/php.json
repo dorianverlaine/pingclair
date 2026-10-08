@@ -1,0 +1,378 @@
+{
+  "debug": false,
+  "servers": [
+    {
+      "name": "app.example.test",
+      "names": [
+        "app.example.test"
+      ],
+      "bind": null,
+      "listen": [
+        "[::]:8080"
+      ],
+      "proxy_protocol_listen": [],
+      "plaintext_listen": [
+        "[::]:8080"
+      ],
+      "tls": null,
+      "routes": [
+        {
+          "path": "/*",
+          "handler": {
+            "type": "pipeline",
+            "handlers": [
+              {
+                "matcher": {
+                  "and": [
+                    {
+                      "file": {
+                        "try_files": [
+                          "{http.request.uri.path}/index.php"
+                        ],
+                        "root": "./public"
+                      }
+                    },
+                    {
+                      "not": {
+                        "path": {
+                          "patterns": [
+                            "*/"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                },
+                "type": "redirect",
+                "to": "{http.request.orig_uri.path}/{http.request.orig_uri.prefixed_query}",
+                "code": 308
+              },
+              {
+                "matcher": {
+                  "file": {
+                    "try_files": [
+                      "{http.request.uri.path}",
+                      "{http.request.uri.path}/index.php",
+                      "index.php"
+                    ],
+                    "root": "./public",
+                    "try_policy": "first_exist_fallback",
+                    "split_path": [
+                      ".php"
+                    ]
+                  }
+                },
+                "type": "rewrite",
+                "strip_prefix": null,
+                "strip_suffix": null,
+                "replace": "{http.matchers.file.relative}",
+                "regex": null,
+                "regex_replace": null
+              },
+              {
+                "matcher": {
+                  "path": {
+                    "patterns": [
+                      "*.php"
+                    ]
+                  }
+                },
+                "type": "reverse_proxy",
+                "upstreams": [
+                  "unix//run/php-fpm.sock"
+                ],
+                "fastcgi": {
+                  "root": "./public",
+                  "split_path": [
+                    ".php"
+                  ],
+                  "env": {
+                    "APP_ENV": "production"
+                  }
+                },
+                "upstream_options": [
+                  {
+                    "address": "unix//run/php-fpm.sock",
+                    "weight": 1,
+                    "backup": false
+                  }
+                ],
+                "load_balance": {
+                  "strategy": ""
+                },
+                "health_check": null,
+                "headers_up": {},
+                "headers_down": {},
+                "flush_interval": null,
+                "read_timeout": null,
+                "write_timeout": null,
+                "connect_timeout": null,
+                "first_byte_timeout": null,
+                "between_reads_timeout": null,
+                "retry": {
+                  "max_attempts": 16,
+                  "total_timeout_ms": null,
+                  "backoff_ms": 0
+                },
+                "overload": {
+                  "max_in_flight": null,
+                  "max_pending": 0,
+                  "pending_timeout_ms": 1000,
+                  "upstream_max_connections": null
+                },
+                "circuit_breaker": {
+                  "consecutive_failures": null,
+                  "error_rate_percent": null,
+                  "minimum_requests": 20,
+                  "window_requests": 100,
+                  "open_duration_ms": 30000,
+                  "half_open_requests": 1,
+                  "failure_statuses": []
+                },
+                "upstream_tls": {
+                  "enable": false,
+                  "server_name": null,
+                  "trusted_ca_certs": [],
+                  "client_cert": null,
+                  "client_key": null,
+                  "insecure_skip_verify": false
+                },
+                "cache": null
+              }
+            ]
+          },
+          "methods": null,
+          "matcher": null
+        }
+      ],
+      "log": null,
+      "client_max_body_size": 0,
+      "limits": {
+        "header_timeout_ms": null,
+        "body_timeout_ms": null,
+        "idle_timeout_ms": null,
+        "request_timeout_ms": null,
+        "max_header_count": null,
+        "max_header_bytes": null,
+        "max_connections": null,
+        "upload_bytes_per_sec": null,
+        "download_bytes_per_sec": null,
+        "long_connections": {
+          "idle_timeout_ms": null,
+          "request_timeout_ms": null
+        }
+      },
+      "security": {
+        "enabled": false,
+        "x_frame_options": "",
+        "x_content_type_options": "",
+        "x_xss_protection": "",
+        "x_permitted_cross_domain": "",
+        "referrer_policy": "",
+        "permissions_policy": "",
+        "hsts": null,
+        "csp": null
+      },
+      "gzip_types": [
+        "text/*",
+        "application/json",
+        "application/*+json",
+        "application/x-ndjson",
+        "application/json-seq",
+        "application/xml",
+        "application/*+xml",
+        "application/javascript",
+        "application/x-javascript",
+        "image/svg+xml"
+      ],
+      "encodings": [],
+      "error_pages": {}
+    },
+    {
+      "name": "legacy.example.test",
+      "names": [
+        "legacy.example.test"
+      ],
+      "bind": null,
+      "listen": [
+        "[::]:8081"
+      ],
+      "proxy_protocol_listen": [],
+      "plaintext_listen": [
+        "[::]:8081"
+      ],
+      "tls": null,
+      "routes": [
+        {
+          "path": "/*",
+          "handler": {
+            "type": "pipeline",
+            "handlers": [
+              {
+                "matcher": {
+                  "file": {
+                    "try_files": [
+                      "{path}",
+                      "{path}/index.php",
+                      "/index.php"
+                    ],
+                    "root": "./legacy",
+                    "try_policy": "first_exist_fallback",
+                    "split_path": [
+                      ".php",
+                      ".phtml"
+                    ]
+                  }
+                },
+                "type": "rewrite",
+                "strip_prefix": null,
+                "strip_suffix": null,
+                "replace": "{http.matchers.file.relative}",
+                "regex": null,
+                "regex_replace": null
+              },
+              {
+                "matcher": {
+                  "path": {
+                    "patterns": [
+                      "*.php",
+                      "*.phtml"
+                    ]
+                  }
+                },
+                "type": "reverse_proxy",
+                "upstreams": [
+                  "127.0.0.1:9000",
+                  "127.0.0.1:9001"
+                ],
+                "fastcgi": {
+                  "root": "./legacy",
+                  "split_path": [
+                    ".php",
+                    ".phtml"
+                  ],
+                  "dial_timeout_ms": 2000,
+                  "read_timeout_ms": 30000,
+                  "capture_stderr": true
+                },
+                "upstream_options": [
+                  {
+                    "address": "127.0.0.1:9000",
+                    "weight": 1,
+                    "backup": false
+                  },
+                  {
+                    "address": "127.0.0.1:9001",
+                    "weight": 1,
+                    "backup": false
+                  }
+                ],
+                "load_balance": {
+                  "strategy": ""
+                },
+                "health_check": null,
+                "headers_up": {},
+                "headers_down": {},
+                "flush_interval": null,
+                "read_timeout": null,
+                "write_timeout": null,
+                "connect_timeout": null,
+                "first_byte_timeout": null,
+                "between_reads_timeout": null,
+                "retry": {
+                  "max_attempts": 16,
+                  "total_timeout_ms": null,
+                  "backoff_ms": 0
+                },
+                "overload": {
+                  "max_in_flight": null,
+                  "max_pending": 0,
+                  "pending_timeout_ms": 1000,
+                  "upstream_max_connections": null
+                },
+                "circuit_breaker": {
+                  "consecutive_failures": null,
+                  "error_rate_percent": null,
+                  "minimum_requests": 20,
+                  "window_requests": 100,
+                  "open_duration_ms": 30000,
+                  "half_open_requests": 1,
+                  "failure_statuses": []
+                },
+                "upstream_tls": {
+                  "enable": false,
+                  "server_name": null,
+                  "trusted_ca_certs": [],
+                  "client_cert": null,
+                  "client_key": null,
+                  "insecure_skip_verify": false
+                },
+                "cache": null
+              }
+            ]
+          },
+          "methods": null,
+          "matcher": null
+        }
+      ],
+      "log": null,
+      "client_max_body_size": 0,
+      "limits": {
+        "header_timeout_ms": null,
+        "body_timeout_ms": null,
+        "idle_timeout_ms": null,
+        "request_timeout_ms": null,
+        "max_header_count": null,
+        "max_header_bytes": null,
+        "max_connections": null,
+        "upload_bytes_per_sec": null,
+        "download_bytes_per_sec": null,
+        "long_connections": {
+          "idle_timeout_ms": null,
+          "request_timeout_ms": null
+        }
+      },
+      "security": {
+        "enabled": false,
+        "x_frame_options": "",
+        "x_content_type_options": "",
+        "x_xss_protection": "",
+        "x_permitted_cross_domain": "",
+        "referrer_policy": "",
+        "permissions_policy": "",
+        "hsts": null,
+        "csp": null
+      },
+      "gzip_types": [
+        "text/*",
+        "application/json",
+        "application/*+json",
+        "application/x-ndjson",
+        "application/json-seq",
+        "application/xml",
+        "application/*+xml",
+        "application/javascript",
+        "application/x-javascript",
+        "image/svg+xml"
+      ],
+      "encodings": [],
+      "error_pages": {}
+    }
+  ],
+  "admin": null,
+  "global": {
+    "email": null,
+    "http_port": 80,
+    "https_port": 443,
+    "metrics": false,
+    "auto_https": "on",
+    "blocked_ips": [],
+    "trusted_proxies": [],
+    "upstream_keepalive_pool_size": null,
+    "http3": true,
+    "worker_threads": null,
+    "dns_refresh_secs": 30,
+    "grace_period_secs": null
+  },
+  "logging": {}
+}

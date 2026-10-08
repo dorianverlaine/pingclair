@@ -1,0 +1,63 @@
+{
+  "debug": false,
+  "servers": [],
+  "layer4": [
+    {
+      "listen": ":443",
+      "max_connections": 4096,
+      "preread_timeout_ms": 30000,
+      "preread_buffer_size": 16384,
+      "proxy_connect_timeout_ms": 5000,
+      "proxy_timeout_ms": 300000,
+      "proxy_half_close": true,
+      "proxy_buffer_size": 65536,
+      "routes": [
+        {
+          "matches": [
+            {
+              "tls": {
+                "sni": [
+                  "tunnel.example.test"
+                ],
+                "alpn": [
+                  "h2"
+                ]
+              }
+            }
+          ],
+          "upstream": "10.0.0.20:8443"
+        },
+        {
+          "matches": [
+            {
+              "remote_ip": [
+                "10.0.0.0/8"
+              ]
+            }
+          ],
+          "upstream": "10.0.0.21:9000"
+        },
+        {
+          "matches": [],
+          "upstream": "10.0.0.22:443"
+        }
+      ]
+    }
+  ],
+  "admin": null,
+  "global": {
+    "email": null,
+    "http_port": 80,
+    "https_port": 443,
+    "metrics": false,
+    "auto_https": "on",
+    "blocked_ips": [],
+    "trusted_proxies": [],
+    "upstream_keepalive_pool_size": null,
+    "http3": true,
+    "worker_threads": null,
+    "dns_refresh_secs": 30,
+    "grace_period_secs": null
+  },
+  "logging": {}
+}

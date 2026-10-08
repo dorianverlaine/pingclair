@@ -1,0 +1,335 @@
+{
+  "debug": false,
+  "servers": [
+    {
+      "name": "example.test",
+      "names": [
+        "example.test"
+      ],
+      "bind": null,
+      "listen": [
+        "[::]:8080"
+      ],
+      "proxy_protocol_listen": [],
+      "plaintext_listen": [
+        "[::]:8080"
+      ],
+      "tls": null,
+      "routes": [
+        {
+          "path": "/api*",
+          "handler": {
+            "type": "respond",
+            "status": 200,
+            "body": "path",
+            "headers": {}
+          },
+          "methods": null,
+          "matcher": {
+            "path": {
+              "patterns": [
+                "/api",
+                "/api/*"
+              ]
+            }
+          }
+        },
+        {
+          "path": "/*",
+          "handler": {
+            "type": "respond",
+            "status": 200,
+            "body": "host",
+            "headers": {}
+          },
+          "methods": null,
+          "matcher": {
+            "host": [
+              "a.example.test",
+              "b.example.test"
+            ]
+          }
+        },
+        {
+          "path": "/*",
+          "handler": {
+            "type": "respond",
+            "status": 200,
+            "body": "method",
+            "headers": {}
+          },
+          "methods": null,
+          "matcher": {
+            "method": {
+              "methods": [
+                "GET",
+                "POST"
+              ]
+            }
+          }
+        },
+        {
+          "path": "/*",
+          "handler": {
+            "type": "respond",
+            "status": 200,
+            "body": "header",
+            "headers": {}
+          },
+          "methods": null,
+          "matcher": {
+            "header": {
+              "name": "X-Debug",
+              "condition": {
+                "equals": "1"
+              }
+            }
+          }
+        },
+        {
+          "path": "/*",
+          "handler": {
+            "type": "respond",
+            "status": 200,
+            "body": "bearer",
+            "headers": {}
+          },
+          "methods": null,
+          "matcher": {
+            "header_regexp": {
+              "name": null,
+              "field": "Authorization",
+              "pattern": "^Bearer .+$"
+            }
+          }
+        },
+        {
+          "path": "/*",
+          "handler": {
+            "type": "respond",
+            "status": 200,
+            "body": "query",
+            "headers": {}
+          },
+          "methods": null,
+          "matcher": {
+            "query": {
+              "name": "tenant",
+              "condition": "exists"
+            }
+          }
+        },
+        {
+          "path": "/*",
+          "handler": {
+            "type": "respond",
+            "status": 200,
+            "body": "h2",
+            "headers": {}
+          },
+          "methods": null,
+          "matcher": {
+            "protocol": [
+              "http2"
+            ]
+          }
+        },
+        {
+          "path": "/*",
+          "handler": {
+            "type": "respond",
+            "status": 200,
+            "body": "intranet",
+            "headers": {}
+          },
+          "methods": null,
+          "matcher": {
+            "client_ip": [
+              "192.168.0.0/16",
+              "172.16.0.0/12",
+              "10.0.0.0/8",
+              "127.0.0.1/8",
+              "fd00::/8",
+              "::1"
+            ]
+          }
+        },
+        {
+          "path": "/*",
+          "handler": {
+            "type": "respond",
+            "status": 200,
+            "body": "peer",
+            "headers": {}
+          },
+          "methods": null,
+          "matcher": {
+            "remote_ip": [
+              "203.0.113.0/24"
+            ]
+          }
+        },
+        {
+          "path": "/*",
+          "handler": {
+            "type": "respond",
+            "status": 200,
+            "body": "tier",
+            "headers": {}
+          },
+          "methods": null,
+          "matcher": {
+            "vars": {
+              "name": "tier",
+              "values": [
+                "paid"
+              ]
+            }
+          }
+        },
+        {
+          "path": "/admin*",
+          "handler": {
+            "type": "respond",
+            "status": 202,
+            "body": "both",
+            "headers": {}
+          },
+          "methods": null,
+          "matcher": {
+            "and": [
+              {
+                "path": {
+                  "patterns": [
+                    "/admin",
+                    "/admin/*"
+                  ]
+                }
+              },
+              {
+                "method": {
+                  "methods": [
+                    "DELETE"
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "path": "/*",
+          "handler": {
+            "type": "respond",
+            "status": 200,
+            "body": "up",
+            "headers": {}
+          },
+          "methods": null,
+          "matcher": {
+            "or": [
+              {
+                "path": {
+                  "patterns": [
+                    "/health"
+                  ]
+                }
+              },
+              {
+                "path": {
+                  "patterns": [
+                    "/ready"
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "path": "/*",
+          "handler": {
+            "type": "respond",
+            "status": 200,
+            "body": "anything else",
+            "headers": {}
+          },
+          "methods": null,
+          "matcher": {
+            "not": {
+              "host": [
+                "blocked.example.test"
+              ]
+            }
+          }
+        },
+        {
+          "path": "/*",
+          "handler": {
+            "type": "error",
+            "status": 404,
+            "message": "nothing matched"
+          },
+          "methods": null,
+          "matcher": null
+        }
+      ],
+      "log": null,
+      "client_max_body_size": 0,
+      "limits": {
+        "header_timeout_ms": null,
+        "body_timeout_ms": null,
+        "idle_timeout_ms": null,
+        "request_timeout_ms": null,
+        "max_header_count": null,
+        "max_header_bytes": null,
+        "max_connections": null,
+        "upload_bytes_per_sec": null,
+        "download_bytes_per_sec": null,
+        "long_connections": {
+          "idle_timeout_ms": null,
+          "request_timeout_ms": null
+        }
+      },
+      "security": {
+        "enabled": false,
+        "x_frame_options": "",
+        "x_content_type_options": "",
+        "x_xss_protection": "",
+        "x_permitted_cross_domain": "",
+        "referrer_policy": "",
+        "permissions_policy": "",
+        "hsts": null,
+        "csp": null
+      },
+      "gzip_types": [
+        "text/*",
+        "application/json",
+        "application/*+json",
+        "application/x-ndjson",
+        "application/json-seq",
+        "application/xml",
+        "application/*+xml",
+        "application/javascript",
+        "application/x-javascript",
+        "image/svg+xml"
+      ],
+      "encodings": [],
+      "error_pages": {}
+    }
+  ],
+  "admin": null,
+  "global": {
+    "email": null,
+    "http_port": 80,
+    "https_port": 443,
+    "metrics": false,
+    "auto_https": "on",
+    "blocked_ips": [],
+    "trusted_proxies": [],
+    "upstream_keepalive_pool_size": null,
+    "http3": true,
+    "worker_threads": null,
+    "dns_refresh_secs": 30,
+    "grace_period_secs": null
+  },
+  "logging": {}
+}
