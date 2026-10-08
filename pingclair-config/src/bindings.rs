@@ -75,7 +75,10 @@ impl Bindings {
         if let Some(at) = matcher
             && !is_condition_fragment(&fragment)
         {
-            return Err(at.error("@Matcher requires a condition value such as .tls(...)"));
+            return Err(at.error(
+                "@Matcher requires a condition: an HTTP condition such as \
+                 .path(prefix: \"/api\"), or the L4 .tls(sni: [...])",
+            ));
         }
         if let Some(at) = secret
             && !matches!(&fragment, Fragment::Value(_))
@@ -219,7 +222,10 @@ impl Bindings {
 fn is_condition_fragment(fragment: &Fragment) -> bool {
     matches!(
         fragment,
-        Fragment::Value(Value::Typed(call)) if matches!(call.name.as_str(), "tls")
+        // 🌐 Both families: `.tls(sni:, alpn:)` routes a TCP listener, and the
+        // HTTP conditions are the rest of the list.
+        Fragment::Value(Value::Typed(call))
+            if call.name == "tls" || crate::frontend::is_http_condition(&call.name)
     )
 }
 

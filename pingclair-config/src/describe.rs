@@ -498,6 +498,45 @@ pub const ENTRIES: &[Entry] = &[
 }"#,
     },
     Entry {
+        name: "ErrorRoute",
+        kind: Kind::Component,
+        summary: "What to answer once a handler raised a status: `ErrorRoute(for: [.status(404), .serverError])`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "example.test") {
+        Route(when: .path(prefix: "/api")) { Proxy(to: "127.0.0.1:9000") }
+        ErrorRoute(for: [.status(404), .serverError]) {
+            Respond(status: 404, body: "no such route")
+        }
+        Fallback { ServeFiles(root: "./public") }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "example.test") {
+        ErrorRoute(for: [.success]) {
+            Respond(status: 500, body: "never runs")
+        }
+        Fallback { ServeFiles(root: "./public") }
+    }
+}"#,
+    },
+    Entry {
+        name: "errorPage",
+        kind: Kind::Modifier,
+        summary: "The file served for one error status: `.errorPage(for: [.status(404)], file: \"./404.html\")`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { ServeFiles(root: "./public") }
+    }
+    .errorPage(for: [.status(404)], file: "./errors/404.html")
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { ServeFiles(root: "./public") }
+    }
+    .errorPage(for: [.serverError], file: "./errors/500.html")
+}"#,
+    },
+    Entry {
         name: "encode",
         kind: Kind::Modifier,
         summary: "The codings a site offers, most preferred first: `.encode(.zstd, .gzip)`.",

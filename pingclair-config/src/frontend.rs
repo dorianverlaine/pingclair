@@ -8,12 +8,13 @@ use crate::bindings::Bindings;
 use crate::syntax::{self, Call, Declaration, Position, Value};
 use pingclair_core::config::{
     AccessControlConfig, AcmeServerConfig, AcmeServerPolicy, AdminConfig, BasicAuthAlgorithm,
-    CircuitBreakerConfig, Encoding, ForwardAuthConfig, ForwardAuthHeaderMap, HandlerConfig,
-    HandlerElement, HeaderReplacement, IpRanges, Layer4Matcher, Layer4Route, Layer4Server,
-    Layer4TlsMatcher, ListenerOptions, LoadBalanceConfig, LogConfig, LogFormat, LogOutput,
-    LogRotation, Matcher, MatcherCondition, OverloadConfig, PRIVATE_RANGES, PingclairConfig,
-    ProxyUpstream, RateLimitKey, ResourceLimitsConfig, RetryConfig, ReverseProxyConfig,
-    RouteConfig, ServerConfig, TlsConfig, UpstreamTlsConfig, normalize_listen_addr,
+    CircuitBreakerConfig, Encoding, ErrorRouteConfig, ForwardAuthConfig, ForwardAuthHeaderMap,
+    HandlerConfig, HandlerElement, HeaderReplacement, IpRanges, Layer4Matcher, Layer4Route,
+    Layer4Server, Layer4TlsMatcher, ListenerOptions, LoadBalanceConfig, LogConfig, LogFormat,
+    LogOutput, LogRotation, Matcher, MatcherCondition, OverloadConfig, PRIVATE_RANGES,
+    PingclairConfig, ProxyUpstream, RateLimitKey, ResourceLimitsConfig, RetryConfig,
+    ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig, UpstreamTlsConfig,
+    normalize_listen_addr,
 };
 
 /// 📍 Reports location and expected structure without echoing configuration values.
@@ -361,22 +362,47 @@ fn site(
 ) -> Result<ServerConfig, Error> {
     call.labels(&["host"])?;
     let mut encodings = Vec::new();
+    let mut error_pages: std::collections::BTreeMap<u16, String> =
+        std::collections::BTreeMap::new();
+    let mut page_positions = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for modifier in &call.modifiers {
-        if !seen.insert(modifier.name.clone()) {
+        // 📌 `.errorPage(...)` is the one modifier a site may repeat: its key is
+        // the status it claims, not the modifier's name, and a site with
+        // several error pages is ordinary.
+        if modifier.name != "errorPage" && !seen.insert(modifier.name.clone()) {
             return Err(modifier.at.error("duplicate Site modifier"));
         }
         match modifier.name.as_str() {
             "encode" => encodings = parse_encode(modifier)?,
-            _ => return Err(modifier.at.error("unknown Site modifier; expected .encode")),
+            "errorPage" => {
+                for (status, file) in parse_error_page(modifier)? {
+                    if error_pages.insert(status, file.clone()).is_some() {
+                        return Err(modifier
+                            .at
+                            .error(format!("status {status} already has an error page")));
+                    }
+                    page_positions.push((status, modifier.at));
+                }
+            }
+            _ => {
+                return Err(modifier
+                    .at
+                    .error("unknown Site modifier; expected .encode or .errorPage"));
+            }
         }
     }
     let host = call.string("host")?;
     let body = call.block()?;
     if body.is_empty() {
-        return Err(call.at.error("a Site needs at least one Route or Fallback"));
+        return Err(call
+            .at
+            .error("a Site needs at least one Route, Fallback or ErrorRoute"));
     }
     let mut routes = Vec::new();
+    let mut error_routes = Vec::new();
+    let mut answered_codes = std::collections::HashSet::new();
+    let mut answered_hundreds = std::collections::HashSet::new();
     let mut seen_fallback = false;
     for (index, child) in body.iter().enumerate() {
         match child.name.as_str() {
@@ -385,6 +411,23 @@ fn site(
                     return Err(child.at.error("Fallback must be the last route"));
                 }
                 routes.push(http_route(child)?);
+            }
+            // 🚨 Error routes sit wherever they read best: they are matched by
+            // the status a handler raised, not by position in this list, and
+            // the runtime keeps them in the order they were written.
+            "ErrorRoute" => {
+                let route = error_route(child)?;
+                // 📎 Only a route that can answer shadows a page; one that
+                // stops at middleware leaves the page in place.
+                if child
+                    .block()?
+                    .iter()
+                    .any(|component| is_terminal(&component.name))
+                {
+                    answered_codes.extend(route.codes.iter().copied());
+                    answered_hundreds.extend(route.hundreds.iter().copied());
+                }
+                error_routes.push(route);
             }
             "Fallback" => {
                 if seen_fallback || index + 1 != body.len() {
@@ -397,9 +440,22 @@ fn site(
             }
             other => {
                 return Err(child.at.error(format!(
-                    "a Site contains Route and Fallback components, not {other}"
+                    "a Site contains Route, ErrorRoute and Fallback components, not {other}"
                 )));
             }
+        }
+    }
+    // 🚫 A page for a status an error route already answers is dead
+    // configuration: the route runs first and cannot fall through to it. The
+    // file loads, the page exists, and no request ever sees it — the shape this
+    // repository refuses everywhere else.
+    for (status, at) in page_positions {
+        let hundred = (status / 100) as u8;
+        if answered_codes.contains(&status) || answered_hundreds.contains(&hundred) {
+            return Err(at.error(
+                "an ErrorRoute already answers this status, so the error page can never be \
+                 served; drop one of the two",
+            ));
         }
     }
     // 🗜️ A site that names no coding offers none — the same reading a
@@ -432,8 +488,146 @@ fn site(
         encodings,
         limits: options.limits.clone().unwrap_or_default(),
         routes,
+        error_routes,
+        error_pages,
         ..ServerConfig::default()
     })
+}
+
+/// 🚨 `.errorPage(for:, file:)`: the page served for one error status.
+fn parse_error_page(modifier: &Call) -> Result<Vec<(u16, String)>, Error> {
+    modifier.leaf(&["for", "file"])?;
+    let file = modifier.string("file")?;
+    let Some(Value::Array(items)) = modifier.get("for") else {
+        return Err(modifier.at.error("errorPage takes for: [...]"));
+    };
+    if items.is_empty() {
+        return Err(modifier.at.error("for: needs at least one status"));
+    }
+    let mut pages = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in items {
+        let status = match item {
+            Value::Typed(value) if value.name == "status" => {
+                let status = exact_status(value)?;
+                // 🚫 The model holds one code per entry, so a class here would
+                // have to guess which of a hundred statuses it meant. The
+                // Caddyfile's `error_page` has the same shape, and `ErrorRoute`
+                // is the spelling that takes a class.
+                if !(400..=599).contains(&status) {
+                    return Err(value
+                        .at
+                        .error("an error page is served for 400..=599; list the codes"));
+                }
+                status
+            }
+            _ => {
+                return Err(modifier.at.error(
+                    "errorPage takes .status(<code>) values; a class such as .serverError \
+                     belongs in ErrorRoute(for:)",
+                ));
+            }
+        };
+        if !seen.insert(status) {
+            return Err(modifier.at.error(format!("status {status} appears twice")));
+        }
+        pages.push((status, file.clone()));
+    }
+    Ok(pages)
+}
+
+/// 🚨 `ErrorRoute(for:) { … }`: what to answer once a handler raised a status.
+fn error_route(call: &Call) -> Result<ErrorRouteConfig, Error> {
+    call.labels(&["for"])?;
+    call.no_modifiers()?;
+    let (codes, hundreds) = status_selectors(call)?;
+    let body = call.block()?;
+    // 🧵 Unlike a normal route, a body that stops at middleware is complete:
+    // the error response already exists, so those components shape the answer
+    // the runtime was about to write.
+    Ok(ErrorRouteConfig {
+        codes,
+        hundreds,
+        handlers: route_elements(body, call.at, Ending::MiddlewareAllowed)?,
+    })
+}
+
+/// 🚨 Reads `for: [...]` into the exact codes and whole classes it names.
+fn status_selectors(call: &Call) -> Result<(Vec<u16>, Vec<u8>), Error> {
+    let Some(Value::Array(items)) = call.get("for") else {
+        return Err(call.at.error(
+            "ErrorRoute takes for: [.status(404), .serverError, …]; use .anyError for every status",
+        ));
+    };
+    if items.is_empty() {
+        return Err(call
+            .at
+            .error("for: needs at least one status; .anyError covers every error status"));
+    }
+    let mut codes = Vec::new();
+    let mut hundreds = Vec::new();
+    let mut any = false;
+    for item in items {
+        let Value::Typed(value) = item else {
+            return Err(call.at.error(
+                "for: takes .status(<code>) and .clientError/.serverError/.anyError values",
+            ));
+        };
+        match value.name.as_str() {
+            "status" => {
+                let status = exact_status(value)?;
+                if !(400..=599).contains(&status) {
+                    return Err(value.at.error(
+                        "an error route runs for 400..=599; a successful status is not an error",
+                    ));
+                }
+                if !codes.contains(&status) {
+                    codes.push(status);
+                }
+            }
+            class @ ("clientError" | "serverError") => {
+                value.leaf(&[])?;
+                let hundred = if class == "clientError" { 4 } else { 5 };
+                if !hundreds.contains(&hundred) {
+                    hundreds.push(hundred);
+                }
+            }
+            "anyError" => {
+                value.leaf(&[])?;
+                any = true;
+            }
+            // 🔮 Named now, meaningful later: the response matchers behind
+            // `Intercept` are the call site that can see a successful status.
+            other @ ("informational" | "success" | "redirect") => {
+                return Err(value.at.error(format!(
+                    "'.{other}' never reaches an error route; the response matchers are the \
+                     call site that can see it"
+                )));
+            }
+            other => {
+                return Err(value.at.error(format!(
+                    "unknown status selector '.{other}'; expected .status(<code>), \
+                     .clientError, .serverError or .anyError"
+                )));
+            }
+        }
+    }
+    if any && (!codes.is_empty() || !hundreds.is_empty()) {
+        return Err(call
+            .at
+            .error(".anyError already covers every error status; list it alone"));
+    }
+    Ok((codes, hundreds))
+}
+
+/// 🚨 The one status code a `.status(...)` selector names.
+fn exact_status(value: &Call) -> Result<u16, Error> {
+    let [(None, Value::Number(code))] = value.args.as_slice() else {
+        return Err(value
+            .at
+            .error(".status takes one code such as .status(404)"));
+    };
+    u16::try_from(*code).map_err(|_| value.at.error("status must fit in 0..=65535"))
 }
 
 /// 🗜️ `.encode(.zstd, .gzip)`: the codings this site may produce, most
@@ -724,12 +918,35 @@ fn http_route(call: &Call) -> Result<RouteConfig, Error> {
 /// handler, exactly as a single-directive Caddyfile site does; two or more
 /// become a pipeline the runtime walks front to back.
 fn route_handler(body: &[Call], at: Position) -> Result<HandlerConfig, Error> {
+    let mut handlers = route_elements(body, at, Ending::Terminal)?;
+    if handlers.len() == 1 {
+        return Ok(handlers.remove(0).handler);
+    }
+    Ok(HandlerConfig::Pipeline { handlers })
+}
+
+/// 🅿️ Whether a body may stop at middleware, or has to name who answers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// 🧵 A normal route: the last component answers.
+    Terminal,
+    /// 🚨 An error route: stopping at middleware leaves the runtime's own error
+    /// answer in place with those changes applied.
+    MiddlewareAllowed,
+}
+
+/// 🧵 One body as the ordered elements the runtime walks.
+fn route_elements(
+    body: &[Call],
+    at: Position,
+    ending: Ending,
+) -> Result<Vec<HandlerElement>, Error> {
     let Some((last, middleware)) = body.split_last() else {
         return Err(at.error(format!(
             "a route needs at least one component; end it with {TERMINALS}"
         )));
     };
-    if !is_terminal(&last.name) {
+    if ending == Ending::Terminal && !is_terminal(&last.name) {
         return Err(last.at.error(format!(
             "a route must end with a component that answers the request: {TERMINALS}; {} only changes it",
             last.name
@@ -747,10 +964,7 @@ fn route_handler(body: &[Call], at: Position) -> Result<HandlerConfig, Error> {
     for child in body {
         handlers.push(HandlerElement::plain(http_handler(child)?));
     }
-    if handlers.len() == 1 {
-        return Ok(handlers.remove(0).handler);
-    }
-    Ok(HandlerConfig::Pipeline { handlers })
+    Ok(handlers)
 }
 
 /// 🅿️ The components that answer a request, named once for every refusal.
@@ -761,6 +975,32 @@ fn is_terminal(name: &str) -> bool {
     matches!(
         name,
         "Respond" | "ServeFiles" | "Proxy" | "Redirect" | "Fail" | "ServeMetrics" | "ACMEServer"
+    )
+}
+
+/// 🎛️ Whether a typed value names an HTTP condition.
+///
+/// 📌 The one list both readers consult: `http_condition` below is what turns a
+/// name into a matcher, and a `@Matcher` binding is accepted on the strength of
+/// this predicate before anything uses it. Two lists would let a condition bind
+/// and then fail on the line that uses it, or refuse to bind at all — which is
+/// what happened to every HTTP condition until the corpus wrote one down.
+pub(crate) fn is_http_condition(name: &str) -> bool {
+    matches!(
+        name,
+        "path"
+            | "host"
+            | "method"
+            | "header"
+            | "query"
+            | "protocol"
+            | "clientIP"
+            | "remoteIP"
+            | "variable"
+            | "file"
+            | "all"
+            | "any"
+            | "not"
     )
 }
 

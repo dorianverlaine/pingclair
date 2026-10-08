@@ -1283,6 +1283,177 @@ fn composed_components_that_cannot_mean_anything_fail_closed() {
 }
 
 #[test]
+fn error_surfaces_lower_like_their_caddyfile_twins() {
+    let cases = [
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") {
+                ErrorRoute(for: [.status(404), .serverError]) { Respond(status: 500, body: "oops") }
+                Fallback { Respond(body: "ok") }
+            } }"#
+                .to_string(),
+            "http://:8080 {\n\thandle_errors 404 5xx {\n\t\trespond \"oops\" 500\n\t}\n\trespond \"ok\"\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") {
+                ErrorRoute(for: [.anyError]) { Respond(status: 502, body: "boom") }
+                Fallback { Respond(body: "ok") }
+            } }"#
+                .to_string(),
+            "http://:8080 {\n\thandle_errors {\n\t\trespond \"boom\" 502\n\t}\n\trespond \"ok\"\n}"
+                .to_string(),
+        ),
+        (
+            // 🧵 A body that stops at middleware shapes the answer the runtime
+            // already built, so no terminal is needed here.
+            r#"HTTPListener(on: ":8080") { Site(host: "*") {
+                ErrorRoute(for: [.serverError]) { ResponseHeader(.set("X-Err", "yes")) }
+                Fallback { Respond(body: "ok") }
+            } }"#
+                .to_string(),
+            "http://:8080 {\n\thandle_errors 5xx {\n\t\theader X-Err yes\n\t}\n\trespond \"ok\"\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") {
+                Fallback { Respond(body: "ok") }
+            }
+            .errorPage(for: [.status(404)], file: "/404.html")
+            .errorPage(for: [.status(500), .status(502), .status(503), .status(504)], file: "/50x.html")
+            }"#
+                .to_string(),
+            "http://:8080 {\n\terror_page 404 /404.html\n\terror_page 500 502 503 504 /50x.html\n\trespond \"ok\"\n}"
+                .to_string(),
+        ),
+    ];
+    for (native_source, legacy_source) in cases {
+        let native = crate::compile(&native_source).unwrap();
+        let legacy = crate::compile(&legacy_source).unwrap();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::to_value(legacy).unwrap(),
+            "{native_source}"
+        );
+    }
+}
+
+#[test]
+fn error_surfaces_that_cannot_mean_anything_fail_closed() {
+    let site = |body: &str| {
+        format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ {body} Fallback {{ Respond(body: \"ok\") }} }} }}"
+        )
+    };
+    for body in [
+        // 🚨 A selector is required, and it has to name something an error
+        // route can actually see.
+        "ErrorRoute() { Respond(status: 500, body: \"x\") }",
+        "ErrorRoute(for: []) { Respond(status: 500, body: \"x\") }",
+        "ErrorRoute(for: [.success]) { Respond(status: 500, body: \"x\") }",
+        "ErrorRoute(for: [.redirect]) { Respond(status: 500, body: \"x\") }",
+        "ErrorRoute(for: [.informational]) { Respond(status: 500, body: \"x\") }",
+        "ErrorRoute(for: [.status(200)]) { Respond(status: 500, body: \"x\") }",
+        "ErrorRoute(for: [.status(404, 500)]) { Respond(status: 500, body: \"x\") }",
+        "ErrorRoute(for: [.anyError, .serverError]) { Respond(status: 500, body: \"x\") }",
+        "ErrorRoute(for: [.unknown]) { Respond(status: 500, body: \"x\") }",
+        "ErrorRoute(for: [\"500\"]) { Respond(status: 500, body: \"x\") }",
+        "ErrorRoute(for: [.status(500)]) { }",
+        "ErrorRoute(for: [.status(500)]) { Respond(status: 500, body: \"x\") ServeFiles(root: \"./p\") }",
+        // 🖼️ An error page is one code and one file.
+        "ErrorRoute(for: [.status(500)]) { Fail(status: 500) } .errorPage(for: [.status(404)])",
+    ] {
+        let source = site(body);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+    let with_modifier = |modifier: &str| {
+        format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ Respond(body: \"ok\") }} }} {modifier} }}"
+        )
+    };
+    for modifier in [
+        ".errorPage()",
+        ".errorPage(for: [], file: \"/404.html\")",
+        ".errorPage(for: [.status(404)])",
+        ".errorPage(for: [.status(404)], file: 1)",
+        ".errorPage(for: [.serverError], file: \"/50x.html\")",
+        ".errorPage(for: [.status(200)], file: \"/ok.html\")",
+        ".errorPage(for: [.status(404), .status(404)], file: \"/404.html\")",
+        ".errorPage(for: [.status(404)], file: \"/404.html\").errorPage(for: [.status(404)], file: \"/other.html\")",
+        ".unknown(1)",
+    ] {
+        let source = with_modifier(modifier);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+    // 🚫 A page for a status an answering error route already owns can never be
+    // served; the pair is refused instead of shipped dead.
+    for (error_route, page) in [
+        (
+            "ErrorRoute(for: [.status(404)]) { Respond(status: 404, body: \"x\") }",
+            ".errorPage(for: [.status(404)], file: \"/404.html\")",
+        ),
+        (
+            "ErrorRoute(for: [.serverError]) { Respond(status: 500, body: \"x\") }",
+            ".errorPage(for: [.status(503)], file: \"/503.html\")",
+        ),
+    ] {
+        let source = format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ {error_route} Fallback {{ Respond(body: \"ok\") }} }} {page} }}"
+        );
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+    // 📎 Whereas a route that stops at middleware leaves the page reachable:
+    // the runtime answers from the page after shaping the error in place.
+    crate::compile(
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { ErrorRoute(for: [.serverError]) { ResponseHeader(.set(\"X-Err\", \"yes\")) } Fallback { Respond(body: \"ok\") } } .errorPage(for: [.status(503)], file: \"/503.html\") }",
+    )
+    .unwrap();
+}
+
+#[test]
+fn every_condition_can_be_bound_once_and_reused() {
+    let http = |condition: &str| {
+        format!(
+            "@Matcher\nlet shared = {condition}\nHTTPListener(on: \":8080\") {{\n    Site(host: \"*\") {{\n        Route(when: shared) {{ Respond(body: \"matched\") }}\n        Fallback {{ Respond(body: \"no\") }}\n    }}\n}}\n"
+        )
+    };
+    for condition in [
+        ".path(exact: \"/a\")",
+        ".path(prefix: \"/a\")",
+        ".path(glob: \"/a*\")",
+        ".path(.regex(\"^/a$\"))",
+        ".host([\"a.example\"])",
+        ".method(.get, .post)",
+        ".header(name: \"X-Debug\", value: \"1\")",
+        ".header(.regex(name: \"Authorization\", pattern: \"^Bearer .+$\"))",
+        ".query(name: \"tenant\", exists: true)",
+        ".protocol(.http1, .http2)",
+        ".clientIP([\"10.0.0.0/8\"])",
+        ".remoteIP([.privateRanges])",
+        ".variable(name: \"tier\", values: [\"paid\"])",
+        ".all([.path(prefix: \"/admin\"), .method(.delete)])",
+        ".any([.path(exact: \"/a\"), .path(exact: \"/b\")])",
+        ".not(.host([\"blocked.example\"]))",
+    ] {
+        let source = http(condition);
+        crate::compile(&source).unwrap_or_else(|error| {
+            panic!("binding {condition} failed: {error}");
+        });
+    }
+    // 🔌 The L4 condition is the one that was bindable first, and it stays so.
+    crate::compile(
+        "@Matcher\nlet secure = .tls(sni: [\"tunnel.example\"], alpn: [\"h2\"])\nTCPListener(on: \"127.0.0.1:9443\") {\n    Route(when: secure) { Proxy(to: \"127.0.0.1:8443\") }\n    Fallback { Proxy(to: \"127.0.0.1:8080\") }\n}\n",
+    )
+    .unwrap();
+    // 🚫 A binding that is not a condition is still refused where it is written.
+    for source in [
+        "@Matcher\nlet text = \"not a condition\"\nHTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"ok\") } } }\n",
+        "@Matcher\nlet route = Route(when: .path(exact: \"/a\")) { Respond(body: \"ok\") }\nHTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"ok\") } } }\n",
+    ] {
+        assert!(crate::compile(source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",
