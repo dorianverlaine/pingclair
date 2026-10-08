@@ -2813,6 +2813,26 @@ async fn h3_raise_status(
     .await
 }
 
+/// 🧭 The `Content-Type` a local body carries by default on every transport.
+///
+/// Caddy answers `respond` and `error` with `text/plain; charset=utf-8` unless
+/// the configuration names another type, and the HTTP/1.1 and HTTP/2 paths
+/// have applied that rule since they were written. HTTP/3 builds its own
+/// header map, and it never did: the same route served a typed body on two
+/// transports and an untyped one on the third (#306).
+fn default_local_headers(mut headers: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    if !headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("content-type"))
+    {
+        headers.insert(
+            "Content-Type".to_string(),
+            "text/plain; charset=utf-8".to_string(),
+        );
+    }
+    headers
+}
+
 /// 🧩 Executes non-terminal middleware before selecting an H3 terminal handler.
 #[async_recursion::async_recursion]
 #[allow(clippy::too_many_arguments)]
@@ -3361,7 +3381,7 @@ async fn plan_h3_handler_with_connector(
             Ok(H3Plan::Terminal(H3Terminal::Respond {
                 status: *status,
                 body,
-                headers: headers.clone(),
+                headers: default_local_headers(headers.clone()),
             }))
         }
         // 🚨 A static error answers with its status and message on HTTP/3
@@ -3420,7 +3440,7 @@ async fn plan_h3_handler_with_connector(
                         H3Plan::Continue => H3Plan::Terminal(H3Terminal::Respond {
                             status: *status,
                             body: body.clone(),
-                            headers: BTreeMap::new(),
+                            headers: default_local_headers(BTreeMap::new()),
                         }),
                         // 🚨 A `file_server` anywhere in the error route serves
                         // that route's page, with the raised status — the
@@ -3440,7 +3460,7 @@ async fn plan_h3_handler_with_connector(
             Ok(H3Plan::Terminal(H3Terminal::Respond {
                 status: *status,
                 body,
-                headers: BTreeMap::new(),
+                headers: default_local_headers(BTreeMap::new()),
             }))
         }
         // 🧭 Resolved here rather than at send time so H3 and H1/H2 expand the
@@ -8916,6 +8936,102 @@ mod tests {
         assert!(policy.set_headers().any(|(name, value)| {
             name == "access-control-allow-origin" && value == "https://app.example"
         }));
+    }
+
+    /// 🧭 A local body carries `text/plain; charset=utf-8` on HTTP/3 too.
+    ///
+    /// `respond` and `error` build their own header maps on this path, and
+    /// the default Caddy applies to those bodies was only wired into the
+    /// HTTP/1.1 and HTTP/2 builders: one route carried the field on two
+    /// transports and no field at all on the third (#306). A configured
+    /// `Content-Type` still wins, exactly as it does on H1/H2.
+    #[tokio::test]
+    async fn h3_local_bodies_default_to_text_plain() {
+        let default_expected = Some("text/plain; charset=utf-8");
+        let cases = [
+            (
+                "respond",
+                HandlerConfig::Respond {
+                    status: 200,
+                    body: Some("hello".to_string()),
+                    headers: BTreeMap::new(),
+                },
+            ),
+            (
+                "error",
+                HandlerConfig::Error {
+                    status: 500,
+                    message: None,
+                },
+            ),
+        ];
+
+        for (name, handler) in cases {
+            let state = proxy_state(handler.clone());
+            let mut request = RequestHeader::build(http::Method::GET, b"/", None).unwrap();
+            let mut uri = "/".to_string();
+            let mut policy = ResponseHeaderPolicy::default();
+            let plan = plan_h3_handler(
+                &handler,
+                &state,
+                0,
+                &mut request,
+                &mut uri,
+                &mut policy,
+                "203.0.113.7",
+                None,
+                None,
+                &mut crate::http_policy::RequestVars::default(),
+                &mut None,
+                &mut RequestBodyPlan::default(),
+            )
+            .await
+            .unwrap();
+
+            let H3Plan::Terminal(H3Terminal::Respond { headers, .. }) = plan else {
+                panic!("{name} must terminate with a local response");
+            };
+            assert_eq!(
+                headers.get("Content-Type").map(String::as_str),
+                default_expected,
+                "{name} must carry Caddy's default Content-Type on HTTP/3"
+            );
+        }
+
+        // 🎛️ The operator's own type is the answer when they write one.
+        let handler = HandlerConfig::Respond {
+            status: 200,
+            body: Some("{}".to_string()),
+            headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+        };
+        let state = proxy_state(handler.clone());
+        let mut request = RequestHeader::build(http::Method::GET, b"/", None).unwrap();
+        let mut uri = "/".to_string();
+        let mut policy = ResponseHeaderPolicy::default();
+        let plan = plan_h3_handler(
+            &handler,
+            &state,
+            0,
+            &mut request,
+            &mut uri,
+            &mut policy,
+            "203.0.113.7",
+            None,
+            None,
+            &mut crate::http_policy::RequestVars::default(),
+            &mut None,
+            &mut RequestBodyPlan::default(),
+        )
+        .await
+        .unwrap();
+        let H3Plan::Terminal(H3Terminal::Respond { headers, .. }) = plan else {
+            panic!("a configured respond must terminate with a local response");
+        };
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/json"),
+            "a configured Content-Type must not be replaced by the default"
+        );
     }
 
     #[tokio::test]

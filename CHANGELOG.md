@@ -27,6 +27,16 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🧭 A local body keeps its default `Content-Type` on HTTP/3
+
+Caddy answers `respond` and `error` with `text/plain; charset=utf-8` unless
+the configuration names another type, and the HTTP/1.1 and HTTP/2 paths have
+applied that rule since they were written. HTTP/3 builds its own header list
+and never did, so the same route served a typed body on two transports and an
+untyped one on the third. The H3 terminal for both directives now applies the
+same default, and a configured `Content-Type` still wins, exactly as it does
+on H1/H2 (#306).
+
 ### 🔻 A client that gives up no longer evicts a backend
 
 The health record kept after a connection was made belongs to the origin, and
