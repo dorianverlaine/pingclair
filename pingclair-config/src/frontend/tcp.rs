@@ -2,6 +2,11 @@
 // Copyright 2026 Dorian Verlaine
 
 //! 🛡️ The TCP listener: raw bytes, routed by SNI or peer address.
+//!
+//! 📌 Named `tcp` rather than `layer4` because the crate already has a
+//! `layer4.rs` — the compile-stage module that turns analysed L4 blocks into
+//! configuration. Two files called `layer4.rs` doing different jobs is a tab
+//! nobody can read.
 
 use super::*;
 

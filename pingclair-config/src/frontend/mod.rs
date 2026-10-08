@@ -4,10 +4,10 @@
 //! 🧭 Pingclair's declarative language lowers directly to shared configuration.
 
 mod http;
-mod layer4;
+mod tcp;
 
 use http::http_listener;
-use layer4::listener;
+use tcp::listener;
 
 pub(crate) use http::is_http_condition;
 
