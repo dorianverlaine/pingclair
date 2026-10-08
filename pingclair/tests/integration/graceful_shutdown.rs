@@ -44,9 +44,13 @@ async fn spawn_slow_origin(delay: Duration) -> SocketAddr {
 /// that loses it only shows under load. Four megabytes are hundreds of frames
 /// and several TLS records, so a process that exits before the connection
 /// task flushes truncates the body every time.
-async fn spawn_slow_big_origin(delay: Duration, bytes: usize) -> SocketAddr {
+async fn spawn_slow_big_origin(
+    delay: Duration,
+    bytes: usize,
+) -> (SocketAddr, tokio::sync::mpsc::Receiver<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    let (arrived, requests) = tokio::sync::mpsc::channel(1);
     tokio::spawn(async move {
         let body = vec![b'x'; bytes];
         let head =
@@ -57,16 +61,20 @@ async fn spawn_slow_big_origin(delay: Duration, bytes: usize) -> SocketAddr {
             };
             let body = body.clone();
             let head = head.clone();
+            let arrived = arrived.clone();
             tokio::spawn(async move {
                 let mut request = [0u8; 4096];
-                let _ = stream.read(&mut request).await;
+                if !matches!(stream.read(&mut request).await, Ok(1..)) {
+                    return;
+                }
+                let _ = arrived.send(()).await;
                 tokio::time::sleep(delay).await;
                 let _ = stream.write_all(head.as_bytes()).await;
                 let _ = stream.write_all(&body).await;
             });
         }
     });
-    address
+    (address, requests)
 }
 
 fn sigterm(server: &TestServer) {
@@ -221,7 +229,8 @@ fn tls_config(origin: SocketAddr, grace: &str) -> String {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_h2_response_in_flight_across_sigterm_reaches_the_client() {
-    let origin = spawn_slow_big_origin(Duration::from_millis(800), 4 * 1024 * 1024).await;
+    let (origin, mut requests) =
+        spawn_slow_big_origin(Duration::from_millis(800), 4 * 1024 * 1024).await;
     for attempt in 1..=5 {
         let mut server = TestServer::new_pingclairfile(&tls_config(origin, "30s"));
         assert!(
@@ -249,9 +258,13 @@ async fn test_h2_response_in_flight_across_sigterm_reaches_the_client() {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("curl must start");
-        // 🧭 The request must be on the wire before the signal; the origin's
-        // delay leaves room either side of this pause.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // 🧭 Confirm admission before stopping: spawning curl does not prove
+        // its TLS handshake finished, especially while other suites compile.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), requests.recv()).await,
+            Ok(Some(())),
+            "attempt {attempt}: the origin never received the request"
+        );
         sigterm(&server);
 
         let status = wait_for_exit(&mut server, Duration::from_secs(20)).await;
