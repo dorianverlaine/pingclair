@@ -7,11 +7,12 @@ use crate::attributes::{Attr, resolve_attribute};
 use crate::bindings::Bindings;
 use crate::syntax::{self, Call, Declaration, Position, Value};
 use pingclair_core::config::{
-    AdminConfig, CircuitBreakerConfig, HandlerConfig, IpRanges, Layer4Matcher, Layer4Route,
-    Layer4Server, Layer4TlsMatcher, ListenerOptions, LoadBalanceConfig, LogConfig, LogFormat,
-    LogOutput, LogRotation, Matcher, MatcherCondition, OverloadConfig, PRIVATE_RANGES,
-    PingclairConfig, ProxyUpstream, ResourceLimitsConfig, RetryConfig, ReverseProxyConfig,
-    RouteConfig, ServerConfig, TlsConfig, UpstreamTlsConfig, normalize_listen_addr,
+    AdminConfig, CircuitBreakerConfig, Encoding, HandlerConfig, HandlerElement, HeaderReplacement,
+    IpRanges, Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher, ListenerOptions,
+    LoadBalanceConfig, LogConfig, LogFormat, LogOutput, LogRotation, Matcher, MatcherCondition,
+    OverloadConfig, PRIVATE_RANGES, PingclairConfig, ProxyUpstream, ResourceLimitsConfig,
+    RetryConfig, ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig, UpstreamTlsConfig,
+    normalize_listen_addr,
 };
 
 /// 📍 Reports location and expected structure without echoing configuration values.
@@ -358,8 +359,16 @@ fn site(
     options: &HttpListenerOptions,
 ) -> Result<ServerConfig, Error> {
     call.labels(&["host"])?;
-    if let Some(modifier) = call.modifiers.first() {
-        return Err(modifier.at.error("Site modifiers are not implemented yet"));
+    let mut encodings = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for modifier in &call.modifiers {
+        if !seen.insert(modifier.name.clone()) {
+            return Err(modifier.at.error("duplicate Site modifier"));
+        }
+        match modifier.name.as_str() {
+            "encode" => encodings = parse_encode(modifier)?,
+            _ => return Err(modifier.at.error("unknown Site modifier; expected .encode")),
+        }
     }
     let host = call.string("host")?;
     let body = call.block()?;
@@ -392,6 +401,14 @@ fn site(
             }
         }
     }
+    // 🗜️ A site that names no coding offers none — the same reading a
+    // Caddyfile without `encode` gets — so the file servers below are lowered
+    // to match instead of keeping the flag that means "compression is allowed".
+    if encodings.is_empty() {
+        for route in &mut routes {
+            crate::compiler::apply_site_compression(&mut route.handler);
+        }
+    }
     let (name, names) = if host == "*" {
         (Some("_".to_string()), Vec::new())
     } else {
@@ -409,14 +426,63 @@ fn site(
         },
         tls: options.tls.clone(),
         log: options.log.clone(),
-        // 🧜 No `Encode` component yet: the site offers no compression, which is
-        // what a Caddyfile without an `encode` directive compiles to. The legacy
-        // gzip default on `ServerConfig` only applies to old JSON without the field.
-        encodings: Vec::new(),
+        // 🧜 `.encode(...)` is the only thing that turns compression on; the
+        // legacy gzip default on `ServerConfig` applies to old JSON only.
+        encodings,
         limits: options.limits.clone().unwrap_or_default(),
         routes,
         ..ServerConfig::default()
     })
+}
+
+/// 🗜️ `.encode(.zstd, .gzip)`: the codings this site may produce, most
+/// preferred first.
+fn parse_encode(modifier: &Call) -> Result<Vec<Encoding>, Error> {
+    modifier.no_modifiers()?;
+    if modifier.body.is_some() {
+        return Err(modifier.at.error("encode does not take a block"));
+    }
+    if modifier.args.is_empty() {
+        return Err(modifier.at.error(
+            "encode needs at least one coding; a site with no .encode already offers no compression",
+        ));
+    }
+    let mut encodings = Vec::new();
+    for (label, value) in &modifier.args {
+        if label.is_some() {
+            return Err(modifier
+                .at
+                .error("encode takes unlabeled codings such as .encode(.zstd, .gzip)"));
+        }
+        let Value::Typed(coding) = value else {
+            return Err(modifier.at.error("encode takes .zstd and .gzip values"));
+        };
+        if !coding.args.is_empty() {
+            return Err(coding.at.error("a coding takes no arguments"));
+        }
+        let encoding = match coding.name.as_str() {
+            "zstd" => Encoding::Zstd,
+            "gzip" => Encoding::Gzip,
+            // 🚫 Brotli is refused by name rather than dropped: a coding that
+            // silently disappears looks identical to a working one until the
+            // first client that asked for it.
+            "br" => {
+                return Err(coding
+                    .at
+                    .error("brotli is not implemented; use .zstd or .gzip"));
+            }
+            other => {
+                return Err(coding.at.error(format!(
+                    "unknown coding '.{other}'; expected .zstd or .gzip"
+                )));
+            }
+        };
+        if encodings.contains(&encoding) {
+            return Err(coding.at.error("duplicate coding"));
+        }
+        encodings.push(encoding);
+    }
+    Ok(encodings)
 }
 
 /// 🌐 Listener-level settings a modifier chain may carry.
@@ -618,23 +684,20 @@ fn http_count(call: &Call, key: &str) -> Result<usize, Error> {
         .map_err(|_| call.at.error(format!("{key} exceeds the platform range")))
 }
 
-/// 🧭 An unconditional HTTP route: one terminal handler.
+/// 🧭 An unconditional HTTP route: ordered middleware ending in one terminal.
 fn fallback_route(call: &Call) -> Result<RouteConfig, Error> {
     call.labels(&[])?;
     call.no_modifiers()?;
     let body = call.block()?;
-    let [handler] = body else {
-        return Err(call.at.error("Fallback requires exactly one handler"));
-    };
     Ok(RouteConfig {
         path: "/*".to_string(),
-        handler: http_handler(handler)?,
+        handler: route_handler(body, call.at)?,
         methods: None,
         matcher: None,
     })
 }
 
-/// 🧭 A conditional HTTP route: `when:` plus exactly one handler.
+/// 🧭 A conditional HTTP route: `when:` plus ordered components.
 fn http_route(call: &Call) -> Result<RouteConfig, Error> {
     call.labels(&["when"])?;
     call.no_modifiers()?;
@@ -645,15 +708,56 @@ fn http_route(call: &Call) -> Result<RouteConfig, Error> {
     };
     let (matcher, primary) = http_condition(condition, call.at)?;
     let body = call.block()?;
-    let [handler] = body else {
-        return Err(call.at.error("Route requires exactly one handler"));
-    };
     Ok(RouteConfig {
         path: primary.unwrap_or_else(|| "/*".to_string()),
-        handler: http_handler(handler)?,
+        handler: route_handler(body, call.at)?,
         methods: None,
         matcher: Some(matcher),
     })
+}
+
+/// 🧵 One route body: middleware in writing order, then the handler that
+/// answers the request.
+///
+/// 🧭 The order is the meaning. A body with one component lowers to that
+/// handler, exactly as a single-directive Caddyfile site does; two or more
+/// become a pipeline the runtime walks front to back.
+fn route_handler(body: &[Call], at: Position) -> Result<HandlerConfig, Error> {
+    let Some((last, middleware)) = body.split_last() else {
+        return Err(at.error(
+            "a route needs at least one component; end it with Respond, ServeFiles, Proxy, Redirect, Fail or ServeMetrics",
+        ));
+    };
+    if !is_terminal(&last.name) {
+        return Err(last.at.error(format!(
+            "a route must end with a component that answers the request: Respond, ServeFiles, Proxy, Redirect, Fail or ServeMetrics; {} only changes it",
+            last.name
+        )));
+    }
+    for child in middleware {
+        if is_terminal(&child.name) {
+            return Err(child.at.error(format!(
+                "{} answers the request on its own, so the components after it can never run",
+                child.name
+            )));
+        }
+    }
+    let mut handlers = Vec::with_capacity(body.len());
+    for child in body {
+        handlers.push(HandlerElement::plain(http_handler(child)?));
+    }
+    if handlers.len() == 1 {
+        return Ok(handlers.remove(0).handler);
+    }
+    Ok(HandlerConfig::Pipeline { handlers })
+}
+
+/// 🅿️ Whether a component writes a response, and therefore ends a route.
+fn is_terminal(name: &str) -> bool {
+    matches!(
+        name,
+        "Respond" | "ServeFiles" | "Proxy" | "Redirect" | "Fail" | "ServeMetrics"
+    )
 }
 
 /// 🎛️ A typed HTTP condition, lowered onto the shared matcher model.
@@ -697,24 +801,7 @@ fn http_condition(value: &Value, at: Position) -> Result<(Matcher, Option<String
                         .at
                         .error("method takes unlabeled .get/.post/... values"));
                 };
-                if !value.args.is_empty() {
-                    return Err(value.at.error("a method value takes no arguments"));
-                }
-                let method = match value.name.as_str() {
-                    "get" => "GET",
-                    "post" => "POST",
-                    "put" => "PUT",
-                    "delete" => "DELETE",
-                    "patch" => "PATCH",
-                    "head" => "HEAD",
-                    "options" => "OPTIONS",
-                    other => {
-                        return Err(value.at.error(format!(
-                            "unknown method '.{other}'; expected .get, .post, .put, .delete, .patch, .head or .options"
-                        )));
-                    }
-                };
-                methods.push(method.to_string());
+                methods.push(method_name(value)?.to_string());
             }
             Ok((Matcher::Method { methods }, None))
         }
@@ -986,7 +1073,36 @@ fn variable_condition(call: &Call) -> Result<(Matcher, Option<String>), Error> {
     Ok((Matcher::Vars { name, values }, None))
 }
 
-/// 🧰 HTTP terminal components; `Respond` is the first one implemented.
+/// 🔤 The HTTP method one typed `.get`/`.post`/… value names.
+fn method_name(value: &Call) -> Result<&'static str, Error> {
+    if !value.args.is_empty() {
+        return Err(value.at.error("a method value takes no arguments"));
+    }
+    Ok(match value.name.as_str() {
+        "get" => "GET",
+        "post" => "POST",
+        "put" => "PUT",
+        "delete" => "DELETE",
+        "patch" => "PATCH",
+        "head" => "HEAD",
+        "options" => "OPTIONS",
+        other => {
+            return Err(value.at.error(format!(
+                "unknown method '.{other}'; expected .get, .post, .put, .delete, .patch, .head or .options"
+            )));
+        }
+    })
+}
+
+/// 🔖 One labeled quoted argument, refused when it is missing or mistyped.
+fn labeled_string(call: &Call, key: &str) -> Result<String, Error> {
+    match call.get(key) {
+        Some(Value::String(value)) => Ok(value.clone()),
+        _ => Err(call.at.error(format!("{key} requires a quoted string"))),
+    }
+}
+
+/// 🧰 The HTTP components: terminals that answer, middleware that changes.
 fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
     match call.name.as_str() {
         "Respond" => {
@@ -1007,10 +1123,219 @@ fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
         "Redirect" => redirect(call),
         "Fail" => fail(call),
         "ServeMetrics" => serve_metrics(call),
+        "RequestHeader" => request_headers(call),
+        "ResponseHeader" => response_headers(call),
+        "Rewrite" => rewrite(call),
         _ => Err(call.at.error(
-            "unknown HTTP handler; expected Respond, ServeFiles, Proxy, Redirect, Fail or ServeMetrics",
+            "unknown HTTP component; expected a terminal (Respond, ServeFiles, Proxy, Redirect, \
+             Fail, ServeMetrics) or middleware (RequestHeader, ResponseHeader, Rewrite)",
         )),
     }
+}
+
+/// 🏷️ The header operations one component carries, in writing order.
+#[derive(Default)]
+struct HeaderOps {
+    set: std::collections::BTreeMap<String, String>,
+    add: std::collections::BTreeMap<String, Vec<String>>,
+    remove: Vec<String>,
+    replace: Vec<HeaderReplacement>,
+    set_if_absent: std::collections::BTreeMap<String, String>,
+}
+
+/// 🏷️ `RequestHeader(...)`: rewrites the request later handlers read.
+fn request_headers(call: &Call) -> Result<HandlerConfig, Error> {
+    let ops = header_ops(call, false)?;
+    Ok(HandlerConfig::RequestHeaders {
+        set: ops.set,
+        add: ops.add,
+        remove: ops.remove,
+        replace: ops.replace,
+    })
+}
+
+/// 🏷️ `ResponseHeader(...)`: rewrites the response on its way to the client.
+fn response_headers(call: &Call) -> Result<HandlerConfig, Error> {
+    let ops = header_ops(call, true)?;
+    Ok(HandlerConfig::Headers {
+        set: ops.set,
+        add: ops.add,
+        remove: ops.remove,
+        replace: ops.replace,
+        default_set: ops.set_if_absent,
+        require: None,
+    })
+}
+
+/// 🏷️ Reads the action list both header components share.
+///
+/// One reader because the two components differ in *which message* they edit,
+/// never in how an action is written — two readers would be two chances to
+/// disagree, which is exactly how the Caddyfile's `?` prefix once reached the
+/// request side of a format that refuses it.
+fn header_ops(call: &Call, response_side: bool) -> Result<HeaderOps, Error> {
+    if call.body.is_some() {
+        return Err(call.at.error(format!(
+            "{} does not take a block; write one action per call",
+            call.name
+        )));
+    }
+    call.no_modifiers()?;
+    let actions = if call.args.is_empty() {
+        return Err(call.at.error(format!(
+            "{} needs at least one action such as .set(\"X-Name\", \"value\")",
+            call.name
+        )));
+    } else {
+        &call.args
+    };
+    let mut ops = HeaderOps::default();
+    let mut claimed = std::collections::HashSet::new();
+    for (label, value) in actions {
+        let (None, Value::Typed(action)) = (label, value) else {
+            return Err(call.at.error(format!(
+                "{} takes unlabeled actions such as .set(\"X-Name\", \"value\")",
+                call.name
+            )));
+        };
+        match action.name.as_str() {
+            "set" => {
+                let (field, value) = header_pair(action)?;
+                claim_once(&mut claimed, &field, call)?;
+                ops.set.insert(field, value);
+            }
+            "setIfAbsent" => {
+                if !response_side {
+                    return Err(action.at.error(
+                        "setIfAbsent inspects the finished response; a request header has nothing to inspect yet",
+                    ));
+                }
+                let (field, value) = header_pair(action)?;
+                claim_once(&mut claimed, &field, call)?;
+                ops.set_if_absent.insert(field, value);
+            }
+            // 📋 Repeating this action is the point: two cookies are two
+            // values of one field, and folding them into one line is the bug
+            // RFC 6265 §3 forbids.
+            "append" => {
+                let (field, value) = header_pair(action)?;
+                ops.add.entry(field).or_default().push(value);
+            }
+            "remove" => {
+                let [(None, Value::String(field))] = action.args.as_slice() else {
+                    return Err(action.at.error("remove takes one quoted field name"));
+                };
+                ops.remove.push(field.clone());
+            }
+            "replace" => {
+                let [(None, Value::String(field)), rest @ ..] = action.args.as_slice() else {
+                    return Err(action
+                        .at
+                        .error("replace takes a field name, pattern: and with:"));
+                };
+                if rest.len() != 2 {
+                    return Err(action
+                        .at
+                        .error("replace takes a field name, pattern: and with:"));
+                }
+                ops.replace.push(HeaderReplacement {
+                    field: field.clone(),
+                    search_regexp: labeled_string(action, "pattern")?,
+                    replace: labeled_string(action, "with")?,
+                });
+            }
+            other => {
+                return Err(action.at.error(format!(
+                    "unknown header action '.{other}'; expected .set, .append, .remove{} or .replace",
+                    if response_side { ", .setIfAbsent" } else { "" }
+                )));
+            }
+        }
+    }
+    Ok(ops)
+}
+
+/// 🏷️ Reads the two unlabeled operands of `.set`/`.append`/`.setIfAbsent`.
+fn header_pair(action: &Call) -> Result<(String, String), Error> {
+    let [(None, Value::String(field)), (None, Value::String(value))] = action.args.as_slice()
+    else {
+        return Err(action.at.error(format!(
+            ".{} takes a quoted field name and a quoted value",
+            action.name
+        )));
+    };
+    Ok((field.clone(), value.clone()))
+}
+
+/// 🚫 Refuses a second map-backed action for one field.
+///
+/// `set` and `setIfAbsent` are stored as maps, so a repeated field would keep
+/// one of the two values without saying which. A caller who means to write the
+/// field twice can write a second component, where the order is visible.
+fn claim_once(
+    claimed: &mut std::collections::HashSet<String>,
+    field: &str,
+    call: &Call,
+) -> Result<(), Error> {
+    if !claimed.insert(field.to_string()) {
+        return Err(call.at.error(format!(
+            "'{field}' is set twice in one {}; one field takes one .set or .setIfAbsent",
+            call.name
+        )));
+    }
+    Ok(())
+}
+
+/// ✂️ `Rewrite(...)`: exactly one path or method edit, where it is written.
+///
+/// 📌 One operation per component is deliberate. The shared model can carry
+/// several at once and applies them in a fixed order of its own, so a
+/// component that set two would read as the order they were written and mean
+/// something else; two components in a row say what they mean.
+fn rewrite(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&["to", "stripPrefix", "stripSuffix", "path", "method"])?;
+    let [(label, value)] = call.args.as_slice() else {
+        return Err(call.at.error(
+            "Rewrite takes exactly one operation: to:, stripPrefix:, stripSuffix:, path: or method:",
+        ));
+    };
+    let mut strip_prefix = None;
+    let mut strip_suffix = None;
+    let mut replace = None;
+    let mut regex = None;
+    let mut regex_replace = None;
+    let mut method = None;
+    match (label.as_deref(), value) {
+        (Some("to"), Value::String(path)) => replace = Some(path.clone()),
+        (Some("stripPrefix"), Value::String(prefix)) => strip_prefix = Some(prefix.clone()),
+        (Some("stripSuffix"), Value::String(suffix)) => strip_suffix = Some(suffix.clone()),
+        (Some("path"), Value::Typed(pattern)) if pattern.name == "regex" => {
+            pattern.leaf(&["pattern", "replacement"])?;
+            regex = Some(pattern.string("pattern")?);
+            regex_replace = Some(pattern.string("replacement")?);
+        }
+        (Some("method"), Value::Typed(verb)) => method = Some(method_name(verb)?.to_string()),
+        (Some("to" | "stripPrefix" | "stripSuffix"), _) => {
+            return Err(call.at.error("this operation takes one quoted string"));
+        }
+        (Some("path"), _) => {
+            return Err(call
+                .at
+                .error("path takes .regex(pattern: \"…\", replacement: \"…\")"));
+        }
+        (Some("method"), _) => {
+            return Err(call.at.error("method takes one value such as .put"));
+        }
+        _ => unreachable!("leaf checked the labels"),
+    }
+    Ok(HandlerConfig::Rewrite {
+        strip_prefix,
+        strip_suffix,
+        replace,
+        regex,
+        regex_replace,
+        method,
+    })
 }
 
 /// 📂 `.ServeFiles(root:, browse:, index:)`: the static file handler.
@@ -1035,9 +1360,10 @@ fn serve_files(call: &Call) -> Result<HandlerConfig, Error> {
         index,
         browse,
         browse_limit: None,
-        // 🧜 No `Encode` component yet: the site offers no compression, which is
-        // what a Caddyfile without an `encode` directive compiles to.
-        compress: false,
+        // 🗜️ Allowed here, and lowered by the site's own coding list: a site
+        // without `.encode` turns this off after the routes are built, exactly
+        // as `encode off` does for a file server written in a Pingclairfile.
+        compress: true,
         precompressed: Vec::new(),
         hide: Vec::new(),
         status: None,

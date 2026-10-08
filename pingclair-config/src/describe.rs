@@ -228,6 +228,86 @@ pub const ENTRIES: &[Entry] = &[
 .accessLog(output: .socket)"#,
     },
     Entry {
+        name: "RequestHeader",
+        kind: Kind::Component,
+        summary: "Sets request headers for later components: `.set`, `.append`, `.remove`, `.replace`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            RequestHeader(.set("X-Trace", "probe"), .append("X-Forwarded-For", "10.0.0.1"))
+            Proxy(to: "127.0.0.1:9000")
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            RequestHeader(.setIfAbsent("X-Trace", "probe"))
+            Proxy(to: "127.0.0.1:9000")
+        }
+    }
+}"#,
+    },
+    Entry {
+        name: "ResponseHeader",
+        kind: Kind::Component,
+        summary: "Rewrites the response on its way out: `.set`, `.append`, `.remove`, `.setIfAbsent`, `.replace`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            ResponseHeader(.setIfAbsent("X-Served-By", "pingclair"), .remove("Server"))
+            Respond(body: "hello")
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            ResponseHeader(.replace("X-Served-By", pattern: "clair"))
+            Respond(body: "hello")
+        }
+    }
+}"#,
+    },
+    Entry {
+        name: "Rewrite",
+        kind: Kind::Component,
+        summary: "One path or method edit, applied where it is written: `to:`, `stripPrefix:`, `stripSuffix:`, `path:`, `method:`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Route(when: .path(prefix: "/api")) {
+            Rewrite(stripPrefix: "/api")
+            Proxy(to: "127.0.0.1:9000")
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback {
+            Rewrite(to: "/new", method: .put)
+            Respond(body: "hello")
+        }
+    }
+}"#,
+    },
+    Entry {
+        name: "encode",
+        kind: Kind::Modifier,
+        summary: "The codings a site offers, most preferred first: `.encode(.zstd, .gzip)`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { ServeFiles(root: "./public") }
+    }
+    .encode(.zstd, .gzip)
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { ServeFiles(root: "./public") }
+    }
+    .encode(.br)
+}"#,
+    },
+    Entry {
         name: "Admin",
         kind: Kind::Component,
         summary: "The admin endpoint; one declaration per file.",

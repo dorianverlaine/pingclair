@@ -788,7 +788,11 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
 /// 📌 `file_server { compress off }` is unaffected: it is already false, and
 /// this pass never raises the flag, so a site with a coding still honours a file
 /// server that opted out on its own.
-fn apply_site_compression(handler: &mut pingclair_core::config::HandlerConfig) {
+///
+/// 📌 Shared with the native frontend, which builds its sites from typed
+/// components rather than from this module's AST but must lower the same
+/// setting the same way.
+pub(crate) fn apply_site_compression(handler: &mut pingclair_core::config::HandlerConfig) {
     use pingclair_core::config::HandlerConfig;
     match handler {
         HandlerConfig::FileServer { compress, .. } => *compress = false,

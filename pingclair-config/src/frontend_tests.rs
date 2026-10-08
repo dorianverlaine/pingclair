@@ -772,6 +772,208 @@ fn http_terminal_mistakes_fail_closed() {
 }
 
 #[test]
+fn http_pipelines_lower_like_their_caddyfile_twins() {
+    let cases = [
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                RequestHeader(.set("X-Trace", "probe"))
+                RequestHeader(.append("X-Added", "yes"))
+                RequestHeader(.remove("X-Drop"))
+                RequestHeader(.replace("X-Rep", pattern: "f(.)o", with: "b$1r"))
+                Respond(body: "ok")
+            } } }"#,
+            "http://:8080 {\n\troute {\n\t\trequest_header X-Trace probe\n\t\trequest_header +X-Added yes\n\t\trequest_header -X-Drop\n\t\trequest_header X-Rep f(.)o b$1r\n\t\trespond \"ok\"\n\t}\n}\n",
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                ResponseHeader(.set("X-Set", "v"), .append("X-Add", "yes"), .remove("X-Drop"), .setIfAbsent("X-Def", "1"), .replace("X-Rep", pattern: "f(.)o", with: "b$1r"))
+                Respond(body: "ok")
+            } } }"#,
+            "http://:8080 {\n\troute {\n\t\theader {\n\t\t\tX-Set v\n\t\t\t+X-Add yes\n\t\t\t-X-Drop\n\t\t\t?X-Def 1\n\t\t\t>X-Rep f(.)o b$1r\n\t\t}\n\t\trespond \"ok\"\n\t}\n}\n",
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                Rewrite(method: .put)
+                Rewrite(to: "/new")
+                Rewrite(stripPrefix: "/api")
+                Rewrite(stripSuffix: "/old")
+                Rewrite(path: .regex(pattern: "^/x/(.*)$", replacement: "/y/$1"))
+                Respond(body: "ok")
+            } } }"#,
+            "http://:8080 {\n\troute {\n\t\tmethod PUT\n\t\trewrite /new\n\t\turi strip_prefix /api\n\t\turi strip_suffix /old\n\t\turi path_regexp ^/x/(.*)$ /y/$1\n\t\trespond \"ok\"\n\t}\n}\n",
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") {
+                Route(when: .path(exact: "/a")) {
+                    RequestHeader(.set("X-A", "a"))
+                    Respond(body: "ok")
+                }
+            } }"#,
+            "http://:8080 {\n\t@m path /a\n\troute @m {\n\t\trequest_header X-A a\n\t\trespond \"ok\"\n\t}\n}\n",
+        ),
+    ];
+    for (native_source, legacy_source) in cases {
+        let native = crate::compile(native_source).unwrap();
+        let legacy = crate::compile(legacy_source).unwrap();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::to_value(legacy).unwrap(),
+            "{native_source}"
+        );
+    }
+}
+
+#[test]
+fn a_middleware_pair_becomes_one_pipeline_in_writing_order() {
+    let config = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+            RequestHeader(.set("X-Trace", "probe"))
+            ResponseHeader(.set("X-Set", "v"))
+            Respond(body: "ok")
+        } } }"#,
+    )
+    .unwrap();
+    let HandlerConfig::Pipeline { handlers } = &config.servers[0].routes[0].handler else {
+        panic!("two components must compose into a pipeline");
+    };
+    assert!(matches!(
+        handlers[0].handler,
+        HandlerConfig::RequestHeaders { .. }
+    ));
+    assert!(matches!(handlers[1].handler, HandlerConfig::Headers { .. }));
+    assert!(matches!(handlers[2].handler, HandlerConfig::Respond { .. }));
+    assert!(handlers.iter().all(|element| element.matcher.is_none()));
+}
+
+#[test]
+fn one_component_stays_a_bare_handler() {
+    let config = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+            RequestHeader(.set("X-Trace", "probe"))
+            Respond(body: "ok")
+        } } }"#,
+    )
+    .unwrap();
+    let HandlerConfig::Pipeline { handlers } = &config.servers[0].routes[0].handler else {
+        panic!("expected a pipeline");
+    };
+    assert_eq!(handlers.len(), 2);
+
+    let single = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback { Respond(body: "ok") } } }"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        single.servers[0].routes[0].handler,
+        HandlerConfig::Respond { .. }
+    ));
+}
+
+#[test]
+fn headers_and_rewrites_that_cannot_mean_anything_fail_closed() {
+    let site = |body: &str| {
+        format!("HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {body} }} }} }}")
+    };
+    for body in [
+        // 🅿️ A route body ends in the component that answers.
+        "RequestHeader(.set(\"X-A\", \"a\"))",
+        "Respond(body: \"a\") Proxy(to: \"127.0.0.1:9000\")",
+        "Rewrite(to: \"/new\")",
+        "Respond(body: \"a\") Respond(body: \"b\")",
+        // 🏷️ Header actions are typed, labeled-free, and unambiguous.
+        "RequestHeader() Respond(body: \"ok\")",
+        "RequestHeader(\"X-A\") Respond(body: \"ok\")",
+        "RequestHeader(.set(\"X-A\")) Respond(body: \"ok\")",
+        "RequestHeader(.set(\"X-A\", \"a\", \"b\")) Respond(body: \"ok\")",
+        "RequestHeader(.set(\"X-A\", \"a\"), .set(\"X-A\", \"b\")) Respond(body: \"ok\")",
+        "RequestHeader(.remove()) Respond(body: \"ok\")",
+        "RequestHeader(.remove(\"X-A\", \"X-B\")) Respond(body: \"ok\")",
+        "RequestHeader(.replace(\"X-A\", pattern: \"x\")) Respond(body: \"ok\")",
+        "RequestHeader(.replace(\"X-A\", pattern: \"x\", with: 1)) Respond(body: \"ok\")",
+        "RequestHeader(.setIfAbsent(\"X-A\", \"a\")) Respond(body: \"ok\")",
+        "RequestHeader(.unknown(\"X-A\")) Respond(body: \"ok\")",
+        "RequestHeader(actions: .set(\"X-A\", \"a\")) Respond(body: \"ok\")",
+        "RequestHeader(.set(\"X-A\", \"a\")) { } Respond(body: \"ok\")",
+        // ✂️ One rewrite, one operation, and only the typed verbs.
+        "Rewrite() Respond(body: \"ok\")",
+        "Rewrite(to: \"/a\", method: .put) Respond(body: \"ok\")",
+        "Rewrite(to: 1) Respond(body: \"ok\")",
+        "Rewrite(stripPrefix: 1) Respond(body: \"ok\")",
+        "Rewrite(method: .trace) Respond(body: \"ok\")",
+        "Rewrite(path: .glob(\"/x/*\")) Respond(body: \"ok\")",
+        "Rewrite(path: .regex(pattern: \"^/x$\")) Respond(body: \"ok\")",
+    ] {
+        let source = site(body);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
+fn encode_follows_the_site_coding_list() {
+    let cases = [
+        (
+            r#"HTTPListener(on: ":8080") {
+                Site(host: "*") { Fallback { ServeFiles(root: "/tmp/pub") } }
+                .encode(.zstd, .gzip)
+            }"#,
+            "http://:8080 {\n\tencode zstd gzip\n\troot * /tmp/pub\n\tfile_server\n}\n",
+        ),
+        (
+            r#"HTTPListener(on: ":8080") {
+                Site(host: "*") { Fallback { ServeFiles(root: "/tmp/pub") } }
+                .encode(.zstd)
+            }"#,
+            "http://:8080 {\n\tencode zstd\n\troot * /tmp/pub\n\tfile_server\n}\n",
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback { ServeFiles(root: "/tmp/pub") } } }"#,
+            "http://:8080 {\n\troot * /tmp/pub\n\tfile_server\n}\n",
+        ),
+    ];
+    for (native_source, legacy_source) in cases {
+        let native = crate::compile(native_source).unwrap();
+        let legacy = crate::compile(legacy_source).unwrap();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::to_value(legacy).unwrap(),
+            "{native_source}"
+        );
+    }
+
+    // 🗜️ The file server follows the site's list, not its own default.
+    for (index, expected) in [(1, true), (2, false)] {
+        let config = crate::compile(cases[index].0).unwrap();
+        let HandlerConfig::FileServer { compress, .. } = &config.servers[0].routes[0].handler
+        else {
+            panic!("expected a file server");
+        };
+        assert_eq!(*compress, expected, "{}", cases[index].0);
+    }
+}
+
+#[test]
+fn site_codings_that_cannot_mean_anything_fail_closed() {
+    let site = |modifier: &str| {
+        format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ Respond(body: \"ok\") }} }} {modifier} }}"
+        )
+    };
+    for modifier in [
+        ".encode()",
+        ".encode(.br)",
+        ".encode(.zstd, .zstd)",
+        ".encode(.zstd).encode(.gzip)",
+        ".encode(1)",
+        ".encode(coding: .zstd)",
+        ".encode(.zstd) { }",
+        ".bogus(1)",
+    ] {
+        let source = site(modifier);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",
