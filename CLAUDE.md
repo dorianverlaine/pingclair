@@ -130,10 +130,11 @@ full suite early. See `.github/workflows/README.md` for the workflow map.
 
 ### Configuration becomes precomputed state, once
 
-`pingclair-config` turns a Pingclairfile into `PingclairConfig`: `parser/` →
-`adapter/caddyfile.rs` (or `adapter/json.rs`) → `compiler.rs`. `compiler.rs`
-also owns `validate_config`, which is meant to be the single validation path —
-rules belong there rather than in the DSL adapter, or JSON configs bypass them.
+`pingclair-config` turns a Pingclairfile into `PingclairConfig`: the Caddyfile
+path is `caddyfile/parser/` → `caddyfile/adapter/` (JSON uses `caddyfile/json.rs`),
+and the native language goes `frontend.rs` → `compiler.rs`. `compiler.rs` also
+owns `validate_config`, which is meant to be the single validation path — rules
+belong there rather than in the DSL adapter, or JSON configs bypass them.
 
 At runtime `ProxyState` (`pingclair-proxy/src/server.rs`) holds the compiled
 router, per-route load balancers, and other precomputation. It is published
@@ -260,7 +261,7 @@ directives.
 ### 🧾 Test with a Pingclairfile
 
 Whenever a test, verification run, or reproduction needs a live server, write
-its configuration in the DSL. A JSON-configured server skips `adapter/caddyfile.rs`
+its configuration in the DSL. A JSON-configured server skips `caddyfile/adapter/`
 completely, so it exercises about half the path a real user's configuration
 takes — and every directive that parses into the wrong shape lives in exactly
 the half that was skipped.

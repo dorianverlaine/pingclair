@@ -5,7 +5,7 @@
 //!
 //! This module converts the AST into a runtime `PingclairConfig`.
 
-use crate::parser::ast::*;
+use crate::caddyfile::parser::ast::*;
 use pingclair_core::config::Encoding as CoreEncoding;
 use pingclair_core::config::{
     AccessControlConfig as CoreAccessControlConfig, AdminConfig,
@@ -2835,11 +2835,11 @@ pub(crate) fn compile_log(log: &LogBlock) -> CompileResult<LogConfig> {
         output,
         format,
         level: log.level.map(|level| match level {
-            crate::parser::ast::LogLevel::Trace => "trace".to_string(),
-            crate::parser::ast::LogLevel::Debug => "debug".to_string(),
-            crate::parser::ast::LogLevel::Info => "info".to_string(),
-            crate::parser::ast::LogLevel::Warn => "warn".to_string(),
-            crate::parser::ast::LogLevel::Error => "error".to_string(),
+            crate::caddyfile::parser::ast::LogLevel::Trace => "trace".to_string(),
+            crate::caddyfile::parser::ast::LogLevel::Debug => "debug".to_string(),
+            crate::caddyfile::parser::ast::LogLevel::Info => "info".to_string(),
+            crate::caddyfile::parser::ast::LogLevel::Warn => "warn".to_string(),
+            crate::caddyfile::parser::ast::LogLevel::Error => "error".to_string(),
         }),
         exclude_fields,
         rotation: pingclair_core::config::LogRotation {
@@ -3700,7 +3700,7 @@ mod tests {
     /// a protocol to be disabled and was told, silently, that it was.
     #[test]
     fn protocols_without_h3_disables_http3() {
-        let ast = crate::parser::compile(
+        let ast = crate::caddyfile::parser::compile(
             "{\n    servers {\n        protocols h1 h2\n    }\n}\nexample.com {\n    listen :8080\n}\n",
         )
         .expect("`protocols h1 h2` is valid Caddy syntax");
@@ -3714,7 +3714,7 @@ mod tests {
     /// 🎯 The mirror case, so the fix cannot be "always off".
     #[test]
     fn protocols_listing_h3_keeps_http3_on() {
-        let ast = crate::parser::compile(
+        let ast = crate::caddyfile::parser::compile(
             "{\n    servers {\n        protocols h1 h2 h3\n    }\n}\nexample.com {\n    listen :8080\n}\n",
         )
         .expect("compiles");
@@ -3726,7 +3726,8 @@ mod tests {
     /// list — the default (HTTP/3 on) must survive.
     #[test]
     fn absent_protocols_directive_leaves_http3_default() {
-        let ast = crate::parser::compile("example.com {\n    listen :8080\n}\n").expect("compiles");
+        let ast = crate::caddyfile::parser::compile("example.com {\n    listen :8080\n}\n")
+            .expect("compiles");
         let config = compile_ast(&ast).expect("compiles");
         assert!(
             config.global.http3,
@@ -3736,7 +3737,7 @@ mod tests {
 
     #[test]
     fn test_compile_simple_server() {
-        let ast = crate::parser::compile(
+        let ast = crate::caddyfile::parser::compile(
             r#"
             example.com {
                 listen :8080
@@ -3752,7 +3753,7 @@ mod tests {
 
     #[test]
     fn test_compile_proxy() {
-        let ast = crate::parser::compile(
+        let ast = crate::caddyfile::parser::compile(
             r#"
             api.example.com {
                 listen :8080
@@ -3768,7 +3769,7 @@ mod tests {
 
     #[test]
     fn active_health_check_reaches_compiled_runtime_config() {
-        let ast = crate::parser::compile(
+        let ast = crate::caddyfile::parser::compile(
             r#"
             api.example.com {
                 reverse_proxy https://origin.internal:8443 {
@@ -3850,7 +3851,7 @@ mod tests {
 
     #[test]
     fn exact_rate_limit_reaches_compiled_runtime_config() {
-        let ast = crate::parser::compile(
+        let ast = crate::caddyfile::parser::compile(
             r#"
             api.example.com {
                 rate_limit 5 60s {
@@ -4044,7 +4045,7 @@ mod tests {
 
     #[test]
     fn test_compile_named_matcher() {
-        let ast = crate::parser::compile(
+        let ast = crate::caddyfile::parser::compile(
             r#"
             example.com {
                 @api {

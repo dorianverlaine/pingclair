@@ -77,7 +77,7 @@
 - **Configuration rules belong in the core config layer, not only in the
   Pingclairfile adapter.** The Admin API deserialises a config document straight
   into the core types **with no adapter involved**. A check written only in
-  `adapter/caddyfile.rs` is a check with a bypass. Contradictory or half-specified
+  `caddyfile/adapter/` is a check with a bypass. Contradictory or half-specified
   settings (`insecure_skip_verify` together with a pinned CA; a cert with no key)
   must be rejected on both paths. Day 11 upstream TLS on 2026-07-29 added the
   matching `compiler::validate_config` for exactly this reason.

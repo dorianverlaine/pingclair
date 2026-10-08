@@ -1,0 +1,514 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
+//! 🔬 Semantic analysis for the Pingclair configuration DSL.
+//!
+//! Performs macro expansion, validation, and reference resolution.
+
+use crate::caddyfile::parser::ast::*;
+use std::collections::HashMap;
+use thiserror::Error;
+
+/// Semantic analysis errors
+#[derive(Debug, Error)]
+pub enum SemanticError {
+    #[error("Undefined macro: {name}")]
+    UndefinedMacro { name: String },
+
+    #[error("Macro argument count mismatch for '{name}': expected {expected}, got {got}")]
+    MacroArgCountMismatch {
+        name: String,
+        expected: usize,
+        got: usize,
+    },
+
+    #[error("Duplicate server name: {name}")]
+    DuplicateServer { name: String },
+
+    #[error("Duplicate macro name: {name}")]
+    DuplicateMacro { name: String },
+
+    #[error("Invalid configuration: {message}")]
+    InvalidConfig { message: String },
+}
+
+type SemanticResult<T> = Result<T, SemanticError>;
+
+/// Semantic analyzer
+pub struct SemanticAnalyzer {
+    /// Macro definitions
+    macros: HashMap<String, MacroDef>,
+}
+
+impl SemanticAnalyzer {
+    pub fn new() -> Self {
+        Self {
+            macros: HashMap::new(),
+        }
+    }
+
+    /// Analyze and transform the AST
+    pub fn analyze(&mut self, mut ast: Ast) -> SemanticResult<Ast> {
+        // Phase 1: Collect macro definitions
+        for macro_node in &ast.macros {
+            let macro_def = &macro_node.inner;
+            if self.macros.contains_key(&macro_def.name) {
+                return Err(SemanticError::DuplicateMacro {
+                    name: macro_def.name.clone(),
+                });
+            }
+            self.macros
+                .insert(macro_def.name.clone(), macro_def.clone());
+        }
+
+        // Phase 2: Check for duplicate servers. Two sites may share a hostname
+        // when their listeners differ — `localhost` (implicit HTTPS :443) and
+        // `http://localhost` (explicit plaintext :80) are both valid Caddy
+        // sites and must coexist. Identical name AND identical listeners is
+        // the real mistake.
+        //
+        // 📍 `bind` is part of that identity, not only of the socket: two
+        // blocks on one port with different interfaces are two sites, which is
+        // the shape Caddy accepts since caddyserver/caddy#4635 (#279). The
+        // bind host stands in for every listener's host, because that is what
+        // it does at load time, and a site with no `listen` of its own still
+        // carries its interface into the signature.
+        let mut server_signatures = HashMap::new();
+        for server_node in &ast.servers {
+            let name = &server_node.inner.name;
+            let bind_host = server_node
+                .inner
+                .bind
+                .as_deref()
+                .and_then(pingclair_core::config::bind_socket_host);
+            let mut listens: Vec<String> = server_node
+                .inner
+                .listens
+                .iter()
+                .map(|l| {
+                    format!(
+                        "{}:{}",
+                        bind_host.as_deref().unwrap_or(l.host.as_str()),
+                        l.port.map_or_else(|| "?".to_string(), |p| p.to_string())
+                    )
+                })
+                .collect();
+            if listens.is_empty() {
+                listens.push(format!("{}:?", bind_host.as_deref().unwrap_or("[::]")));
+            }
+            listens.sort();
+            let signature = (name.clone(), listens);
+            if server_signatures.contains_key(&signature) {
+                return Err(SemanticError::DuplicateServer { name: name.clone() });
+            }
+            server_signatures.insert(signature, ());
+        }
+
+        // Phase 3: Expand macros in servers
+        for server_node in &mut ast.servers {
+            self.expand_server(&mut server_node.inner)?;
+        }
+
+        // Phase 4: Validate configuration
+        self.validate(&ast)?;
+
+        Ok(ast)
+    }
+
+    fn expand_server(&self, server: &mut ServerBlock) -> SemanticResult<()> {
+        // Expand macro calls in directives
+        let mut expanded_directives = Vec::new();
+
+        for directive in server.directives.drain(..) {
+            match directive {
+                Directive::MacroCall(call) => {
+                    let expanded = self.expand_macro_call(&call)?;
+                    expanded_directives.extend(expanded);
+                }
+                other => {
+                    expanded_directives.push(other);
+                }
+            }
+        }
+
+        server.directives = expanded_directives;
+
+        // Process expanded headers directives
+        for directive in &server.directives {
+            if let Directive::Headers(headers) = directive {
+                // Apply headers configuration to server (could add to server's headers field)
+                // For now, just validate
+                let _ = headers;
+            }
+        }
+
+        // Expand macros in route handlers
+        if let Some(routes) = &mut server.routes {
+            for arm in &mut routes.inner.arms {
+                self.expand_handler(&mut arm.inner.handler)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn expand_handler(&self, handler: &mut Handler) -> SemanticResult<()> {
+        match handler {
+            Handler::Proxy(proxy) => {
+                // Expand macro calls in proxy config
+                let mut expanded_headers = HashMap::new();
+
+                for call in proxy.macro_calls.drain(..) {
+                    let expanded = self.expand_macro_call(&call)?;
+                    for directive in expanded {
+                        if let Directive::Headers(ref headers) = directive {
+                            // Convert headers to header_up
+                            for (k, v) in &headers.set {
+                                expanded_headers.insert(k.clone(), v.clone());
+                            }
+                        }
+                        // Handle header_up from expanded macro
+                        if let Directive::Setting { ref key, ref value } = directive {
+                            if key == "header_up" {
+                                // Would need more sophisticated handling
+                            }
+                            let _ = value;
+                        }
+                    }
+                }
+
+                // Merge expanded headers
+                proxy.header_up.set.extend(expanded_headers);
+            }
+            Handler::Pipeline(handlers) => {
+                for element in handlers.iter_mut() {
+                    self.expand_handler(&mut element.handler)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn expand_macro_call(&self, call: &MacroCall) -> SemanticResult<Vec<Directive>> {
+        let macro_def =
+            self.macros
+                .get(&call.name)
+                .ok_or_else(|| SemanticError::UndefinedMacro {
+                    name: call.name.clone(),
+                })?;
+
+        if macro_def.params.len() != call.args.len() {
+            return Err(SemanticError::MacroArgCountMismatch {
+                name: call.name.clone(),
+                expected: macro_def.params.len(),
+                got: call.args.len(),
+            });
+        }
+
+        // Build substitution map
+        let mut substitutions = HashMap::new();
+        for (param, arg) in macro_def.params.iter().zip(call.args.iter()) {
+            substitutions.insert(param.name.clone(), arg.clone());
+        }
+
+        // Clone and substitute in body
+        let mut expanded = Vec::new();
+        for directive in &macro_def.body {
+            let substituted = self.substitute_directive(directive, &substitutions);
+            expanded.push(substituted);
+        }
+
+        Ok(expanded)
+    }
+
+    fn substitute_directive(
+        &self,
+        directive: &Directive,
+        subs: &HashMap<String, Expr>,
+    ) -> Directive {
+        match directive {
+            Directive::MacroCall(call) => {
+                // Recursively expand nested macro calls
+                // For now, just clone
+                Directive::MacroCall(MacroCall {
+                    name: call.name.clone(),
+                    args: call
+                        .args
+                        .iter()
+                        .map(|a| Self::substitute_expr(a, subs))
+                        .collect(),
+                })
+            }
+            Directive::Headers(headers) => Directive::Headers(HeadersConfig {
+                set: headers
+                    .set
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.substitute_string(v, subs)))
+                    .collect(),
+                add: headers
+                    .add
+                    .iter()
+                    .map(|(k, values)| {
+                        (
+                            k.clone(),
+                            values
+                                .iter()
+                                .map(|value| self.substitute_string(value, subs))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+                remove: headers.remove.clone(),
+                replace: headers.replace.clone(),
+                default_set: headers.default_set.clone(),
+                // 🔎 Snippets substitute into values, never into a matcher's
+                // structure: `match { status {status} }` would have to
+                // reparse after substitution to mean anything.
+                require: headers.require.clone(),
+            }),
+            Directive::Setting { key, value } => Directive::Setting {
+                key: key.clone(),
+                value: Self::substitute_expr(value, subs),
+            },
+            Directive::Block { name, body } => Directive::Block {
+                name: name.clone(),
+                body: body
+                    .iter()
+                    .map(|d| self.substitute_directive(d, subs))
+                    .collect(),
+            },
+        }
+    }
+
+    fn substitute_expr(expr: &Expr, subs: &HashMap<String, Expr>) -> Expr {
+        match expr {
+            Expr::Ident(name) => {
+                if let Some(replacement) = subs.get(name) {
+                    replacement.clone()
+                } else {
+                    expr.clone()
+                }
+            }
+            Expr::Variable(var) => {
+                // Check if variable references a macro param
+                let parts: Vec<&str> = var.path.split('.').collect();
+                if let Some(first) = parts.first()
+                    && let Some(replacement) = subs.get(*first)
+                {
+                    return replacement.clone();
+                }
+                expr.clone()
+            }
+            Expr::Array(items) => Expr::Array(
+                items
+                    .iter()
+                    .map(|e| Self::substitute_expr(e, subs))
+                    .collect(),
+            ),
+            Expr::Map(map) => Expr::Map(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), Self::substitute_expr(v, subs)))
+                    .collect(),
+            ),
+            _ => expr.clone(),
+        }
+    }
+
+    fn substitute_string(&self, s: &str, _subs: &HashMap<String, Expr>) -> String {
+        // For now, simple string substitution
+        // Could be enhanced to handle ${param} in strings
+        s.to_string()
+    }
+
+    fn validate(&self, ast: &Ast) -> SemanticResult<()> {
+        // Validate global config
+        if let Some(global) = &ast.global {
+            // Check for valid protocol combinations
+            let has_h3 = global.inner.protocols.contains(&Protocol::H3);
+            let has_h1_or_h2 = global.inner.protocols.contains(&Protocol::H1)
+                || global.inner.protocols.contains(&Protocol::H2);
+
+            if has_h3 && !has_h1_or_h2 {
+                // H3 alone is valid but might want to warn
+            }
+        }
+
+        // Validate servers
+        for server_node in &ast.servers {
+            let server = &server_node.inner;
+
+            // 📍 A bare hostname site (`example.com { ... }`) legitimately has
+            // no listen: the runtime derives 443/80 from TLS. Such a site is
+            // still valid when it has a name and some content. An unnamed or
+            // empty server is a mistake.
+            let named_site = server.name != "_" && !server.name.is_empty();
+            let has_content = server.listens.is_empty()
+                && server.routes.is_none()
+                && !named_site
+                && server.bind.is_none();
+            if has_content {
+                return Err(SemanticError::InvalidConfig {
+                    message: format!(
+                        "Server '{}' needs at least 'listen' or 'route' block \
+                         (or a hostname so the runtime can derive the listener)",
+                        server.name
+                    ),
+                });
+            }
+
+            // Validate routes
+            if let Some(routes) = &server.routes {
+                let mut default_count = 0;
+                for arm in &routes.inner.arms {
+                    if arm.inner.matcher.is_none() {
+                        default_count += 1;
+                    }
+                }
+                // ⚠️ Multiple default routes happen naturally after snippet
+                // expansion (e.g. `import common_local` expands headers +
+                // handler directives that each become a default route).
+                // We no longer error here — the runtime will execute them
+                // as a Pipeline in order.
+                if default_count > 1 {
+                    // This is a soft warning, not an error.
+                    let _ = default_count; // silence unused warning
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for SemanticAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_duplicate_server_detection() {
+        // Two blocks with the same name and the SAME listener are the real
+        // mistake: they would fight over one socket.
+        let source = r#"
+            example.com {
+                listen :80
+            }
+            example.com {
+                listen :80
+            }
+        "#;
+
+        let mut analyzer = SemanticAnalyzer::new();
+        // Since compile() now calls analyzer internally, we can either:
+        // 1. Call parse + adapt manually
+        // 2. Call compile and check if it errors with DuplicateServer
+
+        let directives = crate::caddyfile::parser::parse(source).unwrap();
+        let ast = crate::caddyfile::adapter::adapt(directives).unwrap();
+        let result = analyzer.analyze(ast);
+
+        assert!(matches!(result, Err(SemanticError::DuplicateServer { .. })));
+    }
+
+    #[test]
+    fn same_host_on_different_listeners_coexists() {
+        // `localhost` (implicit HTTPS) and `http://localhost` (explicit
+        // plaintext) are two valid Caddy sites sharing one hostname.
+        let source = r#"
+            localhost {
+                respond "https"
+            }
+            http://localhost {
+                respond "http"
+            }
+        "#;
+        let directives = crate::caddyfile::parser::parse(source).unwrap();
+        let ast = crate::caddyfile::adapter::adapt(directives).unwrap();
+        let mut analyzer = SemanticAnalyzer::new();
+        let result = analyzer.analyze(ast);
+        assert!(
+            result.is_ok(),
+            "different listeners must allow the same hostname: {result:?}"
+        );
+    }
+
+    /// 🧩 `bind` decides which interface a site's socket sits on, so it decides
+    /// which site a block is: two blocks on one port with different interfaces
+    /// are two sites, and Caddy accepts them (caddyserver/caddy#4635, #279).
+    #[test]
+    fn two_interfaces_on_one_port_are_two_sites() {
+        let source = r#"
+            http://:21966 {
+                bind 127.0.0.1
+                respond "v4"
+            }
+            http://:21966 {
+                bind [::1]
+                respond "v6"
+            }
+        "#;
+
+        let directives = crate::caddyfile::parser::parse(source).unwrap();
+        let ast = crate::caddyfile::adapter::adapt(directives).unwrap();
+        let mut analyzer = SemanticAnalyzer::new();
+        let result = analyzer.analyze(ast);
+        assert!(
+            result.is_ok(),
+            "different interfaces must allow the same port: {result:?}"
+        );
+    }
+
+    /// 🛡️ The same name on the same port and the same interface is still the
+    /// mistake this check exists for — including when one block spells the
+    /// address with brackets and the other does not.
+    #[test]
+    fn the_same_interface_twice_is_still_a_duplicate() {
+        for (first, second) in [("127.0.0.1", "127.0.0.1"), ("::1", "[::1]")] {
+            let source = format!(
+                r#"
+                http://:21966 {{
+                    bind {first}
+                    respond "a"
+                }}
+                http://:21966 {{
+                    bind {second}
+                    respond "b"
+                }}
+                "#
+            );
+            let directives = crate::caddyfile::parser::parse(&source).unwrap();
+            let ast = crate::caddyfile::adapter::adapt(directives).unwrap();
+            let mut analyzer = SemanticAnalyzer::new();
+            let result = analyzer.analyze(ast);
+            assert!(
+                matches!(result, Err(SemanticError::DuplicateServer { .. })),
+                "{first} and {second} are one interface: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_valid_configuration() {
+        let source = r#"
+            global {
+                protocols H1 H2
+            }
+
+            example.com {
+                listen :80
+                
+                reverse_proxy localhost:3000
+                respond 404
+            }
+        "#;
+
+        let result = crate::caddyfile::parser::compile(source);
+        assert!(result.is_ok());
+    }
+}

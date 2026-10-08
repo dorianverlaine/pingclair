@@ -1,7 +1,7 @@
 # 📊 Benchmark configuration for Pingclair — the DSL twin of
 # `benchmarks/aws-h3/configs/config-pingclair-aws-proxy.json`.
 #
-# 🧾 Why this file exists: the JSON it replaces skips `adapter/caddyfile.rs`
+# 🧾 Why this file exists: the JSON it replaces skips `caddyfile/adapter/`
 # entirely, so every benchmark run measured about half the path a real
 # operator's configuration takes — and the missing half is the one that
 # decides what the compiled handlers actually are. A number measured on a

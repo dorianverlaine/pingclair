@@ -257,7 +257,9 @@ const MODULE_PACKAGE: &str = "pingclair";
 /// ✍️ Renders parsed directives back to canonical Pingclairfile text: two
 /// spaces per block level, one directive per line, arguments re-quoted only
 /// when whitespace or a comment marker demands it.
-fn format_directives(directives: &[pingclair_config::parser::caddy_ast::Directive]) -> String {
+fn format_directives(
+    directives: &[pingclair_config::caddyfile::parser::caddy_ast::Directive],
+) -> String {
     fn quote_argument(argument: &str) -> String {
         if argument.contains([' ', '\t', '#', '"']) {
             format!("\"{}\"", argument.replace('"', "\\\""))
@@ -267,7 +269,7 @@ fn format_directives(directives: &[pingclair_config::parser::caddy_ast::Directiv
     }
 
     fn format_block(
-        directives: &[pingclair_config::parser::caddy_ast::Directive],
+        directives: &[pingclair_config::caddyfile::parser::caddy_ast::Directive],
         indent: usize,
         out: &mut String,
     ) {
@@ -676,7 +678,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
         } => {
             // 🌐 Caddy expands `--to :9000-9003` into one peer per port; the
             // CLI must not ship an address the runtime cannot dial.
-            let to = pingclair_config::adapter::expand_upstream_port_ranges(to);
+            let to = pingclair_config::caddyfile::expand_upstream_port_ranges(to);
             tracing::info!("🚀 Starting reverse proxy: {} -> {:?}", from, to);
             // Create dynamic config
             let mut config = pingclair_core::config::PingclairConfig::default();
@@ -1051,12 +1053,12 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 std::fs::read_to_string(&path)
                     .map_err(|error| anyhow::anyhow!("❌ Failed to read {path}: {error}"))?
             };
-            if pingclair_config::native::is_native(&source) {
+            if pingclair_config::frontend::is_native(&source) {
                 anyhow::bail!(
                     "❌ Native configuration formatting is not supported yet; the source was not modified"
                 );
             }
-            let directives = pingclair_config::parser::parse(&source)
+            let directives = pingclair_config::caddyfile::parser::parse(&source)
                 .map_err(|error| anyhow::anyhow!("❌ Failed to parse {path}: {error}"))?;
             let formatted = format_directives(&directives);
             // 🎯 `caddy fmt` is a linter as well as a formatter: it exits
@@ -1180,7 +1182,7 @@ mod tests {
     fn every_listed_module_is_an_implemented_directive() {
         for module in HANDLER_MODULES {
             assert!(
-                pingclair_config::adapter::is_implemented_directive(module.directive),
+                pingclair_config::caddyfile::is_implemented_directive(module.directive),
                 "`list-modules` advertises `{}`, but the Caddyfile adapter does not \
                  implement it — either wire the directive up or stop listing it",
                 module.directive

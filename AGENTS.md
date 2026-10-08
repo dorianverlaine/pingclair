@@ -504,7 +504,7 @@ private benchmark evidence.
     `pingclair-proxy/src/server.rs`, `pingclair-proxy/src/quic.rs`,
     `pingclair-proxy/src/http_policy.rs`,
     `pingclair-config/src/compiler.rs`,
-    `pingclair-config/src/adapter/caddyfile/tests.rs`,
+    `pingclair-config/src/caddyfile/adapter/tests.rs`,
     `pingclair-core/src/config/types.rs`, `pingclair/tests/integration.rs`.
 - **Unrelated findings** get their own issue — the 🔍 working-note template,
   which exists precisely so that "noticed this, not chasing it now, not sure

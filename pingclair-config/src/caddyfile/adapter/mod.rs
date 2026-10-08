@@ -1,0 +1,385 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
+//! Adapter for converting Generic Caddyfile AST to Typed AST
+//!
+//! 🏗️ ARCHITECTURE: Two-pass adapter:
+//!   Pass 1: Collect snippet definitions `(name) { ... }` and expand `import name`
+//!   Pass 2: Convert the expanded generic directives into the Typed AST
+//!
+//! # 🗺️ Why this is a directory and not one file
+//!
+//! It was one file, and by 2026-08-05 that file was 5,643 lines. The cost was
+//! not the length itself but the absence of any seam: a change to how a site
+//! address is parsed and a change to how a matcher token is read looked like
+//! neighbours, so both were made in the same place and neither had a boundary
+//! to be checked against.
+//!
+//! The split follows the layering the format itself has, which is why it is a
+//! step of the refactor rather than a tidy-up:
+//!
+//! | Module | Owns |
+//! | --- | --- |
+//! | [`sites`] | A site block becomes a server: routes, ordering, defaults. |
+//! | [`route_order`] | 🧭 The order a site's routes are tried in, as one list. |
+//! | [`options`] | The global block. |
+//! | [`addresses`] | What a site address means. |
+//! | [`matchers`] | The matcher token rule, and matcher definitions. |
+//! | [`directives`] | One parsing function per directive. |
+//! | [`error_routes`] | 🚨 `handle_errors` blocks become status-selective error routes. |
+//! | [`root`] | 📂 The `root` directive, shared by the site and its error routes. |
+//! | [`reverse_proxy`] | `reverse_proxy` alone, because its block is as large as most of the others combined. |
+//! | [`logs`] | The `log` block and its destinations. |
+//! | [`tls`] | The `tls` directive. |
+//!
+//! 📌 The seam that matters is the one *above* this module: everything here
+//! maps a parsed configuration onto HTTP, and nothing here does any parsing.
+//! Tokenizing, block structure, and `import` expansion live in
+//! [`crate::caddyfile::parser`] and [`self::imports`], which know nothing about HTTP.
+
+mod addresses;
+mod args;
+mod directives;
+mod encode;
+mod error_routes;
+mod handle_groups;
+mod imports;
+mod layer4;
+mod listen_directive;
+mod logs;
+mod matchers;
+mod options;
+mod order;
+mod ranges;
+pub mod registry;
+mod retry_expr;
+mod reverse_proxy;
+mod root;
+mod route_order;
+mod scoped_middleware;
+mod sites;
+mod tls;
+
+pub use ranges::expand_upstream_port_ranges;
+
+#[cfg(test)]
+mod block_matcher_tests;
+#[cfg(test)]
+mod error_routes_tests;
+#[cfg(test)]
+mod forward_auth_tls_tests;
+#[cfg(test)]
+mod handle_groups_tests;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod trusted_proxies_tests;
+
+use options::adapt_global;
+use registry::is_directive_name;
+use sites::adapt_server;
+
+use crate::caddyfile::parser::ast::*;
+use crate::caddyfile::parser::caddy_ast::{Block, Directive};
+use crate::caddyfile::parser::lexer::Location;
+use std::collections::HashMap;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum AdapterError {
+    #[error("Unknown directive '{0}'")]
+    UnknownDirective(String),
+
+    /// 🚫 A Caddy-compatible feature that Pingclair deliberately does not
+    /// implement yet. Failing loudly here beats compiling a config that
+    /// silently ignores half of what the operator asked for.
+    #[error("Caddy-compatible directive '{0}' is not supported by Pingclair yet: {1}")]
+    UnsupportedFeature(String, String),
+
+    #[error("{}", argument_count_message(.0, *.1, *.2))]
+    ArgumentCount(String, usize, usize),
+
+    #[error("Invalid argument for '{0}': {1}")]
+    InvalidArgument(String, String),
+
+    #[error("Block not allowed for directive '{0}'")]
+    BlockNotAllowed(String),
+
+    #[error("Duplicate global block")]
+    DuplicateGlobal,
+
+    #[error("Undefined snippet '{0}'")]
+    UndefinedSnippet(String),
+
+    #[error("Recursive snippet import detected: '{0}'")]
+    RecursiveSnippet(String),
+}
+
+/// 🔢 Renders the argument-count refusal with the noun agreeing with the
+/// number.
+///
+/// 📌 `expects 1 arguments` was the wording for every one-argument mistake,
+/// which is most of them — and a sentence that is visibly wrong about its own
+/// subject is read as "this message was not written carefully", which is the
+/// wrong frame for a message the operator has to act on.
+fn argument_count_message(directive: &str, expected: usize, got: usize) -> String {
+    let noun = if expected == 1 {
+        "argument"
+    } else {
+        "arguments"
+    };
+    format!("Directive '{directive}' expects {expected} {noun}, got {got}")
+}
+
+// MARK: - Snippet Expansion (Pass 1)
+
+type SnippetMap = HashMap<String, Vec<Directive>>;
+type SnippetCollection = (SnippetMap, Vec<Directive>);
+
+/// Collect snippet `(name) { ... }` definitions from top-level directives
+/// and return (snippets_map, remaining_directives).
+pub(crate) fn collect_snippets(
+    directives: Vec<Directive>,
+) -> Result<SnippetCollection, AdapterError> {
+    let mut snippets = SnippetMap::new();
+    let mut remaining = Vec::new();
+
+    for d in directives {
+        if d.name.starts_with('(') && d.name.ends_with(')') {
+            // Snippet definition: (name) { ... }
+            let snippet_name = d.name[1..d.name.len() - 1].to_string();
+            let body = d.block.map(|b| b.directives).unwrap_or_default();
+            snippets.insert(snippet_name, body);
+        } else {
+            remaining.push(d);
+        }
+    }
+
+    Ok((snippets, remaining))
+}
+
+// MARK: - Main Adapter (Pass 2)
+
+/// Convert generic directives to Typed AST
+pub fn adapt(directives: Vec<Directive>) -> Result<Ast, AdapterError> {
+    adapt_from(directives, None)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SiteAddressGroup {
+    Implicit,
+    Listener {
+        scheme: Scheme,
+        host: String,
+        port: Option<u16>,
+        force_plaintext: bool,
+    },
+}
+
+/// 🌐 Separates site addresses that Caddy assigns to different listeners.
+///
+/// One block may spell `http://plain.example, https://secure.example`. The
+/// handlers are shared, but the host matchers and TLS policy are not: Caddy
+/// emits one server per listener group. Keeping the block whole loses the
+/// hostname-to-scheme relationship and lets one HTTP address suppress TLS for
+/// every HTTPS address beside it.
+fn split_site_address_groups(directive: Directive, global: &GlobalBlock) -> Vec<Directive> {
+    let mut groups: Vec<(SiteAddressGroup, Vec<String>)> = Vec::new();
+    let addresses =
+        std::iter::once(directive.name.as_str()).chain(directive.args.iter().map(String::as_str));
+
+    for raw in addresses {
+        let address = raw.trim_end_matches(',').to_string();
+        let group = match address.as_str() {
+            "http://" => SiteAddressGroup::Listener {
+                scheme: Scheme::Http,
+                host: "[::]".to_string(),
+                port: Some(global.http_port.unwrap_or(80)),
+                force_plaintext: true,
+            },
+            "https://" => SiteAddressGroup::Listener {
+                scheme: Scheme::Https,
+                host: "[::]".to_string(),
+                port: Some(global.https_port.unwrap_or(443)),
+                force_plaintext: false,
+            },
+            _ => addresses::parse_server_address(&address, global).map_or(
+                SiteAddressGroup::Implicit,
+                |parsed| {
+                    if parsed.explicit {
+                        SiteAddressGroup::Listener {
+                            scheme: parsed.listen.scheme,
+                            host: parsed.listen.host,
+                            // 🎧 Bare ports are one catch-all site with several
+                            // listeners; they carry no hostname whose scope could
+                            // leak across ports, so preserve that established shape.
+                            port: (parsed.hostname != "[::]")
+                                .then_some(parsed.listen.port)
+                                .flatten(),
+                            force_plaintext: parsed.listen.force_plaintext,
+                        }
+                    } else {
+                        SiteAddressGroup::Implicit
+                    }
+                },
+            ),
+        };
+
+        if let Some((_, grouped)) = groups.iter_mut().find(|(candidate, _)| *candidate == group) {
+            grouped.push(address);
+        } else {
+            groups.push((group, vec![address]));
+        }
+    }
+
+    if groups.len() <= 1 {
+        return vec![directive];
+    }
+
+    groups
+        .into_iter()
+        .map(|(_, mut addresses)| {
+            let name = addresses.remove(0);
+            // 🧪 A split site is compiler-generated, so a synthetic token run
+            // is the honest representation; its handlers retain their own
+            // original token runs through the cloned block.
+            let mut split = Directive::new(name).with_args(addresses);
+            split.block = directive.block.clone();
+            split
+        })
+        .collect()
+}
+
+/// 📦 Adapts directives, resolving relative `import` paths against `base`.
+///
+/// `base` is the directory of the file these directives were read from. `None`
+/// means they did not come from a file, and a relative import then has nothing
+/// to be relative to — which is refused rather than quietly resolved against
+/// whatever directory the process happens to be in.
+pub fn adapt_from(
+    directives: Vec<Directive>,
+    base: Option<&std::path::Path>,
+) -> Result<Ast, AdapterError> {
+    // Pass 1: Snippet collection + import expansion
+    let (mut snippets, remaining) = collect_snippets(directives)?;
+    // 📦 Snippets, files, globs, arguments and cycle detection all live in
+    // `self::imports` now; the old expansion only knew about snippets, so
+    // `import ./part.conf` failed with "undefined snippet" — a message about the
+    // wrong concept entirely.
+    let mut context = self::imports::ImportContext::new(base);
+    let expanded = self::imports::expand(remaining, &mut snippets, &mut context)?;
+    let expanded = coalesce_bare_single_site(expanded)?;
+
+    // Pass 2: Convert to typed AST
+    let mut ast = Ast::default();
+
+    // 🔢 The directive order is a property of the whole configuration, and the
+    // global block can change it. So it is resolved before any site is
+    // adapted — a site cannot be ordered by a rule that has not been read yet,
+    // and the global block is not required to come first in the file.
+    let mut order = order::DirectiveOrder::default();
+    for d in &expanded {
+        if d.name.is_empty() || d.name == "global" || d.name == "options" {
+            // 🌐 Ports must be resolved before sites are grouped or adapted.
+            if ast.global.is_some() {
+                return Err(AdapterError::DuplicateGlobal);
+            }
+            ast.global = Some(Node::new(adapt_global(d.clone())?, Location::synthetic()));
+            for sub in d.block.iter().flat_map(|block| &block.directives) {
+                if sub.name == "order" {
+                    order.apply(&sub.args)?;
+                }
+            }
+        }
+    }
+
+    let global = ast
+        .global
+        .as_ref()
+        .map(|node| node.inner.clone())
+        .unwrap_or_default();
+    for d in expanded {
+        if d.name.is_empty() || d.name == "global" || d.name == "options" {
+            continue;
+        } else if d.name == "macro" {
+            // 🐛 TODO: Support macros in Caddyfile?
+            // Caddy uses snippets (import), which we now handle above.
+        } else {
+            for split in split_site_address_groups(d, &global) {
+                let server = adapt_server(split, &order, &global)?;
+                ast.servers.push(Node::new(server, Location::synthetic()));
+            }
+        }
+    }
+
+    Ok(ast)
+}
+
+/// 🏠 Caddy lets a single-site file omit its curly braces: the first line is
+/// the site address and every following directive belongs to that site.
+/// `localhost\n\nrespond "Hello"` must parse as `localhost { respond ... }`.
+///
+/// The shorthand is only legal when no other braced site exists — with two
+/// sites the file must use explicit braces, otherwise the bare directives
+/// have no unambiguous home.
+fn coalesce_bare_single_site(directives: Vec<Directive>) -> Result<Vec<Directive>, AdapterError> {
+    let mut globals = Vec::new();
+    let mut bare = Vec::new();
+    let mut braced_sites = Vec::new();
+
+    for d in directives {
+        if d.name.is_empty() || d.name == "global" || d.name == "options" {
+            globals.push(d);
+        } else if is_directive_name(&d.name) {
+            // 🎯 A directive, whether or not it brought a block along.
+            //
+            // This used to read `d.block.is_some()`, which says "anything with
+            // a block is a site" — so `:80` followed by `file_server { … }`
+            // was read as two sites and refused. Nothing about a block makes
+            // something a site; the *name* does, and this is the layer that
+            // knows the names.
+            bare.push(d);
+        } else if d.block.is_some() {
+            braced_sites.push(d);
+        } else {
+            bare.push(d);
+        }
+    }
+
+    if bare.is_empty() {
+        globals.extend(braced_sites);
+        return Ok(globals);
+    }
+
+    if !braced_sites.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            "site address".into(),
+            "bare (unbraced) directives cannot be mixed with braced site blocks; \
+             wrap every site in { } when there is more than one"
+                .into(),
+        ));
+    }
+
+    // 🏠 The first bare directive is the site address; everything after it is
+    // the site's content. A lone bare directive is an empty site.
+    let mut site = bare.remove(0);
+    // 🚫 …unless that first word is a directive, in which case the operator
+    // forgot the site address rather than naming a site after a directive.
+    // Accepting it produced a site called `handle` that served nothing, which
+    // is the same defect as the one above wearing the opposite sign.
+    if is_directive_name(&site.name) {
+        return Err(AdapterError::InvalidArgument(
+            "site address".into(),
+            format!(
+                "`{}` is a directive, not a site address; directives belong inside a \
+                 site block",
+                site.name
+            ),
+        ));
+    }
+    if !bare.is_empty() {
+        site.block = Some(Block { directives: bare });
+    }
+    globals.push(site);
+    Ok(globals)
+}

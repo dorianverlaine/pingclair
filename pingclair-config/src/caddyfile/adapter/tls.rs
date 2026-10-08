@@ -1,0 +1,1359 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dorian Verlaine
+
+use super::AdapterError;
+use super::args::{parse_renewal_window_ratio, parse_required_duration};
+use crate::caddyfile::parser::ast::*;
+use crate::caddyfile::parser::caddy_ast::Directive;
+use pingclair_core::config::{ClientAuthConfig, ClientAuthMode, DnsProviderConfig, TrustPool};
+
+// MARK: - 🔐 TLS Directive
+
+/// 🏷️ Reads the one server name a `default_sni` may carry.
+///
+/// Shared by the site-level `tls { default_sni … }` and the global option of
+/// the same name, so the two spellings cannot drift into accepting different
+/// things — the failure this repository has already had once, when a flat
+/// alias took milliseconds where its block form took seconds.
+pub(super) fn parse_default_sni(d: &Directive) -> Result<String, AdapterError> {
+    match d.args.as_slice() {
+        [name] if !name.is_empty() => Ok(name.clone()),
+        // 🚫 An empty or missing name would select nothing, which is the state
+        // this option exists to get out of.
+        [] => Err(AdapterError::ArgumentCount("default_sni".into(), 1, 0)),
+        args => Err(AdapterError::ArgumentCount(
+            "default_sni".into(),
+            1,
+            args.len(),
+        )),
+    }
+}
+
+/// 🛡️ Deepest `trust_pool combined { source combined { … } }` nesting accepted.
+///
+/// `combined` is recursive, and the Admin API deserialises straight into these
+/// types, so the nesting an attacker can express is the nesting the parser has
+/// to survive. Nothing legitimate nests trust pools more than a couple deep;
+/// this mirrors the bound matchers already carry for the same reason.
+const MAX_TRUST_POOL_DEPTH: usize = 8;
+
+/// 🪪 Reads `client_auth { … }` into a typed configuration.
+///
+/// ⚠️ Parsing it is not enforcing it. Nothing in the acceptor checks a client
+/// certificate yet, which is why `validate_config` refuses a configuration that
+/// asks for one: a site that believes it requires mutual TLS and does not is a
+/// worse outcome than a site that will not start.
+fn parse_client_auth(d: &Directive) -> Result<ClientAuthConfig, AdapterError> {
+    let mut auth = ClientAuthConfig::default();
+    let mut mode_given = false;
+
+    let Some(block) = &d.block else {
+        return Err(AdapterError::InvalidArgument(
+            "tls client_auth".into(),
+            "block required, e.g. `client_auth { mode require_and_verify }`".into(),
+        ));
+    };
+
+    for sub in &block.directives {
+        match sub.name.as_str() {
+            "mode" => {
+                let value = expect_single(sub, "client_auth mode")?;
+                auth.mode = match value.as_str() {
+                    "request" => ClientAuthMode::Request,
+                    "require" => ClientAuthMode::Require,
+                    "verify_if_given" => ClientAuthMode::VerifyIfGiven,
+                    "require_and_verify" => ClientAuthMode::RequireAndVerify,
+                    // 🚫 A misspelled mode must not fall back to a weaker one.
+                    other => {
+                        return Err(AdapterError::InvalidArgument(
+                            "tls client_auth mode".into(),
+                            format!(
+                                "unknown mode `{other}` (expected request, require, \
+                                 verify_if_given or require_and_verify)"
+                            ),
+                        ));
+                    }
+                };
+                mode_given = true;
+            }
+            "trusted_ca_cert" => auth
+                .trusted_ca_certs
+                .push(expect_single(sub, "client_auth trusted_ca_cert")?),
+            "trusted_ca_cert_file" => auth
+                .trusted_ca_cert_files
+                .push(expect_single(sub, "client_auth trusted_ca_cert_file")?),
+            "trusted_leaf_cert" => auth
+                .trusted_leaf_certs
+                .push(expect_single(sub, "client_auth trusted_leaf_cert")?),
+            "trusted_leaf_cert_file" => auth
+                .trusted_leaf_cert_files
+                .push(expect_single(sub, "client_auth trusted_leaf_cert_file")?),
+            "trust_pool" => auth.trust_pool = Some(parse_trust_pool(sub, 0)?),
+            // 🍃 `verifier <module>` selects an extra check run against the
+            // client's certificate, on top of chain verification. `leaf` is
+            // the one the format ships and the one implemented here: the
+            // presented leaf must be one of a known set.
+            //
+            // 🚫 Any other module name is refused. There is no module registry
+            // here, and accepting the word would mean an operator's custom
+            // verification silently never running — which for an authentication
+            // control is the worst possible way to be wrong.
+            "verifier" => parse_leaf_verifier(sub, &mut auth)?,
+            other => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "client_auth: {other}"
+                )));
+            }
+        }
+    }
+
+    // 🚫 Upstream refuses the two spellings together, because each one is a
+    // complete answer to the same question and there is no rule for merging
+    // them.
+    if auth.trust_pool.is_some()
+        && !(auth.trusted_ca_certs.is_empty() && auth.trusted_ca_cert_files.is_empty())
+    {
+        return Err(AdapterError::InvalidArgument(
+            "tls client_auth".into(),
+            "cannot specify both `trust_pool` and `trusted_ca_cert`/`trusted_ca_cert_file`".into(),
+        ));
+    }
+
+    // 🎚️ Upstream's default: verifying makes sense once there is something to
+    // verify against, so a trust pool implies the strict mode and its absence
+    // means the certificate is only demanded.
+    if !mode_given {
+        auth.mode = if auth.trust_pool.is_some() {
+            ClientAuthMode::RequireAndVerify
+        } else {
+            ClientAuthMode::Require
+        };
+    }
+    Ok(auth)
+}
+
+/// 🏛️ Reads one `trust_pool <provider> { … }`, bounded against deep nesting.
+fn parse_trust_pool(d: &Directive, depth: usize) -> Result<TrustPool, AdapterError> {
+    if depth > MAX_TRUST_POOL_DEPTH {
+        return Err(AdapterError::InvalidArgument(
+            "tls client_auth trust_pool".into(),
+            format!("nested more than {MAX_TRUST_POOL_DEPTH} levels deep"),
+        ));
+    }
+    let provider = d
+        .args
+        .first()
+        .ok_or_else(|| AdapterError::ArgumentCount("tls client_auth trust_pool".into(), 1, 0))?;
+    let directives = d
+        .block
+        .as_ref()
+        .map(|block| block.directives.as_slice())
+        .unwrap_or_default();
+
+    match provider.as_str() {
+        "inline" => {
+            let mut trust_der = Vec::new();
+            for sub in directives {
+                match sub.name.as_str() {
+                    "trust_der" => trust_der.extend(sub.args.iter().cloned()),
+                    other => {
+                        return Err(AdapterError::UnknownDirective(format!(
+                            "trust_pool inline: {other}"
+                        )));
+                    }
+                }
+            }
+            Ok(TrustPool::Inline { trust_der })
+        }
+        "file" => {
+            let mut pem_files = Vec::new();
+            for sub in directives {
+                match sub.name.as_str() {
+                    "pem_file" => pem_files.extend(sub.args.iter().cloned()),
+                    other => {
+                        return Err(AdapterError::UnknownDirective(format!(
+                            "trust_pool file: {other}"
+                        )));
+                    }
+                }
+            }
+            Ok(TrustPool::File { pem_files })
+        }
+        "system" => Ok(TrustPool::System),
+        // 🏛️ Parsed so a configuration written for upstream translates. The
+        // refusal lives at startup, in `CompiledClientAuth::compile`, because
+        // this build never becomes a CA and so has no such root to trust.
+        "pki_root" | "pki_intermediate" => {
+            let mut authority = String::new();
+            for sub in directives {
+                match sub.name.as_str() {
+                    "authority" => authority = expect_single(sub, "trust_pool authority")?,
+                    other => {
+                        return Err(AdapterError::UnknownDirective(format!(
+                            "trust_pool {provider}: {other}"
+                        )));
+                    }
+                }
+            }
+            if authority.is_empty() {
+                // 🏷️ Upstream's own default when the block names none.
+                authority = "local".to_string();
+            }
+            Ok(if provider == "pki_root" {
+                TrustPool::PkiRoot { authority }
+            } else {
+                TrustPool::PkiIntermediate { authority }
+            })
+        }
+        "combined" => {
+            let mut sources = Vec::new();
+            for sub in directives {
+                match sub.name.as_str() {
+                    "source" => sources.push(parse_trust_pool(sub, depth + 1)?),
+                    other => {
+                        return Err(AdapterError::UnknownDirective(format!(
+                            "trust_pool combined: {other}"
+                        )));
+                    }
+                }
+            }
+            Ok(TrustPool::Combined { sources })
+        }
+        // 🚫 `storage` reads from a subsystem this build does not have.
+        other => Err(AdapterError::UnsupportedFeature(
+            format!("tls client_auth trust_pool {other}"),
+            "only inline, file, system, combined and the pki sources are parsed".into(),
+        )),
+    }
+}
+
+/// 🔢 Reads a subdirective that takes exactly one argument.
+fn expect_single(d: &Directive, name: &str) -> Result<String, AdapterError> {
+    match d.args.as_slice() {
+        [value] => Ok(value.clone()),
+        args => Err(AdapterError::ArgumentCount(name.into(), 1, args.len())),
+    }
+}
+
+/// 🔐 Adapts the supported downstream TLS directive forms.
+pub(super) fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, AdapterError> {
+    let mut tls = TlsDirective::default();
+
+    // 📧 Positional arguments mean the same with and without a block, so they
+    // are read once. A single argument containing `@` is the ACME account
+    // email, decided exactly the way upstream decides it; anything else on
+    // its own is refused rather than silently dropped when a block follows.
+    match d.args.as_slice() {
+        [] => {}
+        [arg] if arg == "off" => tls.off = true,
+        [arg] if arg == "auto" => tls.auto = true,
+        [arg] if arg == "internal" => tls.internal = true,
+        [arg] if arg.contains('@') => tls.acme_email = Some(arg.clone()),
+        [arg] if arg == "force_automate" => {
+            return Err(AdapterError::UnsupportedFeature(
+                "tls force_automate".into(),
+                "Pingclair does not implement certificate force-automation yet".into(),
+            ));
+        }
+        [cert, key] => {
+            tls.cert = Some(cert.clone());
+            tls.key = Some(key.clone());
+        }
+        _ => {
+            return Err(AdapterError::InvalidArgument(
+                "tls".into(),
+                "expected 'off', 'auto', 'internal', an email address, '<cert> <key>', \
+                 or a block"
+                    .into(),
+            ));
+        }
+    }
+
+    if let Some(block) = &d.block {
+        for sub in &block.directives {
+            match sub.name.as_str() {
+                "cert" => tls.cert = sub.args.first().cloned(),
+                "key" => tls.key = sub.args.first().cloned(),
+                "acme_email" | "email" => tls.acme_email = sub.args.first().cloned(),
+                "auto" => tls.auto = true,
+                "internal" => {
+                    if !sub.args.is_empty() {
+                        return Err(AdapterError::InvalidArgument(
+                            "tls internal".into(),
+                            "expected no arguments".into(),
+                        ));
+                    }
+                    tls.internal = true;
+                }
+                "http3" => {
+                    tls.http3 = Some(
+                        sub.args
+                            .first()
+                            .map(|s| s != "off" && s != "false")
+                            .unwrap_or(true),
+                    );
+                }
+                "default_sni" => tls.default_sni = Some(parse_default_sni(sub)?),
+                "client_auth" => tls.client_auth = Some(parse_client_auth(sub)?),
+                // 📡 The DNS-01 cluster. Every one of these implies the DNS
+                // challenge, so they share one accumulator rather than each
+                // setting an independent field that could be written without
+                // the challenge ever being switched on.
+                "dns" => {
+                    let name = sub
+                        .args
+                        .first()
+                        .ok_or_else(|| AdapterError::ArgumentCount("tls dns".into(), 1, 0))?;
+                    tls.dns_challenge.get_or_insert_default().provider = Some(DnsProviderConfig {
+                        name: name.clone(),
+                        arguments: sub.args[1..]
+                            .iter()
+                            .map(|arg| arg.as_str().into())
+                            .collect(),
+                    });
+                }
+                "resolvers" => {
+                    if sub.args.is_empty() {
+                        return Err(AdapterError::ArgumentCount("tls resolvers".into(), 1, 0));
+                    }
+                    tls.dns_challenge
+                        .get_or_insert_default()
+                        .resolvers
+                        .extend(sub.args.iter().cloned());
+                }
+                "dns_ttl" => {
+                    tls.dns_challenge.get_or_insert_default().ttl_secs =
+                        Some(parse_required_duration(sub)?.div_ceil(1000));
+                }
+                "propagation_delay" => {
+                    tls.dns_challenge
+                        .get_or_insert_default()
+                        .propagation_delay_secs =
+                        Some(parse_required_duration(sub)?.div_ceil(1000));
+                }
+                "propagation_timeout" => {
+                    tls.dns_challenge
+                        .get_or_insert_default()
+                        .propagation_timeout_secs =
+                        Some(parse_required_duration(sub)?.div_ceil(1000));
+                }
+                "dns_challenge_override_domain" => {
+                    tls.dns_challenge
+                        .get_or_insert_default()
+                        .challenge_override_domain =
+                        Some(expect_single(sub, "tls dns_challenge_override_domain")?);
+                }
+                // 🔄 A renewal window for this site's certificate. Caddy turns
+                // this into its own automation policy for the site's subjects
+                // (caddy v2.11.4, `caddyconfig/httpcaddyfile/tlsapp.go:146-149`
+                // reading the pile `builtins.go:602-607` filled), which is why
+                // it does not simply override the global value: the global one
+                // stays the answer for every other name.
+                "renewal_window_ratio" => {
+                    tls.renewal_window_ratio = Some(parse_renewal_window_ratio(sub)?);
+                }
+                // 🚫 TLS options the format defines and this crate does not
+                // implement. Almost all of them belong to two subsystems we do
+                // not have — certificate issuance beyond the built-in local
+                // authority, and mutual TLS — so the honest answer is to name
+                // the feature rather than the word.
+                //
+                // 📌 Getting this wrong is worse here than elsewhere: an
+                // operator debugging why `client_auth` did nothing, told the
+                // word is unknown, will assume they misspelled a TLS setting
+                // and go looking for the right spelling of a feature that does
+                // not exist.
+                name if is_known_tls_option(name) => {
+                    return Err(AdapterError::UnsupportedFeature(
+                        format!("tls {name}"),
+                        "Pingclair does not implement this TLS option yet".into(),
+                    ));
+                }
+                _ => return Err(AdapterError::UnknownDirective(format!("tls: {}", sub.name))),
+            }
+        }
+    }
+
+    // 🚫 `tls off` with a block contradicts itself — one half says there is
+    // no TLS and the other configures it — so the combination is refused
+    // rather than letting one half win silently.
+    if tls.off && d.block.is_some() {
+        return Err(AdapterError::InvalidArgument(
+            "tls".into(),
+            "off cannot be combined with a block".into(),
+        ));
+    }
+
+    // 🔗 A certificate without its matching private key is unusable.
+    if tls.cert.is_some() != tls.key.is_some() {
+        return Err(AdapterError::InvalidArgument(
+            "tls".into(),
+            "cert and key must be specified together".into(),
+        ));
+    }
+
+    // 🛡️ A local issuer must never fall through to manual or public issuance.
+    if tls.internal && (tls.auto || tls.cert.is_some() || tls.acme_email.is_some()) {
+        return Err(AdapterError::InvalidArgument(
+            "tls".into(),
+            "internal cannot be combined with auto, cert/key, or an ACME email".into(),
+        ));
+    }
+
+    Ok(tls)
+}
+
+/// 🧾 TLS block options the format defines, whether or not we implement them.
+///
+/// Two clusters, and neither is a small gap: certificate issuance beyond the
+/// built-in local authority (`issuer`, `ca`, `eab`, `dns` and its timers,
+/// `on_demand`, `get_certificate`), and mutual TLS (`client_auth`). Both are
+/// subsystems rather than options, which is exactly why they need to be told
+/// apart from a misspelling.
+fn is_known_tls_option(name: &str) -> bool {
+    RECOGNISED_TLS_OPTIONS.contains(&name)
+}
+
+/// 🧾 Whether `name` is an option that belongs inside `tls { … }`.
+///
+/// The site-level adapter needs this to explain a top-level `client_auth { … }`
+/// as a misplaced option rather than as a second site (#285). Both the options
+/// this crate implements and the ones it refuses belong here: the operator's
+/// mistake is the same either way.
+///
+/// 📌 Keep in step with the `match` in `parse_tls_directive` and with
+/// [`RECOGNISED_TLS_OPTIONS`]. A name missing from both falls back to the
+/// second-site message, which is merely less useful than this one.
+pub(super) fn is_tls_option(name: &str) -> bool {
+    SUPPORTED_TLS_OPTIONS.contains(&name) || is_known_tls_option(name)
+}
+
+/// 🧾 Every `tls { … }` option this crate implements.
+const SUPPORTED_TLS_OPTIONS: [&str; 16] = [
+    "cert",
+    "key",
+    "acme_email",
+    "email",
+    "auto",
+    "internal",
+    "http3",
+    "default_sni",
+    "client_auth",
+    "dns",
+    "resolvers",
+    "dns_ttl",
+    "propagation_delay",
+    "propagation_timeout",
+    "dns_challenge_override_domain",
+    "renewal_window_ratio",
+];
+
+/// 🚫 Every `tls { … }` option the format defines and this crate refuses.
+///
+/// 📌 A table rather than a `matches!` keeps recognition explicit and makes the
+/// refusal path easy to audit when the supported surface changes.
+const RECOGNISED_TLS_OPTIONS: [&str; 15] = [
+    "protocols",
+    "ciphers",
+    "curves",
+    "alpn",
+    "load",
+    "ca",
+    "ca_root",
+    "key_type",
+    "eab",
+    "issuer",
+    "get_certificate",
+    "on_demand",
+    "reuse_private_keys",
+    "insecure_secrets_log",
+    "force_automate",
+];
+
+#[cfg(test)]
+mod client_auth_tests {
+    use super::*;
+    use crate::compile;
+    use pingclair_core::config::{ClientAuthMode, TrustPool};
+
+    fn client_auth_of(source: &str) -> ClientAuthConfig {
+        compile(source)
+            .expect("must compile")
+            .servers
+            .remove(0)
+            .tls
+            .expect("tls")
+            .client_auth
+            .expect("client_auth")
+    }
+
+    /// 🍃 The four spellings of `verifier leaf` are one instruction.
+    ///
+    /// The one-liner exists to accommodate the common case and the block to
+    /// hold several loaders; a configuration written either way has to compile
+    /// to the same thing, or carrying one over from upstream changes what it
+    /// does.
+    #[test]
+    fn every_leaf_verifier_spelling_reaches_the_same_configuration() {
+        let auth = |body: &str| {
+            client_auth_of(&format!(
+                "localhost {{\n tls {{\n client_auth {{\n mode request\n {body}\n }}\n }}\n \
+                 respond \"x\"\n}}"
+            ))
+        };
+
+        let inline_file = auth("verifier leaf file /a.pem /b.pem");
+        assert_eq!(inline_file.trusted_leaf_cert_files, ["/a.pem", "/b.pem"]);
+
+        let block_file = auth("verifier leaf {\n file /a.pem\n file /b.pem\n }");
+        assert_eq!(
+            block_file.trusted_leaf_cert_files, inline_file.trusted_leaf_cert_files,
+            "the block and the one-liner mean the same thing"
+        );
+
+        let inline_folder = auth("verifier leaf folder /certs");
+        assert_eq!(inline_folder.trusted_leaf_cert_folders, ["/certs"]);
+        assert!(inline_folder.trusted_leaf_cert_files.is_empty());
+
+        let block_folder = auth("verifier leaf {\n folder /certs\n }");
+        assert_eq!(
+            block_folder.trusted_leaf_cert_folders,
+            inline_folder.trusted_leaf_cert_folders
+        );
+
+        // 🧩 A block may mix loaders, and both kinds land in their own list.
+        let mixed = auth("verifier leaf {\n file /a.pem\n folder /certs\n }");
+        assert_eq!(mixed.trusted_leaf_cert_files, ["/a.pem"]);
+        assert_eq!(mixed.trusted_leaf_cert_folders, ["/certs"]);
+    }
+
+    /// 🚫 An unknown verifier module is refused rather than accepted and
+    /// ignored.
+    ///
+    /// This is the arm that matters most: `verifier` names an *authentication*
+    /// check, so a name we accept and never run is a site that believes it is
+    /// verifying clients and is not. Upstream's own corpus has a `dummy`
+    /// verifier that only its test binary registers — accepting arbitrary
+    /// names to match that fixture would be trading a real guarantee for a
+    /// point on a scoreboard.
+    #[test]
+    fn an_unknown_verifier_module_is_refused() {
+        for body in [
+            "verifier dummy",
+            "verifier leaf pem",
+            "verifier leaf storage",
+        ] {
+            let error = compile(&format!(
+                "localhost {{\n tls {{\n client_auth {{\n mode request\n {body}\n }}\n }}\n \
+                 respond \"x\"\n}}"
+            ))
+            .expect_err("must be refused");
+            assert!(
+                error.to_string().contains("verifier"),
+                "must be named; got {error} for `{body}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leaf_verifier_that_names_no_certificates_is_refused() {
+        for body in [
+            "verifier leaf",
+            "verifier leaf {\n }",
+            "verifier leaf {\n file\n }",
+            // 🚫 A loader on the line and a block have no defined order.
+            "verifier leaf file /a.pem {\n file /b.pem\n }",
+        ] {
+            let error = compile(&format!(
+                "localhost {{\n tls {{\n client_auth {{\n mode request\n {body}\n }}\n }}\n \
+                 respond \"x\"\n}}"
+            ))
+            .expect_err("must be refused");
+            assert!(
+                error.to_string().contains("leaf") || error.to_string().contains("verifier"),
+                "must be named; got {error} for `{body}`"
+            );
+        }
+    }
+
+    /// 🎚️ Each mode keeps its own meaning; none collapses into a weaker one.
+    #[test]
+    fn every_mode_keeps_its_own_meaning() {
+        for (written, expected) in [
+            ("request", ClientAuthMode::Request),
+            ("require", ClientAuthMode::Require),
+            ("verify_if_given", ClientAuthMode::VerifyIfGiven),
+            ("require_and_verify", ClientAuthMode::RequireAndVerify),
+        ] {
+            let auth = client_auth_of(&format!(
+                "localhost {{\n\ttls {{\n\t\tclient_auth {{\n\t\t\tmode {written}\n\t\t}}\n\t}}\n\trespond \"ok\"\n}}"
+            ));
+            assert_eq!(auth.mode, expected, "mode {written}");
+        }
+    }
+
+    /// 🚫 A misspelled mode must not fall back to a weaker one.
+    #[test]
+    fn an_unknown_mode_is_refused_rather_than_defaulted() {
+        let error = compile(
+            "localhost {\n\ttls {\n\t\tclient_auth {\n\t\t\tmode requre_and_verify\n\t\t}\n\t}\n\trespond \"ok\"\n}",
+        )
+        .expect_err("a typo in the mode must not silently weaken it");
+        assert!(format!("{error}").contains("unknown mode"), "{error}");
+    }
+
+    /// 🎚️ Upstream's default: a trust pool implies verifying, its absence does not.
+    #[test]
+    fn the_default_mode_follows_whether_there_is_anything_to_verify_against() {
+        let with_pool = client_auth_of(
+            "localhost {\n\ttls {\n\t\tclient_auth {\n\t\t\ttrust_pool system\n\t\t}\n\t}\n\trespond \"ok\"\n}",
+        );
+        assert_eq!(with_pool.mode, ClientAuthMode::RequireAndVerify);
+
+        let without = client_auth_of(
+            "localhost {\n\ttls {\n\t\tclient_auth {\n\t\t\ttrusted_leaf_cert AAAA\n\t\t}\n\t}\n\trespond \"ok\"\n}",
+        );
+        assert_eq!(without.mode, ClientAuthMode::Require);
+    }
+
+    /// 🧩 `combined` nests, and the shape survives compilation.
+    #[test]
+    fn a_combined_pool_keeps_its_sources_in_order() {
+        let auth = client_auth_of(
+            "localhost {\n\ttls {\n\t\tclient_auth {\n\t\t\ttrust_pool combined {\n\t\t\t\tsource inline {\n\t\t\t\t\ttrust_der AAAA BBBB\n\t\t\t\t}\n\t\t\t\tsource system\n\t\t\t}\n\t\t}\n\t}\n\trespond \"ok\"\n}",
+        );
+        let TrustPool::Combined { sources } = auth.trust_pool.expect("trust pool") else {
+            panic!("expected a combined pool");
+        };
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources[0],
+            TrustPool::Inline {
+                trust_der: vec!["AAAA".to_string(), "BBBB".to_string()]
+            }
+        );
+        assert_eq!(sources[1], TrustPool::System);
+    }
+
+    /// 🛡️ Nesting is bounded, because the Admin API deserialises into this type.
+    ///
+    /// An untagged recursive type already produced a remotely triggerable stack
+    /// overflow in this codebase once; a bound is the other half of not
+    /// repeating it.
+    #[test]
+    fn deeply_nested_pools_are_refused_rather_than_overflowing() {
+        let depth = MAX_TRUST_POOL_DEPTH + 4;
+        let mut body = "trust_pool combined {\n".to_string();
+        for _ in 0..depth {
+            body.push_str("source combined {\n");
+        }
+        body.push_str("source system\n");
+        for _ in 0..=depth {
+            body.push_str("}\n");
+        }
+        let error = compile(&format!(
+            "localhost {{\n\ttls {{\n\t\tclient_auth {{\n{body}\t\t}}\n\t}}\n\trespond \"ok\"\n}}"
+        ))
+        .expect_err("nesting past the bound must be refused");
+        assert!(format!("{error}").contains("levels deep"), "{error}");
+    }
+
+    /// 🚫 The two ways of naming a trust source cannot both be given.
+    #[test]
+    fn a_trust_pool_and_the_legacy_spelling_cannot_both_be_given() {
+        let error = compile(
+            "localhost {\n\ttls {\n\t\tclient_auth {\n\t\t\ttrust_pool system\n\t\t\ttrusted_ca_cert AAAA\n\t\t}\n\t}\n\trespond \"ok\"\n}",
+        )
+        .expect_err("each is a complete answer; there is no rule for merging them");
+        assert!(
+            format!("{error}").contains("cannot specify both"),
+            "{error}"
+        );
+    }
+
+    /// 🚫 A verifier module is refused rather than accepted and never run.
+    #[test]
+    fn a_verifier_module_is_refused_by_name() {
+        let error = compile(
+            "localhost {\n\ttls {\n\t\tclient_auth {\n\t\t\tverifier leaf\n\t\t}\n\t}\n\trespond \"ok\"\n}",
+        )
+        .expect_err("an unimplemented verifier must not look configured");
+        assert!(format!("{error}").contains("verifier"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod dns_challenge_tests {
+
+    /// 🔓 A secret does not compare with `&str` on purpose, so a test that
+    /// wants the values has to say so.
+    fn exposed(args: &[pingclair_core::config::SecretString]) -> Vec<&str> {
+        args.iter().map(|arg| arg.expose()).collect()
+    }
+
+    fn config_of(source: &str) -> pingclair_core::config::PingclairConfig {
+        crate::compile(source).expect("the configuration compiles")
+    }
+
+    fn challenge_of(source: &str) -> pingclair_core::config::DnsChallengeConfig {
+        config_of(source).servers[0]
+            .tls
+            .as_ref()
+            .expect("tls")
+            .dns_challenge
+            .clone()
+            .expect("a DNS challenge")
+    }
+
+    /// 📡 Every DNS-01 option lands on the same challenge, so writing one of
+    /// them is enough to ask for the challenge at all.
+    #[test]
+    fn the_site_options_all_reach_one_challenge() {
+        let challenge = challenge_of(
+            r#"
+            localhost {
+                tls {
+                    dns cloudflare secret-token
+                    resolvers 1.1.1.1 8.8.8.8
+                    dns_ttl 5m10s
+                    propagation_delay 30s
+                    propagation_timeout 10m
+                }
+            }
+            "#,
+        );
+        let provider = challenge.provider.expect("a provider");
+        assert_eq!(provider.name, "cloudflare");
+        assert_eq!(exposed(&provider.arguments), vec!["secret-token"]);
+        assert_eq!(challenge.resolvers, vec!["1.1.1.1", "8.8.8.8"]);
+        // ⏱️ Upstream writes durations with units; 5m10s is 310 seconds.
+        assert_eq!(challenge.ttl_secs, Some(310));
+        assert_eq!(challenge.propagation_delay_secs, Some(30));
+        assert_eq!(challenge.propagation_timeout_secs, Some(600));
+    }
+
+    /// 📡 The global `dns` provider and `tls_resolvers` fill in what a site
+    /// left blank, and a site that named its own keeps it.
+    #[test]
+    fn global_options_fill_the_blanks_without_overriding() {
+        let config = config_of(
+            r#"
+            {
+                dns cloudflare global-token
+                tls_resolvers 1.1.1.1 8.8.8.8
+                acme_dns
+            }
+
+            inherits.test {
+            }
+
+            overrides.test {
+                tls {
+                    dns cloudflare own-token
+                    resolvers 9.9.9.9
+                }
+            }
+            "#,
+        );
+        let challenge = |name: &str| {
+            config
+                .servers
+                .iter()
+                .find(|server| server.name.as_deref() == Some(name))
+                .and_then(|server| server.tls.as_ref())
+                .and_then(|tls| tls.dns_challenge.clone())
+                .unwrap_or_else(|| panic!("{name} has no DNS challenge"))
+        };
+
+        // 🌐 `acme_dns` moved a site that said nothing at all onto DNS-01.
+        let inherited = challenge("inherits.test");
+        assert_eq!(
+            exposed(&inherited.provider.as_ref().unwrap().arguments),
+            ["global-token"]
+        );
+        assert_eq!(inherited.resolvers, vec!["1.1.1.1", "8.8.8.8"]);
+
+        // 🎯 The site that spoke for itself is not overwritten by the global.
+        let own = challenge("overrides.test");
+        assert_eq!(
+            exposed(&own.provider.as_ref().unwrap().arguments),
+            ["own-token"]
+        );
+        assert_eq!(own.resolvers, vec!["9.9.9.9"]);
+    }
+
+    /// 🚫 A challenge nobody can answer must not compile.
+    ///
+    /// Both spellings upstream refuses: the bare `acme_dns` with no global
+    /// `dns`, and a site setting DNS-01 timers without naming a provider. The
+    /// failure they prevent is the same one — the certificate can never be
+    /// issued, and without this the operator learns that at renewal.
+    #[test]
+    fn a_challenge_without_a_provider_is_refused() {
+        let naked_acme_dns = crate::compile(
+            r#"
+            {
+                acme_dns
+            }
+
+            example.com {
+                respond "hello"
+            }
+            "#,
+        );
+        assert!(naked_acme_dns.is_err(), "{naked_acme_dns:?}");
+
+        let timers_only = crate::compile(
+            r#"
+            :443 {
+                tls {
+                    propagation_delay 30s
+                }
+            }
+            "#,
+        );
+        assert!(timers_only.is_err(), "{timers_only:?}");
+    }
+
+    /// 🏛️ A site with its own certificate, or one served by the internal
+    /// authority, never talks to a public CA — so a global `acme_dns` must not
+    /// give it a challenge it would then be refused for having no provider.
+    #[test]
+    fn sites_that_never_use_acme_are_left_alone() {
+        let config = config_of(
+            r#"
+            {
+                acme_dns cloudflare token
+            }
+
+            internal.test {
+                tls internal
+            }
+            "#,
+        );
+        assert!(
+            config.servers[0]
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.dns_challenge.as_ref())
+                .is_none(),
+            "an internally issued site acquired a DNS-01 challenge"
+        );
+    }
+}
+
+// MARK: - PKI (configuration only)
+
+/// 🏛️ Reads the global `pki { ca <id> { … } }` block.
+///
+/// Every authority here is configuration this build understands and does not
+/// operate. Parsing it means a configuration written for upstream still
+/// translates through `adapt`, which is what `adapt` is for; the refusal to
+/// *act* as a CA lives at startup, where an operator can see it.
+pub(super) fn parse_pki_block(
+    d: &Directive,
+) -> Result<Vec<pingclair_core::config::PkiAuthority>, AdapterError> {
+    use pingclair_core::config::PkiAuthority;
+
+    let Some(block) = d.block.as_ref() else {
+        return Err(AdapterError::InvalidArgument(
+            "pki".into(),
+            "block required, e.g. `pki { ca local { name \"Local\" } }`".into(),
+        ));
+    };
+
+    let mut authorities: Vec<PkiAuthority> = Vec::new();
+    for entry in &block.directives {
+        if entry.name != "ca" {
+            return Err(AdapterError::UnknownDirective(format!(
+                "pki: {}",
+                entry.name
+            )));
+        }
+        if entry.args.len() > 1 {
+            return Err(AdapterError::ArgumentCount(
+                "pki ca".into(),
+                1,
+                entry.args.len(),
+            ));
+        }
+        // 🏷️ An unnamed `ca` block is upstream's `local` authority.
+        let id = entry
+            .args
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "local".into());
+        if authorities.iter().any(|existing| existing.id == id) {
+            return Err(AdapterError::InvalidArgument(
+                "pki ca".into(),
+                format!("authority `{id}` is declared twice"),
+            ));
+        }
+
+        let mut authority = PkiAuthority {
+            id,
+            ..Default::default()
+        };
+        for option in entry
+            .block
+            .as_ref()
+            .map(|b| b.directives.as_slice())
+            .unwrap_or_default()
+        {
+            match option.name.as_str() {
+                "name" => authority.name = Some(expect_single(option, "pki ca name")?),
+                "root_cn" => authority.root_cn = Some(expect_single(option, "pki ca root_cn")?),
+                "intermediate_cn" => {
+                    authority.intermediate_cn =
+                        Some(expect_single(option, "pki ca intermediate_cn")?)
+                }
+                "root" => authority.root = Some(parse_pki_key_pair(option)?),
+                "intermediate" => authority.intermediate = Some(parse_pki_key_pair(option)?),
+                other => {
+                    return Err(AdapterError::UnknownDirective(format!("pki ca: {other}")));
+                }
+            }
+        }
+        authorities.push(authority);
+    }
+    Ok(authorities)
+}
+
+/// 🔑 Reads a `root { … }` or `intermediate { … }` sub-block.
+fn parse_pki_key_pair(d: &Directive) -> Result<pingclair_core::config::PkiKeyPair, AdapterError> {
+    let mut pair = pingclair_core::config::PkiKeyPair::default();
+    for option in d
+        .block
+        .as_ref()
+        .map(|b| b.directives.as_slice())
+        .unwrap_or_default()
+    {
+        match option.name.as_str() {
+            "cert" => pair.cert = Some(expect_single(option, "pki cert")?),
+            "key" => pair.key = Some(expect_single(option, "pki key")?),
+            "format" => pair.format = Some(expect_single(option, "pki format")?),
+            other => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "pki {}: {other}",
+                    d.name
+                )));
+            }
+        }
+    }
+    // 🔗 A certificate without its key cannot sign anything, and a key without
+    // its certificate names nothing — the same pairing rule `tls cert/key` has.
+    if pair.cert.is_some() != pair.key.is_some() {
+        return Err(AdapterError::InvalidArgument(
+            format!("pki {}", d.name),
+            "cert and key must be given together".into(),
+        ));
+    }
+    Ok(pair)
+}
+
+/// 🏛️ Reads a site's `acme_server { … }` block.
+pub(super) fn parse_acme_server(
+    d: &Directive,
+) -> Result<pingclair_core::config::AcmeServerConfig, AdapterError> {
+    use pingclair_core::config::{AcmeServerConfig, AcmeServerPolicy};
+
+    let mut server = AcmeServerConfig::default();
+    for option in d
+        .block
+        .as_ref()
+        .map(|b| b.directives.as_slice())
+        .unwrap_or_default()
+    {
+        match option.name.as_str() {
+            "ca" => server.ca = Some(expect_single(option, "acme_server ca")?),
+            "lifetime" => {
+                server.lifetime_secs =
+                    Some(super::args::parse_required_duration(option)?.div_ceil(1000))
+            }
+            "sign_with_root" => {
+                if !option.args.is_empty() {
+                    return Err(AdapterError::ArgumentCount(
+                        "acme_server sign_with_root".into(),
+                        0,
+                        option.args.len(),
+                    ));
+                }
+                server.sign_with_root = true;
+            }
+            // 🧩 Written with no arguments means "the default set", which is a
+            // different answer from not written at all — so the empty list is
+            // kept rather than collapsed into `None`.
+            "challenges" => server.challenges = Some(option.args.clone()),
+            "allow" => server.allow = Some(parse_acme_server_policy(option)?),
+            "deny" => server.deny = Some(parse_acme_server_policy(option)?),
+            other => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "acme_server: {other}"
+                )));
+            }
+        }
+    }
+    let _ = AcmeServerPolicy::default();
+    Ok(server)
+}
+
+/// 🧭 Reads an `allow`/`deny` sub-block.
+fn parse_acme_server_policy(
+    d: &Directive,
+) -> Result<pingclair_core::config::AcmeServerPolicy, AdapterError> {
+    let mut policy = pingclair_core::config::AcmeServerPolicy::default();
+    for option in d
+        .block
+        .as_ref()
+        .map(|b| b.directives.as_slice())
+        .unwrap_or_default()
+    {
+        match option.name.as_str() {
+            "domains" => policy.domains.extend(option.args.iter().cloned()),
+            "ip_ranges" => policy.ip_ranges.extend(option.args.iter().cloned()),
+            other => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "acme_server {}: {other}",
+                    d.name
+                )));
+            }
+        }
+    }
+    if policy.domains.is_empty() && policy.ip_ranges.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            format!("acme_server {}", d.name),
+            "needs at least one `domains` or `ip_ranges` entry".into(),
+        ));
+    }
+    Ok(policy)
+}
+
+#[cfg(test)]
+mod pki_tests {
+    /// 🏛️ The whole `pki` shape upstream defines, in one configuration.
+    #[test]
+    fn a_pki_block_parses_every_authority_option() {
+        let config = crate::compile(
+            r#"
+            {
+                skip_install_trust
+                pki {
+                    ca {
+                        name "Local"
+                        root_cn "Custom Local Root Name"
+                        intermediate_cn "Custom Local Intermediate Name"
+                        root {
+                            cert /path/to/cert.pem
+                            key /path/to/key.pem
+                            format pem_file
+                        }
+                    }
+                    ca foo {
+                        name "Foo"
+                    }
+                }
+            }
+
+            a.example.com {
+                tls internal
+            }
+            "#,
+        )
+        .expect("the configuration compiles");
+
+        assert!(config.global.skip_install_trust);
+        assert_eq!(config.global.pki.len(), 2);
+
+        // 🏷️ An unnamed `ca` block is upstream's `local` authority; naming it
+        // anything else here would silently break `acme_server { ca local }`.
+        let local = &config.global.pki[0];
+        assert_eq!(local.id, "local");
+        assert_eq!(local.name.as_deref(), Some("Local"));
+        assert_eq!(local.root_cn.as_deref(), Some("Custom Local Root Name"));
+        let root = local.root.as_ref().expect("a root key pair");
+        assert_eq!(root.cert.as_deref(), Some("/path/to/cert.pem"));
+        assert_eq!(root.format.as_deref(), Some("pem_file"));
+
+        assert_eq!(config.global.pki[1].id, "foo");
+    }
+
+    /// 🔗 A signing certificate without its key cannot sign, and a key with no
+    /// certificate names nothing — the same pairing rule `tls cert/key` has.
+    #[test]
+    fn a_half_configured_signing_pair_is_refused() {
+        let result = crate::compile(
+            r#"
+            {
+                pki {
+                    ca {
+                        root {
+                            cert /path/to/cert.pem
+                        }
+                    }
+                }
+            }
+
+            a.example.com {
+                respond "hi"
+            }
+            "#,
+        );
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    /// 🏷️ Two authorities under one id would make `acme_server { ca … }`
+    /// ambiguous, and whichever won would be a coin toss.
+    #[test]
+    fn a_duplicate_authority_id_is_refused() {
+        let result = crate::compile(
+            r#"
+            {
+                pki {
+                    ca foo { name "One" }
+                    ca foo { name "Two" }
+                }
+            }
+
+            a.example.com {
+                respond "hi"
+            }
+            "#,
+        );
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    /// 🏛️ Every `acme_server` sub-directive reaches the configuration.
+    #[test]
+    fn an_acme_server_block_parses_its_options() {
+        use pingclair_core::config::HandlerConfig;
+
+        let config = crate::compile(
+            r#"
+            {
+                pki {
+                    ca custom-ca {
+        name "Custom CA"
+    }
+                }
+            }
+
+            acme.example.com {
+                acme_server {
+                    ca custom-ca
+                    lifetime 7d
+                    sign_with_root
+                    challenges dns-01 http-01
+                    allow {
+                        domains host-1.internal.example.com host-2.internal.example.com
+                    }
+                    deny {
+                        domains dc.internal.example.com
+                    }
+                }
+            }
+            "#,
+        )
+        .expect("the configuration compiles");
+
+        let handler = &config.servers[0].routes[0].handler;
+        let HandlerConfig::AcmeServer(server) = handler else {
+            panic!("expected an acme_server handler, got {handler:?}");
+        };
+        assert_eq!(server.ca.as_deref(), Some("custom-ca"));
+        assert_eq!(server.lifetime_secs, Some(7 * 24 * 60 * 60));
+        assert!(server.sign_with_root);
+        assert_eq!(
+            server.challenges.as_deref(),
+            Some(["dns-01".to_string(), "http-01".to_string()].as_slice())
+        );
+        assert_eq!(
+            server.allow.as_ref().expect("allow").domains,
+            ["host-1.internal.example.com", "host-2.internal.example.com"]
+        );
+        assert_eq!(
+            server.deny.as_ref().expect("deny").domains,
+            ["dc.internal.example.com"]
+        );
+    }
+
+    /// 🧩 `challenges` with no arguments means upstream's default set, which
+    /// is a different answer from not writing it — so the two must not both
+    /// arrive as `None`.
+    #[test]
+    fn a_bare_challenges_line_is_not_the_same_as_omitting_it() {
+        use pingclair_core::config::HandlerConfig;
+
+        let server_of = |source: &str| {
+            let config = crate::compile(source).expect("compiles");
+            match &config.servers[0].routes[0].handler {
+                HandlerConfig::AcmeServer(server) => server.clone(),
+                other => panic!("expected acme_server, got {other:?}"),
+            }
+        };
+
+        let written = server_of(
+            r#"
+            {
+                pki {
+                    ca c {
+                        name "C"
+                    }
+                }
+            }
+            acme.example.com {
+                acme_server {
+                    ca c
+                    challenges
+                }
+            }
+            "#,
+        );
+        let omitted = server_of(
+            r#"
+            {
+                pki {
+                    ca c {
+                        name "C"
+                    }
+                }
+            }
+            acme.example.com {
+                acme_server {
+                    ca c
+                }
+            }
+            "#,
+        );
+        assert_eq!(written.challenges, Some(Vec::new()));
+        assert_eq!(omitted.challenges, None);
+    }
+
+    /// 🏛️ A trust pool pointing at a `pki` authority parses, so an upstream
+    /// configuration translates. It is refused when the server tries to use
+    /// it, not here — see `CompiledClientAuth::compile`.
+    #[test]
+    fn a_pki_trust_pool_parses_and_defaults_to_the_local_authority() {
+        use pingclair_core::config::TrustPool;
+
+        let config = crate::compile(
+            r#"
+            localhost {
+                tls {
+                    client_auth {
+                        mode require_and_verify
+                        trust_pool pki_root {
+                            authority local
+                        }
+                    }
+                }
+            }
+            "#,
+        )
+        .expect("compiles");
+
+        let pool = config.servers[0]
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.client_auth.as_ref())
+            .and_then(|auth| auth.trust_pool.clone())
+            .expect("a trust pool");
+        assert_eq!(
+            pool,
+            TrustPool::PkiRoot {
+                authority: "local".to_string()
+            }
+        );
+    }
+}
+
+/// 🍃 Reads `verifier leaf …`, in every spelling the format allows.
+///
+/// Four shapes, and they are the same instruction written four ways:
+///
+/// ```text
+/// verifier leaf file /a.pem /b.pem        # one-liner, one loader
+/// verifier leaf folder /certs
+/// verifier leaf { file /a.pem }           # block, one loader
+/// verifier leaf { file /a.pem            # block, repeated
+///                 file /b.pem }
+/// ```
+///
+/// The one-liner and the block are not two features: upstream accepts a
+/// one-liner "to accommodate" the common case and otherwise reads a block, and
+/// a configuration written either way has to mean the same thing here.
+///
+/// 🧭 What `leaf` *does* is pin the client's leaf certificate — the presented
+/// certificate must be one of these, byte for byte. That is a different
+/// question from the trust pool, which asks who signed it, and both apply when
+/// both are configured.
+fn parse_leaf_verifier(
+    directive: &Directive,
+    auth: &mut ClientAuthConfig,
+) -> Result<(), AdapterError> {
+    let Some(kind) = directive.args.first() else {
+        return Err(AdapterError::ArgumentCount(
+            "tls client_auth verifier".into(),
+            1,
+            0,
+        ));
+    };
+    if kind != "leaf" {
+        return Err(AdapterError::UnsupportedFeature(
+            format!("tls client_auth verifier {kind}"),
+            "`leaf` is the only client-certificate verifier this build has;              there is no module registry, and accepting the name would mean              the verification never runs"
+                .into(),
+        ));
+    }
+
+    // 📥 One loader named on the same line, or a block of them.
+    let mut loaders: Vec<(&str, &[String])> = Vec::new();
+    if directive.args.len() > 1 {
+        if directive.block.is_some() {
+            return Err(AdapterError::InvalidArgument(
+                "tls client_auth verifier leaf".into(),
+                "a loader on the same line and a block cannot both be given".into(),
+            ));
+        }
+        loaders.push((directive.args[1].as_str(), &directive.args[2..]));
+    } else if let Some(block) = &directive.block {
+        for sub in &block.directives {
+            loaders.push((sub.name.as_str(), sub.args.as_slice()));
+        }
+    }
+
+    if loaders.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            "tls client_auth verifier leaf".into(),
+            "names no certificates; add `file <path>` or `folder <dir>`".into(),
+        ));
+    }
+
+    for (loader, paths) in loaders {
+        if paths.is_empty() {
+            return Err(AdapterError::ArgumentCount(
+                format!("tls client_auth verifier leaf {loader}"),
+                1,
+                0,
+            ));
+        }
+        match loader {
+            "file" => auth.trusted_leaf_cert_files.extend(paths.iter().cloned()),
+            "folder" => auth.trusted_leaf_cert_folders.extend(paths.iter().cloned()),
+            // 🚩 `pem` and `storage` are real loaders in the format. Named
+            // individually so an operator who spelled one correctly is told it
+            // is missing rather than sent hunting for a typo.
+            "pem" | "storage" => {
+                return Err(AdapterError::UnsupportedFeature(
+                    format!("tls client_auth verifier leaf {loader}"),
+                    "only the `file` and `folder` leaf loaders are implemented".into(),
+                ));
+            }
+            other => {
+                return Err(AdapterError::UnknownDirective(format!(
+                    "client_auth verifier leaf: {other}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}

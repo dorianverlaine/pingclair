@@ -24,11 +24,11 @@
 > here now.
 
 - **A rule written in the adapter is a rule the Admin API walks straight past.**
-  A Pingclairfile goes `parser/` → `adapter/caddyfile.rs` → `compiler.rs`. JSON
-  configuration — including a document pasted in through the Admin API's
-  `POST /load` — **skips the adapter entirely** and lands directly in
-  `compiler.rs`. So anything rejected only in the adapter gets in the moment
-  somebody writes it as JSON.
+  A Pingclairfile goes `caddyfile/parser/` → `caddyfile/adapter/` → `compiler.rs`
+  (the native language goes `frontend.rs` → `compiler.rs`). JSON configuration —
+  including a document pasted in through the Admin API's `POST /load` — **skips
+  the adapter entirely** and lands directly in `compiler.rs`. So anything
+  rejected only in the adapter gets in the moment somebody writes it as JSON.
 
   > 🎯 **The operable rule**: if a rule is **about security**, it belongs in
   > `validate_config`; only **syntax and spelling** stay in the adapter. The test

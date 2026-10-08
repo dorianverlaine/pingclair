@@ -24,17 +24,19 @@
 //! let config = compile(source).unwrap();
 //! ```
 
-pub mod adapter;
+mod attributes;
+mod bindings;
+pub mod caddyfile;
 pub mod compiler;
+pub mod frontend;
 mod header_fields;
 mod layer4;
-pub mod native;
-pub mod parser;
 mod retired_placeholders;
 mod shared_ports;
+mod syntax;
 mod upstream_weights;
 
-pub use parser::{
+pub use caddyfile::parser::{
     Ast, CompileError as AnalyzeError, LexError, ParseError, SemanticAnalyzer, SemanticError,
     Token, compile as parse_and_analyze, parse, tokenize,
 };
@@ -101,8 +103,8 @@ fn compile_named_with(
     name: Option<&Path>,
     validate: bool,
 ) -> Result<PingclairConfig, FullCompileError> {
-    if native::is_native(source) {
-        let config = native::adapt(source).map_err(|error| {
+    if frontend::is_native(source) {
+        let config = frontend::adapt(source).map_err(|error| {
             let error = FullCompileError::Native(error);
             match name {
                 Some(path) => FullCompileError::InFile {
@@ -122,16 +124,15 @@ fn compile_named_with(
     // importing file rather than the working directory — a configuration that
     // works when started from its own directory and fails from anywhere else is
     // worse than one that never worked.
-    let ast =
-        parser::compile_from(source, name.and_then(|p| p.parent())).map_err(
-            |error| match name {
-                Some(path) => FullCompileError::InFile {
-                    path: path.display().to_string(),
-                    source: Box::new(error.into()),
-                },
-                None => error.into(),
+    let ast = caddyfile::parser::compile_from(source, name.and_then(|p| p.parent())).map_err(
+        |error| match name {
+            Some(path) => FullCompileError::InFile {
+                path: path.display().to_string(),
+                source: Box::new(error.into()),
             },
-        )?;
+            None => error.into(),
+        },
+    )?;
 
     // 🏗️ Compile the typed tree and enforce cross-field invariants.
     let config = compile_ast(&ast)?;
@@ -465,7 +466,7 @@ fn configuration_paths(dir_path: &Path) -> Result<Vec<std::path::PathBuf>, FullC
 #[derive(Debug, thiserror::Error)]
 pub enum FullCompileError {
     #[error("Native configuration error: {0}")]
-    Native(#[from] native::Error),
+    Native(#[from] frontend::Error),
     #[error("IO error: {0}")]
     Io(String),
 
