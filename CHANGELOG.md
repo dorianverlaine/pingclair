@@ -27,6 +27,17 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🛡️ A site-wide guard keeps its place in the directive order
+
+`redir` ranks ahead of `basic_auth` in the order table, and the reference
+answers that redirect without asking for credentials. An unmatched
+`basic_auth` was copied ahead of *every* answering route, though — including
+the matched `redir` beside it — so adding the guard to a site turned the same
+308 into a 401. Unmatched site middleware now follows the rule matched
+middleware already followed: it goes ahead of an answering route when the
+directive order puts it first, which is what the module's own documentation
+promised (#310).
+
 ### 🛡️ A static file honors `no-transform` on both sides
 
 `Cache-Control: no-transform` is a directive about bytes: a client sends it so

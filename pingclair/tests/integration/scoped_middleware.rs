@@ -252,3 +252,69 @@ async fn scoped_header_reaches_the_route_that_answers() {
         );
     }
 }
+/// 🛡️ A site-wide guard respects the documented order: `redir` answers first.
+///
+/// `redir` ranks ahead of `basic_auth` in the order table the adapter
+/// publishes, and the reference answers that redirect without asking for
+/// credentials. The unmatched `basic_auth` was copied ahead of *every*
+/// answering route, so adding it to the site turned the same 308 into a 401
+/// (#310).
+#[tokio::test]
+async fn site_wide_basic_auth_does_not_preempt_redir() {
+    let server = TestServer::new_pingclairfile(&site(&format!(
+        r#"
+            redir /go /target 308
+
+            basic_auth bcrypt "R" {{
+                alice {ALICE_HASH}
+            }}
+
+            respond "welcome"
+        "#
+    )));
+    // 🚪 A site-wide `basic_auth` guards every path — including the harness's
+    // readiness route, which is the behaviour under test. Wait for the
+    // listeners themselves: the banner is written after every one is bound.
+    let mut up = false;
+    for _ in 0..75 {
+        if server.announced_its_listeners() {
+            up = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(up, "server failed to start");
+
+    // 🚫 The assertion is about the redirect itself: a client that follows it
+    // lands on a path the guard protects and would report the 401 instead.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let redirect = client.get(server.url(0, "/go")).send().await.unwrap();
+    assert_eq!(
+        (
+            redirect.status().as_u16(),
+            redirect
+                .headers()
+                .get("location")
+                .unwrap()
+                .to_str()
+                .unwrap()
+        ),
+        (308, "/target"),
+        "`redir` answers before `basic_auth`, exactly as the order table says"
+    );
+
+    // 🩺 The control: the guard still runs where nothing answered first.
+    let unauthenticated = client.get(server.url(0, "/other")).send().await.unwrap();
+    assert_eq!(unauthenticated.status(), 401);
+    let authenticated = client
+        .get(server.url(0, "/other"))
+        .basic_auth("alice", Some("secret1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authenticated.status(), 200);
+}
