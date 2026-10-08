@@ -1638,6 +1638,148 @@ fn intercept_entries_that_cannot_mean_anything_fail_closed() {
 }
 
 #[test]
+fn php_fastcgi_lowers_like_its_caddyfile_twin() {
+    // 🌐 Without a root the whole configuration compares: both spellings leave
+    // the document root to the process's working directory.
+    let native = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback { PHPFastCGI(to: "unix//run/php-fpm.sock") } } }"#,
+    )
+    .unwrap();
+    let legacy =
+        crate::compile("http://:8080 {\n\tphp_fastcgi unix//run/php-fpm.sock\n}\n").unwrap();
+    assert_eq!(
+        serde_json::to_value(native).unwrap(),
+        serde_json::to_value(legacy).unwrap()
+    );
+}
+
+#[test]
+fn php_fastcgi_expands_the_front_controller_shape() {
+    let config = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+            PHPFastCGI(to: "unix//run/php-fpm.sock", root: "./public", env: [.env("APP_ENV", "production")], captureStderr: true, readTimeout: .seconds(30))
+        } } }"#,
+    )
+    .unwrap();
+    let HandlerConfig::Pipeline { handlers } = &config.servers[0].routes[0].handler else {
+        panic!("the expansion is a pipeline");
+    };
+    assert_eq!(handlers.len(), 3);
+    // 🗂️ A directory without its slash is redirected, so relative links work.
+    assert!(matches!(
+        &handlers[0].handler,
+        HandlerConfig::Redirect { code: 308, .. }
+    ));
+    // 🗂️ The rewrite names the candidates, the root, the policy and the split.
+    let Some(Matcher::File {
+        try_files,
+        root,
+        try_policy,
+        split_path,
+    }) = &handlers[1].matcher
+    else {
+        panic!("expected a file matcher");
+    };
+    assert_eq!(
+        try_files,
+        &[
+            "{http.request.uri.path}",
+            "{http.request.uri.path}/index.php",
+            "index.php"
+        ]
+    );
+    assert_eq!(root.as_deref(), Some("./public"));
+    assert_eq!(try_policy.as_deref(), Some("first_exist_fallback"));
+    assert_eq!(split_path, &[".php".to_string()]);
+    // 🐘 And the proxy carries the FastCGI transport.
+    let HandlerConfig::ReverseProxy(proxy) = &handlers[2].handler else {
+        panic!("expected the proxy");
+    };
+    assert_eq!(proxy.upstreams, ["unix//run/php-fpm.sock"]);
+    let fastcgi = proxy.fastcgi.as_ref().expect("a fastcgi transport");
+    assert_eq!(fastcgi.root.as_deref(), Some("./public"));
+    assert_eq!(fastcgi.split_path, [".php".to_string()]);
+    assert_eq!(
+        fastcgi.env.get("APP_ENV").map(String::as_str),
+        Some("production")
+    );
+    assert!(fastcgi.capture_stderr);
+    assert_eq!(fastcgi.read_timeout_ms, Some(30_000));
+    // 🔤 `index: .off` leaves the plain proxy and nothing else.
+    let bare = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback { PHPFastCGI(to: "127.0.0.1:9000", index: .off) } } }"#,
+    )
+    .unwrap();
+    let HandlerConfig::Pipeline { handlers } = &bare.servers[0].routes[0].handler else {
+        panic!("still a pipeline");
+    };
+    assert_eq!(handlers.len(), 1);
+    assert!(matches!(
+        &handlers[0].handler,
+        HandlerConfig::ReverseProxy(proxy) if proxy.fastcgi.is_some()
+    ));
+}
+
+#[test]
+fn php_fastcgi_leaves_the_static_files_to_the_next_component() {
+    // 🧵 The rewrite stands down for anything that is not PHP, so the file
+    // server written after it serves the rest — the Caddyfile composes the two
+    // exactly this way, a pipeline inside a pipeline.
+    let native = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+            PHPFastCGI(to: "unix//run/php-fpm.sock", root: "./public")
+            ServeFiles(root: "./public")
+        } } }"#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "http://:8080 {\n\troot * ./public\n\tphp_fastcgi unix//run/php-fpm.sock\n\tfile_server\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(native).unwrap(),
+        serde_json::to_value(legacy).unwrap()
+    );
+}
+
+#[test]
+fn php_fastcgi_that_cannot_mean_anything_fail_closed() {
+    let site = |handler: &str| {
+        format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {handler} }} }} }}"
+        )
+    };
+    for handler in [
+        // 🐘 The pool and the split are required and have to be usable.
+        "PHPFastCGI()",
+        "PHPFastCGI(to: [])",
+        "PHPFastCGI(to: 1)",
+        "PHPFastCGI(to: \"127.0.0.1:9000\", split: [])",
+        "PHPFastCGI(to: \"127.0.0.1:9000\", split: \".php\")",
+        "PHPFastCGI(to: \"127.0.0.1:9000\", split: [\".phpé\"])",
+        // 🔤 The index is a file name, or the explicit off switch.
+        "PHPFastCGI(to: \"127.0.0.1:9000\", index: \"\")",
+        "PHPFastCGI(to: \"127.0.0.1:9000\", index: .never)",
+        // 🌱 Environment entries are pairs, once each.
+        "PHPFastCGI(to: \"127.0.0.1:9000\", env: [])",
+        "PHPFastCGI(to: \"127.0.0.1:9000\", env: [\"APP_ENV=production\"])",
+        "PHPFastCGI(to: \"127.0.0.1:9000\", env: [.env(\"APP_ENV\")])",
+        "PHPFastCGI(to: \"127.0.0.1:9000\", env: [.env(\"APP_ENV\", \"a\"), .env(\"APP_ENV\", \"b\")])",
+        // 🗂️ The candidate override is the same typed vocabulary as TryFiles.
+        "PHPFastCGI(to: \"127.0.0.1:9000\", tryFiles: [])",
+        "PHPFastCGI(to: \"127.0.0.1:9000\", tryFiles: [\"{path}\"])",
+        "PHPFastCGI(to: \"127.0.0.1:9000\", tryFiles: \"{path}\")",
+        // ⏱️ Deadlines are durations, not bare numbers.
+        "PHPFastCGI(to: \"127.0.0.1:9000\", readTimeout: 30)",
+        "PHPFastCGI(to: \"127.0.0.1:9000\", captureStderr: 1)",
+        "PHPFastCGI(to: \"127.0.0.1:9000\", unknown: 1)",
+    ] {
+        let source = site(handler);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",

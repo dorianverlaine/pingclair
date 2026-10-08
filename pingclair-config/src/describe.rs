@@ -558,6 +558,25 @@ pub const ENTRIES: &[Entry] = &[
 }"#,
     },
     Entry {
+        name: "PHPFastCGI",
+        kind: Kind::Component,
+        summary: "PHP through FastCGI: `PHPFastCGI(to:, root:, index:, split:, env:, …)`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "app.example.test") {
+        Fallback {
+            PHPFastCGI(to: "unix//run/php-fpm.sock", root: "./public", env: [.env("APP_ENV", "production")])
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "app.example.test") {
+        Fallback {
+            PHPFastCGI(to: "unix//run/php-fpm.sock", split: [".phpé"])
+        }
+    }
+}"#,
+    },
+    Entry {
         name: "Intercept",
         kind: Kind::Component,
         summary: "Rewrites the response of the components after it: `Intercept { Respond(when: …, …) }`.",

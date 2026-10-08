@@ -719,7 +719,12 @@ fn route_elements(
             "a route needs at least one component; end it with {TERMINALS}"
         )));
     };
-    if ending == Ending::Terminal && !is_terminal(&last.name) {
+    // 🐘 `PHPFastCGI` may end a route even though it is listed as middleware: it
+    // answers for the extensions it split off and stands down for everything
+    // else, which is exactly how `php_fastcgi` alone behaves in a Caddyfile. A
+    // file server written after it takes the rest.
+    let answers = is_terminal(&last.name) || last.name == "PHPFastCGI";
+    if ending == Ending::Terminal && !answers {
         return Err(last.at.error(format!(
             "a route must end with a component that answers the request: {TERMINALS}; {} only changes it",
             last.name
@@ -1376,6 +1381,7 @@ fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
         "Rewrite" => rewrite(call),
         "BasicAuth" => basic_auth(call),
         "TryFiles" => try_files(call),
+        "PHPFastCGI" => php_fastcgi(call),
         "Intercept" => intercept(call),
         "RateLimit" => rate_limit(call),
         "AccessControl" => access_control(call),
@@ -1390,7 +1396,7 @@ fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
             "unknown HTTP component; expected a terminal (Respond, ServeFiles, Proxy, Redirect, \
              Fail, ServeMetrics, ACMEServer) or middleware (RequestHeader, ResponseHeader, \
              Rewrite, BasicAuth, RateLimit, AccessControl, CORS, SetVariable, LimitRequestBody, \
-             SkipLog, Templates, ForwardAuth, TryFiles, Intercept)",
+             SkipLog, Templates, ForwardAuth, TryFiles, Intercept, PHPFastCGI)",
         )),
     }
 }
@@ -2325,8 +2331,232 @@ fn serve_files(call: &Call) -> Result<HandlerConfig, Error> {
 }
 
 /// 🌐 `.Proxy(to:)`: the reverse proxy with the build's bare defaults.
+/// 📌 Middleware, not a terminal, even though it ends in a proxy: the rewrite
+/// element stands down for paths that are not PHP, and the file server written
+/// after it is what serves them. The Caddyfile composes the two the same way —
+/// a pipeline inside a pipeline — which is why this component lowers to one.
+fn php_fastcgi(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&[
+        "to",
+        "root",
+        "index",
+        "split",
+        "env",
+        "tryFiles",
+        "resolveRootSymlink",
+        "dialTimeout",
+        "readTimeout",
+        "writeTimeout",
+        "captureStderr",
+    ])?;
+    let upstreams = upstream_addresses(call)?;
+    let root = if call.get("root").is_some() {
+        Some(call.string("root")?)
+    } else {
+        None
+    };
+    let split_path = match call.get("split") {
+        None => vec![".php".to_string()],
+        Some(_) => {
+            let split = call.strings("split")?;
+            // 🛡️ Matching is byte-wise ASCII, so a Unicode delimiter would
+            // never match anything; the Caddyfile refuses it for the same
+            // reason rather than storing a rule that cannot fire.
+            if let Some(non_ascii) = split.iter().find(|entry| !entry.is_ascii()) {
+                return Err(call.at.error(format!(
+                    "split path '{non_ascii}' contains non-ASCII characters, which would \
+                     never match"
+                )));
+            }
+            split
+        }
+    };
+    let mut env = std::collections::BTreeMap::new();
+    match call.get("env") {
+        None => {}
+        Some(Value::Array(items)) => {
+            if items.is_empty() {
+                return Err(call.at.error("env must not be empty; leave it out instead"));
+            }
+            for item in items {
+                let Value::Typed(entry) = item else {
+                    return Err(call.at.error("env takes .env(\"NAME\", \"value\") values"));
+                };
+                if entry.name != "env" {
+                    return Err(entry.at.error("env takes .env(\"NAME\", \"value\") values"));
+                }
+                let [(None, Value::String(name)), (None, Value::String(value))] =
+                    entry.args.as_slice()
+                else {
+                    return Err(entry.at.error(".env takes a name and a value"));
+                };
+                if env.insert(name.clone(), value.clone()).is_some() {
+                    return Err(entry.at.error(format!("'{name}' is set twice in env")));
+                }
+            }
+        }
+        Some(_) => {
+            return Err(call
+                .at
+                .error("env takes an array of .env(\"NAME\", \"value\")"));
+        }
+    }
+    // 🔤 `index: .off` is the Caddyfile's `index off`: it turns the whole
+    // rewrite half off and leaves a plain FastCGI proxy behind.
+    let index = match call.get("index") {
+        None => "index.php".to_string(),
+        Some(Value::String(name)) if !name.is_empty() => name.clone(),
+        Some(Value::Typed(off)) if off.name == "off" => {
+            off.leaf(&[])?;
+            "off".to_string()
+        }
+        Some(_) => {
+            return Err(call.at.error("index takes a quoted file name, or .off"));
+        }
+    };
+    let try_files = match call.get("tryFiles") {
+        None => None,
+        Some(Value::Array(items)) => {
+            if items.is_empty() {
+                return Err(call
+                    .at
+                    .error("tryFiles must not be empty; leave it out instead"));
+            }
+            let mut candidates = Vec::new();
+            for item in items {
+                candidates.push(file_candidate(item, call.at)?);
+            }
+            Some(candidates)
+        }
+        Some(_) => {
+            return Err(call.at.error(
+                "tryFiles takes an array of candidates such as [.requestPath, \"/index.php\"]",
+            ));
+        }
+    };
+    let fastcgi = FastCgiTransportConfig {
+        root: root.clone(),
+        split_path: split_path.clone(),
+        env,
+        resolve_root_symlink: if call.get("resolveRootSymlink").is_some() {
+            call.boolean("resolveRootSymlink")?
+        } else {
+            false
+        },
+        dial_timeout_ms: if call.get("dialTimeout").is_some() {
+            Some(call.measure("dialTimeout", false)?)
+        } else {
+            None
+        },
+        read_timeout_ms: if call.get("readTimeout").is_some() {
+            Some(call.measure("readTimeout", false)?)
+        } else {
+            None
+        },
+        write_timeout_ms: if call.get("writeTimeout").is_some() {
+            Some(call.measure("writeTimeout", false)?)
+        } else {
+            None
+        },
+        capture_stderr: if call.get("captureStderr").is_some() {
+            call.boolean("captureStderr")?
+        } else {
+            false
+        },
+    };
+    // 🧭 The expansion, exactly as the Caddyfile's `php_fastcgi` writes it: a
+    // directory redirect, a file matcher that rewrites to whichever candidate
+    // exists, and the FastCGI proxy for the extensions that were split off. One
+    // shape, so the front-controller behaviour cannot drift between the two
+    // spellings.
+    let extensions = split_path;
+    let mut elements = Vec::new();
+    if index != "off" {
+        // 📌 The engine's own path placeholders, because this is the shape the
+        // Caddyfile compiles to; a hand-written `TryFiles` uses `.requestPath`
+        // and lowers to `{path}`, which resolves to the same value.
+        let path = "{http.request.uri.path}";
+        let dir_index = format!("{path}/{index}");
+        let (try_policy, dir_redirect) = match &try_files {
+            Some(overrides) => (
+                overrides
+                    .last()
+                    .is_some_and(|last| last.ends_with(".php"))
+                    .then_some("first_exist_fallback"),
+                overrides.contains(&dir_index),
+            ),
+            None => (Some("first_exist_fallback"), true),
+        };
+        let candidates = try_files
+            .clone()
+            .unwrap_or_else(|| vec![path.to_string(), dir_index.clone(), index.clone()]);
+        if dir_redirect {
+            elements.push(HandlerElement {
+                matcher: Some(Matcher::And(
+                    Box::new(Matcher::File {
+                        try_files: vec![dir_index.clone()],
+                        root: root.clone(),
+                        try_policy: None,
+                        split_path: Vec::new(),
+                    }),
+                    Box::new(Matcher::Not(Box::new(Matcher::Path {
+                        patterns: vec!["*/".to_string()],
+                    }))),
+                )),
+                handler: HandlerConfig::Redirect {
+                    to: "{http.request.orig_uri.path}/{http.request.orig_uri.prefixed_query}"
+                        .to_string(),
+                    code: 308,
+                },
+            });
+        }
+        elements.push(HandlerElement {
+            matcher: Some(Matcher::File {
+                try_files: candidates,
+                root: root.clone(),
+                try_policy: try_policy.map(str::to_string),
+                split_path: extensions.clone(),
+            }),
+            handler: HandlerConfig::Rewrite {
+                strip_prefix: None,
+                strip_suffix: None,
+                replace: Some("{http.matchers.file.relative}".to_string()),
+                regex: None,
+                regex_replace: None,
+                method: None,
+            },
+        });
+    }
+    elements.push(HandlerElement {
+        matcher: Some(Matcher::Path {
+            patterns: extensions
+                .iter()
+                .map(|extension| format!("*{extension}"))
+                .collect(),
+        }),
+        handler: HandlerConfig::ReverseProxy(Box::new(reverse_proxy(
+            upstreams,
+            Some(Box::new(fastcgi)),
+        ))),
+    });
+    // 🧵 A pipeline, not a first-match group: the directory redirect may not
+    // match, the file matcher may rewrite and stand down, and the proxy answers
+    // last. Grouping them as alternatives would stop at the first element that
+    // matched, which is a different server.
+    Ok(HandlerConfig::Pipeline { handlers: elements })
+}
+
+/// 🌐 `.Proxy(to:)`: the reverse proxy with the build's bare defaults.
 fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
     call.leaf(&["to"])?;
+    let upstreams = upstream_addresses(call)?;
+    Ok(HandlerConfig::ReverseProxy(Box::new(reverse_proxy(
+        upstreams, None,
+    ))))
+}
+
+/// 🔌 The addresses an upstream list names.
+fn upstream_addresses(call: &Call) -> Result<Vec<String>, Error> {
     let mut upstreams = Vec::new();
     match call.get("to") {
         Some(Value::String(address)) => upstreams.push(address.clone()),
@@ -2341,12 +2571,22 @@ fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
         _ => {
             return Err(call
                 .at
-                .error("Proxy requires to: \"host:port\" or to: [\"host:port\", ...]"));
+                .error("to takes \"host:port\" or [\"host:port\", ...]"));
         }
     }
     if upstreams.is_empty() {
-        return Err(call.at.error("Proxy needs at least one upstream"));
+        return Err(call.at.error("to needs at least one address"));
     }
+    Ok(upstreams)
+}
+
+/// 🌐 The proxy the build's bare defaults describe, with an optional FastCGI
+/// transport. Shared by `Proxy` and `PHPFastCGI`, so the two cannot disagree
+/// about a default neither of them wrote.
+fn reverse_proxy(
+    upstreams: Vec<String>,
+    fastcgi: Option<Box<FastCgiTransportConfig>>,
+) -> ReverseProxyConfig {
     let upstream_options = upstreams
         .iter()
         .map(|address| ProxyUpstream {
@@ -2355,9 +2595,9 @@ fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
             backup: false,
         })
         .collect();
-    Ok(HandlerConfig::ReverseProxy(Box::new(ReverseProxyConfig {
+    ReverseProxyConfig {
         upstreams,
-        fastcgi: None,
+        fastcgi,
         dynamic_upstream: None,
         rewrite_method: None,
         rewrite_uri: None,
@@ -2409,7 +2649,7 @@ fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
         }),
         upstream_tls: Box::new(UpstreamTlsConfig::default()),
         cache: None,
-    })))
+    }
 }
 
 /// ➡️ `.Redirect(to:, status:)`: the redirect statuses the RFC names.

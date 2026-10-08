@@ -1,0 +1,38 @@
+// 🐘 PHP through FastCGI.
+//
+// 📌 `PHPFastCGI` expands the front-controller shape the Caddyfile's
+// `php_fastcgi` writes: a directory redirect, a file matcher that rewrites to
+// whichever candidate exists, and the FastCGI proxy for the split-off
+// extensions. The candidates are the same typed values `TryFiles` takes.
+HTTPListener(on: ":8080") {
+    Site(host: "app.example.test") {
+        Fallback {
+            // 🗂️ The pool, the document root, and one environment entry.
+            PHPFastCGI(
+                to: "unix//run/php-fpm.sock",
+                root: "./public",
+                index: "index.php",
+                env: [.env("APP_ENV", "production")],
+            )
+        }
+    }
+}
+
+HTTPListener(on: ":8081") {
+    Site(host: "legacy.example.test") {
+        Fallback {
+            // ⏱️ A pool with deadlines and its own candidates: the last one
+            // ends in `.php`, so the matcher falls back to it when nothing
+            // else exists — that is what a front controller needs.
+            PHPFastCGI(
+                to: ["127.0.0.1:9000", "127.0.0.1:9001"],
+                root: "./legacy",
+                split: [".php", ".phtml"],
+                tryFiles: [.requestPath, .requestPath(appending: "/index.php"), "/index.php"],
+                dialTimeout: .seconds(2),
+                readTimeout: .seconds(30),
+                captureStderr: true,
+            )
+        }
+    }
+}
