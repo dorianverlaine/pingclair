@@ -94,7 +94,7 @@ pub const ENTRIES: &[Entry] = &[
         refusal: r#"TCPListener(on: "127.0.0.1:9443") {
     Fallback { Proxy(to: 8080) }
 }"#,
-        labels: crate::frontend::http::PROXY_LABELS,
+        labels: crate::frontend::tcp::L4_PROXY_LABELS,
     },
     Entry {
         name: "HTTPListener",
@@ -184,7 +184,7 @@ pub const ENTRIES: &[Entry] = &[
         Fallback { Proxy(to: []) }
     }
 }"#,
-        labels: &[],
+        labels: crate::frontend::http::PROXY_LABELS,
     },
     Entry {
         name: "Redirect",
@@ -900,6 +900,29 @@ pub fn render_json(name: Option<&str>) -> Result<String, String> {
     serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
 }
 
+/// Renders the entries as compact JSON lines for agents.
+///
+/// 📌 One entry per line, the same fields as [`render_json`], in the order the
+/// catalogue declares: an agent reads it without the pretty-printed
+/// whitespace, and `jq` parses every line unchanged.
+pub fn render_agents(name: Option<&str>) -> Result<String, String> {
+    let entries = select(name)?;
+    let mut rendered = String::new();
+    for entry in entries {
+        let line = json!({
+            "name": entry.name,
+            "kind": entry.kind.label(),
+            "summary": entry.summary,
+            "example": entry.example,
+            "refusal": entry.refusal,
+            "labels": entry.labels,
+        });
+        rendered.push_str(&serde_json::to_string(&line).map_err(|error| error.to_string())?);
+        rendered.push('\n');
+    }
+    Ok(rendered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,8 +1004,15 @@ mod tests {
     #[test]
     fn the_labels_are_the_parsers_own_lists() {
         // 🏷️ Not a copy: the same constants the frontend validates against.
-        let proxy = find("Proxy").expect("described");
-        assert_eq!(proxy.labels, crate::frontend::http::PROXY_LABELS);
+        // The two `Proxy` entries are the L4 and HTTP contexts, and each
+        // carries its own context's list — they were swapped once.
+        let proxies: Vec<_> = ENTRIES
+            .iter()
+            .filter(|entry| entry.name == "Proxy")
+            .collect();
+        assert_eq!(proxies.len(), 2, "L4 and HTTP contexts");
+        assert_eq!(proxies[0].labels, crate::frontend::tcp::L4_PROXY_LABELS);
+        assert_eq!(proxies[1].labels, crate::frontend::http::PROXY_LABELS);
         let files = find("ServeFiles").expect("described");
         assert_eq!(files.labels, crate::frontend::http::FILE_SERVER_LABELS);
     }
@@ -1007,5 +1037,34 @@ mod tests {
         for entry in ENTRIES {
             assert!(rendered.contains(entry.name), "json missing {}", entry.name);
         }
+    }
+
+    #[test]
+    fn the_agents_format_is_one_parsable_line_per_entry() {
+        let rendered = render_agents(None).unwrap();
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), ENTRIES.len(), "one line per entry");
+        for (line, entry) in lines.iter().zip(ENTRIES) {
+            let value: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|error| panic!("{line}: {error}"));
+            assert_eq!(value["name"], entry.name);
+            assert_eq!(value["kind"], entry.kind.label());
+            assert_eq!(value["labels"], serde_json::json!(entry.labels));
+            assert_eq!(value["example"], entry.example);
+        }
+        // 🔁 Fixed order: the catalogue's own, with no sorting step between.
+        assert!(lines[0].contains("\"TCPListener\""));
+    }
+
+    /// 📏 The point of the format is the tokens it saves: at least a tenth of
+    /// the pretty JSON, which is what the RFC asked to measure when it landed.
+    #[test]
+    fn the_agents_format_is_smaller_than_the_pretty_json() {
+        let agents = render_agents(None).unwrap().len();
+        let json = render_json(None).unwrap().len();
+        assert!(
+            agents * 10 < json * 9,
+            "agents must save at least a tenth: agents={agents} json={json}"
+        );
     }
 }

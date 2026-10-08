@@ -1097,6 +1097,9 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             let rendered = match format {
                 DescribeFormat::Text => pingclair_config::describe::render_text(name.as_deref()),
                 DescribeFormat::Json => pingclair_config::describe::render_json(name.as_deref()),
+                DescribeFormat::Agents => {
+                    pingclair_config::describe::render_agents(name.as_deref())
+                }
             }
             .map_err(|error| anyhow::anyhow!("❌ {error}"))?;
             print!("{rendered}");

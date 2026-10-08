@@ -17,6 +17,10 @@ pub(crate) const TCP_LISTENER_LABELS: &[&str] = &["on"];
 /// 🏷️ The labels an L4 route accepts (`Fallback` takes none).
 pub(crate) const L4_ROUTE_LABELS: &[&str] = &["when", "from"];
 
+/// 🏷️ What an L4 `Proxy` accepts: a destination and nothing else — the
+/// dynamic sources and header policy are HTTP-proxy vocabulary.
+pub(crate) const L4_PROXY_LABELS: &[&str] = &["to"];
+
 pub(super) fn listener(call: &Call) -> Result<Layer4Server, Error> {
     call.labels(TCP_LISTENER_LABELS)?;
     let mut server = Layer4Server::new(call.string("on")?);
@@ -113,7 +117,7 @@ pub(super) fn route(call: &Call) -> Result<Layer4Route, Error> {
     if proxy.name != "Proxy" {
         return Err(proxy.at.error("expected Proxy(to: ...)"));
     }
-    proxy.leaf(&["to"])?;
+    proxy.leaf(L4_PROXY_LABELS)?;
     Ok(Layer4Route {
         matches,
         upstream: proxy.string("to")?,

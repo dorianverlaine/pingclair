@@ -52,6 +52,10 @@ pub(crate) enum DescribeFormat {
     #[default]
     Text,
     Json,
+    /// 📇 One compact JSON object per line, the same fields as `json`, in a
+    /// fixed order — the shape an agent reads without the pretty-printed
+    /// whitespace.
+    Agents,
 }
 
 #[derive(Subcommand)]
