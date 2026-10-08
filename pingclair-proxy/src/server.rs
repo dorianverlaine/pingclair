@@ -2999,10 +2999,13 @@ impl PingclairProxy {
             .as_http1()
             .is_some_and(|h1| !h1.will_keepalive())
         {
+            // ⏱️ nginx's `keepalive_timeout` default is 75 s; this used to be
+            // 60 s from this server's own history, and 0.3 aligns the whole
+            // default set on nginx (memory issue #58).
             session.as_mut().set_keepalive(Some(
                 limits
                     .idle_timeout_ms
-                    .map_or(60, |idle_ms| idle_ms.div_ceil(1_000)),
+                    .map_or(75, |idle_ms| idle_ms.div_ceil(1_000)),
             ));
         }
     }
