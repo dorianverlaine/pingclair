@@ -5,8 +5,9 @@
 // compiled by `pingclair-config/tests/documentation.rs`, so nothing here can
 // quietly stop being true.
 // 🔐 A secret binding: its value never appears in diagnostics, JSON or logs.
-// The components that take a secret (admin keys, DNS-01 tokens) arrive with
-// their own batches; the attribute and the masking are here already.
+// The one field that stores secrets — the DNS-01 provider arguments — is where
+// it is allowed to flow; `examples/tls.pingclair` shows that case, and every
+// other position is refused at load.
 @Secret
 let metricsToken = "placeholder-secret"
 
@@ -17,6 +18,10 @@ let api = .path(prefix: "/api")
 
 Metrics(enabled: true)
 Shutdown(grace: .seconds(10))
+TrustedProxies(ranges: [.privateRanges], headers: [.xForwardedFor, .xRealIP])
+Storage(root: "./.pingclair-store")
+Log(output: .file("/tmp/pingclair-process.log"), level: .info)
+AutomaticTLS(mode: .automatic, httpPort: 80, httpsPort: 443)
 
 // 🔌 Layer 4 passthrough, routed by SNI.
 TCPListener(on: ":9443") {

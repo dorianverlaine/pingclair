@@ -490,12 +490,24 @@
   "admin": null,
   "global": {
     "email": null,
+    "storage_path": "./.pingclair-store",
     "http_port": 80,
     "https_port": 443,
     "metrics": true,
     "auto_https": "on",
     "blocked_ips": [],
-    "trusted_proxies": [],
+    "trusted_proxies": [
+      "192.168.0.0/16",
+      "172.16.0.0/12",
+      "10.0.0.0/8",
+      "127.0.0.1/8",
+      "fd00::/8",
+      "::1"
+    ],
+    "client_ip_headers": [
+      "X-Forwarded-For",
+      "X-Real-IP"
+    ],
     "listener_options": {
       ":8443": {
         "http3": false
@@ -507,5 +519,20 @@
     "dns_refresh_secs": 30,
     "grace_period_secs": 10
   },
-  "logging": {}
+  "logging": {
+    "default": {
+      "output": {
+        "file": "/tmp/pingclair-process.log"
+      },
+      "format": "text",
+      "level": "info",
+      "exclude_fields": [],
+      "rotation": {
+        "compress": false
+      },
+      "request_headers": [],
+      "response_headers": [],
+      "include_tls": false
+    }
+  }
 }

@@ -700,6 +700,38 @@ TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#
         labels: &[],
     },
     Entry {
+        name: "TrustedProxies",
+        kind: Kind::Component,
+        summary: "Which proxies are believed, and which headers name the client to them.",
+        example: r#"TrustedProxies(ranges: ["10.0.0.0/8"], headers: [.xForwardedFor, .xRealIP])"#,
+        refusal: r#"TrustedProxies(ranges: [])"#,
+        labels: crate::frontend::TRUSTED_PROXIES_LABELS,
+    },
+    Entry {
+        name: "Storage",
+        kind: Kind::Component,
+        summary: "Where certificates, ACME account keys and the internal CA live.",
+        example: r#"Storage(root: "/var/lib/pingclair")"#,
+        refusal: r#"Storage(root: "")"#,
+        labels: crate::frontend::STORAGE_LABELS,
+    },
+    Entry {
+        name: "Log",
+        kind: Kind::Component,
+        summary: "The process logger: output and level.",
+        example: r#"Log(output: .file("/var/log/pingclair/server.log"), level: .info)"#,
+        refusal: r#"Log(level: .verbose)"#,
+        labels: crate::frontend::LOG_LABELS,
+    },
+    Entry {
+        name: "AutomaticTLS",
+        kind: Kind::Component,
+        summary: "Automatic HTTPS: mode, companion ports and trust installation.",
+        example: r#"AutomaticTLS(mode: .automatic, httpPort: 80, httpsPort: 443)"#,
+        refusal: r#"AutomaticTLS(mode: .disableCerts)"#,
+        labels: crate::frontend::AUTOMATIC_TLS_LABELS,
+    },
+    Entry {
         name: "limits",
         kind: Kind::Modifier,
         summary: "Connection count and buffer bounds for a TCP listener.",
@@ -903,6 +935,10 @@ mod tests {
             "Route",
             "errorPage",
             "accessLog",
+            "TrustedProxies",
+            "Storage",
+            "Log",
+            "AutomaticTLS",
         ] {
             let entry = find(name).unwrap_or_else(|| panic!("{name} is not described"));
             assert!(!entry.labels.is_empty(), "{name} names no arguments");

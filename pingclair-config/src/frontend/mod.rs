@@ -15,12 +15,12 @@ use crate::attributes::{Attr, resolve_attribute};
 use crate::bindings::Bindings;
 use crate::syntax::{self, Call, Declaration, Position, Value};
 use pingclair_core::config::{
-    AccessControlConfig, AcmeServerConfig, AcmeServerPolicy, AdminConfig, BasicAuthAlgorithm,
-    CircuitBreakerConfig, Encoding, ErrorRouteConfig, FastCgiTransportConfig, ForwardAuthConfig,
-    ForwardAuthHeaderMap, HandlerConfig, HandlerElement, HeaderReplacement, HealthCheckConfig,
-    IpRanges, Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher, ListenerOptions,
-    LoadBalanceConfig, LogConfig, LogFormat, LogOutput, LogRotation, Matcher, MatcherCondition,
-    OverloadConfig, PRIVATE_RANGES, PingclairConfig, ProxyUpstream, RateLimitKey,
+    AccessControlConfig, AcmeServerConfig, AcmeServerPolicy, AdminConfig, AutoHttpsMode,
+    BasicAuthAlgorithm, CircuitBreakerConfig, Encoding, ErrorRouteConfig, FastCgiTransportConfig,
+    ForwardAuthConfig, ForwardAuthHeaderMap, HandlerConfig, HandlerElement, HeaderReplacement,
+    HealthCheckConfig, IpRanges, Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher,
+    ListenerOptions, LoadBalanceConfig, LogConfig, LogFormat, LogOutput, LogRotation, Matcher,
+    MatcherCondition, OverloadConfig, PRIVATE_RANGES, PingclairConfig, ProxyUpstream, RateLimitKey,
     ResourceLimitsConfig, ResponseHandlerConfig, ResponseMatcher, RetryConfig, ReverseProxyConfig,
     RouteConfig, ServerConfig, TlsConfig, UpstreamHttpVersions, UpstreamTlsConfig,
     normalize_listen_addr,
@@ -118,6 +118,14 @@ pub(crate) fn declared_globals(source: &str) -> Result<Vec<String>, Error> {
     Ok(names)
 }
 
+/// 🏷️ The argument labels the global declarations accept, named once for the
+/// parser and `describe`.
+pub(crate) const TRUSTED_PROXIES_LABELS: &[&str] = &["ranges", "headers"];
+pub(crate) const STORAGE_LABELS: &[&str] = &["root"];
+pub(crate) const LOG_LABELS: &[&str] = &["output", "level"];
+pub(crate) const AUTOMATIC_TLS_LABELS: &[&str] =
+    &["mode", "httpPort", "httpsPort", "skipInstallTrust"];
+
 pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
     let declarations = syntax::parse(source)?;
     let mut bindings = Bindings::default();
@@ -186,18 +194,326 @@ pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
                 }
                 config.global.grace_period_secs = Some(millis / 1000);
             }
+            "TrustedProxies" => {
+                call.leaf(TRUSTED_PROXIES_LABELS)?;
+                if call.get("ranges").is_none() && call.get("headers").is_none() {
+                    return Err(call
+                        .at
+                        .error("TrustedProxies needs ranges:, headers:, or both"));
+                }
+                if let Some(ranges) = call.get("ranges") {
+                    config.global.trusted_proxies = parse_ranges(ranges, call.at)?;
+                }
+                if let Some(headers) = call.get("headers") {
+                    config.global.client_ip_headers = parse_header_names(headers, call.at)?;
+                }
+            }
+            "Storage" => {
+                call.leaf(STORAGE_LABELS)?;
+                let root = call.string("root")?;
+                if root.is_empty() {
+                    return Err(call.at.error("Storage root must not be empty"));
+                }
+                config.global.storage_path = Some(root);
+            }
+            "Log" => {
+                call.leaf(LOG_LABELS)?;
+                if call.get("output").is_none() && call.get("level").is_none() {
+                    return Err(call.at.error("Log needs output:, level:, or both"));
+                }
+                let output = match call.get("output") {
+                    Some(value) => parse_log_output(value, call.at)?,
+                    // 📌 The unnamed global logger writes to stdout unless told
+                    // otherwise, which is the same default the Caddyfile has.
+                    None => LogOutput::Stdout,
+                };
+                let level = match call.get("level") {
+                    Some(value) => Some(parse_log_level(value, call.at)?),
+                    None => None,
+                };
+                config.logging.default = Some(process_log(output, level));
+            }
+            "AutomaticTLS" => {
+                call.leaf(AUTOMATIC_TLS_LABELS)?;
+                if call.get("mode").is_none()
+                    && call.get("httpPort").is_none()
+                    && call.get("httpsPort").is_none()
+                    && call.get("skipInstallTrust").is_none()
+                {
+                    return Err(call.at.error(
+                        "AutomaticTLS needs at least one setting: mode:, httpPort:, httpsPort: \
+                         or skipInstallTrust:",
+                    ));
+                }
+                if let Some(mode) = call.get("mode") {
+                    let Value::Typed(case) = mode else {
+                        return Err(call.at.error(
+                            "mode takes .automatic, .off, .disableRedirects or .ignoreLoadedCerts",
+                        ));
+                    };
+                    config.global.auto_https = match case.name.as_str() {
+                        "automatic" => {
+                            expect_bare_case(case, ".automatic")?;
+                            AutoHttpsMode::On
+                        }
+                        "off" => {
+                            expect_bare_case(case, ".off")?;
+                            AutoHttpsMode::Off
+                        }
+                        "disableRedirects" => {
+                            expect_bare_case(case, ".disableRedirects")?;
+                            AutoHttpsMode::DisableRedirects
+                        }
+                        "ignoreLoadedCerts" => {
+                            expect_bare_case(case, ".ignoreLoadedCerts")?;
+                            AutoHttpsMode::IgnoreLoadedCerts
+                        }
+                        "disableCerts" => {
+                            return Err(case.at.error(
+                                "disable_certs is not implemented; expected .automatic, .off, \
+                                 .disableRedirects or .ignoreLoadedCerts",
+                            ));
+                        }
+                        other => {
+                            return Err(case.at.error(format!(
+                                "unknown auto-HTTPS mode `.{other}`; expected .automatic, .off, \
+                                 .disableRedirects or .ignoreLoadedCerts"
+                            )));
+                        }
+                    };
+                }
+                if let Some(value) = call.get("httpPort") {
+                    config.global.http_port = parse_port(value, "httpPort", call.at)?;
+                }
+                if let Some(value) = call.get("httpsPort") {
+                    config.global.https_port = parse_port(value, "httpsPort", call.at)?;
+                }
+                if let Some(value) = call.get("skipInstallTrust") {
+                    match value {
+                        Value::Bool(true) => config.global.skip_install_trust = true,
+                        Value::Bool(false) => {
+                            return Err(call.at.error(
+                                "skipInstallTrust only accepts true: this build never installs \
+                                 the internal root at startup, so false would describe a step \
+                                 that never happens",
+                            ));
+                        }
+                        _ => return Err(call.at.error("skipInstallTrust takes true")),
+                    }
+                }
+            }
             _ => {
                 return Err(call.at.error(
-                    "unknown global declaration; expected TCPListener, Admin, Metrics, or Shutdown",
+                    "unknown global declaration; expected TCPListener, HTTPListener, Admin, \
+                     Metrics, Shutdown, TrustedProxies, Storage, Log or AutomaticTLS",
                 ));
             }
         }
     }
-    // 📌 A file is allowed to hold nothing but declarations: `Admin`, `Metrics`
-    // and `Shutdown` are options of the server, not of a listener, and a
-    // directory splits them into their own file. Whether the *merged* result
-    // can serve anything is a question for the runtime.
+    // 📌 A file is allowed to hold nothing but declarations: `Admin`, `Metrics`,
+    // `Shutdown`, `TrustedProxies`, `Storage`, `Log` and `AutomaticTLS` are
+    // options of the server, not of a listener, and a directory splits them
+    // into their own file. Whether the *merged* result can serve anything is a
+    // question for the runtime.
     Ok(config)
+}
+
+/// 🌐 `ranges:` accepts CIDR strings and `.privateRanges`, which expands to the
+/// six prefixes every other private-range spelling uses.
+fn parse_ranges(value: &Value, at: Position) -> Result<Vec<String>, Error> {
+    let Value::Array(items) = value else {
+        return Err(at.error("ranges takes an array of CIDR strings or .privateRanges"));
+    };
+    if items.is_empty() {
+        return Err(at.error("ranges must not be empty"));
+    }
+    let mut ranges = Vec::new();
+    for item in items {
+        match item {
+            Value::String(text) => {
+                if text.parse::<ipnet::IpNet>().is_err()
+                    && text.parse::<std::net::IpAddr>().is_err()
+                {
+                    return Err(at.error(format!("ranges contains invalid IP or CIDR `{text}`")));
+                }
+                ranges.push(text.clone());
+            }
+            Value::Typed(case) if case.name == "privateRanges" => {
+                expect_bare_case(case, ".privateRanges")?;
+                ranges.extend(PRIVATE_RANGES.iter().map(|range| (*range).to_string()));
+            }
+            Value::Typed(case) => {
+                return Err(case.at.error(format!(
+                    "unknown range `.{name}`; expected .privateRanges or a quoted CIDR",
+                    name = case.name
+                )));
+            }
+            _ => {
+                return Err(at.error("ranges takes an array of CIDR strings or .privateRanges"));
+            }
+        }
+    }
+    Ok(ranges)
+}
+
+/// 🛡️ `headers:` names the request headers a trusted proxy may set the client
+/// address in, in the order they are consulted.
+fn parse_header_names(value: &Value, at: Position) -> Result<Vec<String>, Error> {
+    let Value::Array(items) = value else {
+        return Err(at.error(
+            "headers takes an array of .xForwardedFor, .forwarded, .xRealIP, .cfConnectingIP \
+             or .header(\"Name\")",
+        ));
+    };
+    if items.is_empty() {
+        return Err(at.error(
+            "headers must not be empty: an empty list and the built-in set would read the same",
+        ));
+    }
+    let mut names = Vec::new();
+    for item in items {
+        let Value::Typed(case) = item else {
+            return Err(
+                at.error("headers takes typed values such as .xRealIP or .header(\"X-Name\")")
+            );
+        };
+        let name = match case.name.as_str() {
+            "xForwardedFor" => {
+                expect_bare_case(case, ".xForwardedFor")?;
+                "X-Forwarded-For".to_string()
+            }
+            "forwarded" => {
+                expect_bare_case(case, ".forwarded")?;
+                "Forwarded".to_string()
+            }
+            "xRealIP" => {
+                expect_bare_case(case, ".xRealIP")?;
+                "X-Real-IP".to_string()
+            }
+            "cfConnectingIP" => {
+                expect_bare_case(case, ".cfConnectingIP")?;
+                "CF-Connecting-IP".to_string()
+            }
+            "header" => {
+                if case.body.is_some() || !case.modifiers.is_empty() {
+                    return Err(case.at.error(".header does not take a block or modifiers"));
+                }
+                let [(None, Value::String(name))] = case.args.as_slice() else {
+                    return Err(case.at.error(".header takes one quoted header name"));
+                };
+                // 📌 `::http` is the crate; the bare name is this module's own
+                // `http` child.
+                if ::http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                    return Err(case
+                        .at
+                        .error(format!("`{name}` is not a valid header name")));
+                }
+                name.clone()
+            }
+            other => {
+                return Err(case.at.error(format!(
+                    "unknown header `.{other}`; expected .xForwardedFor, .forwarded, .xRealIP, \
+                     .cfConnectingIP or .header(\"Name\")"
+                )));
+            }
+        };
+        names.push(name);
+    }
+    Ok(names)
+}
+
+/// 🪵 One process-log destination.
+fn parse_log_output(value: &Value, at: Position) -> Result<LogOutput, Error> {
+    let Value::Typed(case) = value else {
+        return Err(at.error("output takes .stdout, .stderr or .file(\"…\")"));
+    };
+    match case.name.as_str() {
+        "stdout" => {
+            expect_bare_case(case, ".stdout")?;
+            Ok(LogOutput::Stdout)
+        }
+        "stderr" => {
+            expect_bare_case(case, ".stderr")?;
+            Ok(LogOutput::Stderr)
+        }
+        "file" => {
+            if case.body.is_some() || !case.modifiers.is_empty() {
+                return Err(case.at.error(".file does not take a block or modifiers"));
+            }
+            let [(None, Value::String(path))] = case.args.as_slice() else {
+                return Err(case.at.error(".file takes one quoted path"));
+            };
+            if path.is_empty() {
+                return Err(case.at.error(".file takes a non-empty path"));
+            }
+            Ok(LogOutput::File(path.clone()))
+        }
+        other => Err(case.at.error(format!(
+            "unknown output `.{other}`; expected .stdout, .stderr or .file(\"…\")"
+        ))),
+    }
+}
+
+/// 🚦 One process-log level.
+fn parse_log_level(value: &Value, at: Position) -> Result<&'static str, Error> {
+    let Value::Typed(case) = value else {
+        return Err(at.error("level takes .trace, .debug, .info, .warn or .error"));
+    };
+    let level = match case.name.as_str() {
+        "trace" => "trace",
+        "debug" => "debug",
+        "info" => "info",
+        "warn" => "warn",
+        "error" => "error",
+        other => {
+            return Err(case.at.error(format!(
+                "unknown level `.{other}`; expected .trace, .debug, .info, .warn or .error"
+            )));
+        }
+    };
+    expect_bare_case(case, "a log level")?;
+    Ok(level)
+}
+
+/// 🪵 A process logger with the model's defaults for everything but output and
+/// level; the log batch extends this declaration along the same fields.
+fn process_log(output: LogOutput, level: Option<&str>) -> LogConfig {
+    LogConfig {
+        output,
+        format: LogFormat::default(),
+        level: level.map(str::to_string),
+        exclude_fields: Vec::new(),
+        rotation: LogRotation::default(),
+        request_headers: Vec::new(),
+        response_headers: Vec::new(),
+        include_tls: false,
+        hostnames: Vec::new(),
+        include: Vec::new(),
+        exclude: Vec::new(),
+        sampling: None,
+    }
+}
+
+/// 🔢 A port for `httpPort:`/`httpsPort:`.
+fn parse_port(value: &Value, setting: &str, at: Position) -> Result<u16, Error> {
+    match value {
+        Value::Number(port) if (1..=65535).contains(port) => Ok(*port as u16),
+        _ => Err(at.error(format!("{setting} takes a port between 1 and 65535"))),
+    }
+}
+
+/// 🧷 Checks a typed case takes no block, no modifiers and no arguments.
+fn expect_bare_case(case: &Call, what: &str) -> Result<(), Error> {
+    if case.body.is_some() {
+        return Err(case.at.error(format!("{what} does not take a block")));
+    }
+    if !case.modifiers.is_empty() {
+        return Err(case.at.error(format!("{what} does not take modifiers")));
+    }
+    if !case.args.is_empty() {
+        return Err(case.at.error(format!("{what} takes no arguments")));
+    }
+    Ok(())
 }
 
 impl Call {
@@ -295,6 +611,8 @@ impl Call {
     }
 }
 
+#[cfg(test)]
+mod globals_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
