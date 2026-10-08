@@ -32,6 +32,9 @@
 //! read as authoritative, and this one told an operator that a directive they
 //! had written was being rejected while the server was honouring it.
 
+mod stream;
+pub use stream::StreamEntry;
+
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 use std::fs::{File, OpenOptions};
