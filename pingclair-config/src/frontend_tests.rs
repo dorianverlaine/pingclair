@@ -349,6 +349,83 @@ fn http_shape_mistakes_fail_closed() {
 }
 
 #[test]
+fn bind_extends_the_listener_addresses() {
+    let native = crate::compile(
+        r#"
+        HTTPListener(on: ":8080") {
+            Site(host: "*") { Fallback { Respond(body: "hi") } }
+        }
+        .bind([":8081"])
+        "#,
+    )
+    .unwrap();
+    let legacy = crate::compile("http://:8080, http://:8081 {\n\trespond \"hi\"\n}\n").unwrap();
+    assert_eq!(
+        serde_json::to_value(native).unwrap(),
+        serde_json::to_value(legacy).unwrap()
+    );
+}
+
+#[test]
+fn protocols_toggle_http3_per_listener() {
+    let native = crate::compile(
+        r#"
+        HTTPListener(on: ":8080") {
+            Site(host: "*") { Fallback { Respond(body: "hi") } }
+        }
+        .protocols([.http1, .http2])
+        "#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "{\n\tservers :8080 {\n\t\tprotocols h1 h2\n\t}\n}\nhttp://:8080 {\n\trespond \"hi\"\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(native).unwrap(),
+        serde_json::to_value(legacy).unwrap()
+    );
+}
+
+#[test]
+fn limits_lower_to_the_resource_bounds() {
+    let native = crate::compile(
+        r#"
+        HTTPListener(on: ":9090") {
+            Site(host: "*") { Fallback { Respond(body: "hi") } }
+        }
+        .limits(headerTimeout: .seconds(30), maxConnections: 64)
+        "#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "http://:9090 {\n\tlimits {\n\t\theader_timeout 30s\n\t\tmax_connections 64\n\t}\n\trespond \"hi\"\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(native).unwrap(),
+        serde_json::to_value(legacy).unwrap()
+    );
+}
+
+#[test]
+fn http_listener_modifiers_fail_closed() {
+    for source in [
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"hi\") } } }.protocols([.http1])",
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"hi\") } } }.protocols([.http1, .http2, .http4])",
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"hi\") } } }.protocols([.http1, .http1, .http2])",
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"hi\") } } }.bind(\":8081\")",
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"hi\") } } }.bind([\":8080\"])",
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"hi\") } } }.bind([\":8081\"]).bind([\":8082\"])",
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"hi\") } } }.limits(longConnections: .seconds(1))",
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"hi\") } } }.limits(headerTimeout: 30)",
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"hi\") } } }.unknown(1)",
+    ] {
+        assert!(crate::compile(source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",

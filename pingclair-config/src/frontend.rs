@@ -8,7 +8,8 @@ use crate::bindings::Bindings;
 use crate::syntax::{self, Call, Declaration, Value};
 use pingclair_core::config::{
     AdminConfig, HandlerConfig, Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher,
-    PingclairConfig, RouteConfig, ServerConfig, normalize_listen_addr,
+    ListenerOptions, PingclairConfig, ResourceLimitsConfig, RouteConfig, ServerConfig,
+    normalize_listen_addr,
 };
 
 /// 📍 Reports location and expected structure without echoing configuration values.
@@ -87,7 +88,7 @@ pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
         }
         match call.name.as_str() {
             "TCPListener" => config.layer4.push(listener(&call)?),
-            "HTTPListener" => config.servers.extend(http_listener(&call)?),
+            "HTTPListener" => http_listener(&call, &mut config)?,
             "Admin" => {
                 call.leaf(&["listen"])?;
                 config.admin = Some(AdminConfig {
@@ -227,13 +228,92 @@ fn route(call: &Call) -> Result<Layer4Route, Error> {
 }
 
 /// 🌐 One plaintext HTTP listener serving one or more sites.
-fn http_listener(call: &Call) -> Result<Vec<ServerConfig>, Error> {
+fn http_listener(call: &Call, config: &mut PingclairConfig) -> Result<(), Error> {
     call.labels(&["on"])?;
-    let address = normalize_listen_addr(&call.string("on")?);
-    if let Some(modifier) = call.modifiers.first() {
-        return Err(modifier.at.error(
-            "HTTPListener modifiers are not implemented yet; `.bind`, `.protocols`, `.limits`, `.tls` and `.accessLog` follow in the next batches",
-        ));
+    let on = call.string("on")?;
+    let mut keys = vec![on.clone()];
+    let mut addresses = vec![normalize_listen_addr(&on)];
+    let mut protocols = None;
+    let mut limits = None;
+    let mut seen = std::collections::HashSet::new();
+    for modifier in &call.modifiers {
+        if !seen.insert(modifier.name.clone()) {
+            return Err(modifier.at.error("duplicate HTTPListener modifier"));
+        }
+        match modifier.name.as_str() {
+            "bind" => {
+                let [(None, Value::Array(items))] = modifier.args.as_slice() else {
+                    return Err(modifier
+                        .at
+                        .error("bind takes one array of quoted addresses"));
+                };
+                if modifier.body.is_some() {
+                    return Err(modifier.at.error("bind does not take a block"));
+                }
+                if items.is_empty() {
+                    return Err(modifier.at.error("bind needs at least one address"));
+                }
+                for item in items {
+                    let Value::String(address) = item else {
+                        return Err(modifier.at.error("bind takes quoted addresses"));
+                    };
+                    let normalized = normalize_listen_addr(address);
+                    if addresses.contains(&normalized) {
+                        return Err(modifier.at.error(format!("duplicate address '{address}'")));
+                    }
+                    keys.push(address.clone());
+                    addresses.push(normalized);
+                }
+            }
+            "protocols" => {
+                let [(None, Value::Array(items))] = modifier.args.as_slice() else {
+                    return Err(modifier
+                        .at
+                        .error("protocols takes one array of .http1, .http2 and .http3"));
+                };
+                if modifier.body.is_some() {
+                    return Err(modifier.at.error("protocols does not take a block"));
+                }
+                let mut names = Vec::new();
+                for item in items {
+                    let Value::Typed(value) = item else {
+                        return Err(modifier
+                            .at
+                            .error("protocols takes .http1, .http2 or .http3 values"));
+                    };
+                    if !value.args.is_empty() {
+                        return Err(value.at.error("a protocol value takes no arguments"));
+                    }
+                    names.push(value.name.as_str());
+                }
+                let mut unique = names.clone();
+                unique.sort_unstable();
+                unique.dedup();
+                if unique.len() != names.len() {
+                    return Err(modifier.at.error("duplicate protocol entry"));
+                }
+                if let Some(unknown) = unique
+                    .iter()
+                    .find(|name| !matches!(**name, "http1" | "http2" | "http3"))
+                {
+                    return Err(modifier.at.error(format!(
+                        "unknown protocol '.{unknown}'; expected .http1, .http2 or .http3"
+                    )));
+                }
+                if !(unique.contains(&"http1") && unique.contains(&"http2")) {
+                    return Err(modifier.at.error(
+                        "this build always serves h1 and h2; list `.http1` and `.http2` together and add `.http3` to offer QUIC",
+                    ));
+                }
+                protocols = Some(unique.contains(&"http3"));
+            }
+            "limits" => {
+                let mut bounds = ResourceLimitsConfig::default();
+                apply_http_limits(modifier, &mut bounds)?;
+                limits = Some(bounds);
+            }
+            _ => return Err(modifier.at.error("unknown HTTPListener modifier")),
+        }
     }
     let mut servers = Vec::new();
     for child in call.block()? {
@@ -242,16 +322,37 @@ fn http_listener(call: &Call) -> Result<Vec<ServerConfig>, Error> {
                 .at
                 .error("HTTPListener children must be Site components"));
         }
-        servers.push(site(child, &address)?);
+        servers.push(site(child, &addresses, limits.as_ref())?);
     }
     if servers.is_empty() {
         return Err(call.at.error("HTTPListener must contain at least one Site"));
     }
-    Ok(servers)
+    if let Some(http3) = protocols {
+        for key in keys {
+            if config.global.listener_options.contains_key(&key) {
+                return Err(call
+                    .at
+                    .error(format!("listener options for '{key}' are already declared")));
+            }
+            config.global.listener_options.insert(
+                key,
+                ListenerOptions {
+                    http3: Some(http3),
+                    ..ListenerOptions::default()
+                },
+            );
+        }
+    }
+    config.servers.extend(servers);
+    Ok(())
 }
 
 /// 🏠 One virtual host: the host it answers for and the routes it runs.
-fn site(call: &Call, address: &str) -> Result<ServerConfig, Error> {
+fn site(
+    call: &Call,
+    addresses: &[String],
+    limits: Option<&ResourceLimitsConfig>,
+) -> Result<ServerConfig, Error> {
     call.labels(&["host"])?;
     if let Some(modifier) = call.modifiers.first() {
         return Err(modifier.at.error("Site modifiers are not implemented yet"));
@@ -276,15 +377,70 @@ fn site(call: &Call, address: &str) -> Result<ServerConfig, Error> {
     Ok(ServerConfig {
         name,
         names,
-        listen: vec![address.to_string()],
-        plaintext_listen: vec![address.to_string()],
+        listen: addresses.to_vec(),
+        plaintext_listen: addresses.to_vec(),
         // 🧜 No `Encode` component yet: the site offers no compression, which is
         // what a Caddyfile without an `encode` directive compiles to. The legacy
         // gzip default on `ServerConfig` only applies to old JSON without the field.
         encodings: Vec::new(),
+        limits: limits.cloned().unwrap_or_default(),
         routes: vec![fallback_route(fallback)?],
         ..ServerConfig::default()
     })
+}
+
+/// 🧱 The listener-level bounds a `.limits(...)` modifier sets.
+fn apply_http_limits(call: &Call, limits: &mut ResourceLimitsConfig) -> Result<(), Error> {
+    call.leaf(&[
+        "headerTimeout",
+        "bodyTimeout",
+        "idleTimeout",
+        "requestTimeout",
+        "maxHeaders",
+        "maxHeaderBytes",
+        "maxConnections",
+        "uploadBytesPerSecond",
+        "downloadBytesPerSecond",
+        "longConnections",
+    ])?;
+    if call.get("longConnections").is_some() {
+        return Err(call
+            .at
+            .error("longConnections overrides are not implemented yet"));
+    }
+    if call.get("headerTimeout").is_some() {
+        limits.header_timeout_ms = Some(call.measure("headerTimeout", false)?);
+    }
+    if call.get("bodyTimeout").is_some() {
+        limits.body_timeout_ms = Some(call.measure("bodyTimeout", false)?);
+    }
+    if call.get("idleTimeout").is_some() {
+        limits.idle_timeout_ms = Some(call.measure("idleTimeout", false)?);
+    }
+    if call.get("requestTimeout").is_some() {
+        limits.request_timeout_ms = Some(call.measure("requestTimeout", false)?);
+    }
+    if call.get("maxHeaders").is_some() {
+        limits.max_header_count = Some(http_count(call, "maxHeaders")?);
+    }
+    if call.get("maxHeaderBytes").is_some() {
+        limits.max_header_bytes = Some(http_count(call, "maxHeaderBytes")?);
+    }
+    if call.get("maxConnections").is_some() {
+        limits.max_connections = Some(http_count(call, "maxConnections")?);
+    }
+    if call.get("uploadBytesPerSecond").is_some() {
+        limits.upload_bytes_per_sec = Some(call.measure("uploadBytesPerSecond", true)?);
+    }
+    if call.get("downloadBytesPerSecond").is_some() {
+        limits.download_bytes_per_sec = Some(call.measure("downloadBytesPerSecond", true)?);
+    }
+    Ok(())
+}
+
+fn http_count(call: &Call, key: &str) -> Result<usize, Error> {
+    usize::try_from(call.integer(key)?)
+        .map_err(|_| call.at.error(format!("{key} exceeds the platform range")))
 }
 
 /// 🧭 An unconditional HTTP route: one terminal handler.
