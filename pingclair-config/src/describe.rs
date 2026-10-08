@@ -125,6 +125,32 @@ pub const ENTRIES: &[Entry] = &[
 }"#,
     },
     Entry {
+        name: "tls",
+        kind: Kind::Modifier,
+        summary: "TLS for an HTTP listener: `.automatic`, `.internal` or `.files`.",
+        example: r#"HTTPListener(on: ":8443") {
+    Site(host: "localhost") { Fallback { Respond(body: "hello") } }
+}
+.tls(.internal)"#,
+        refusal: r#"HTTPListener(on: ":8443") {
+    Site(host: "localhost") { Fallback { Respond(body: "hello") } }
+}
+.tls(.acme(email: "admin@example.com"))"#,
+    },
+    Entry {
+        name: "accessLog",
+        kind: Kind::Modifier,
+        summary: "The listener's access log: `output` and `format`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") { Fallback { Respond(body: "hello") } }
+}
+.accessLog(output: .file("/tmp/access.log"), format: .json)"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") { Fallback { Respond(body: "hello") } }
+}
+.accessLog(output: .socket)"#,
+    },
+    Entry {
         name: "Admin",
         kind: Kind::Component,
         summary: "The admin endpoint; one declaration per file.",

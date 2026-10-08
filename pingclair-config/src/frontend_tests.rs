@@ -426,6 +426,84 @@ fn http_listener_modifiers_fail_closed() {
 }
 
 #[test]
+fn tls_variants_lower_like_their_caddyfile_twins() {
+    let cases = [
+        (
+            "HTTPListener(on: \":8443\") { Site(host: \"localhost\") { Fallback { Respond(body: \"hi\") } } }.tls(.internal)",
+            "https://localhost:8443 {\n\ttls internal\n\trespond \"hi\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8443\") { Site(host: \"example.test\") { Fallback { Respond(body: \"hi\") } } }.tls(.automatic(email: \"admin@example.com\"))",
+            "https://example.test:8443 {\n\ttls admin@example.com\n\trespond \"hi\"\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8443\") { Site(host: \"example.test\") { Fallback { Respond(body: \"hi\") } } }.tls(.files(certificate: \"/tmp/c.pem\", key: \"/tmp/k.pem\"))",
+            "https://example.test:8443 {\n\ttls /tmp/c.pem /tmp/k.pem\n\trespond \"hi\"\n}\n",
+        ),
+    ];
+    for (native_source, legacy_source) in cases {
+        let native = crate::adapt(native_source).unwrap();
+        let legacy = crate::adapt(legacy_source).unwrap();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::to_value(legacy).unwrap(),
+            "{native_source}"
+        );
+    }
+    // 🏛️ The internal authority needs no files and no public ACME, so it also
+    // passes the full validation gate.
+    assert!(crate::compile(cases[0].0).is_ok());
+}
+
+#[test]
+fn access_logs_lower_like_their_caddyfile_twins() {
+    let native = crate::compile(
+        r#"
+        HTTPListener(on: ":8080") {
+            Site(host: "*") { Fallback { Respond(body: "hi") } }
+        }
+        .accessLog(output: .file("/tmp/access.log"), format: .json)
+        "#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "http://:8080 {\n\tlog {\n\t\toutput file /tmp/access.log\n\t\tformat json\n\t}\n\trespond \"hi\"\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(native).unwrap(),
+        serde_json::to_value(legacy).unwrap()
+    );
+
+    let bare_native = crate::compile(
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"hi\") } } }.accessLog()",
+    )
+    .unwrap();
+    let bare_legacy = crate::compile("http://:8080 {\n\tlog\n\trespond \"hi\"\n}\n").unwrap();
+    assert_eq!(
+        serde_json::to_value(bare_native).unwrap(),
+        serde_json::to_value(bare_legacy).unwrap()
+    );
+}
+
+#[test]
+fn tls_and_log_mistakes_fail_closed() {
+    let prefix = "HTTPListener(on: \":8443\") { Site(host: \"localhost\") { Fallback { Respond(body: \"hi\") } } }";
+    for modifier in [
+        ".tls(.acme(email: \"x\"))",
+        ".tls(.files(certificate: \"/tmp/c.pem\"))",
+        ".tls(.internal(email: \"x\"))",
+        ".tls(.internal).tls(.internal)",
+        ".accessLog(output: .socket)",
+        ".accessLog(output: .file(1))",
+        ".accessLog(level: .info)",
+    ] {
+        let source = format!("{prefix}{modifier}");
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",

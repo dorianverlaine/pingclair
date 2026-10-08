@@ -8,8 +8,8 @@ use crate::bindings::Bindings;
 use crate::syntax::{self, Call, Declaration, Value};
 use pingclair_core::config::{
     AdminConfig, HandlerConfig, Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher,
-    ListenerOptions, PingclairConfig, ResourceLimitsConfig, RouteConfig, ServerConfig,
-    normalize_listen_addr,
+    ListenerOptions, LogConfig, LogFormat, LogOutput, LogRotation, PingclairConfig,
+    ResourceLimitsConfig, RouteConfig, ServerConfig, TlsConfig, normalize_listen_addr,
 };
 
 /// 📍 Reports location and expected structure without echoing configuration values.
@@ -234,7 +234,7 @@ fn http_listener(call: &Call, config: &mut PingclairConfig) -> Result<(), Error>
     let mut keys = vec![on.clone()];
     let mut addresses = vec![normalize_listen_addr(&on)];
     let mut protocols = None;
-    let mut limits = None;
+    let mut options = HttpListenerOptions::default();
     let mut seen = std::collections::HashSet::new();
     for modifier in &call.modifiers {
         if !seen.insert(modifier.name.clone()) {
@@ -310,8 +310,10 @@ fn http_listener(call: &Call, config: &mut PingclairConfig) -> Result<(), Error>
             "limits" => {
                 let mut bounds = ResourceLimitsConfig::default();
                 apply_http_limits(modifier, &mut bounds)?;
-                limits = Some(bounds);
+                options.limits = Some(bounds);
             }
+            "tls" => options.tls = Some(parse_tls(modifier)?),
+            "accessLog" => options.log = Some(parse_access_log(modifier)?),
             _ => return Err(modifier.at.error("unknown HTTPListener modifier")),
         }
     }
@@ -322,7 +324,7 @@ fn http_listener(call: &Call, config: &mut PingclairConfig) -> Result<(), Error>
                 .at
                 .error("HTTPListener children must be Site components"));
         }
-        servers.push(site(child, &addresses, limits.as_ref())?);
+        servers.push(site(child, &addresses, &options)?);
     }
     if servers.is_empty() {
         return Err(call.at.error("HTTPListener must contain at least one Site"));
@@ -351,7 +353,7 @@ fn http_listener(call: &Call, config: &mut PingclairConfig) -> Result<(), Error>
 fn site(
     call: &Call,
     addresses: &[String],
-    limits: Option<&ResourceLimitsConfig>,
+    options: &HttpListenerOptions,
 ) -> Result<ServerConfig, Error> {
     call.labels(&["host"])?;
     if let Some(modifier) = call.modifiers.first() {
@@ -378,14 +380,166 @@ fn site(
         name,
         names,
         listen: addresses.to_vec(),
-        plaintext_listen: addresses.to_vec(),
+        // 🛡️ A `.tls` listener terminates TLS; the site is not plaintext.
+        plaintext_listen: if options.tls.is_some() {
+            Vec::new()
+        } else {
+            addresses.to_vec()
+        },
+        tls: options.tls.clone(),
+        log: options.log.clone(),
         // 🧜 No `Encode` component yet: the site offers no compression, which is
         // what a Caddyfile without an `encode` directive compiles to. The legacy
         // gzip default on `ServerConfig` only applies to old JSON without the field.
         encodings: Vec::new(),
-        limits: limits.cloned().unwrap_or_default(),
+        limits: options.limits.clone().unwrap_or_default(),
         routes: vec![fallback_route(fallback)?],
         ..ServerConfig::default()
+    })
+}
+
+/// 🌐 Listener-level settings a modifier chain may carry.
+#[derive(Default)]
+struct HttpListenerOptions {
+    limits: Option<ResourceLimitsConfig>,
+    tls: Option<TlsConfig>,
+    log: Option<LogConfig>,
+}
+
+/// 🔐 The `.tls(...)` variants this build serves.
+fn parse_tls(modifier: &Call) -> Result<TlsConfig, Error> {
+    let [(None, Value::Typed(variant))] = modifier.args.as_slice() else {
+        return Err(modifier
+            .at
+            .error("tls takes one variant: .automatic, .internal or .files"));
+    };
+    if modifier.body.is_some() {
+        return Err(modifier.at.error("tls does not take a block"));
+    }
+    match variant.name.as_str() {
+        "internal" => {
+            variant.leaf(&[])?;
+            Ok(TlsConfig {
+                internal: true,
+                ..TlsConfig::default()
+            })
+        }
+        "automatic" => {
+            variant.leaf(&["email"])?;
+            let acme_email = if variant.get("email").is_some() {
+                Some(variant.string("email")?)
+            } else {
+                None
+            };
+            Ok(TlsConfig {
+                auto: true,
+                acme_email,
+                ..TlsConfig::default()
+            })
+        }
+        "files" => {
+            variant.leaf(&["certificate", "key"])?;
+            Ok(TlsConfig {
+                cert: Some(variant.string("certificate")?),
+                key: Some(variant.string("key")?),
+                ..TlsConfig::default()
+            })
+        }
+        other => Err(variant.at.error(format!(
+            "unknown TLS variant '.{other}'; expected .automatic, .internal or .files"
+        ))),
+    }
+}
+
+/// 🪵 The `.accessLog(...)` settings this build serves.
+fn parse_access_log(modifier: &Call) -> Result<LogConfig, Error> {
+    modifier.leaf(&[
+        "output",
+        "format",
+        "level",
+        "hostnames",
+        "include",
+        "exclude",
+        "sampling",
+        "rotation",
+    ])?;
+    for unsupported in [
+        "level",
+        "hostnames",
+        "include",
+        "exclude",
+        "sampling",
+        "rotation",
+    ] {
+        if modifier.get(unsupported).is_some() {
+            return Err(modifier.at.error(format!(
+                "{unsupported} in an access log is not implemented yet"
+            )));
+        }
+    }
+    let output = match modifier.get("output") {
+        None => LogOutput::Stdout,
+        Some(Value::Typed(value)) => match value.name.as_str() {
+            "stdout" => {
+                value.leaf(&[])?;
+                LogOutput::Stdout
+            }
+            "stderr" => {
+                value.leaf(&[])?;
+                LogOutput::Stderr
+            }
+            "file" => {
+                let [(None, Value::String(path))] = value.args.as_slice() else {
+                    return Err(value.at.error("file takes one quoted path"));
+                };
+                LogOutput::File(path.clone())
+            }
+            other => {
+                return Err(value.at.error(format!(
+                    "unknown log output '.{other}'; expected .stdout, .stderr or .file"
+                )));
+            }
+        },
+        Some(_) => {
+            return Err(modifier
+                .at
+                .error("output takes .stdout, .stderr or .file(...)"));
+        }
+    };
+    let format = match modifier.get("format") {
+        None => LogFormat::Text,
+        Some(Value::Typed(value)) => match value.name.as_str() {
+            "console" => {
+                value.leaf(&[])?;
+                LogFormat::Text
+            }
+            "json" => {
+                value.leaf(&[])?;
+                LogFormat::Json
+            }
+            other => {
+                return Err(value.at.error(format!(
+                    "unknown log format '.{other}'; expected .console or .json"
+                )));
+            }
+        },
+        Some(_) => {
+            return Err(modifier.at.error("format takes .console or .json"));
+        }
+    };
+    Ok(LogConfig {
+        output,
+        format,
+        level: None,
+        exclude_fields: Vec::new(),
+        rotation: LogRotation::default(),
+        request_headers: Vec::new(),
+        response_headers: Vec::new(),
+        include_tls: false,
+        hostnames: Vec::new(),
+        include: Vec::new(),
+        exclude: Vec::new(),
+        sampling: None,
     })
 }
 
