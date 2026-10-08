@@ -36,6 +36,13 @@ may appear once. Their order does not change behavior. Modifiers on other
 component types are rejected. Defaults and runtime behavior remain those in the
 [L4 guardrail](layer4.md), including static DNS resolution and bounded dialing.
 
+`HTTPListener(on: ":8080")` serves plaintext HTTP: each `Site(host: "example.com")`
+(or `host: "*"` for the catch-all) becomes a virtual host, and its
+`Fallback { Respond(body: "hello", status: 200) }` answers. HTTP route
+conditions, the remaining handlers, and the listener modifiers
+(`.bind`/`.protocols`/`.limits`/`.tls`/`.accessLog`) are refused with a message
+that names the next batch.
+
 File-level `let` bindings reuse values and component subtrees:
 
 ```swift
@@ -62,9 +69,10 @@ and argument lists allow trailing commas. Integers may use internal underscores.
 
 The top level also accepts `Admin(listen: "127.0.0.1:2019")`,
 `Metrics(enabled: true)`, and `Shutdown(grace: .seconds(5))`. Grace requires whole
-seconds. These declarations are optional and cannot repeat. This first frontend
-covers TCP configuration; HTTP, access-log declarations and dynamic DNS are not
-accepted yet. Unsupported components are errors, not ignored placeholders.
+seconds. These declarations are optional and cannot repeat. The frontend covers
+TCP configuration and plaintext HTTP sites; the remaining HTTP handlers,
+access-log declarations and dynamic DNS are not accepted yet. Unsupported
+components are errors, not ignored placeholders.
 
 ## 🛡️ Boundaries
 

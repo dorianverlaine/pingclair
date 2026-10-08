@@ -283,6 +283,72 @@ fn modifiers_must_follow_the_block() {
 }
 
 #[test]
+fn http_listener_sites_lower_to_the_existing_validated_model() {
+    let native = crate::compile(
+        r#"
+        HTTPListener(on: ":8080") {
+            Site(host: "*") {
+                Fallback { Respond(body: "hi", status: 200) }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    let legacy = crate::compile("http://:8080 {\n\trespond \"hi\" 200\n}\n").unwrap();
+    assert_eq!(
+        serde_json::to_value(native).unwrap(),
+        serde_json::to_value(legacy).unwrap()
+    );
+}
+
+#[test]
+fn named_sites_lower_like_their_caddyfile_twin() {
+    let native = crate::compile(
+        r#"
+        HTTPListener(on: ":8080") {
+            Site(host: "example.com") {
+                Fallback { Respond(body: "hi") }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    let legacy = crate::compile("http://example.com:8080 {\n\trespond \"hi\"\n}\n").unwrap();
+    assert_eq!(
+        serde_json::to_value(native).unwrap(),
+        serde_json::to_value(legacy).unwrap()
+    );
+}
+
+#[test]
+fn several_http_listeners_are_allowed() {
+    let config = crate::compile(
+        r#"
+        HTTPListener(on: ":8080") { Site(host: "a.test") { Fallback { Respond(body: "a") } } }
+        HTTPListener(on: ":8081") { Site(host: "b.test") { Fallback { Respond(body: "b") } } }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(config.servers.len(), 2);
+}
+
+#[test]
+fn http_shape_mistakes_fail_closed() {
+    for source in [
+        "HTTPListener(on: \":8080\") {}",
+        "HTTPListener(on: \":8080\") { Route(when: .tls(sni: [\"x\"])) { Proxy(to: \"127.0.0.1:80\") } }",
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"hi\") } } }.limits(connections: 8)",
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") {} }",
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback {} } }",
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { ServeFiles(root: \"./pub\") } } }",
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"hi\", status: 999999) } } }",
+        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .tls(sni: [\"x\"])) { Respond(body: \"hi\") } } }",
+    ] {
+        assert!(crate::compile(source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",

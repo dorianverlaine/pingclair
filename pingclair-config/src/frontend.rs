@@ -7,7 +7,8 @@ use crate::attributes::{Attr, resolve_attribute};
 use crate::bindings::Bindings;
 use crate::syntax::{self, Call, Declaration, Value};
 use pingclair_core::config::{
-    AdminConfig, Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher, PingclairConfig,
+    AdminConfig, HandlerConfig, Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher,
+    PingclairConfig, RouteConfig, ServerConfig, normalize_listen_addr,
 };
 
 /// 📍 Reports location and expected structure without echoing configuration values.
@@ -79,11 +80,14 @@ pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
                 "the Pingclair(version: ...) header was removed; declare components at the top level",
             ));
         }
-        if call.name != "TCPListener" && !seen.insert(call.name.clone()) {
+        if !matches!(call.name.as_str(), "TCPListener" | "HTTPListener")
+            && !seen.insert(call.name.clone())
+        {
             return Err(call.at.error("duplicate global declaration"));
         }
         match call.name.as_str() {
             "TCPListener" => config.layer4.push(listener(&call)?),
+            "HTTPListener" => config.servers.extend(http_listener(&call)?),
             "Admin" => {
                 call.leaf(&["listen"])?;
                 config.admin = Some(AdminConfig {
@@ -113,10 +117,9 @@ pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
             }
         }
     }
-    if config.layer4.is_empty() {
-        return Err(
-            syntax::Position { line: 1, column: 1 }.error("expected at least one TCPListener")
-        );
+    if config.layer4.is_empty() && config.servers.is_empty() {
+        return Err(syntax::Position { line: 1, column: 1 }
+            .error("expected at least one TCPListener or HTTPListener"));
     }
     Ok(config)
 }
@@ -221,6 +224,105 @@ fn route(call: &Call) -> Result<Layer4Route, Error> {
         matches,
         upstream: proxy.string("to")?,
     })
+}
+
+/// 🌐 One plaintext HTTP listener serving one or more sites.
+fn http_listener(call: &Call) -> Result<Vec<ServerConfig>, Error> {
+    call.labels(&["on"])?;
+    let address = normalize_listen_addr(&call.string("on")?);
+    if let Some(modifier) = call.modifiers.first() {
+        return Err(modifier.at.error(
+            "HTTPListener modifiers are not implemented yet; `.bind`, `.protocols`, `.limits`, `.tls` and `.accessLog` follow in the next batches",
+        ));
+    }
+    let mut servers = Vec::new();
+    for child in call.block()? {
+        if child.name != "Site" {
+            return Err(child
+                .at
+                .error("HTTPListener children must be Site components"));
+        }
+        servers.push(site(child, &address)?);
+    }
+    if servers.is_empty() {
+        return Err(call.at.error("HTTPListener must contain at least one Site"));
+    }
+    Ok(servers)
+}
+
+/// 🏠 One virtual host: the host it answers for and the routes it runs.
+fn site(call: &Call, address: &str) -> Result<ServerConfig, Error> {
+    call.labels(&["host"])?;
+    if let Some(modifier) = call.modifiers.first() {
+        return Err(modifier.at.error("Site modifiers are not implemented yet"));
+    }
+    let host = call.string("host")?;
+    let body = call.block()?;
+    let [fallback] = body else {
+        return Err(call
+            .at
+            .error("a Site needs exactly one Fallback until HTTP route conditions land"));
+    };
+    if fallback.name != "Fallback" {
+        return Err(fallback
+            .at
+            .error("HTTP route conditions are not implemented yet; use Fallback"));
+    }
+    let (name, names) = if host == "*" {
+        (Some("_".to_string()), Vec::new())
+    } else {
+        (Some(host.clone()), vec![host])
+    };
+    Ok(ServerConfig {
+        name,
+        names,
+        listen: vec![address.to_string()],
+        plaintext_listen: vec![address.to_string()],
+        // 🧜 No `Encode` component yet: the site offers no compression, which is
+        // what a Caddyfile without an `encode` directive compiles to. The legacy
+        // gzip default on `ServerConfig` only applies to old JSON without the field.
+        encodings: Vec::new(),
+        routes: vec![fallback_route(fallback)?],
+        ..ServerConfig::default()
+    })
+}
+
+/// 🧭 An unconditional HTTP route: one terminal handler.
+fn fallback_route(call: &Call) -> Result<RouteConfig, Error> {
+    call.labels(&[])?;
+    call.no_modifiers()?;
+    let body = call.block()?;
+    let [handler] = body else {
+        return Err(call.at.error("Fallback requires exactly one handler"));
+    };
+    Ok(RouteConfig {
+        path: "/*".to_string(),
+        handler: http_handler(handler)?,
+        methods: None,
+        matcher: None,
+    })
+}
+
+/// 🧰 HTTP terminal components; `Respond` is the first one implemented.
+fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
+    match call.name.as_str() {
+        "Respond" => {
+            call.leaf(&["body", "status"])?;
+            let status = match call.get("status") {
+                Some(_) => u16::try_from(call.integer("status")?)
+                    .map_err(|_| call.at.error("status must fit in 0..=65535"))?,
+                None => 200,
+            };
+            Ok(HandlerConfig::Respond {
+                status,
+                body: Some(call.string("body")?),
+                headers: std::collections::BTreeMap::new(),
+            })
+        }
+        _ => Err(call.at.error(
+            "unknown HTTP handler; `Respond` is implemented first and the rest follow in the next batches",
+        )),
+    }
 }
 
 impl Call {

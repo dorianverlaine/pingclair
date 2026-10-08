@@ -86,6 +86,45 @@ pub const ENTRIES: &[Entry] = &[
 }"#,
     },
     Entry {
+        name: "HTTPListener",
+        kind: Kind::Component,
+        summary: "A plaintext HTTP listener serving one or more sites.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { Respond(body: "hello", status: 200) }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {}"#,
+    },
+    Entry {
+        name: "Site",
+        kind: Kind::Component,
+        summary: "One virtual host inside an HTTP listener.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "example.test") {
+        Fallback { Respond(body: "hello") }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "example.test") { }
+}"#,
+    },
+    Entry {
+        name: "Respond",
+        kind: Kind::Component,
+        summary: "A fixed HTTP response: `Respond(body:, status:)`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { Respond(body: "hello", status: 200) }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { Respond(body: "hello", status: 999999) }
+    }
+}"#,
+    },
+    Entry {
         name: "Admin",
         kind: Kind::Component,
         summary: "The admin endpoint; one declaration per file.",
