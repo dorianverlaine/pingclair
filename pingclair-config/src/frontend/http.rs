@@ -2659,208 +2659,109 @@ fn php_fastcgi(call: &Call) -> Result<HandlerConfig, Error> {
 
 /// 🌐 `.Proxy(to:)`: the reverse proxy with the build's bare defaults.
 fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&[
-        "to",
-        "headersUp",
-        "headersDown",
-        "loadBalance",
-        "tryDuration",
-        "tryInterval",
-        "upstreamWeights",
-        "maxFails",
-        "failDuration",
-        "flushInterval",
-        "connectTimeout",
-        "firstByteTimeout",
-        "betweenReadsTimeout",
-        "readTimeout",
-        "writeTimeout",
-        "versions",
-        "healthCheck",
-        "upstreamTLS",
-    ])?;
-    let upstreams = upstream_addresses(call)?;
+    // 🌐 Identity stays in the call, policy goes in the modifier chain, which
+    // is the shape the RFC promised: `Proxy(to: […]).loadBalance(…)`.
+    call.labels(&["to", "headersUp", "headersDown"])?;
+    if call.body.is_some() {
+        return Err(call.at.error(
+            "Proxy does not take a block; write its policy as modifiers, as in \
+             `.loadBalance(.roundRobin)`",
+        ));
+    }
+    let upstreams = upstream_values(call)?;
     let up = header_list(call, "headersUp", false)?;
     let down = header_list(call, "headersDown", true)?;
-    let mut config = reverse_proxy(upstreams, None);
-    // 🎛️ Load balancing: the strategy, and the field the hashing strategies
-    // read their key from. `.weightedRoundRobin([2, 1])` is the Caddyfile's
-    // `lb_policy weighted_round_robin 2 1`, which is round-robin with the
-    // upstreams' weights set rather than a strategy of its own.
-    let mut policy_chosen: Option<&str> = None;
-    if let Some(value) = call.get("loadBalance") {
-        let Value::Typed(policy) = value else {
-            return Err(call
-                .at
-                .error("loadBalance takes a typed value such as .leastConn"));
-        };
-        match policy.name.as_str() {
-            "roundRobin" | "random" | "leastConn" | "ipHash" | "first" => {
-                policy.leaf(&[])?;
-                policy_chosen = Some(policy.name.as_str());
-                config.load_balance.strategy = match policy.name.as_str() {
-                    "roundRobin" => "round_robin",
-                    "leastConn" => "least_conn",
-                    "ipHash" => "ip_hash",
-                    other => other,
-                }
-                .to_string();
+    let mut config = reverse_proxy(
+        upstreams.iter().map(|item| item.address.clone()).collect(),
+        None,
+    );
+    config.upstream_options = upstreams;
+    let mut chosen_policy = None;
+    let mut seen = std::collections::HashSet::new();
+    for modifier in &call.modifiers {
+        if !seen.insert(modifier.name.clone()) {
+            return Err(modifier.at.error("duplicate Proxy modifier"));
+        }
+        match modifier.name.as_str() {
+            "loadBalance" => {
+                chosen_policy = Some(load_balance(modifier, &mut config)?);
             }
-            // 🔑 The hashing strategies that read a request field must name it:
-            // a cookie policy with no cookie hashes the same empty string for
-            // every client and pins the site to one upstream.
-            "header" | "cookie" | "query" => {
-                let [(None, Value::String(key))] = policy.args.as_slice() else {
-                    return Err(policy.at.error(format!(
-                        ".{} takes one name, such as .{}(\"X-User\")",
-                        policy.name, policy.name
-                    )));
+            "healthCheck" => {
+                config.health_check = Some(Box::new(health_check(
+                    &single_value(modifier, "healthCheck")?,
+                    modifier.at,
+                )?));
+            }
+            "upstreamTLS" => {
+                config.upstream_tls = Box::new(upstream_tls(
+                    &single_value(modifier, "upstreamTLS")?,
+                    modifier.at,
+                )?);
+            }
+            "timeouts" => proxy_timeouts(modifier, &mut config)?,
+            "retry" => proxy_retry(modifier, &mut config)?,
+            "flush" => {
+                let value = single_value(modifier, "flush")?;
+                config.flush_interval = Some(match &value {
+                    Value::Typed(value) if value.name == "immediate" => {
+                        value.leaf(&[])?;
+                        -1
+                    }
+                    Value::Typed(_) => i64::try_from(measured(&value, "flush", modifier.at)?)
+                        .map_err(|_| modifier.at.error("flush exceeds the supported range"))?,
+                    _ => {
+                        return Err(modifier
+                            .at
+                            .error("flush takes .immediate or one duration such as .seconds(1)"));
+                    }
+                });
+            }
+            "versions" => {
+                let value = single_value(modifier, "versions")?;
+                let Value::Typed(versions) = &value else {
+                    return Err(modifier
+                        .at
+                        .error("versions takes .http11, .h2 or .h2AndHttp11"));
                 };
-                policy_chosen = Some(policy.name.as_str());
-                config.load_balance.strategy = policy.name.clone();
-                config.load_balance.hash_key = Some(key.clone());
+                versions.leaf(&[])?;
+                config.upstream_versions = Some(match versions.name.as_str() {
+                    "http11" => UpstreamHttpVersions::Http11,
+                    "h2" => UpstreamHttpVersions::H2,
+                    "h2AndHttp11" => UpstreamHttpVersions::H2AndHttp11,
+                    other => {
+                        return Err(versions.at.error(format!(
+                            "unknown upstream version set '.{other}'; expected .http11, .h2 or \
+                             .h2AndHttp11"
+                        )));
+                    }
+                });
             }
             other => {
-                return Err(policy.at.error(format!(
-                    "unknown load balance policy '.{other}'; expected .roundRobin, .random, \
-                     .leastConn, .ipHash, .first, .header(\"…\"), .cookie(\"…\") or \
-                     .query(\"…\")"
+                return Err(modifier.at.error(format!(
+                    "unknown Proxy modifier '.{other}'; expected .loadBalance, .healthCheck, \
+                     .upstreamTLS, .timeouts, .retry, .flush or .versions"
                 )));
             }
         }
     }
-    let mut weights_given = false;
-    if let Some(value) = call.get("upstreamWeights") {
-        weights_given = true;
-        let Value::Array(weights) = value else {
-            return Err(call
-                .at
-                .error("upstreamWeights takes an array with one weight per upstream"));
-        };
-        if weights.len() != config.upstream_options.len() {
-            return Err(call.at.error(format!(
-                "{} weights were given for {} upstreams",
-                weights.len(),
-                config.upstream_options.len()
-            )));
-        }
-        for (option, weight) in config.upstream_options.iter_mut().zip(weights) {
-            let Value::Number(weight) = weight else {
-                return Err(call.at.error("upstreamWeights takes numbers"));
-            };
-            let weight = u32::try_from(*weight)
-                .map_err(|_| call.at.error("a weight must fit in 0..=4294967295"))?;
-            // 🚫 Zero is not "no traffic yet": the runtime clamps it to one,
-            // which is the opposite of what a drained backend asked for.
-            if weight == 0 {
-                return Err(call
-                    .at
-                    .error("a weight of 0 would be clamped to 1; leave the upstream out instead"));
-            }
-            option.weight = weight;
-        }
-    }
-    // 🚫 Weights are the round-robin strategy's own knob: writing them beside
-    // another policy asks for two different things, and silently keeping one
-    // is how a drained backend goes on serving.
-    if let Some(policy) = policy_chosen
-        && policy != "roundRobin"
-        && weights_given
-    {
-        return Err(call.at.error(format!(
-            "upstreamWeights belong to .roundRobin, not .{policy}; pick one"
-        )));
-    }
-    // 📌 Weights without a policy is round-robin with weights — what the
-    // Caddyfile's `lb_policy weighted_round_robin` means — so the strategy is
-    // spelled out rather than left to a default the JSON happens to carry.
-    if weights_given && policy_chosen.is_none() {
-        config.load_balance.strategy = "round_robin".to_string();
-    }
-    // ⏱️ `lb_try_duration` and `lb_try_interval`: how long the proxy keeps
-    // trying another upstream, and how long it waits between attempts.
-    if call.get("tryDuration").is_some() {
-        config.retry.total_timeout_ms = Some(call.measure("tryDuration", false)?);
-    }
-    if call.get("tryInterval").is_some() {
-        config.retry.backoff_ms = call.measure("tryInterval", false)?;
-    }
-    // 🩺 Passive health: how many failures retire an upstream, and for how long.
-    if call.get("maxFails").is_some() {
-        config.max_fails = Some(
-            u32::try_from(call.integer("maxFails")?)
-                .map_err(|_| call.at.error("maxFails must fit in 0..=4294967295"))?,
-        );
-    }
-    if call.get("failDuration").is_some() {
-        config.fail_duration_ms = Some(call.measure("failDuration", false)?);
-    }
-    // 🚿 Streaming: `.immediate` sends bytes as they arrive; a duration batches
-    // them, which is what a proxy in front of a video file wants.
-    if let Some(value) = call.get("flushInterval") {
-        config.flush_interval = Some(match value {
-            Value::Typed(value) if value.name == "immediate" => {
-                value.leaf(&[])?;
-                -1
-            }
-            _ => i64::try_from(call.measure("flushInterval", false)?)
-                .map_err(|_| call.at.error("flushInterval exceeds the supported range"))?,
-        });
-    }
-    // ⏱️ The transport's deadlines, flat rather than nested under
-    // `transport http { … }`: they are the same five knobs either way.
-    for (label, field) in [
-        ("connectTimeout", 0usize),
-        ("firstByteTimeout", 1),
-        ("betweenReadsTimeout", 2),
-        ("readTimeout", 3),
-        ("writeTimeout", 4),
-    ] {
-        if call.get(label).is_none() {
-            continue;
-        }
-        let millis = i64::try_from(call.measure(label, false)?).map_err(|_| {
-            call.at
-                .error(format!("{label} exceeds the supported range"))
-        })?;
-        match field {
-            0 => config.connect_timeout = Some(millis),
-            1 => config.first_byte_timeout = Some(millis),
-            2 => config.between_reads_timeout = Some(millis),
-            3 => config.read_timeout = Some(millis),
-            _ => config.write_timeout = Some(millis),
-        }
-    }
-    // 🔢 Which HTTP versions the upstream may be spoken to in. Only the three
-    // reachable states exist, because a fourth spelling would promise a
-    // combination the upstream stack cannot produce.
-    if let Some(value) = call.get("versions") {
-        let Value::Typed(versions) = value else {
-            return Err(call.at.error("versions takes .http11, .h2 or .h2AndHttp11"));
-        };
-        versions.leaf(&[])?;
-        config.upstream_versions = Some(match versions.name.as_str() {
-            "http11" => UpstreamHttpVersions::Http11,
-            "h2" => UpstreamHttpVersions::H2,
-            "h2AndHttp11" => UpstreamHttpVersions::H2AndHttp11,
-            other => {
-                return Err(versions.at.error(format!(
-                    "unknown upstream version set '.{other}'; expected .http11, .h2 or \
-                     .h2AndHttp11"
+    // 🌱 Weights are round-robin's own knob. Writing them beside another
+    // policy asks for two different things, and weighted round-robin is the
+    // strategy the Caddyfile spells as its own name — so the strategy is
+    // written out rather than left to a default the JSON happens to carry.
+    let weighted = config
+        .upstream_options
+        .iter()
+        .any(|option| option.weight != 1 || option.backup);
+    if weighted {
+        match chosen_policy {
+            Some(policy) if policy != "roundRobin" => {
+                return Err(call.at.error(format!(
+                    "weights and backup belong to .roundRobin, not .{policy}; pick one"
                 )));
             }
-        });
-    }
-    // 🩺 Active health checks: one probe endpoint per upstream, and the
-    // thresholds that decide when a peer leaves and rejoins rotation.
-    if let Some(value) = call.get("healthCheck") {
-        config.health_check = Some(Box::new(health_check(value, call.at)?));
-    }
-    // 🔒 The upstream's own TLS: the Caddyfile's `transport http { tls … }`,
-    // which is per-route policy rather than a global switch — a private CA
-    // here *replaces* the system trust store for this route alone.
-    if let Some(value) = call.get("upstreamTLS") {
-        config.upstream_tls = Box::new(upstream_tls(value, call.at)?);
+            Some(_) => {}
+            None => config.load_balance.strategy = "round_robin".to_string(),
+        }
     }
     config.headers_up = up.set;
     config.headers_up_add = up.add;
@@ -2872,6 +2773,230 @@ fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
     config.headers_down_replace = down.replace;
     config.headers_down_default = down.set_if_absent;
     Ok(HandlerConfig::ReverseProxy(Box::new(config)))
+}
+
+/// 🌐 `to:` — quoted addresses, or `.upstream(…)` values that carry their own
+/// weight and backup mark.
+///
+/// 📌 The weight travels with the address, which is the whole point of the
+/// value: a parallel array made reordering the list silently re-assign who
+/// weighs what, and no type could help.
+fn upstream_values(call: &Call) -> Result<Vec<ProxyUpstream>, Error> {
+    let Some(value) = call.get("to") else {
+        return Err(call.at.error(
+            "Proxy requires to: \"host:port\" or to: [.upstream(\"host:port\", weight: 2)]",
+        ));
+    };
+    let items: Vec<&Value> = match value {
+        Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    if items.is_empty() {
+        return Err(call.at.error("to needs at least one upstream"));
+    }
+    let typed = items.iter().any(|item| matches!(item, Value::Typed(_)));
+    if !typed {
+        return items
+            .iter()
+            .map(|item| {
+                let Value::String(address) = item else {
+                    return Err(call.at.error("to takes quoted addresses"));
+                };
+                Ok(ProxyUpstream {
+                    address: address.clone(),
+                    weight: 1,
+                    backup: false,
+                })
+            })
+            .collect();
+    }
+    let mut upstreams = Vec::new();
+    for item in items {
+        let Value::Typed(upstream) = item else {
+            return Err(call
+                .at
+                .error("to takes either quoted addresses or .upstream(…) values, not both"));
+        };
+        if upstream.name != "upstream" {
+            return Err(upstream.at.error(format!(
+                "unknown upstream value '.{}'; expected .upstream(\"host:port\", weight:, backup:)",
+                upstream.name
+            )));
+        }
+        let [(None, Value::String(address)), rest @ ..] = upstream.args.as_slice() else {
+            return Err(upstream
+                .at
+                .error(".upstream takes a quoted address, and optionally weight: and backup:"));
+        };
+        if rest.len() > 2 {
+            return Err(upstream
+                .at
+                .error(".upstream takes a quoted address, and optionally weight: and backup:"));
+        }
+        upstream.no_modifiers()?;
+        let weight = if upstream.get("weight").is_some() {
+            let weight = u32::try_from(upstream.integer("weight")?)
+                .map_err(|_| upstream.at.error("a weight must fit in 0..=4294967295"))?;
+            // 🚫 Zero is not "no traffic yet": the runtime clamps it to one,
+            // which is the opposite of what a drained backend asked for.
+            if weight == 0 {
+                return Err(upstream
+                    .at
+                    .error("a weight of 0 would be clamped to 1; leave the upstream out instead"));
+            }
+            weight
+        } else {
+            1
+        };
+        let backup = if upstream.get("backup").is_some() {
+            upstream.boolean("backup")?
+        } else {
+            false
+        };
+        upstreams.push(ProxyUpstream {
+            address: address.clone(),
+            weight,
+            backup,
+        });
+    }
+    Ok(upstreams)
+}
+
+/// 🎛️ `.loadBalance(…)`: the strategy, and the field a hashing one reads.
+fn load_balance(modifier: &Call, config: &mut ReverseProxyConfig) -> Result<String, Error> {
+    let [(None, Value::Typed(policy))] = modifier.args.as_slice() else {
+        return Err(modifier
+            .at
+            .error("loadBalance takes one policy such as .leastConn"));
+    };
+    let strategy = match policy.name.as_str() {
+        "roundRobin" | "random" | "leastConn" | "ipHash" | "first" => {
+            policy.leaf(&[])?;
+            match policy.name.as_str() {
+                "roundRobin" => "round_robin",
+                "leastConn" => "least_conn",
+                "ipHash" => "ip_hash",
+                other => other,
+            }
+        }
+        // 🔑 The hashing strategies that read a request field must name it: a
+        // cookie policy with no cookie hashes the same empty string for every
+        // client and pins the site to one upstream.
+        "header" | "cookie" | "query" => {
+            let [(None, Value::String(key))] = policy.args.as_slice() else {
+                return Err(policy.at.error(format!(
+                    ".{} takes one name, such as .{}(\"X-User\")",
+                    policy.name, policy.name
+                )));
+            };
+            policy.no_modifiers()?;
+            config.load_balance.hash_key = Some(key.clone());
+            match policy.name.as_str() {
+                "header" => "header",
+                "cookie" => "cookie",
+                _ => "query",
+            }
+        }
+        other => {
+            return Err(policy.at.error(format!(
+                "unknown load balance policy '.{other}'; expected .roundRobin, .random, \
+                 .leastConn, .ipHash, .first, .header(\"…\"), .cookie(\"…\") or .query(\"…\")"
+            )));
+        }
+    };
+    config.load_balance.strategy = strategy.to_string();
+    Ok(match strategy {
+        "round_robin" => "roundRobin".to_string(),
+        "least_conn" => "leastConn".to_string(),
+        "ip_hash" => "ipHash".to_string(),
+        other => other.to_string(),
+    })
+}
+
+/// ⏱️ `.timeouts(connect:, firstByte:, betweenReads:, read:, write:)`.
+fn proxy_timeouts(modifier: &Call, config: &mut ReverseProxyConfig) -> Result<(), Error> {
+    modifier.leaf(&["connect", "firstByte", "betweenReads", "read", "write"])?;
+    if modifier.args.is_empty() {
+        return Err(modifier.at.error("timeouts needs at least one deadline"));
+    }
+    let millis = |key: &str| -> Result<i64, Error> {
+        i64::try_from(modifier.measure(key, false)?).map_err(|_| {
+            modifier
+                .at
+                .error(format!("{key} exceeds the supported range"))
+        })
+    };
+    if modifier.get("connect").is_some() {
+        config.connect_timeout = Some(millis("connect")?);
+    }
+    if modifier.get("firstByte").is_some() {
+        config.first_byte_timeout = Some(millis("firstByte")?);
+    }
+    if modifier.get("betweenReads").is_some() {
+        config.between_reads_timeout = Some(millis("betweenReads")?);
+    }
+    if modifier.get("read").is_some() {
+        config.read_timeout = Some(millis("read")?);
+    }
+    if modifier.get("write").is_some() {
+        config.write_timeout = Some(millis("write")?);
+    }
+    Ok(())
+}
+
+/// \(\u{1f501}\) `.retry(tryDuration:, tryInterval:, maxFails:, failDuration:)`.
+fn proxy_retry(modifier: &Call, config: &mut ReverseProxyConfig) -> Result<(), Error> {
+    modifier.leaf(&["tryDuration", "tryInterval", "maxFails", "failDuration"])?;
+    if modifier.args.is_empty() {
+        return Err(modifier.at.error("retry needs at least one setting"));
+    }
+    if modifier.get("tryDuration").is_some() {
+        config.retry.total_timeout_ms = Some(modifier.measure("tryDuration", false)?);
+    }
+    if modifier.get("tryInterval").is_some() {
+        config.retry.backoff_ms = modifier.measure("tryInterval", false)?;
+    }
+    if modifier.get("maxFails").is_some() {
+        config.max_fails = Some(
+            u32::try_from(modifier.integer("maxFails")?)
+                .map_err(|_| modifier.at.error("maxFails must fit in 0..=4294967295"))?,
+        );
+    }
+    if modifier.get("failDuration").is_some() {
+        config.fail_duration_ms = Some(modifier.measure("failDuration", false)?);
+    }
+    Ok(())
+}
+
+/// 🌐 The one unlabelled value a modifier takes.
+fn single_value(modifier: &Call, name: &str) -> Result<Value, Error> {
+    let [(None, value)] = modifier.args.as_slice() else {
+        return Err(modifier.at.error(format!("{name} takes exactly one value")));
+    };
+    modifier.no_modifiers()?;
+    Ok(value.clone())
+}
+
+/// ⏱️ The duration a `.flush(.seconds(1))`-shaped value names.
+fn measured(value: &Value, name: &str, at: Position) -> Result<u64, Error> {
+    let Value::Typed(value) = value else {
+        return Err(at.error(format!("{name} takes a duration")));
+    };
+    let [(None, Value::Number(number))] = value.args.as_slice() else {
+        return Err(value.at.error(format!("{name} takes a duration")));
+    };
+    let factor = match value.name.as_str() {
+        "milliseconds" => 1,
+        "seconds" => 1_000,
+        "minutes" => 60_000,
+        "hours" => 3_600_000,
+        _ => return Err(value.at.error(format!("{name} takes a duration"))),
+    };
+    number.checked_mul(factor).ok_or_else(|| {
+        value
+            .at
+            .error(format!("{name} exceeds the supported range"))
+    })
 }
 
 /// 🏷️ One of a proxy's header lists, read with the components' own reader.
