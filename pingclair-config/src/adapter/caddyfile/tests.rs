@@ -145,8 +145,8 @@ mod global_tests {
         let handler = &routes.inner.arms[0].inner.handler;
         if let Handler::Proxy(proxy) = handler {
             assert_eq!(proxy.upstreams, vec!["127.0.0.1:3000"]);
-            assert!(proxy.header_up.contains_key("X-Forwarded-Proto"));
-            assert!(proxy.header_up.contains_key("X-Real-IP"));
+            assert!(proxy.header_up.set.contains_key("X-Forwarded-Proto"));
+            assert!(proxy.header_up.set.contains_key("X-Real-IP"));
             assert!(matches!(
                 proxy.flush_interval,
                 Some(FlushInterval::Immediate)
@@ -2082,18 +2082,70 @@ mod fail_closed_tests {
         );
     }
 
+    /// 🗄️ `header_up` takes the same shapes `header_down` does.
+    ///
+    /// A three-argument line is the rewrite form — the reference compiles
+    /// `header_up X-Foo a b` into a replace without requiring the `>` prefix
+    /// — and `?`, which the reference refuses on requests because a default
+    /// cannot be decided without the message, is refused here too. Before
+    /// this the request half knew only set and delete: `+Name` went upstream
+    /// as a literal header name, `?Name` turned every request into a 500 (an
+    /// invalid field name the transport rejected, with the client paying for
+    /// it), and the three-argument form was refused (#311).
     #[test]
-    fn reverse_proxy_rejects_header_up_with_extra_arguments() {
+    fn reverse_proxy_header_up_takes_the_same_shapes_as_header_down() {
+        use crate::parser::{Handler, adapt, parse};
+        let source = r#"
+            example.com {
+                reverse_proxy 127.0.0.1:3000 {
+                    header_up X-Set one
+                    header_up +X-Append two
+                    header_up -X-Remove
+                    header_up X-Rewrite old new
+                }
+            }
+        "#;
+        let ast = adapt(parse(source).unwrap()).unwrap();
+        let Handler::Proxy(proxy) = &ast.servers[0].inner.routes.as_ref().unwrap().inner.arms[0]
+            .inner
+            .handler
+        else {
+            panic!("Expected Proxy handler");
+        };
+        assert_eq!(
+            proxy.header_up.set.get("X-Set").map(String::as_str),
+            Some("one")
+        );
+        assert_eq!(
+            proxy
+                .header_up
+                .add
+                .get("X-Append")
+                .map(|values| values.as_slice()),
+            Some(&["two".to_string()][..])
+        );
+        assert_eq!(proxy.header_up.remove, vec!["X-Remove".to_string()]);
+        assert_eq!(
+            (
+                proxy.header_up.replace.len(),
+                proxy.header_up.replace[0].field.as_str(),
+                proxy.header_up.replace[0].search_regexp.as_str(),
+                proxy.header_up.replace[0].replace.as_str(),
+            ),
+            (1, "X-Rewrite", "old", "new"),
+            "a three-argument line is the rewrite form on requests too"
+        );
+
         let error = compile_err(
             r#"example.com {
                 reverse_proxy localhost:8080 {
-                    header_up X-Foo a b
+                    header_up ?X-Keep kept
                 }
             }"#,
         );
         assert!(
-            error.contains("header_up"),
-            "a third header_up argument must fail; got {error}"
+            error.contains("response headers only"),
+            "the reference refuses `?` on requests; got {error}"
         );
     }
 

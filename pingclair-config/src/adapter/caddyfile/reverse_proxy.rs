@@ -64,81 +64,46 @@ pub(super) fn adapt_reverse_proxy(d: Directive) -> Result<Handler, AdapterError>
                 name if name.starts_with('@') => {
                     response_matchers.insert(name.to_string(), parse_response_matcher(&sub)?);
                 }
-                "header_up" => {
-                    // header_up Key Value
-                    // Value may be a {placeholder} → preserved as-is for runtime resolution
-                    match sub.args.as_slice() {
-                        [key, value] => {
-                            proxy
-                                .header_up
-                                .insert(key.clone(), Expr::String(value.clone()));
-                        }
-                        // 🚫 `header_up -Name` takes that header off the
-                        // request before it reaches the origin. It is one
-                        // argument, so it used to be refused as "expects 2
-                        // arguments, got 1" — an argument-count mistake the
-                        // operator had not made, reported for the most
-                        // ordinary spelling of a delete.
-                        //
-                        // 🧭 A lone `-` is not a name and still falls through
-                        // to the count error below.
-                        [key] if key.len() > 1 && key.starts_with('-') => {
-                            proxy.header_up_remove.push(key[1..].to_string());
-                        }
-                        // 🚩 A third argument used to be silently dropped, so
-                        // `header_up X-Foo a b` sent only `a` upstream while
-                        // looking like it sent both.
-                        _ => {
-                            return Err(AdapterError::ArgumentCount(
-                                "header_up".into(),
-                                2,
-                                sub.args.len(),
-                            ));
-                        }
-                    }
-                }
-                "header_down" => {
-                    // 🗄️ The four shapes Caddy's `header_down` takes are the
-                    // ones `apply_header_op` already knows, because they are the
-                    // same four shapes its `header` directive takes:
-                    //
-                    //     header_down -X-Remove              (one argument)
-                    //     header_down X-Set hello            (two)
-                    //     header_down >X-Replace find found  (three)
-                    //
-                    // 📌 Sharing the parser rather than writing a second one is
-                    // what keeps the two directives from drifting — the corpus
-                    // that made `header` reject a bare field without a prefix,
-                    // and the arm order that makes a prefix beat a third
-                    // argument, both apply here for free.
+                // 🗄️ `header_up` and `header_down` take the same four shapes,
+                // and now share the parser the `header` directive already uses:
+                //
+                //     header_up   -X-Remove              (one argument)
+                //     header_down X-Set hello            (two)
+                //     header_up   >X-Replace find found  (three)
+                //
+                // 📌 Sharing the parser rather than writing a second one is
+                // what keeps the two directives from drifting — and they had
+                // drifted: the request half grew only set and delete, so
+                // `+Name` went upstream as a literal header name, `?Name`
+                // turned every request into a 500, and the three-argument
+                // rewrite was refused (#311). The prefix beats a third
+                // argument, and a bare field without a prefix is still a
+                // missing-value mistake, on both sides.
+                "header_up" | "header_down" => {
+                    let (directive, response_side, ops) = match sub.name.as_str() {
+                        "header_down" => ("header_down", true, &mut proxy.header_down),
+                        _ => ("header_up", false, &mut proxy.header_up),
+                    };
                     let args = &sub.args;
                     let (Some(field), replacement) = (args.first(), args.get(2)) else {
-                        return Err(AdapterError::ArgumentCount(
-                            "header_down".into(),
-                            2,
-                            args.len(),
-                        ));
+                        return Err(AdapterError::ArgumentCount(directive.into(), 2, args.len()));
                     };
                     if args.len() > 3 {
-                        return Err(AdapterError::ArgumentCount(
-                            "header_down".into(),
-                            3,
-                            args.len(),
-                        ));
+                        return Err(AdapterError::ArgumentCount(directive.into(), 3, args.len()));
                     }
                     // 🚩 Same deliberate divergence as the `header` directive,
-                    // for the same reason: a response header whose value is
-                    // empty is almost always a removal typed without its `-`.
+                    // for the same reason: a header whose value is empty is
+                    // almost always a removal typed without its `-`.
                     if args.len() == 1 && !field.starts_with(['-', '+', '?', '>']) {
-                        return Err(AdapterError::ArgumentCount("header_down".into(), 2, 1));
+                        return Err(AdapterError::ArgumentCount(directive.into(), 2, 1));
                     }
                     apply_header_op(
-                        "header_down",
-                        &mut proxy.header_down,
+                        directive,
+                        ops,
                         field,
                         args.get(1).cloned().unwrap_or_default(),
                         replacement,
-                        true,
+                        response_side,
                     )?;
                 }
                 "dynamic" => {

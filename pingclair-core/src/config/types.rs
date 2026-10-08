@@ -2292,6 +2292,28 @@ pub struct ReverseProxyConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers_up_remove: Vec<String>,
 
+    /// 🗄️ Upstream-request headers to append rather than set, from
+    /// `header_up +Name Value`.
+    ///
+    /// 📋 Multi-valued for the same reason as the response side: two
+    /// `+Name` lines are two field lines, not one folded value (#276).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_probe_headers",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub headers_up_add: BTreeMap<String, Vec<String>>,
+
+    /// 🔁 Search-and-replace over an upstream request header's existing value,
+    /// from `header_up >Name Search Replace`.
+    ///
+    /// 📌 There is no request-side `?N` default: the reference refuses the
+    /// modifier on requests ("a default cannot be decided without the
+    /// message"), and the shared parser refuses it with that sentence instead
+    /// of sending a literal `?Name` upstream (#311).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers_up_replace: Vec<HeaderReplacement>,
+
     /// Flush interval in milliseconds (-1 for immediate)
     pub flush_interval: Option<i64>,
 

@@ -161,8 +161,13 @@ pub struct RequestContext {
     pub upstream: Option<Upstream>,
     /// Extra headers to add upstream
     pub headers_upstream: BTreeMap<String, String>,
+    /// 📋 Upstream request headers to append, from `header_up +Name Value`.
+    pub headers_upstream_add: BTreeMap<String, Vec<String>>,
     /// 🚫 Header names to take off the upstream request, from `header_up -Name`.
     pub headers_upstream_remove: Vec<String>,
+    /// 🔁 Rewrites over an upstream request header's existing value, from
+    /// `header_up >Name find replacement`.
+    pub headers_upstream_replace: Vec<pingclair_core::config::HeaderReplacement>,
     /// 🧭 Transport-neutral downstream response header mutations.
     pub(crate) response_headers: ResponseHeaderPolicy,
     /// 🗜️ Coding agreed between this client's `Accept-Encoding` and the
@@ -340,7 +345,9 @@ impl Default for RequestContext {
             cache_size_tracked: false,
             upstream: None,
             headers_upstream: BTreeMap::new(),
+            headers_upstream_add: BTreeMap::new(),
             headers_upstream_remove: Vec::new(),
+            headers_upstream_replace: Vec::new(),
             response_headers: ResponseHeaderPolicy::default(),
             negotiated_encoding: None,
             streaming_response: false,
@@ -3428,10 +3435,21 @@ impl PingclairProxy {
             ),
         };
         let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
-        let prepared_request = crate::fastcgi::prepare_request_header(
+        let mut prepared_request = crate::fastcgi::prepare_request_header(
             session.req_header(),
             &config.headers_up,
+            &config.headers_up_add,
             &config.headers_up_remove,
+            verified_client_ip.as_deref(),
+            ctx.request_scheme,
+            &ctx.request_vars,
+        )
+        .map_err(|()| proxy_error(500, "FastCGI upstream header is invalid"))?;
+        crate::fastcgi::apply_request_replacements(
+            &mut prepared_request,
+            &config.headers_up_replace,
+            &state,
+            route_index,
             verified_client_ip.as_deref(),
             ctx.request_scheme,
             &ctx.request_vars,
@@ -4057,10 +4075,11 @@ impl PingclairProxy {
     /// `-Foo` beside a `Foo` set in the same block removes it, rather than the
     /// two racing on declaration order.
     #[allow(clippy::too_many_arguments)]
-    fn apply_request_headers(
+    fn apply_request_header_ops(
         &self,
-        session: &mut Session,
-        ctx: &mut RequestContext,
+        target: &mut pingora_http::RequestHeader,
+        source: &pingora_http::RequestHeader,
+        ctx: &RequestContext,
         route_index: usize,
         set: &std::collections::BTreeMap<String, String>,
         add: &std::collections::BTreeMap<String, Vec<String>>,
@@ -4086,7 +4105,7 @@ impl PingclairProxy {
             let value = if template.contains('{') {
                 resolve_caddy_placeholders(
                     template,
-                    session.req_header(),
+                    source,
                     verified_client_ip.as_deref(),
                     scheme,
                     &ctx.request_vars,
@@ -4098,7 +4117,7 @@ impl PingclairProxy {
             resolved.push((name.clone(), value, is_add));
         }
 
-        let header = session.req_header_mut();
+        let header = target;
         for (name, value, is_add) in resolved {
             let failed = if is_add {
                 header.append_header(name.clone(), value).is_err()
@@ -5253,7 +5272,21 @@ impl PingclairProxy {
                 remove,
                 replace,
             } => {
-                self.apply_request_headers(session, ctx, route_index, set, add, remove, replace)?;
+                // 🧭 The client's own request header is both the placeholder
+                // source and the target of these ops; one snapshot keeps the
+                // borrows apart, and only routes that configure the directive
+                // pay for it.
+                let source = session.req_header().clone();
+                self.apply_request_header_ops(
+                    session.req_header_mut(),
+                    &source,
+                    ctx,
+                    route_index,
+                    set,
+                    add,
+                    remove,
+                    replace,
+                )?;
                 Ok(false)
             }
             HandlerConfig::RequestBody {
@@ -7796,7 +7829,9 @@ impl ProxyHttp for PingclairProxy {
             };
             if let Some(proxy_config) = &proxy_config {
                 ctx.headers_upstream = proxy_config.headers_up.clone();
+                ctx.headers_upstream_add = proxy_config.headers_up_add.clone();
                 ctx.headers_upstream_remove = proxy_config.headers_up_remove.clone();
+                ctx.headers_upstream_replace = proxy_config.headers_up_replace.clone();
                 ctx.streaming_response = wants_immediate_flush(proxy_config.flush_interval);
             }
             // ⌛ Only the whole-request deadline bounds this attempt; see the
@@ -7874,7 +7909,9 @@ impl ProxyHttp for PingclairProxy {
             Self::enforce_request_deadline(ctx)?;
             if let Some(proxy_config) = &proxy_config {
                 ctx.headers_upstream = proxy_config.headers_up.clone();
+                ctx.headers_upstream_add = proxy_config.headers_up_add.clone();
                 ctx.headers_upstream_remove = proxy_config.headers_up_remove.clone();
+                ctx.headers_upstream_replace = proxy_config.headers_up_replace.clone();
                 ctx.streaming_response = wants_immediate_flush(proxy_config.flush_interval);
             }
             // ⌛ `lb_try_duration` is deliberately absent here. It decides
@@ -8053,39 +8090,39 @@ impl ProxyHttp for PingclairProxy {
                 .keys()
                 .any(|key| key.eq_ignore_ascii_case(name))
                 || ctx
+                    .headers_upstream_add
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case(name))
+                || ctx
                     .headers_upstream_remove
                     .iter()
                     .any(|key| key.eq_ignore_ascii_case(name))
+                || ctx
+                    .headers_upstream_replace
+                    .iter()
+                    .any(|replacement| replacement.field.eq_ignore_ascii_case(name))
         };
 
-        // Add configured upstream headers with variable resolution
-        let needs_placeholder = ctx
-            .headers_upstream
-            .values()
-            .any(|template| template.contains('{'));
-        let verified_client_ip = if needs_placeholder {
-            ctx.verified_client_ip.map(|ip| ip.to_string())
-        } else {
-            None
-        };
-        for (key, value_template) in &ctx.headers_upstream {
-            let resolved = resolve_caddy_placeholders(
-                value_template,
-                downstream_headers,
-                verified_client_ip.as_deref(),
-                ctx.request_scheme,
-                &ctx.request_vars,
-            );
-            upstream_request.insert_header(key.clone(), resolved.as_ref())?;
-        }
-
-        // 🚫 Deletions run after the sets and before the automatic headers
-        // below, which is the order Caddy's `HeaderOps` applies them in — so
-        // `header_up -Name` also removes whatever the client sent, rather than
+        // 🗄️ Configured upstream headers — set, `+` add, `-` remove and the
+        // `>` rewrite — are applied by the shared request-op applier below,
+        // which resolves each placeholder against the request as it stands.
+        // 🗄️ `header_up` is the same four shapes a site's `request_header`
+        // gives the client's request, applied to the request the origin will
+        // see — one implementation, so the two cannot drift again (#311).
+        // Placeholders resolve against the request as the client sent it, and
+        // deletions run before the automatic headers below, so
+        // `header_up -Name` also removes whatever the client sent rather than
         // only declining to add one of our own.
-        for name in &ctx.headers_upstream_remove {
-            upstream_request.remove_header(name.as_str());
-        }
+        self.apply_request_header_ops(
+            upstream_request,
+            downstream_headers,
+            ctx,
+            ctx.route_index.unwrap_or(0),
+            &ctx.headers_upstream,
+            &ctx.headers_upstream_add,
+            &ctx.headers_upstream_remove,
+            &ctx.headers_upstream_replace,
+        )?;
 
         // Add standard proxy headers (only if not already configured by user)
         if !has_header_up("X-Forwarded-Proto") {
@@ -9720,6 +9757,25 @@ pub(crate) fn collect_route_regexes(
         // already failed, so compiling it lazily would put the cost exactly
         // where the machine can least afford it.
         HandlerConfig::ReverseProxy(proxy) => {
+            // 🔁 A request-side rewrite (`header_up >Name find replacement`)
+            // searches with a regex exactly as the response side does, and it
+            // is compiled here for the same reason: the pattern is known at
+            // load and cannot change per request (#311).
+            for replacement in &proxy.headers_up_replace {
+                if replacement.search_regexp.contains('{') {
+                    continue;
+                }
+                match Regex::new(&replacement.search_regexp) {
+                    Ok(regex) => {
+                        regexes.insert(replacement.search_regexp.clone(), Arc::new(regex));
+                    }
+                    Err(error) => tracing::error!(
+                        pattern = %replacement.search_regexp,
+                        %error,
+                        "🧯 Invalid header_up replace regex"
+                    ),
+                }
+            }
             for predicate in &proxy.retry.retry_match {
                 predicate.for_each_regex(&mut |pattern| match Regex::new(pattern) {
                     Ok(regex) => {

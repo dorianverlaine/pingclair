@@ -27,6 +27,19 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🗄️ `header_up` takes the same shapes as `header_down`
+
+The reference gives both directives one set of shapes — `X v` sets, `+X v`
+appends, `-X` removes, and a three-argument line rewrites — and the two halves
+had drifted: the request side knew only set and delete. A `+Name` line reached
+the origin as a field literally named `+Name`, a `?Name` line became an
+invalid field name that turned every request into a 500, and the rewrite was
+refused as an argument-count mistake. Both directives now share the parser the
+`header` directive already used, and the request side is applied by the same
+applier a site's `request_header` uses, FastCGI included. `?` is refused at
+load with the reference's own reason — a request default cannot be decided —
+which is the one shape upstream does not take either (#311).
+
 ### 🛡️ A site-wide guard keeps its place in the directive order
 
 `redir` ranks ahead of `basic_auth` in the order table, and the reference

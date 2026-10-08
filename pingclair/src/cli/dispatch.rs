@@ -767,6 +767,10 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 max_fails: None,
                 fail_duration_ms: None,
                 headers_up,
+                // 🚫 The one-liner's `--header-up X=value` spells a set and
+                // nothing else; the other shapes belong to a Pingclairfile.
+                headers_up_add: Default::default(),
+                headers_up_replace: Vec::new(),
                 headers_down: headers_down.into_iter().collect(),
                 // 🚫 The one-liner has no `+Name`/`?Name`/`-Name` spelling and
                 // no three-argument replacement to offer, so there is nothing

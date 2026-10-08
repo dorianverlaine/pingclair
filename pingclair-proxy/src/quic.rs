@@ -5288,10 +5288,21 @@ async fn fastcgi_upstream(
         }
     };
 
-    let prepared_request = crate::fastcgi::prepare_request_header(
+    let mut prepared_request = crate::fastcgi::prepare_request_header(
         request_header,
         &proxy_config.headers_up,
+        &proxy_config.headers_up_add,
         &proxy_config.headers_up_remove,
+        Some(verified_client_ip),
+        "https",
+        request_vars,
+    )
+    .map_err(|()| (500, "FastCGI Upstream Header Is Invalid"))?;
+    crate::fastcgi::apply_request_replacements(
+        &mut prepared_request,
+        &proxy_config.headers_up_replace,
+        state,
+        route_index,
         Some(verified_client_ip),
         "https",
         request_vars,

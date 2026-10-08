@@ -3120,7 +3120,9 @@ fn compile_handler(
                 max_fails: proxy.max_fails,
                 fail_duration_ms: proxy.fail_duration_ms,
                 headers_up: BTreeMap::new(),
+                headers_up_add: BTreeMap::new(),
                 headers_up_remove: Vec::new(),
+                headers_up_replace: Vec::new(),
                 headers_down: BTreeMap::new(),
                 headers_down_add: BTreeMap::new(),
                 headers_down_remove: Vec::new(),
@@ -3189,16 +3191,16 @@ fn compile_handler(
                 });
             }
 
-            // Header up
-            for (key, value) in &proxy.header_up {
-                let value_str = match value {
-                    Expr::String(s) => s.clone(),
-                    Expr::Variable(v) => format!("${{{}}}", v.path),
-                    _ => continue,
-                };
-                config.headers_up.insert(key.clone(), value_str);
-            }
-            config.headers_up_remove = proxy.header_up_remove.clone();
+            // 🗄️ Header up. The op set the DSL built is spread back into the
+            // flat fields the runtime reads, exactly as the response side is
+            // below — the two directives now share one parser, so they carry
+            // the same shapes (#311). There is no request-side `?N` field: the
+            // reference refuses that modifier on requests and the parser
+            // refuses it first.
+            config.headers_up = proxy.header_up.set.clone();
+            config.headers_up_add = proxy.header_up.add.clone();
+            config.headers_up_remove = proxy.header_up.remove.clone();
+            config.headers_up_replace = proxy.header_up.replace.clone();
 
             // 🗄️ Header down. The op set the DSL built is spread back into the
             // flat fields the runtime reads — the same fields the JSON

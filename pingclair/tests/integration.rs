@@ -4812,6 +4812,84 @@ async fn test_pingclairfile_header_replace_rewrites_an_upstream_value() {
     upstream_task.await.unwrap();
 }
 
+/// 🗄️ `header_up` takes the same shapes `header_down` does.
+///
+/// The request half used to know only set and delete — `+Name` reached the
+/// origin as a field literally named `+Name`, `?Name` turned every request
+/// into a 500 (an invalid field name the transport rejected, with the client
+/// paying for it), and the three-argument rewrite was refused (#311). One
+/// implementation now serves both directives; this drives the three remaining
+/// shapes through a real upstream and reads back the head it received.
+#[tokio::test]
+async fn test_pingclairfile_header_up_shapes_reach_the_origin() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let head = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
+        let body = String::from_utf8_lossy(&head).to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+
+    let config = format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            reverse_proxy http://{upstream_address} {{
+                header_up +X-Append two
+                header_up -X-Remove
+                header_up X-Rewrite old new
+            }}
+        }}
+    "#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let response = no_proxy_client()
+        .get(server.url(0, "/probe"))
+        .header("X-Append", "one")
+        .header("X-Remove", "gone")
+        .header("X-Rewrite", "old value")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let seen = response.text().await.unwrap().to_ascii_lowercase();
+    assert!(
+        seen.contains("x-append: one\r\nx-append: two\r\n"),
+        "the client's value and the appended one must both arrive: {seen}"
+    );
+    assert!(
+        !seen.contains("x-remove"),
+        "a removed field must not reach the origin: {seen}"
+    );
+    assert!(
+        seen.contains("x-rewrite: new value\r\n"),
+        "the rewrite must run against what the client sent: {seen}"
+    );
+    upstream_task.await.unwrap();
+}
+
 /// 🧵 The shape most Caddy configurations are actually written in.
 ///
 /// Middleware and a terminal in one `handle` block is the ordinary way to
