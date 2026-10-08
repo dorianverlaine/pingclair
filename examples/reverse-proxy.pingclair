@@ -22,6 +22,10 @@ HTTPListener(on: ":8080") {
             // 🗄️ Store fresh upstream responses for a while; the ceiling is
             // process-wide and shared by every cached route.
             .cache(ttl: .seconds(30), maxSize: .mebibytes(128))
+            // 🧱 Memory ceilings, admission limits, and a per-upstream circuit.
+            .buffers(request: .mebibytes(4), response: .unlimited)
+            .overload(maxInFlight: 256, maxPending: 128, pendingTimeout: .seconds(1))
+            .circuitBreaker(consecutiveFailures: 5, openFor: .seconds(30))
         }
 
         // 🌐 DNS-discovered upstreams: the peers come from the service records

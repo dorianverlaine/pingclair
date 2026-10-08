@@ -1807,6 +1807,61 @@ fn proxy_header_lists_lower_like_their_caddyfile_twins() {
     assert_eq!(twin(native), twin(legacy));
 }
 
+/// 🧱 Every `reverse_proxy` runtime knob that used to be Caddyfile-only now
+/// has a spelling, and it lowers to exactly the same configuration.
+#[test]
+fn the_remaining_proxy_knobs_lower_like_their_caddyfile_twins() {
+    let cases: [(&str, &str); 3] = [
+        (
+            r#"Proxy(to: "127.0.0.1:9000").buffers(request: .mebibytes(4), response: .unlimited)"#,
+            "reverse_proxy 127.0.0.1:9000 {\n\t\trequest_buffers 4MiB\n\t\tresponse_buffers unlimited\n\t}",
+        ),
+        (
+            r#"Proxy(to: "127.0.0.1:9000").overload(maxInFlight: 100, maxPending: 50, pendingTimeout: .seconds(1), upstreamMaxConnections: 10)"#,
+            "reverse_proxy 127.0.0.1:9000 {\n\t\toverload {\n\t\t\tmax_in_flight 100\n\t\t\tmax_pending 50\n\t\t\tpending_timeout 1s\n\t\t\tupstream_max_connections 10\n\t\t}\n\t}",
+        ),
+        (
+            r#"Proxy(to: "127.0.0.1:9000").circuitBreaker(consecutiveFailures: 5, errorRatePercent: 50, minimumRequests: 20, windowRequests: 100, openFor: .seconds(30), halfOpenRequests: 2, failureStatuses: [503, 502])"#,
+            "reverse_proxy 127.0.0.1:9000 {\n\t\tcircuit_breaker {\n\t\t\tconsecutive_failures 5\n\t\t\terror_rate_percent 50\n\t\t\tminimum_requests 20\n\t\t\twindow_requests 100\n\t\t\topen_for 30s\n\t\t\thalf_open_requests 2\n\t\t\tfailure_statuses 503 502\n\t\t}\n\t}",
+        ),
+    ];
+    for (handler, legacy_body) in cases {
+        let native = crate::compile(&format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {handler} }} }} }}"
+        ))
+        .unwrap();
+        let legacy = crate::compile(&format!("http://:8080 {{\n\t{legacy_body}\n}}")).unwrap();
+        assert_eq!(twin(native), twin(legacy), "{handler}");
+    }
+}
+
+#[test]
+fn the_remaining_proxy_knob_mistakes_fail_closed() {
+    let site = |handler: &str| {
+        format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {handler} }} }} }}"
+        )
+    };
+    for handler in [
+        r#"Proxy(to: "127.0.0.1:9000").buffers()"#,
+        r#"Proxy(to: "127.0.0.1:9000").buffers(request: 0)"#,
+        r#"Proxy(to: "127.0.0.1:9000").buffers(request: .seconds(1))"#,
+        r#"Proxy(to: "127.0.0.1:9000").buffers(unknown: .mebibytes(1))"#,
+        r#"Proxy(to: "127.0.0.1:9000").overload()"#,
+        r#"Proxy(to: "127.0.0.1:9000").overload(pendingTimeout: .seconds(1))"#,
+        r#"Proxy(to: "127.0.0.1:9000").overload(maxInFlight: 0)"#,
+        r#"Proxy(to: "127.0.0.1:9000").circuitBreaker()"#,
+        r#"Proxy(to: "127.0.0.1:9000").circuitBreaker(minimumRequests: 10)"#,
+        r#"Proxy(to: "127.0.0.1:9000").circuitBreaker(errorRatePercent: 101)"#,
+        r#"Proxy(to: "127.0.0.1:9000").circuitBreaker(consecutiveFailures: 5, failureStatuses: [])"#,
+        r#"Proxy(to: "127.0.0.1:9000").circuitBreaker(consecutiveFailures: 5, failureStatuses: [200])"#,
+        r#"Proxy(to: "127.0.0.1:9000").circuitBreaker(consecutiveFailures: 0)"#,
+    ] {
+        let source = site(handler);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
 /// 🌐 `dynamic:` lowers exactly like the Caddyfile's `dynamic` directive.
 #[test]
 fn proxy_dynamic_upstreams_lower_like_their_caddyfile_twins() {

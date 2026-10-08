@@ -1499,6 +1499,9 @@ fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
             "timeouts" => proxy_timeouts(modifier, &mut config)?,
             "retry" => proxy_retry(modifier, &mut config)?,
             "cache" => config.cache = Some(Box::new(proxy_cache(modifier)?)),
+            "buffers" => proxy_buffers(modifier, &mut config)?,
+            "overload" => proxy_overload(modifier, &mut config)?,
+            "circuitBreaker" => proxy_circuit_breaker(modifier, &mut config)?,
             "flush" => {
                 let value = single_value(modifier, "flush")?;
                 config.flush_interval = Some(match &value {
@@ -1538,7 +1541,8 @@ fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
             other => {
                 return Err(modifier.at.error(format!(
                     "unknown Proxy modifier '.{other}'; expected .loadBalance, .healthCheck, \
-                     .upstreamTLS, .timeouts, .retry, .cache, .flush or .versions"
+                     .upstreamTLS, .timeouts, .retry, .cache, .buffers, .overload, \
+                     .circuitBreaker, .flush or .versions"
                 )));
             }
         }
@@ -2019,6 +2023,174 @@ fn port_number(value: &Value, setting: &str, at: Position) -> Result<u16, Error>
         Value::Number(port) if (1..=65535).contains(port) => Ok(*port as u16),
         _ => Err(at.error(format!("{setting} takes a port between 1 and 65535"))),
     }
+}
+
+/// 🧱 `.buffers(request:, response:)`: how much of a body is read into memory
+/// before any of it moves on.
+///
+/// 📌 `.unlimited` is accepted and encoded as `-1`, the way the Caddyfile
+/// spells it; the runtime puts its own ceiling on that (`body_buffer.rs`).
+fn proxy_buffers(modifier: &Call, config: &mut ReverseProxyConfig) -> Result<(), Error> {
+    modifier.leaf(&["request", "response"])?;
+    if modifier.args.is_empty() {
+        return Err(modifier
+            .at
+            .error("buffers needs request:, response:, or both"));
+    }
+    if modifier.get("request").is_some() {
+        config.request_buffer_bytes = Some(buffer_size(modifier, "request")?);
+    }
+    if modifier.get("response").is_some() {
+        config.response_buffer_bytes = Some(buffer_size(modifier, "response")?);
+    }
+    Ok(())
+}
+
+/// 📏 One buffer ceiling: a byte count or `.unlimited` (`-1`).
+fn buffer_size(modifier: &Call, label: &str) -> Result<i64, Error> {
+    if let Some(Value::Typed(value)) = modifier.get(label)
+        && value.name == "unlimited"
+    {
+        value.leaf(&[])?;
+        return Ok(-1);
+    }
+    let bytes = modifier.measure(label, true)?;
+    i64::try_from(bytes).map_err(|_| {
+        modifier
+            .at
+            .error(format!("{label} exceeds the supported range"))
+    })
+}
+
+/// 🚦 `.overload(maxInFlight:, maxPending:, pendingTimeout:, upstreamMaxConnections:)`.
+fn proxy_overload(modifier: &Call, config: &mut ReverseProxyConfig) -> Result<(), Error> {
+    modifier.leaf(&[
+        "maxInFlight",
+        "maxPending",
+        "pendingTimeout",
+        "upstreamMaxConnections",
+    ])?;
+    if modifier.get("maxInFlight").is_some() {
+        config.overload.max_in_flight = Some(positive_count(modifier, "maxInFlight")?);
+    }
+    if modifier.get("maxPending").is_some() {
+        config.overload.max_pending = positive_count(modifier, "maxPending")?;
+    }
+    if modifier.get("pendingTimeout").is_some() {
+        config.overload.pending_timeout_ms = duration_millis(
+            modifier.get("pendingTimeout").expect("checked above"),
+            "pendingTimeout",
+            modifier.at,
+        )?;
+    }
+    if modifier.get("upstreamMaxConnections").is_some() {
+        config.overload.upstream_max_connections =
+            Some(positive_count(modifier, "upstreamMaxConnections")?);
+    }
+    // 🚫 A limit policy with no limit is a misreading, not a configuration:
+    // the defaults alone would compile to "do nothing".
+    if config.overload.max_in_flight.is_none()
+        && config.overload.max_pending == 0
+        && config.overload.upstream_max_connections.is_none()
+    {
+        return Err(modifier.at.error(
+            "overload needs at least one active limit: maxInFlight:, maxPending: or \
+             upstreamMaxConnections:",
+        ));
+    }
+    Ok(())
+}
+
+/// 🔌 `.circuitBreaker(consecutiveFailures:, errorRatePercent:, minimumRequests:,
+/// windowRequests:, openFor:, halfOpenRequests:, failureStatuses:)`.
+fn proxy_circuit_breaker(modifier: &Call, config: &mut ReverseProxyConfig) -> Result<(), Error> {
+    modifier.leaf(&[
+        "consecutiveFailures",
+        "errorRatePercent",
+        "minimumRequests",
+        "windowRequests",
+        "openFor",
+        "halfOpenRequests",
+        "failureStatuses",
+    ])?;
+    if modifier.get("consecutiveFailures").is_some() {
+        let value = positive_count(modifier, "consecutiveFailures")?;
+        config.circuit_breaker.consecutive_failures = Some(u32::try_from(value).map_err(|_| {
+            modifier
+                .at
+                .error("consecutiveFailures exceeds the supported range")
+        })?);
+    }
+    if modifier.get("errorRatePercent").is_some() {
+        let value = positive_count(modifier, "errorRatePercent")?;
+        if value > 100 {
+            return Err(modifier
+                .at
+                .error("errorRatePercent is a percentage between 1 and 100"));
+        }
+        config.circuit_breaker.error_rate_percent = Some(value as u8);
+    }
+    if modifier.get("minimumRequests").is_some() {
+        config.circuit_breaker.minimum_requests = positive_count(modifier, "minimumRequests")?;
+    }
+    if modifier.get("windowRequests").is_some() {
+        config.circuit_breaker.window_requests = positive_count(modifier, "windowRequests")?;
+    }
+    if modifier.get("openFor").is_some() {
+        config.circuit_breaker.open_duration_ms = duration_millis(
+            modifier.get("openFor").expect("checked above"),
+            "openFor",
+            modifier.at,
+        )?;
+    }
+    if modifier.get("halfOpenRequests").is_some() {
+        config.circuit_breaker.half_open_requests = positive_count(modifier, "halfOpenRequests")?;
+    }
+    if let Some(value) = modifier.get("failureStatuses") {
+        let Value::Array(items) = value else {
+            return Err(modifier
+                .at
+                .error("failureStatuses takes an array of status codes such as [503]"));
+        };
+        if items.is_empty() {
+            return Err(modifier.at.error("failureStatuses must not be empty"));
+        }
+        let mut statuses = Vec::new();
+        for item in items {
+            let Value::Number(status) = item else {
+                return Err(modifier
+                    .at
+                    .error("failureStatuses takes an array of status codes such as [503]"));
+            };
+            if !(400..=599).contains(status) {
+                return Err(modifier
+                    .at
+                    .error("failureStatuses entries are status codes between 400 and 599"));
+            }
+            statuses.push(*status as u16);
+        }
+        config.circuit_breaker.failure_statuses = statuses;
+    }
+    // 🚫 The knobs are meaningless until a threshold opens the circuit.
+    if !config.circuit_breaker.enabled() {
+        return Err(modifier
+            .at
+            .error("circuitBreaker needs a threshold: consecutiveFailures: or errorRatePercent:"));
+    }
+    Ok(())
+}
+
+/// 🔢 A positive count for one overload/breaker setting.
+fn positive_count(modifier: &Call, label: &str) -> Result<usize, Error> {
+    let value = modifier.integer(label)?;
+    if value == 0 {
+        return Err(modifier.at.error(format!("{label} must be at least 1")));
+    }
+    usize::try_from(value).map_err(|_| {
+        modifier
+            .at
+            .error(format!("{label} exceeds the platform range"))
+    })
 }
 
 /// 🌐 The one unlabelled value a modifier takes.
