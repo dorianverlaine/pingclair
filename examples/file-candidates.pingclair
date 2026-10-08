@@ -1,0 +1,30 @@
+// 🗂️ File candidates: pick the first path that exists, then serve it.
+//
+// 📌 Two spellings of one idea. `TryFiles` is the handler that rewrites the
+// request and stands down; `.file(...)` is the condition that asks the same
+// question in a `Route(when:)`. Neither interpolates: the request path is the
+// typed `.requestPath`, and `appending:` is how a suffix rides on it. A
+// candidate that carries the request's query string says `keepQuery: true`.
+HTTPListener(on: ":8080") {
+    Site(host: "app.example.test") {
+        // 🧭 A single-page app: anything that is not a file on disk goes to
+        // index.html, which is what a client-side router needs.
+        Fallback {
+            TryFiles(candidates: [.requestPath, .requestPath(appending: "/index.html"), "/index.html"], root: "./public")
+            ServeFiles(root: "./public")
+        }
+    }
+}
+
+HTTPListener(on: ":8081") {
+    Site(host: "php.example.test") {
+        // 🐘 The same question asked as a condition, with the `.php` split and
+        // the query string a front controller wants. `PHPFastCGI` will write
+        // this shape for you once it lands; this spells it out by hand.
+        Route(when: .file(candidates: [.requestPath, .requestPath(appending: "/"), .path("/index.php", keepQuery: true)], root: "./public", policy: .mostRecentlyModified)) {
+            Rewrite(to: "/index.php")
+            ServeFiles(root: "./public")
+        }
+        Fallback { Fail(status: 404, message: "no such file") }
+    }
+}

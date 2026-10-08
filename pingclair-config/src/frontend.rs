@@ -1063,9 +1063,7 @@ fn http_condition(value: &Value, at: Position) -> Result<(Matcher, Option<String
         "clientIP" => address_condition(call, true),
         "remoteIP" => address_condition(call, false),
         "variable" => variable_condition(call),
-        "file" => Err(call
-            .at
-            .error("the file matcher needs its typed-candidate design; it follows in its own batch")),
+        "file" => file_condition(call).map(|matcher| (matcher, None)),
         other => Err(call.at.error(format!(
             "unknown condition '.{other}'; expected .path, .host, .method, .header, .query, .protocol, .clientIP, .remoteIP, .variable, .file, .all, .any or .not"
         ))),
@@ -1317,6 +1315,239 @@ fn variable_condition(call: &Call) -> Result<(Matcher, Option<String>), Error> {
     Ok((Matcher::Vars { name, values }, None))
 }
 
+/// 📂 `.file(candidates:, root:, policy:)`: whether a candidate exists on disk.
+///
+/// 📌 The same candidate vocabulary as `TryFiles` below, and for the same
+/// reason: one reader for one concept. A condition on file existence is what
+/// the `try_files` shorthand is built out of.
+fn file_condition(call: &Call) -> Result<Matcher, Error> {
+    let files = file_candidates(call)?;
+    let root = if call.get("root").is_some() {
+        Some(call.string("root")?)
+    } else {
+        None
+    };
+    let try_policy = file_policy(call)?;
+    Ok(Matcher::File {
+        try_files: files,
+        root,
+        try_policy,
+        // 🐘 The `.php` split belongs to the FastCGI expansion, which knows
+        // what it is splitting; a hand-written condition says what it means
+        // by naming its candidates.
+        split_path: Vec::new(),
+    })
+}
+
+/// 📂 `candidates:` — literal paths and the request path itself.
+///
+/// 🚫 Two things are refused by name rather than passed through: `{…}` because
+/// the language has typed sources instead of interpolation, and `*` because
+/// glob candidates are unimplemented in this build (#21) and would have to be
+/// silently treated as a literal `*` in a filename.
+fn file_candidates(call: &Call) -> Result<Vec<String>, Error> {
+    call.leaf(&["candidates", "root", "policy"])?;
+    let Some(Value::Array(items)) = call.get("candidates") else {
+        return Err(call
+            .at
+            .error("candidates takes an array such as [.requestPath, \"/index.html\"]"));
+    };
+    if items.is_empty() {
+        return Err(call.at.error("candidates needs at least one entry"));
+    }
+    let mut files = Vec::new();
+    for item in items {
+        files.push(file_candidate(item, call.at)?);
+    }
+    Ok(files)
+}
+
+/// 📂 One candidate, as the matcher spells it.
+fn file_candidate(value: &Value, at: Position) -> Result<String, Error> {
+    match value {
+        // 🔤 A literal path. No interpolation: `{path}` spelled by hand is the
+        // engine's own vocabulary, and `.requestPath` is the typed spelling of
+        // exactly that idea.
+        Value::String(path) => Ok(with_kept_query(candidate_path(path, at)?, false)),
+        Value::Typed(source) => {
+            match source.name.as_str() {
+                // 🌐 The request path itself.
+                "requestPath" => {
+                    source.leaf(&["appending", "keepQuery"])?;
+                    let appending = if source.get("appending").is_some() {
+                        source.string("appending")?
+                    } else {
+                        String::new()
+                    };
+                    let keep_query = if source.get("keepQuery").is_some() {
+                        source.boolean("keepQuery")?
+                    } else {
+                        false
+                    };
+                    // 🌐 Only the part the author wrote is checked: the `{path}`
+                    // head is the typed source's own lowering.
+                    let suffix = if appending.is_empty() {
+                        String::new()
+                    } else {
+                        candidate_path(&appending, source.at)?
+                    };
+                    Ok(with_kept_query(format!("{{path}}{suffix}"), keep_query))
+                }
+                // 🔤 A fixed path. Typed rather than a plain string because it
+                // can carry `keepQuery:`; a string cannot say that.
+                "path" => {
+                    let (path, keep_query) = match source.args.as_slice() {
+                        [(None, Value::String(path))] => (path.clone(), false),
+                        [
+                            (None, Value::String(path)),
+                            (Some(label), Value::Bool(keep)),
+                        ] if label == "keepQuery" => (path.clone(), *keep),
+                        _ => {
+                            return Err(source.at.error(
+                                ".path takes a quoted path, and optionally keepQuery: true",
+                            ));
+                        }
+                    };
+                    source.no_modifiers()?;
+                    if source.body.is_some() {
+                        return Err(source.at.error(".path does not take a block"));
+                    }
+                    Ok(with_kept_query(
+                        candidate_path(&path, source.at)?,
+                        keep_query,
+                    ))
+                }
+                other => Err(source.at.error(format!(
+                    "unknown candidate '.{other}'; expected .requestPath, \
+                         .requestPath(appending: \"…\") or .path(\"…\", keepQuery: true)"
+                ))),
+            }
+        }
+        _ => Err(at.error(
+            "a candidate is a quoted path, .requestPath(appending: \"…\") or \
+             .path(\"…\", keepQuery: true)",
+        )),
+    }
+}
+
+/// 📂 One literal candidate path, checked for the spellings this build refuses.
+fn candidate_path(path: &str, at: Position) -> Result<String, Error> {
+    if path.is_empty() {
+        return Err(at.error("a candidate must not be empty"));
+    }
+    if path.contains('{') || path.contains('}') {
+        return Err(at.error(
+            "candidates do not interpolate; write .requestPath for the request path, or \
+             .requestPath(appending: \"…\") for it plus a suffix",
+        ));
+    }
+    if path.contains('*') {
+        return Err(at.error(
+            "glob candidates are not implemented in this build, and a literal `*` in a path \
+             is not what this would mean; write the paths out",
+        ));
+    }
+    if path.contains('?') {
+        return Err(at.error(
+            "a candidate is a path; `keepQuery: true` on a typed candidate is how the request's \
+             query string is carried into the rewrite",
+        ));
+    }
+    Ok(path.to_string())
+}
+
+/// 📌 The query flag travels as the matcher's own `?` marker — the same thing
+/// the Caddyfile spelling compiles to.
+fn with_kept_query(path: String, keep_query: bool) -> String {
+    if keep_query {
+        format!("{path}?{{query}}")
+    } else {
+        path
+    }
+}
+
+/// 🗂️ `policy:` — how several existing candidates are ranked.
+fn file_policy(call: &Call) -> Result<Option<String>, Error> {
+    let Some(value) = call.get("policy") else {
+        return Ok(None);
+    };
+    let Value::Typed(policy) = value else {
+        return Err(call
+            .at
+            .error("policy takes a typed value such as .mostRecentlyModified"));
+    };
+    policy.leaf(&[])?;
+    Ok(Some(
+        match policy.name.as_str() {
+            "firstExist" => "first_exist",
+            "firstExistFallback" => "first_exist_fallback",
+            "largestSize" => "largest_size",
+            "smallestSize" => "smallest_size",
+            "mostRecentlyModified" => "most_recently_modified",
+            other => {
+                return Err(policy.at.error(format!(
+                    "unknown file policy '.{other}'; expected .firstExist, .firstExistFallback, \
+                     .largestSize, .smallestSize or .mostRecentlyModified"
+                )));
+            }
+        }
+        .to_string(),
+    ))
+}
+
+/// 🗂️ `TryFiles(candidates:, root:, policy:)`: rewrite to the first candidate
+/// that exists, then stand down so the next component serves it.
+///
+/// 📌 Lowered exactly the way the Caddyfile's `try_files` is — a first-match
+/// group of `file` matcher plus a rewrite to the file the matcher picked. One
+/// implementation, so the two spellings cannot drift (that drift is what #21
+/// was, and the fix was to delete the second lookup rather than maintain it).
+fn try_files(call: &Call) -> Result<HandlerConfig, Error> {
+    let files = file_candidates(call)?;
+    let root = if call.get("root").is_some() {
+        Some(call.string("root")?)
+    } else {
+        None
+    };
+    let try_policy = file_policy(call)?;
+    // 🧭 A candidate carrying the query gets its own group, because the rewrite
+    // target differs; the plain candidates share one. The groups are mutually
+    // exclusive, so only the first matching rewrite runs.
+    let group = |candidates: Vec<String>, query: &str| HandlerElement {
+        matcher: Some(Matcher::File {
+            try_files: candidates,
+            root: root.clone(),
+            try_policy: try_policy.clone(),
+            split_path: Vec::new(),
+        }),
+        handler: HandlerConfig::Rewrite {
+            strip_prefix: None,
+            strip_suffix: None,
+            replace: Some(format!("{{http.matchers.file.relative}}{query}")),
+            regex: None,
+            regex_replace: None,
+            method: None,
+        },
+    };
+    let mut elements = Vec::new();
+    let mut plain: Vec<String> = Vec::new();
+    for candidate in files {
+        match candidate.split_once('?') {
+            Some((file, query)) => {
+                if !plain.is_empty() {
+                    elements.push(group(std::mem::take(&mut plain), ""));
+                }
+                elements.push(group(vec![file.to_string()], &format!("?{query}")));
+            }
+            None => plain.push(candidate),
+        }
+    }
+    if !plain.is_empty() {
+        elements.push(group(plain, ""));
+    }
+    Ok(HandlerConfig::FirstMatch { handlers: elements })
+}
+
 /// 🔤 The HTTP method one typed `.get`/`.post`/… value names.
 fn method_name(value: &Call) -> Result<&'static str, Error> {
     if !value.args.is_empty() {
@@ -1371,6 +1602,7 @@ fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
         "ResponseHeader" => response_headers(call),
         "Rewrite" => rewrite(call),
         "BasicAuth" => basic_auth(call),
+        "TryFiles" => try_files(call),
         "RateLimit" => rate_limit(call),
         "AccessControl" => access_control(call),
         "CORS" => cors(call),
@@ -1384,7 +1616,7 @@ fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
             "unknown HTTP component; expected a terminal (Respond, ServeFiles, Proxy, Redirect, \
              Fail, ServeMetrics, ACMEServer) or middleware (RequestHeader, ResponseHeader, \
              Rewrite, BasicAuth, RateLimit, AccessControl, CORS, SetVariable, LimitRequestBody, \
-             SkipLog, Templates, ForwardAuth)",
+             SkipLog, Templates, ForwardAuth, TryFiles)",
         )),
     }
 }

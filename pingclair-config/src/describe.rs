@@ -537,6 +537,27 @@ pub const ENTRIES: &[Entry] = &[
 }"#,
     },
     Entry {
+        name: "TryFiles",
+        kind: Kind::Component,
+        summary: "Rewrites to the first candidate that exists, then lets the next component serve it: `TryFiles(candidates:, root:, policy:)`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "app.example.test") {
+        Fallback {
+            TryFiles(candidates: [.requestPath, .requestPath(appending: "/index.html"), "/index.html"], root: "./public")
+            ServeFiles(root: "./public")
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "app.example.test") {
+        Fallback {
+            TryFiles(candidates: ["{path}"], root: "./public")
+            ServeFiles(root: "./public")
+        }
+    }
+}"#,
+    },
+    Entry {
         name: "encode",
         kind: Kind::Modifier,
         summary: "The codings a site offers, most preferred first: `.encode(.zstd, .gzip)`.",

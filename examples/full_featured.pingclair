@@ -50,9 +50,11 @@ HTTPListener(on: ":8443") {
             LimitRequestBody(max: .mebibytes(64), readTimeout: .minutes(5))
             Respond(status: 201, body: "stored")
         }
+        Route(when: .file(candidates: [.requestPath, "/index.html"], root: publicRoot)) { ServeFiles(root: publicRoot) }
         ErrorRoute(for: [.status(404)]) { Respond(status: 404, body: "no such route") }
         ErrorRoute(for: [.anyError]) { Respond(status: 500, body: "something broke") }
         Fallback {
+            TryFiles(candidates: [.requestPath, .requestPath(appending: "/index.html"), "/index.html"], root: publicRoot)
             Templates(root: publicRoot)
             ServeFiles(root: publicRoot, index: ["index.html"])
         }

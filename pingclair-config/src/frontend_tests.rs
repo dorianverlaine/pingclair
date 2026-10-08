@@ -1454,6 +1454,86 @@ fn every_condition_can_be_bound_once_and_reused() {
 }
 
 #[test]
+fn file_candidates_lower_like_their_caddyfile_twins() {
+    let cases = [
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                TryFiles(candidates: [.requestPath, .requestPath(appending: "/index.html"), "/index.html"])
+                ServeFiles(root: "/tmp/pub")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troute {\n\t\ttry_files {path} {path}/index.html /index.html\n\t\tfile_server {\n\t\t\troot /tmp/pub\n\t\t}\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                TryFiles(candidates: [.requestPath, .requestPath(appending: "/"), .path("/index.php", keepQuery: true)], root: "./public", policy: .mostRecentlyModified)
+                ServeFiles(root: "./public")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troot * ./public\n\troute {\n\t\ttry_files {path} {path}/ /index.php?{query} {\n\t\t\tpolicy most_recently_modified\n\t\t}\n\t\tfile_server\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") {
+                Route(when: .file(candidates: [.requestPath, .requestPath(appending: "/"), .path("/index.php", keepQuery: true)], root: "./public", policy: .mostRecentlyModified)) {
+                    ServeFiles(root: "./public")
+                }
+            } }"#
+                .to_string(),
+            "http://:8080 {\n\t@existing {\n\t\tfile {\n\t\t\ttry_files {path} {path}/ /index.php?{query}\n\t\t\troot ./public\n\t\t\ttry_policy most_recently_modified\n\t\t}\n\t}\n\tfile_server @existing {\n\t\troot ./public\n\t}\n}"
+                .to_string(),
+        ),
+    ];
+    for (native_source, legacy_source) in cases {
+        let native = crate::compile(&native_source).unwrap();
+        let legacy = crate::compile(&legacy_source).unwrap();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::to_value(legacy).unwrap(),
+            "{native_source}"
+        );
+    }
+}
+
+#[test]
+fn file_candidates_that_cannot_mean_anything_fail_closed() {
+    let site = |body: &str| {
+        format!("HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {body} }} }} }}")
+    };
+    for body in [
+        // 📂 A candidate list is required and has to be a list.
+        "TryFiles() ServeFiles(root: \"/tmp\")",
+        "TryFiles(candidates: []) ServeFiles(root: \"/tmp\")",
+        "TryFiles(candidates: \"/index.html\") ServeFiles(root: \"/tmp\")",
+        "TryFiles(candidates: [1]) ServeFiles(root: \"/tmp\")",
+        // 🚫 The engine's placeholders are not this language's spelling.
+        "TryFiles(candidates: [\"{path}\"]) ServeFiles(root: \"/tmp\")",
+        "TryFiles(candidates: [.requestPath(appending: \"/{path}.html\")]) ServeFiles(root: \"/tmp\")",
+        "TryFiles(candidates: [.path]) ServeFiles(root: \"/tmp\")",
+        "TryFiles(candidates: [.uri]) ServeFiles(root: \"/tmp\")",
+        // 🌐 Globs and literal queries are refused by name.
+        "TryFiles(candidates: [\"/assets/*\"]) ServeFiles(root: \"/tmp\")",
+        "TryFiles(candidates: [\"/index.php?x=1\"]) ServeFiles(root: \"/tmp\")",
+        "TryFiles(candidates: [\"\"]) ServeFiles(root: \"/tmp\")",
+        "TryFiles(candidates: [.requestPath], keepQuery: true) ServeFiles(root: \"/tmp\")",
+        // 🗂️ Policy and root are typed, and a policy has to be one of the five.
+        "TryFiles(candidates: [.requestPath], policy: \"first_exist\") ServeFiles(root: \"/tmp\")",
+        "TryFiles(candidates: [.requestPath], policy: .best) ServeFiles(root: \"/tmp\")",
+        "TryFiles(candidates: [.requestPath], policy: .firstExist(1)) ServeFiles(root: \"/tmp\")",
+        "TryFiles(candidates: [.requestPath], root: 1) ServeFiles(root: \"/tmp\")",
+        "TryFiles(candidates: [.requestPath], root: \"/tmp\", root: \"/var\") ServeFiles(root: \"/tmp\")",
+        // 📂 The condition refuses the same spellings.
+        "Route(when: .file()) { Fail(status: 404) }",
+        "Route(when: .file(candidates: [\"{path}\"])) { Fail(status: 404) }",
+        "Route(when: .file(candidates: [.requestPath], policy: .best)) { Fail(status: 404) }",
+    ] {
+        let source = site(body);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",
