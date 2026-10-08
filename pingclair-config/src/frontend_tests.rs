@@ -268,6 +268,21 @@ fn invalid_attributes_fail_closed() {
 }
 
 #[test]
+fn modifiers_must_follow_the_block() {
+    let source = r#"
+        TCPListener(on: "127.0.0.1:9443")
+            .limits(connections: 8) {
+            Fallback { Proxy(to: "127.0.0.1:8080") }
+        }
+    "#;
+    let error = adapt(source).unwrap_err().to_string();
+    assert!(
+        error.contains("block must come before modifiers"),
+        "{error}"
+    );
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",

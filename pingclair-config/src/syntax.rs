@@ -375,6 +375,11 @@ impl Parser {
                 modifiers.push(self.call(depth + 1, false)?);
             }
         }
+        if block && self.peek() == &Token::Mark('{') {
+            return Err(self.error(
+                "a block must come before modifiers; put the `.modifier(...)` chain after the closing brace",
+            ));
+        }
         Ok(Call {
             name,
             args,
