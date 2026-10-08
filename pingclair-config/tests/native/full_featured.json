@@ -28,7 +28,7 @@
               {
                 "type": "request_headers",
                 "set": {
-                  "X-Real-IP": "pingclair"
+                  "X-Forwarded-By": "pingclair"
                 },
                 "remove": [
                   "Cookie"
@@ -161,6 +161,15 @@
             "type": "pipeline",
             "handlers": [
               {
+                "type": "rate_limit",
+                "requests": 30,
+                "window_secs": 60,
+                "by_ip": true,
+                "burst": 0,
+                "key": "ip",
+                "dry_run": false
+              },
+              {
                 "type": "basic_auth",
                 "realm": "Admin Area",
                 "credentials": [
@@ -170,15 +179,6 @@
                     "algorithm": "bcrypt"
                   }
                 ]
-              },
-              {
-                "type": "rate_limit",
-                "requests": 30,
-                "window_secs": 60,
-                "by_ip": true,
-                "burst": 0,
-                "key": "ip",
-                "dry_run": false
               },
               {
                 "type": "file_server",
@@ -227,30 +227,6 @@
               "patterns": [
                 "/upload"
               ]
-            }
-          }
-        },
-        {
-          "path": "/*",
-          "handler": {
-            "type": "file_server",
-            "root": "./public",
-            "index": [
-              "index.html"
-            ],
-            "browse": false,
-            "browse_limit": null,
-            "compress": true,
-            "canonical_uris": true
-          },
-          "methods": null,
-          "matcher": {
-            "file": {
-              "try_files": [
-                "{path}",
-                "/index.html"
-              ],
-              "root": "./public"
             }
           }
         },
@@ -415,110 +391,6 @@
       ],
       "tls": null,
       "routes": [
-        {
-          "path": "/api*",
-          "handler": {
-            "type": "pipeline",
-            "handlers": [
-              {
-                "type": "cors",
-                "allowed_origins": [
-                  "https://www.example.test"
-                ],
-                "allowed_methods": [
-                  "GET",
-                  "POST"
-                ],
-                "allowed_headers": [
-                  "Content-Type",
-                  "Authorization",
-                  "X-Requested-With"
-                ],
-                "exposed_headers": [],
-                "allow_credentials": false,
-                "max_age": 86400
-              },
-              {
-                "type": "rate_limit",
-                "requests": 200,
-                "window_secs": 60,
-                "by_ip": true,
-                "burst": 50,
-                "key": "ip",
-                "dry_run": false
-              },
-              {
-                "type": "vars",
-                "values": {
-                  "tier": "free"
-                }
-              },
-              {
-                "type": "reverse_proxy",
-                "upstreams": [
-                  "10.0.0.10:8080"
-                ],
-                "upstream_options": [
-                  {
-                    "address": "10.0.0.10:8080",
-                    "weight": 1,
-                    "backup": false
-                  }
-                ],
-                "load_balance": {
-                  "strategy": ""
-                },
-                "health_check": null,
-                "headers_up": {},
-                "headers_down": {},
-                "flush_interval": null,
-                "read_timeout": null,
-                "write_timeout": null,
-                "connect_timeout": null,
-                "first_byte_timeout": null,
-                "between_reads_timeout": null,
-                "retry": {
-                  "max_attempts": 16,
-                  "total_timeout_ms": null,
-                  "backoff_ms": 0
-                },
-                "overload": {
-                  "max_in_flight": null,
-                  "max_pending": 0,
-                  "pending_timeout_ms": 1000,
-                  "upstream_max_connections": null
-                },
-                "circuit_breaker": {
-                  "consecutive_failures": null,
-                  "error_rate_percent": null,
-                  "minimum_requests": 20,
-                  "window_requests": 100,
-                  "open_duration_ms": 30000,
-                  "half_open_requests": 1,
-                  "failure_statuses": []
-                },
-                "upstream_tls": {
-                  "enable": false,
-                  "server_name": null,
-                  "trusted_ca_certs": [],
-                  "client_cert": null,
-                  "client_key": null,
-                  "insecure_skip_verify": false
-                },
-                "cache": null
-              }
-            ]
-          },
-          "methods": null,
-          "matcher": {
-            "path": {
-              "patterns": [
-                "/api",
-                "/api/*"
-              ]
-            }
-          }
-        },
         {
           "path": "/*",
           "handler": {

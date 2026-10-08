@@ -31,7 +31,11 @@ TCPListener(on: ":9443") {
 HTTPListener(on: ":8443") {
     Site(host: "www.example.test") {
         Route(when: api) {
-            RequestHeader(.set("X-Real-IP", "pingclair"), .remove("Cookie"))
+            // 🏷️ Not `X-Real-IP`: that field names the client's address, and
+            // this build has no typed source for it yet. A name that does not
+            // claim more than it knows is the honest placeholder until
+            // `.clientIP` lands.
+            RequestHeader(.set("X-Forwarded-By", "pingclair"), .remove("Cookie"))
             Rewrite(stripPrefix: "/api")
             ResponseHeader(.setIfAbsent("X-Served-By", "pingclair"))
             Proxy(to: ["10.0.0.10:8080", "10.0.0.11:8080"])
@@ -42,15 +46,27 @@ HTTPListener(on: ":8443") {
             ServeMetrics()
         }
         Route(when: .path(prefix: "/admin")) {
-            BasicAuth(users: [.user("alice", hash: "$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W")], realm: "Admin Area")
+            // 🛡️ The budget runs first: bcrypt is deliberately slow, so
+            // checking a password before counting the attempt is how a
+            // password-guessing flood turns into CPU load.
             RateLimit(requests: 30, per: .minutes(1), key: .ip)
+
+            // 🔑 A test vector from this repository's corpus, not a password
+            // worth keeping: `pingclair hash-password --bcrypt-cost 14`.
+            BasicAuth(users: [.user("alice", hash: "$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W")], realm: "Admin Area")
             ServeFiles(root: "./admin")
         }
         Route(when: .path(exact: "/upload")) {
             LimitRequestBody(max: .mebibytes(64), readTimeout: .minutes(5))
             Respond(status: 201, body: "stored")
         }
-        Route(when: .file(candidates: [.requestPath, "/index.html"], root: publicRoot)) { ServeFiles(root: publicRoot) }
+
+        // 📌 A `.file(...)` condition decides *whether*, never *what*: the
+        // component after it serves the request path, not the candidate that
+        // matched. `TryFiles` in the fallback below is the spelling that hands
+        // the matched file on, and this route is deliberately not written with
+        // a candidate that always exists — `/index.html` beside the request
+        // path would make it match every request and the fallback unreachable.
         ErrorRoute(for: [.status(404)]) { Respond(status: 404, body: "no such route") }
         ErrorRoute(for: [.anyError]) { Respond(status: 500, body: "something broke") }
         Fallback {
@@ -76,20 +92,13 @@ HTTPListener(on: ":8443") {
 .limits(maxConnections: 4096, headerTimeout: .seconds(30))
 .accessLog(output: .file("/tmp/pingclair-access.log"), format: .console)
 
-// 🔀 A plaintext listener that only redirects, guarded by CORS and a budget.
+// 🔀 A plaintext listener that redirects, and nothing else.
 HTTPListener(on: ":8080") {
     Site(host: "www.example.test") {
-        Route(when: .path(prefix: "/api")) {
-            CORS(origins: ["https://www.example.test"], methods: [.get, .post])
-            RateLimit(
-                requests: 200,
-                per: .minutes(1),
-                key: .ip,
-                burst: 50,
-            )
-            SetVariable(name: "tier", value: "free")
-            Proxy(to: "10.0.0.10:8080")
-        }
+        // 📌 It used to answer `/api` here while the comment above it said it
+        // only redirected: an API over cleartext is a different promise than a
+        // redirect, and CORS is not a TLS policy. Anything that answers belongs
+        // on the TLS listener above.
         Fallback { Redirect(to: "https://www.example.test", status: .permanent) }
     }
 }
