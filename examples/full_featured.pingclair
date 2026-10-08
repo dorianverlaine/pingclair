@@ -56,7 +56,14 @@ HTTPListener(on: ":8443") {
         Fallback {
             TryFiles(candidates: [.requestPath, .requestPath(appending: "/index.html"), "/index.html"], root: publicRoot)
             Templates(root: publicRoot)
-            ServeFiles(root: publicRoot, index: ["index.html"])
+            ServeFiles(
+                root: publicRoot,
+                index: ["index.html"],
+                hide: [".git"],
+                precompressed: [.br, .zstd, .gzip],
+                etagFileExtensions: [".etag"],
+                browse: false,
+            )
         }
     }
     .encode(.zstd, .gzip)

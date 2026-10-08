@@ -1454,6 +1454,58 @@ fn every_condition_can_be_bound_once_and_reused() {
 }
 
 #[test]
+fn file_server_options_lower_like_their_caddyfile_twins() {
+    let native = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+            ServeFiles(root: "./public", browse: true, browseLimit: 500, hide: [".git", "*.tmp"], status: 503, canonicalUris: false, etagFileExtensions: [".etag"], precompressed: [.br, .gzip], compress: false)
+        } } }"#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "http://:8080 {\n\troot * ./public\n\tfile_server {\n\t\thide .git\n\t\thide *.tmp\n\t\tstatus 503\n\t\tdisable_canonical_uris\n\t\tetag_file_extensions .etag\n\t\tprecompressed br gzip\n\t\tcompress off\n\t\tbrowse {\n\t\t\tfile_limit 500\n\t\t}\n\t}\n}",
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(native).unwrap(),
+        serde_json::to_value(legacy).unwrap()
+    );
+}
+
+#[test]
+fn file_server_options_that_cannot_mean_anything_fail_closed() {
+    let site = |handler: &str| {
+        format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {handler} }} }} }}"
+        )
+    };
+    for handler in [
+        // 🗂️ A listing ceiling belongs to a listing.
+        "ServeFiles(root: \"./public\", browseLimit: 500)",
+        "ServeFiles(root: \"./public\", browse: true, browseLimit: -1)",
+        // 🗜️ Sidecar codings are the three this build reads, once each.
+        "ServeFiles(root: \"./public\", precompressed: [])",
+        "ServeFiles(root: \"./public\", precompressed: [\"br\"])",
+        "ServeFiles(root: \"./public\", precompressed: [.brotli])",
+        "ServeFiles(root: \"./public\", precompressed: [.gzip, .gzip])",
+        // 🔢 The maintenance status is a real status code.
+        "ServeFiles(root: \"./public\", status: 99)",
+        "ServeFiles(root: \"./public\", status: 600)",
+        "ServeFiles(root: \"./public\", status: \"503\")",
+        // 🚩 And every flag is a boolean, not a truthy token.
+        "ServeFiles(root: \"./public\", passThru: 1)",
+        "ServeFiles(root: \"./public\", canonicalUris: 1)",
+        "ServeFiles(root: \"./public\", compress: 1)",
+        // 📂 Lists are lists.
+        "ServeFiles(root: \"./public\", hide: [])",
+        "ServeFiles(root: \"./public\", etagFileExtensions: [])",
+        "ServeFiles(root: \"./public\", hide: \".git\")",
+    ] {
+        let source = site(handler);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
 fn file_candidates_lower_like_their_caddyfile_twins() {
     let cases = [
         (

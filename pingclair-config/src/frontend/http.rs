@@ -2297,12 +2297,39 @@ fn rewrite(call: &Call) -> Result<HandlerConfig, Error> {
 
 /// 📂 `.ServeFiles(root:, browse:, index:)`: the static file handler.
 fn serve_files(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&["root", "browse", "index"])?;
+    call.leaf(&[
+        "root",
+        "browse",
+        "browseLimit",
+        "index",
+        "hide",
+        "precompressed",
+        "status",
+        "passThru",
+        "canonicalUris",
+        "etagFileExtensions",
+        "compress",
+    ])?;
     let root = call.string("root")?;
     let browse = if call.get("browse").is_some() {
         call.boolean("browse")?
     } else {
         false
+    };
+    let browse_limit = if call.get("browseLimit").is_some() {
+        // 🚫 A listing ceiling for a listing nobody asked for is a setting
+        // that reads as if it did something.
+        if !browse {
+            return Err(call
+                .at
+                .error("browseLimit needs browse: true; it caps the listing that turn on"));
+        }
+        Some(
+            usize::try_from(call.integer("browseLimit")?)
+                .map_err(|_| call.at.error("browseLimit exceeds the platform range"))?,
+        )
+    } else {
+        None
     };
     let index = if call.get("index").is_some() {
         call.strings("index")?
@@ -2312,21 +2339,90 @@ fn serve_files(call: &Call) -> Result<HandlerConfig, Error> {
     if index.is_empty() {
         return Err(call.at.error("index needs at least one file name"));
     }
+    let hide = call.strings("hide")?;
+    // 🗜️ Sidecar lookup is asked for, never assumed: a stale `.gz` beside a
+    // file is a wrong answer, and the Caddyfile's bare `precompressed` is the
+    // three codings this build reads in its own default order.
+    let precompressed = match call.get("precompressed") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => {
+            if items.is_empty() {
+                return Err(call
+                    .at
+                    .error("precompressed needs at least one coding; leave it out for none"));
+            }
+            let mut codings = Vec::new();
+            for item in items {
+                let Value::Typed(coding) = item else {
+                    return Err(call
+                        .at
+                        .error("precompressed takes .br, .zstd and .gzip values"));
+                };
+                coding.leaf(&[])?;
+                let name = match coding.name.as_str() {
+                    "br" | "zstd" | "gzip" => coding.name.as_str(),
+                    other => {
+                        return Err(coding.at.error(format!(
+                            "unknown precompressed coding '.{other}'; expected .br, .zstd or \
+                             .gzip"
+                        )));
+                    }
+                };
+                if codings.contains(&name.to_string()) {
+                    return Err(coding.at.error("duplicate coding"));
+                }
+                codings.push(name.to_string());
+            }
+            codings
+        }
+        Some(_) => {
+            return Err(call
+                .at
+                .error("precompressed takes an array such as [.br, .zstd, .gzip]"));
+        }
+    };
+    let status = if call.get("status").is_some() {
+        let code = u16::try_from(call.integer("status")?)
+            .map_err(|_| call.at.error("status must fit in 0..=65535"))?;
+        if !(100..=599).contains(&code) {
+            return Err(call.at.error("status is a code between 100 and 599"));
+        }
+        Some(code)
+    } else {
+        None
+    };
+    let pass_thru = if call.get("passThru").is_some() {
+        call.boolean("passThru")?
+    } else {
+        false
+    };
+    let canonical_uris = if call.get("canonicalUris").is_some() {
+        call.boolean("canonicalUris")?
+    } else {
+        true
+    };
+    let etag_file_extensions = call.strings("etagFileExtensions")?;
     Ok(HandlerConfig::FileServer {
         root,
         index,
         browse,
-        browse_limit: None,
+        browse_limit,
         // 🗜️ Allowed here, and lowered by the site's own coding list: a site
         // without `.encode` turns this off after the routes are built, exactly
         // as `encode off` does for a file server written in a Pingclairfile.
-        compress: true,
-        precompressed: Vec::new(),
-        hide: Vec::new(),
-        status: None,
-        pass_thru: false,
-        canonical_uris: true,
-        etag_file_extensions: Vec::new(),
+        // A file server may also opt itself out on a site that did ask for a
+        // coding, which is the one thing `encode` alone cannot say.
+        compress: if call.get("compress").is_some() {
+            call.boolean("compress")?
+        } else {
+            true
+        },
+        precompressed,
+        hide,
+        status,
+        pass_thru,
+        canonical_uris,
+        etag_file_extensions,
     })
 }
 

@@ -295,7 +295,18 @@
                 "browse": false,
                 "browse_limit": null,
                 "compress": true,
-                "canonical_uris": true
+                "precompressed": [
+                  "br",
+                  "zstd",
+                  "gzip"
+                ],
+                "hide": [
+                  ".git"
+                ],
+                "canonical_uris": true,
+                "etag_file_extensions": [
+                  ".etag"
+                ]
               }
             ]
           },

@@ -140,7 +140,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         name: "ServeFiles",
         kind: Kind::Component,
-        summary: "Static files: `ServeFiles(root:, browse:, index:)`.",
+        summary: "Static files: `ServeFiles(root:, index:, browse:, hide:, precompressed:, status:, passThru:, …)`.",
         example: r#"HTTPListener(on: ":8080") {
     Site(host: "*") {
         Fallback { ServeFiles(root: "./public", browse: false) }
