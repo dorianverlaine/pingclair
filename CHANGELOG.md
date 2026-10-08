@@ -27,6 +27,17 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🚰 An HTTP/2 response in flight across SIGTERM reaches the client
+
+The in-flight count reaches zero when the proxy has handed the response to its
+transport, which is not the same as the bytes being on the wire: HTTP/1 writes
+synchronously, while the HTTP/2 codec queues frames for its connection task
+and the TLS layer buffers one more. The process left in between, so a stream
+the origin had already answered was closed with its response still in
+userspace — five runs out of seven in the black-box suite. A shutdown that
+served a request now gives the transports a bounded moment to flush before the
+process exits; one that served nothing pays nothing (#313).
+
 ### 🗄️ `header_up` takes the same shapes as `header_down`
 
 The reference gives both directives one set of shapes — `X v` sets, `+X v`

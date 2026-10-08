@@ -36,6 +36,39 @@ async fn spawn_slow_origin(delay: Duration) -> SocketAddr {
     address
 }
 
+/// 🐢 The same slow origin, with a body large enough that its response is
+/// still crossing the transports when the process leaves.
+///
+/// 📌 The size is the point, not decoration: a nine-byte answer fits in the
+/// HTTP/2 codec's and TLS layer's buffers in one go, and the shutdown race
+/// that loses it only shows under load. Four megabytes are hundreds of frames
+/// and several TLS records, so a process that exits before the connection
+/// task flushes truncates the body every time.
+async fn spawn_slow_big_origin(delay: Duration, bytes: usize) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let body = vec![b'x'; bytes];
+        let head =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {bytes}\r\nConnection: close\r\n\r\n");
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let body = body.clone();
+            let head = head.clone();
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                tokio::time::sleep(delay).await;
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            });
+        }
+    });
+    address
+}
+
 fn sigterm(server: &TestServer) {
     // SAFETY: 🧯 `kill` is handed the pid of a child this test spawned, with a
     // signal constant from libc; a refusal is reported, never ignored.
@@ -147,4 +180,92 @@ async fn test_sigterm_cuts_a_request_that_outlives_the_grace_period() {
         in_flight.await.unwrap().is_err(),
         "a request longer than the grace period cannot have completed"
     );
+}
+
+/// 🔐 An HTTPS site with HTTP/2, and the ports the harness reserves for it.
+fn tls_config(origin: SocketAddr, grace: &str) -> String {
+    format!(
+        r#"
+        {{
+            admin off
+            grace_period {grace}
+            http_port __PINGCLAIR_TEST_HTTP_PORT__
+            https_port __PINGCLAIR_TEST_HTTPS_PORT__
+            servers {{
+                protocols h1 h2
+            }}
+        }}
+
+        https://slow.test:__PINGCLAIR_TEST_HTTPS_PORT__ {{
+            tls internal
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            reverse_proxy {origin}
+        }}
+        "#
+    )
+}
+
+/// 🚰 An HTTP/2 response in flight across SIGTERM still reaches the client.
+///
+/// The in-flight count reaches zero when the proxy has *handed* the response
+/// to its transport, which is not the same as the bytes being on the wire:
+/// HTTP/1 writes synchronously, while the HTTP/2 codec queues frames for its
+/// connection task and the TLS layer buffers one more. The process used to
+/// exit in between, so the connection closed with the response still in
+/// userspace and the client lost a request the origin had already answered
+/// (#313).
+///
+/// 📌 The loop is deliberate: measured before the fix, 5 of 7 runs lost the
+/// response — one run would be a coin flip, five in a row are not.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_h2_response_in_flight_across_sigterm_reaches_the_client() {
+    let origin = spawn_slow_big_origin(Duration::from_millis(800), 4 * 1024 * 1024).await;
+    for attempt in 1..=5 {
+        let mut server = TestServer::new_pingclairfile(&tls_config(origin, "30s"));
+        assert!(
+            server.wait_until_tls_ready("slow.test").await,
+            "attempt {attempt}: server failed to start"
+        );
+
+        // 🔌 curl, not a Rust client: the wire behaviour under test is the
+        // one a real client sees, and curl is what the issue measured with.
+        let curl = std::process::Command::new("curl")
+            .args([
+                "--http2",
+                "-ksS",
+                "--noproxy",
+                "*",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code} %{size_download}",
+                "--resolve",
+                &format!("slow.test:{}:127.0.0.1", server.address(0).port()),
+                &server.tls_url(0, "slow.test", "/slow"),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("curl must start");
+        // 🧭 The request must be on the wire before the signal; the origin's
+        // delay leaves room either side of this pause.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        sigterm(&server);
+
+        let status = wait_for_exit(&mut server, Duration::from_secs(20)).await;
+        let output = curl.wait_with_output().expect("curl must exit");
+        let observed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if observed != "200 4194304" {
+            server.print_diagnostics();
+            panic!(
+                "attempt {attempt}: the HTTP/2 response was cut by SIGTERM \
+                 (curl said {observed:?}, rc {:?}, {})",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(status.success(), "attempt {attempt}: {status}");
+    }
 }
