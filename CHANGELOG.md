@@ -14,6 +14,14 @@ fact.
 
 ## [Unreleased]
 
+### 🧩 Native configuration language for 0.3 alpha
+
+`Pingclair(version: 1)` selects the new declarative frontend. TCP listeners,
+routes and proxies compose through typed arguments and listener modifiers,
+then use the existing common validation and runtime. Existing Caddy-style files
+remain supported during migration. Admin accepts `text/pingclair`; native input
+is refused by `fmt` until a comment-preserving formatter exists.
+
 ### 🔌 Layer 4 TCP routing for 0.3 alpha
 
 L4 listeners now enforce `max_connections` (default 1024, range 1–4096),

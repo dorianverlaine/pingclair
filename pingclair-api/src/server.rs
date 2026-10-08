@@ -580,7 +580,12 @@ async fn handle_request_inner(
             // 🛡️ Full-document replacement: parse AND validate everything
             // before touching a single proxy, so a bad document rolls back by
             // never being applied at all.
-            let config: PingclairConfig = if content_type.contains("caddyfile") {
+            let config: PingclairConfig = if content_type.contains("caddyfile")
+                || content_type
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim() == "text/pingclair")
+            {
                 let source = match std::str::from_utf8(&body_bytes) {
                     Ok(source) => source,
                     Err(_) => {

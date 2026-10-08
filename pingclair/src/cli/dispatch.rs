@@ -1051,6 +1051,11 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 std::fs::read_to_string(&path)
                     .map_err(|error| anyhow::anyhow!("❌ Failed to read {path}: {error}"))?
             };
+            if pingclair_config::native::is_native(&source) {
+                anyhow::bail!(
+                    "❌ Native configuration formatting is not supported yet; the source was not modified"
+                );
+            }
             let directives = pingclair_config::parser::parse(&source)
                 .map_err(|error| anyhow::anyhow!("❌ Failed to parse {path}: {error}"))?;
             let formatted = format_directives(&directives);

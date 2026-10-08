@@ -28,6 +28,7 @@ pub mod adapter;
 pub mod compiler;
 mod header_fields;
 mod layer4;
+pub mod native;
 pub mod parser;
 mod retired_placeholders;
 mod shared_ports;
@@ -100,6 +101,22 @@ fn compile_named_with(
     name: Option<&Path>,
     validate: bool,
 ) -> Result<PingclairConfig, FullCompileError> {
+    if native::is_native(source) {
+        let config = native::adapt(source).map_err(|error| {
+            let error = FullCompileError::Native(error);
+            match name {
+                Some(path) => FullCompileError::InFile {
+                    path: path.display().to_string(),
+                    source: Box::new(error),
+                },
+                None => error,
+            }
+        })?;
+        if validate {
+            compiler::validate_config(&config)?;
+        }
+        return Ok(config);
+    }
     // 🧩 Parse and analyze the human-readable configuration. The file's own
     // directory goes with it, because a relative `import` resolves against the
     // importing file rather than the working directory — a configuration that
@@ -202,21 +219,7 @@ fn compile_file_unvalidated(path: &Path) -> Result<PingclairConfig, FullCompileE
         serde_json::from_str(&source)
             .map_err(|e| FullCompileError::Io(format!("JSON parse error: {e}")))
     } else {
-        // 📍 Named, because this is the path where the name matters most: a
-        // directory configuration reports one line number out of several files,
-        // and without the name the operator has to guess which.
-        let ast = parser::compile_from(&source, path.parent()).map_err(|error| {
-            FullCompileError::InFile {
-                path: path.display().to_string(),
-                source: Box::new(error.into()),
-            }
-        })?;
-        Ok(
-            compiler::compile_ast(&ast).map_err(|error| FullCompileError::InFile {
-                path: path.display().to_string(),
-                source: Box::new(error.into()),
-            })?,
-        )
+        compile_named_with(&source, Some(path), false)
     }
 }
 
@@ -461,6 +464,8 @@ fn configuration_paths(dir_path: &Path) -> Result<Vec<std::path::PathBuf>, FullC
 /// Full compilation error
 #[derive(Debug, thiserror::Error)]
 pub enum FullCompileError {
+    #[error("Native configuration error: {0}")]
+    Native(#[from] native::Error),
     #[error("IO error: {0}")]
     Io(String),
 
