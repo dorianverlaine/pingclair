@@ -11,6 +11,22 @@
       "proxy_timeout_ms": 300000,
       "proxy_half_close": true,
       "proxy_buffer_size": 65536,
+      "log": {
+        "output": {
+          "file": "/tmp/pingclair-sessions.log"
+        },
+        "format": "json",
+        "level": null,
+        "exclude_fields": [],
+        "rotation": {
+          "max_size_bytes": 52428800,
+          "keep": 3,
+          "compress": false
+        },
+        "request_headers": [],
+        "response_headers": [],
+        "include_tls": false
+      },
       "routes": [
         {
           "matches": [

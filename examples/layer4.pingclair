@@ -11,3 +11,4 @@ TCPListener(on: ":443") {
 .limits(connections: 4096, preread: .kibibytes(16), relay: .kibibytes(64))
 .timeouts(preread: .seconds(30), connect: .seconds(5), idle: .minutes(5))
 .halfClose(enabled: true)
+.sessionLog(output: .file("/tmp/pingclair-sessions.log"), format: .json, rotation: .roll(size: .mebibytes(50), keep: 3))

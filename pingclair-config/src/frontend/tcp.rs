@@ -8,6 +8,7 @@
 //! configuration. Two files called `layer4.rs` doing different jobs is a tab
 //! nobody can read.
 
+use super::log::{LogScope, parse_log};
 use super::*;
 
 /// 🏷️ The argument labels a TCP listener accepts.
@@ -67,6 +68,7 @@ pub(super) fn listener(call: &Call) -> Result<Layer4Server, Error> {
                 child.leaf(&["enabled"])?;
                 server.proxy_half_close = child.boolean("enabled")?;
             }
+            "sessionLog" => server.log = Some(parse_log(child, LogScope::TcpSession)?),
             _ => return Err(child.at.error("unknown TCPListener modifier")),
         }
     }

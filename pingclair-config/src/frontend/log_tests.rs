@@ -155,3 +155,71 @@ fn the_formatter_round_trips_the_log_shapes() {
         formatted
     );
 }
+
+#[test]
+fn the_session_log_lowers_like_its_caddyfile_twin() {
+    let native_source = r#"TCPListener(on: "127.0.0.1:9443") {
+    Fallback { Proxy(to: "127.0.0.1:8080") }
+}
+.sessionLog(
+    output: .file("/tmp/sessions.log"),
+    format: .json,
+    level: .info,
+    excludeFields: ["duration_ms"],
+    sampling: .window(interval: .seconds(30), first: 50, thereafter: 10),
+    rotation: .roll(size: .mebibytes(50), age: .hours(6), keep: 3, compress: true),
+)"#;
+    let legacy_source = "{\n\
+         \x20   layer4 {\n\
+         \x20       127.0.0.1:9443 {\n\
+         \x20           log {\n\
+         \x20               output file /tmp/sessions.log\n\
+         \x20               format filter {\n\
+         \x20                   wrap json\n\
+         \x20                   fields {\n\
+         \x20                       duration_ms delete\n\
+         \x20                   }\n\
+         \x20               }\n\
+         \x20               level info\n\
+         \x20               sampling {\n\
+         \x20                   interval 30s\n\
+         \x20                   first 50\n\
+         \x20                   thereafter 10\n\
+         \x20               }\n\
+         \x20               roll {\n\
+         \x20                   size 50MiB\n\
+         \x20                   age 6h\n\
+         \x20                   keep 3\n\
+         \x20                   compress\n\
+         \x20               }\n\
+         \x20           }\n\
+         \x20           route {\n\
+         \x20               proxy 127.0.0.1:8080\n\
+         \x20           }\n\
+         \x20       }\n\
+         \x20   }\n\
+         }\n";
+
+    let native = native(native_source);
+    let legacy = legacy(legacy_source);
+    assert_eq!(
+        serde_json::to_value(&native.layer4[0].log).expect("the session log serialises"),
+        serde_json::to_value(&legacy.layer4[0].log).expect("the session log serialises"),
+        "{native_source}"
+    );
+}
+
+#[test]
+fn a_session_log_refuses_what_a_session_cannot_have() {
+    for modifier in [
+        ".sessionLog(headers: [.tls])",
+        ".sessionLog(hostnames: [\"a.test\"])",
+        ".sessionLog(unknown: 1)",
+        ".sessionLog(output: .file(\"/tmp/a.log\"), rotation: .roll(keep: 3))",
+    ] {
+        let source = format!(
+            "TCPListener(on: \"127.0.0.1:9443\") {{ Fallback {{ Proxy(to: \"127.0.0.1:8080\") }} }}\n{modifier}"
+        );
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}

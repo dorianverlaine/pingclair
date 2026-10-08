@@ -256,6 +256,26 @@ pub const ENTRIES: &[Entry] = &[
         labels: crate::frontend::http::ACCESS_LOG_LABELS,
     },
     Entry {
+        name: "sessionLog",
+        kind: Kind::Modifier,
+        summary: "A TCP session log: the same options as an access log, minus headers and \
+                  hostnames, because a session has neither.",
+        example: r#"TCPListener(on: "127.0.0.1:9443") {
+    Fallback { Proxy(to: "127.0.0.1:8080") }
+}
+.sessionLog(
+    output: .file("/tmp/sessions.log"),
+    format: .json,
+    level: .info,
+    rotation: .roll(size: .mebibytes(50), keep: 3),
+)"#,
+        refusal: r#"TCPListener(on: "127.0.0.1:9443") {
+    Fallback { Proxy(to: "127.0.0.1:8080") }
+}
+.sessionLog(headers: [.tls])"#,
+        labels: crate::frontend::log::SESSION_LOG_LABELS,
+    },
+    Entry {
         name: "RequestHeader",
         kind: Kind::Component,
         summary: "Sets request headers for later components: `.set`, `.append`, `.remove`, `.replace`.",
@@ -941,6 +961,7 @@ mod tests {
             "Route",
             "errorPage",
             "accessLog",
+            "sessionLog",
             "TrustedProxies",
             "Storage",
             "Log",
