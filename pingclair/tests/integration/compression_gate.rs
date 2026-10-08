@@ -285,3 +285,119 @@ async fn test_compressed_http1_response_is_chunked() {
     assert!(reply.headers().get("content-length").is_none());
     assert_eq!(gunzip(&reply.bytes().await.unwrap()), body);
 }
+
+/// 🗜️ A static site with `encode gzip`, plus whatever else the test needs.
+fn static_site(root: &std::path::Path, extra: &str) -> String {
+    format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        http://__PINGCLAIR_TEST_LISTEN__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            root * {}
+            encode gzip
+            {extra}
+            file_server
+        }}
+        "#,
+        root.display()
+    )
+}
+
+/// 🛡️ A static file honors the request's `no-transform` too.
+///
+/// RFC 9111 §5.2.1 makes the directive a *request* one, and the proxy path has
+/// honored it since compression existed; the static file server compressed
+/// anyway, so the same bytes came back gzip or identity depending on which
+/// handler answered (#309). The control below is what keeps this test from
+/// passing against a server that never encodes at all.
+#[tokio::test]
+async fn test_static_file_honors_request_no_transform() {
+    let root = tempfile::tempdir().unwrap();
+    let body = "hello world ".repeat(200);
+    std::fs::write(root.path().join("long.txt"), &body).unwrap();
+    let mut server = TestServer::new_pingclairfile(&static_site(root.path(), ""));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    let compressed = client
+        .get(server.url(0, "/long.txt"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        compressed.headers().get("content-encoding").unwrap(),
+        "gzip",
+        "the control request must be compressed, or this test proves nothing"
+    );
+
+    let identity = client
+        .get(server.url(0, "/long.txt"))
+        .header("Accept-Encoding", "gzip")
+        .header("Cache-Control", "no-transform")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(identity.status(), 200);
+    assert!(
+        identity.headers().get("content-encoding").is_none(),
+        "the client asked for the file's own bytes"
+    );
+    assert_eq!(identity.headers()["content-length"], body.len().to_string());
+    assert_eq!(identity.text().await.unwrap(), body);
+}
+
+/// 🛡️ A static response's own `no-transform` gates encoding too.
+///
+/// RFC 9111 §5.2.2.6 binds the intermediary when the response carries the
+/// directive, and a site's `header` block is how a static response gets one.
+/// The file was compressed anyway, so the response contradicted itself:
+/// `Cache-Control: no-transform` beside `Content-Encoding: gzip` (#309).
+#[tokio::test]
+async fn test_static_response_no_transform_is_not_compressed() {
+    let root = tempfile::tempdir().unwrap();
+    let body = "hello world ".repeat(200);
+    std::fs::write(root.path().join("long.txt"), &body).unwrap();
+    let client = no_proxy_client();
+
+    let control_root = tempfile::tempdir().unwrap();
+    std::fs::write(control_root.path().join("long.txt"), &body).unwrap();
+    let mut control = TestServer::new_pingclairfile(&static_site(control_root.path(), ""));
+    assert!(control.wait_until_ready().await, "server failed to start");
+    let plain = client
+        .get(control.url(0, "/long.txt"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        plain.headers().get("content-encoding").unwrap(),
+        "gzip",
+        "the control request must be compressed, or this test proves nothing"
+    );
+    control.stop();
+
+    let mut server = TestServer::new_pingclairfile(&static_site(
+        root.path(),
+        "header Cache-Control \"no-transform\"",
+    ));
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let reply = client
+        .get(server.url(0, "/long.txt"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 200);
+    assert_eq!(reply.headers()["cache-control"], "no-transform");
+    assert!(
+        reply.headers().get("content-encoding").is_none(),
+        "the response declared its own bytes untouchable"
+    );
+    assert_eq!(reply.text().await.unwrap(), body);
+}

@@ -27,6 +27,18 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🛡️ A static file honors `no-transform` on both sides
+
+`Cache-Control: no-transform` is a directive about bytes: a client sends it so
+the body it receives is the one a signature or a hash was computed over, and
+RFC 9111 binds an intermediary when a response carries it. The proxy path has
+honored both since compression existed; the static file server honored
+neither, so a file could come back gzip-encoded to a client that asked for its
+exact bytes — and a site that set the header on its own responses could answer
+`Cache-Control: no-transform` beside `Content-Encoding: gzip`, contradicting
+itself. Both the request directive and the response one now gate static
+encoding, through the same predicate the proxy uses (#309).
+
 ### 🧾 Every header-limit refusal leaves a record, on every transport
 
 An oversized header block was answered `431` on all three transports, but only

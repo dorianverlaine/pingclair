@@ -171,13 +171,7 @@ fn full_representation(status: http::StatusCode, partial: bool) -> bool {
 /// archive, a payload checked against a hash — and compressing one breaks
 /// that check with no error anywhere to explain it.
 pub(crate) fn forbids_transform(header: &ResponseHeader) -> bool {
-    field_tokens(&header.headers, "cache-control")
-        .any(|token| token.eq_ignore_ascii_case("no-transform"))
-}
-
-/// 🛡️ A client's byte-preservation request binds both proxy transports.
-pub(crate) fn request_allows_encoding(headers: &http::HeaderMap) -> bool {
-    !field_tokens(headers, "cache-control").any(|token| token.eq_ignore_ascii_case("no-transform"))
+    pingclair_core::encoding::forbids_transform(&header.headers)
 }
 
 /// 🧊 Encoding is part of the cache key even when this client receives identity.

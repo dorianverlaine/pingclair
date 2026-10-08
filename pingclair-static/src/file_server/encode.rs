@@ -24,11 +24,6 @@ impl FileServer {
         meta: &super::cache::FileMeta,
         request: &super::FileRequest<'_>,
     ) -> bool {
-        if !self.encode_policy.has_matcher() {
-            return self
-                .encode_policy
-                .allows_content_type(meta.content_type.to_str().unwrap_or(""));
-        }
         let mut headers = http::HeaderMap::with_capacity(6);
         headers.insert("content-type", meta.content_type.clone());
         headers.insert("content-length", meta.content_length.clone());
@@ -37,7 +32,12 @@ impl FileServer {
         if let Some(value) = &meta.last_modified {
             headers.insert("last-modified", value.clone());
         }
-        self.matches_encode_headers(status, headers, request)
+        self.identity_headers_allow_encoding(
+            status,
+            meta.content_type.to_str().unwrap_or(""),
+            headers,
+            request,
+        )
     }
 
     /// 🎯 Listings obey the same header policy as regular static files.
@@ -46,22 +46,24 @@ impl FileServer {
         length: u64,
         request: &super::FileRequest<'_>,
     ) -> bool {
-        if !self.encode_policy.has_matcher() {
-            return self.encode_policy.allows_content_type("text/html");
-        }
         let mut headers = http::HeaderMap::with_capacity(3);
         headers.insert(
             "content-type",
             http::HeaderValue::from_static("text/html; charset=utf-8"),
         );
         headers.insert("content-length", http::HeaderValue::from(length));
-        self.matches_encode_headers(200, headers, request)
+        self.identity_headers_allow_encoding(200, "text/html", headers, request)
     }
 
-    /// 🧊 The matcher reads identity headers before encoding changes byte metadata.
-    fn matches_encode_headers(
+    /// 🧊 The matcher reads identity headers before encoding changes byte
+    /// metadata, and the transport's final headers get their say first: a
+    /// response that declares `Cache-Control: no-transform` binds this
+    /// intermediary (RFC 9111 §5.2.2.6), so a body a signature or hash check
+    /// covers must not be rewritten here either (#309).
+    fn identity_headers_allow_encoding(
         &self,
         status: u16,
+        content_type: &str,
         mut headers: http::HeaderMap,
         request: &super::FileRequest<'_>,
     ) -> bool {
@@ -71,6 +73,12 @@ impl FileServer {
             .is_some_and(|policy| !policy(status, &mut headers))
         {
             return false;
+        }
+        if pingclair_core::encoding::forbids_transform(&headers) {
+            return false;
+        }
+        if !self.encode_policy.has_matcher() {
+            return self.encode_policy.allows_content_type(content_type);
         }
         self.encode_policy.matches(status, |name, patterns| {
             headers

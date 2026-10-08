@@ -151,6 +151,20 @@ impl FileServer {
         request: FileRequest<'_>,
         accept_encoding: Option<&str>,
     ) -> Result<Option<ServedResponse>> {
+        // 🛡️ A request that carries `Cache-Control: no-transform` gets the
+        // file's own bytes. The directive binds every intermediary (RFC 9111
+        // §5.2.1), and the proxy path has honored it since compression
+        // existed; this path compressed anyway, so the same URL came back
+        // transformed or not depending on which handler answered (#309).
+        // Dropping the client's coding preferences here is the whole gate:
+        // negotiation, precompressed sidecars and the compress cache all read
+        // this one value.
+        let accept_encoding = if pingclair_core::encoding::request_allows_encoding(request.headers)
+        {
+            accept_encoding
+        } else {
+            None
+        };
         // 🔁 Keep the original query separate from filesystem and basename checks.
         let (original_path, query) = original_uri
             .split_once('?')

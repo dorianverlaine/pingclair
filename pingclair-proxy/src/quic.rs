@@ -6600,7 +6600,7 @@ async fn reverse_proxy_upstream(
     // instead of installed (#264).
     let bodiless = client_header.method == http::Method::HEAD;
     let encode_decision =
-        if crate::response_encoding::request_allows_encoding(&client_header.headers)
+        if pingclair_core::encoding::request_allows_encoding(&client_header.headers)
             && intercept_file.is_none()
             && intercept_replacement.is_none()
             && !immediate_stream
