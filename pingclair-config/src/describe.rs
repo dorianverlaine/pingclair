@@ -558,6 +558,40 @@ pub const ENTRIES: &[Entry] = &[
 }"#,
     },
     Entry {
+        name: "Intercept",
+        kind: Kind::Component,
+        summary: "Rewrites the response of the components after it: `Intercept { Respond(when: …, …) }`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "app.example.test") {
+        Fallback {
+            Intercept {
+                Response(when: .status(404)) {
+                    Respond(status: 200, body: "soft 404")
+                }
+                Response(when: .status(.serverError)) {
+                    ResponseHeader(.remove("Set-Cookie"))
+                    CopyResponse(status: 503)
+                }
+            }
+            Proxy(to: "127.0.0.1:9000")
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "app.example.test") {
+        Fallback {
+            Intercept {
+                Response(when: .status(.serverError)) {
+                    CopyResponseHeaders(include: ["Etag"], exclude: ["Set-Cookie"])
+                    Respond(status: 503, body: "retry later")
+                }
+            }
+            Proxy(to: "127.0.0.1:9000")
+        }
+    }
+}"#,
+    },
+    Entry {
         name: "encode",
         kind: Kind::Modifier,
         summary: "The codings a site offers, most preferred first: `.encode(.zstd, .gzip)`.",

@@ -12,9 +12,9 @@ use pingclair_core::config::{
     HandlerConfig, HandlerElement, HeaderReplacement, IpRanges, Layer4Matcher, Layer4Route,
     Layer4Server, Layer4TlsMatcher, ListenerOptions, LoadBalanceConfig, LogConfig, LogFormat,
     LogOutput, LogRotation, Matcher, MatcherCondition, OverloadConfig, PRIVATE_RANGES,
-    PingclairConfig, ProxyUpstream, RateLimitKey, ResourceLimitsConfig, RetryConfig,
-    ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig, UpstreamTlsConfig,
-    normalize_listen_addr,
+    PingclairConfig, ProxyUpstream, RateLimitKey, ResourceLimitsConfig, ResponseHandlerConfig,
+    ResponseMatcher, RetryConfig, ReverseProxyConfig, RouteConfig, ServerConfig, TlsConfig,
+    UpstreamTlsConfig, normalize_listen_addr,
 };
 
 /// 📍 Reports location and expected structure without echoing configuration values.
@@ -1603,6 +1603,7 @@ fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
         "Rewrite" => rewrite(call),
         "BasicAuth" => basic_auth(call),
         "TryFiles" => try_files(call),
+        "Intercept" => intercept(call),
         "RateLimit" => rate_limit(call),
         "AccessControl" => access_control(call),
         "CORS" => cors(call),
@@ -1616,9 +1617,245 @@ fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
             "unknown HTTP component; expected a terminal (Respond, ServeFiles, Proxy, Redirect, \
              Fail, ServeMetrics, ACMEServer) or middleware (RequestHeader, ResponseHeader, \
              Rewrite, BasicAuth, RateLimit, AccessControl, CORS, SetVariable, LimitRequestBody, \
-             SkipLog, Templates, ForwardAuth, TryFiles)",
+             SkipLog, Templates, ForwardAuth, TryFiles, Intercept)",
         )),
     }
+}
+
+/// 🧭 `Intercept { … }`: response handlers for whatever the later components
+/// answer with.
+///
+/// 📌 The entries are an ordered list, and each one is an ordinary component
+/// name with a response matcher: `when:` here asks about the *response*, which
+/// is why it takes `.status(...)` and `.header(...)` rather than the request
+/// conditions a `Route(when:)` takes.
+fn intercept(call: &Call) -> Result<HandlerConfig, Error> {
+    call.labels(&[])?;
+    call.no_modifiers()?;
+    let body = call.block()?;
+    if body.is_empty() {
+        return Err(call
+            .at
+            .error("Intercept needs at least one response handler"));
+    }
+    let mut handlers = Vec::new();
+    for (index, child) in body.iter().enumerate() {
+        let entry = response_handler(child)?;
+        // 🚫 An entry with no `when:` matches every response, so anything
+        // written after it can never run. The Caddyfile sorts such entries
+        // last; this language refuses the order instead of repairing it.
+        if entry.matcher.is_none() && index + 1 != body.len() {
+            return Err(child.at.error(
+                "an entry with no when: matches every response, so the entries after it can \
+                 never run; move it to the end",
+            ));
+        }
+        handlers.push(entry);
+    }
+    Ok(HandlerConfig::Intercept { handlers })
+}
+
+/// 🧭 One entry of an `Intercept` block: a response shape and what to do with
+/// it.
+///
+/// 📌 The handlers live in a group because an entry is not always one handler.
+/// `CopyResponseHeaders` is the case that forced it: it only says which of the
+/// upstream's headers ride along onto a *replacement* response, so on its own
+/// it changes nothing a client can see. Writing it beside the handler that
+/// replaces the response is the only way it means something.
+fn response_handler(call: &Call) -> Result<ResponseHandlerConfig, Error> {
+    if call.name != "Response" {
+        return Err(call.at.error(format!(
+            "unknown Intercept entry '{}'; expected a Response(when: …) block",
+            call.name
+        )));
+    }
+    if call
+        .args
+        .iter()
+        .any(|(label, _)| label.as_deref() != Some("when"))
+    {
+        return Err(call
+            .at
+            .error("Response takes only when:; its handlers go in the block"));
+    }
+    call.no_modifiers()?;
+    let matcher = response_matcher(call)?;
+    let body = call.block()?;
+    if body.is_empty() {
+        return Err(call
+            .at
+            .error("Response needs at least one handler, such as Respond or ReplaceStatus"));
+    }
+    let mut status_code = None;
+    let mut handlers = Vec::new();
+    for child in body {
+        match child.name.as_str() {
+            // 🔢 Answer with a different status, keeping the body.
+            "ReplaceStatus" => {
+                if status_code.is_some() || !handlers.is_empty() {
+                    return Err(child.at.error(
+                        "ReplaceStatus is the whole entry: it answers with another status and \
+                         nothing else runs",
+                    ));
+                }
+                child.leaf(&["status"])?;
+                let status = u16::try_from(child.integer("status")?)
+                    .map_err(|_| child.at.error("status must fit in 0..=65535"))?;
+                status_code = Some(status.to_string());
+            }
+            // 💬 Answer with a body this configuration wrote.
+            "Respond" => {
+                child.leaf(&["body", "status"])?;
+                let status = match child.get("status") {
+                    Some(_) => u16::try_from(child.integer("status")?)
+                        .map_err(|_| child.at.error("status must fit in 0..=65535"))?,
+                    None => 200,
+                };
+                handlers.push(HandlerConfig::Respond {
+                    status,
+                    // 📌 Optional here, unlike a route's `Respond`: a response
+                    // handler that only changes the status is ordinary.
+                    body: if child.get("body").is_some() {
+                        Some(child.string("body")?)
+                    } else {
+                        None
+                    },
+                    headers: std::collections::BTreeMap::new(),
+                });
+            }
+            // 📨 Pass the response through, optionally with another status.
+            "CopyResponse" => {
+                child.leaf(&["status"])?;
+                let status_code = if child.get("status").is_some() {
+                    Some(
+                        u16::try_from(child.integer("status")?)
+                            .map_err(|_| child.at.error("status must fit in 0..=65535"))?,
+                    )
+                } else {
+                    None
+                };
+                handlers.push(HandlerConfig::CopyResponse { status_code });
+            }
+            // 🏷️ The same `ResponseHeader` component the routes use. It is
+            // what edits a response that passes through: `CopyResponse`
+            // forwards the upstream's headers untouched, so removing one is a
+            // header operation, not a copy policy.
+            "ResponseHeader" => handlers.push(response_headers(child)?),
+            // 🏷️ Say which of the upstream's headers a *replacement* keeps.
+            "CopyResponseHeaders" => {
+                child.leaf(&["include", "exclude"])?;
+                let include = child.strings("include")?;
+                let exclude = child.strings("exclude")?;
+                // 🚫 "include wins when both are present" is a rule the reader
+                // would have to know; the two lists answer different questions.
+                if !include.is_empty() && !exclude.is_empty() {
+                    return Err(child
+                        .at
+                        .error("include: and exclude: are alternatives; pick one"));
+                }
+                if include.is_empty() && exclude.is_empty() {
+                    return Err(child
+                        .at
+                        .error("CopyResponseHeaders needs include: or exclude:"));
+                }
+                handlers.push(HandlerConfig::CopyResponseHeaders { include, exclude });
+            }
+            other => {
+                return Err(child.at.error(format!(
+                    "unknown response handler '{other}'; expected Respond, ResponseHeader, \
+                     ReplaceStatus, CopyResponse or CopyResponseHeaders"
+                )));
+            }
+        }
+    }
+    Ok(ResponseHandlerConfig {
+        matcher,
+        status_code,
+        handlers,
+    })
+}
+
+/// 🧭 `when:` inside an `Intercept` block: a matcher over the response.
+fn response_matcher(call: &Call) -> Result<Option<ResponseMatcher>, Error> {
+    let Some(value) = call.get("when") else {
+        return Ok(None);
+    };
+    let Value::Typed(value) = value else {
+        return Err(call
+            .at
+            .error("when: takes a typed response condition such as .status(.serverError)"));
+    };
+    let mut matcher = ResponseMatcher::default();
+    match value.name.as_str() {
+        // 🚦 Codes and classes in one list, exactly the two things the model
+        // stores: a three-digit code, or a one-digit class.
+        "status" => {
+            if value.args.is_empty() {
+                return Err(value.at.error("status needs at least one code or class"));
+            }
+            for (label, item) in &value.args {
+                if label.is_some() {
+                    return Err(value.at.error("status takes unlabeled codes and classes"));
+                }
+                let code = match item {
+                    Value::Number(code) => {
+                        let code = u16::try_from(*code)
+                            .map_err(|_| value.at.error("status must fit in 0..=65535"))?;
+                        if !(100..=599).contains(&code) {
+                            return Err(value
+                                .at
+                                .error("a status code is 100..=599; write .serverError for 5xx"));
+                        }
+                        code
+                    }
+                    Value::Typed(class) => match class.name.as_str() {
+                        "informational" => 1,
+                        "success" => 2,
+                        "redirect" => 3,
+                        "clientError" => 4,
+                        "serverError" => 5,
+                        other => {
+                            return Err(class.at.error(format!(
+                                "unknown status class '.{other}'; expected .informational, \
+                                 .success, .redirect, .clientError or .serverError"
+                            )));
+                        }
+                    },
+                    _ => {
+                        return Err(value.at.error("status takes codes and class values"));
+                    }
+                };
+                if !matcher.status_codes.contains(&code) {
+                    matcher.status_codes.push(code);
+                }
+            }
+        }
+        // 🏷️ A header the response carries. `exists: true` is the model's `*`
+        // pattern; a value may use `*` as the model's own wildcard.
+        "header" => {
+            value.leaf(&["name", "value", "exists"])?;
+            let name = value.string("name")?;
+            let pattern = if value.get("exists").is_some() {
+                if !value.boolean("exists")? {
+                    return Err(value.at.error(
+                        "a response matcher cannot say a header is absent; match the responses \
+                         you want instead",
+                    ));
+                }
+                "*".to_string()
+            } else {
+                value.string("value")?
+            };
+            matcher.headers.entry(name).or_default().push(pattern);
+        }
+        other => {
+            return Err(value.at.error(format!(
+                "unknown response condition '.{other}'; expected .status(...) or .header(...)"
+            )));
+        }
+    }
+    Ok(Some(matcher))
 }
 
 /// 🧩 `Templates(root:)`: renders the files later components serve.

@@ -1534,6 +1534,110 @@ fn file_candidates_that_cannot_mean_anything_fail_closed() {
 }
 
 #[test]
+fn intercept_lowers_like_its_caddyfile_twin() {
+    let cases = [
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                Intercept {
+                    Response(when: .status(.serverError)) { ReplaceStatus(status: 502) }
+                    Response(when: .status(.success)) {
+                        CopyResponseHeaders(exclude: ["Set-Cookie"])
+                        CopyResponse(status: 201)
+                    }
+                }
+                Proxy(to: "127.0.0.1:9000")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troute {\n\t\tintercept {\n\t\t\t@err status 5xx\n\t\t\t@ok status 2xx\n\t\t\treplace_status @err 502\n\t\t\thandle_response @ok {\n\t\t\t\tcopy_response_headers {\n\t\t\t\t\texclude Set-Cookie\n\t\t\t\t}\n\t\t\t\tcopy_response 201\n\t\t\t}\n\t\t}\n\t\treverse_proxy 127.0.0.1:9000\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                Intercept {
+                    Response(when: .status(404)) { Respond(status: 200, body: "soft 404") }
+                    Response { ReplaceStatus(status: 503) }
+                }
+                Proxy(to: "127.0.0.1:9000")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troute {\n\t\tintercept {\n\t\t\t@missing status 404\n\t\t\thandle_response @missing {\n\t\t\t\trespond \"soft 404\" 200\n\t\t\t}\n\t\t\treplace_status 503\n\t\t}\n\t\treverse_proxy 127.0.0.1:9000\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                Intercept {
+                    Response(when: .header(name: "Content-Type", value: "text/*")) {
+                        CopyResponseHeaders(include: ["Content-Type", "Etag"])
+                        Respond(status: 200, body: "rewritten")
+                    }
+                }
+                ServeFiles(root: "/tmp/pub")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troute {\n\t\tintercept {\n\t\t\t@text header Content-Type text/*\n\t\t\thandle_response @text {\n\t\t\t\tcopy_response_headers {\n\t\t\t\t\tinclude Content-Type Etag\n\t\t\t\t}\n\t\t\t\trespond \"rewritten\" 200\n\t\t\t}\n\t\t}\n\t\tfile_server {\n\t\t\troot /tmp/pub\n\t\t}\n\t}\n}"
+                .to_string(),
+        ),
+    ];
+    for (native_source, legacy_source) in cases {
+        let native = crate::compile(&native_source).unwrap();
+        let legacy = crate::compile(&legacy_source).unwrap();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::to_value(legacy).unwrap(),
+            "{native_source}"
+        );
+    }
+}
+
+#[test]
+fn intercept_entries_that_cannot_mean_anything_fail_closed() {
+    let site = |body: &str| {
+        format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {body} Proxy(to: \"127.0.0.1:9000\") }} }} }}"
+        )
+    };
+    for body in [
+        // 🧭 A block is required and it has to hold something.
+        "Intercept()",
+        "Intercept { }",
+        "Intercept(unknown: 1) { }",
+        "Intercept { Response() }",
+        "Intercept { Response { } }",
+        "Intercept { Response(unknown: 1) { ReplaceStatus(status: 503) } }",
+        // 🥇 An entry that matches every response has to come last.
+        "Intercept { Response { ReplaceStatus(status: 503) } Response(when: .status(500)) { ReplaceStatus(status: 502) } }",
+        // 🚦 Statuses are codes and classes, in range.
+        "Intercept { Response(when: .status()) { ReplaceStatus(status: 503) } }",
+        "Intercept { Response(when: .status(99)) { ReplaceStatus(status: 503) } }",
+        "Intercept { Response(when: .status(600)) { ReplaceStatus(status: 503) } }",
+        "Intercept { Response(when: .status(.anyError)) { ReplaceStatus(status: 503) } }",
+        "Intercept { Response(when: .status(.unknown)) { ReplaceStatus(status: 503) } }",
+        "Intercept { Response(when: .status(code: 500)) { ReplaceStatus(status: 503) } }",
+        // 🏷️ A header condition names a header and one predicate.
+        "Intercept { Response(when: .header(name: \"X-Foo\")) { ReplaceStatus(status: 503) } }",
+        "Intercept { Response(when: .header(name: \"X-Foo\", exists: false)) { ReplaceStatus(status: 503) } }",
+        "Intercept { Response(when: .header(value: \"x\")) { ReplaceStatus(status: 503) } }",
+        "Intercept { Response(when: .path(exact: \"/x\")) { ReplaceStatus(status: 503) } }",
+        "Intercept { Response(when: \"status\") { ReplaceStatus(status: 503) } }",
+        // 💬 The handler family is four names, and each has its own shape.
+        "Intercept { Response(when: .status(500)) { Fail(status: 500) } }",
+        "Intercept { Response(when: .status(500)) { Proxy(to: \"127.0.0.1:9000\") } }",
+        "Intercept { Response(when: .status(500)) { ReplaceStatus() } }",
+        "Intercept { Response(when: .status(500)) { ReplaceStatus(status: 999999) } }",
+        "Intercept { Response(when: .status(500)) { ReplaceStatus(status: \"502\") } }",
+        "Intercept { Response(when: .status(500)) { ReplaceStatus(status: 503) ReplaceStatus(status: 504) } }",
+        "Intercept { Response(when: .status(500)) { CopyResponse(status: 999999) } }",
+        "Intercept { Response(when: .status(500)) { CopyResponseHeaders() } }",
+        "Intercept { Response(when: .status(500)) { CopyResponseHeaders(include: [], exclude: [\"X\"]) } }",
+        "Intercept { Response(when: .status(500)) { CopyResponseHeaders(include: [\"X\"], exclude: [\"Y\"]) } }",
+        "Intercept { Response(when: .status(500)) { CopyResponseHeaders(include: \"X\") } }",
+    ] {
+        let source = site(body);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",

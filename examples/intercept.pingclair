@@ -1,0 +1,30 @@
+// 🧭 `Intercept`: rewrite the response of the components written after it.
+//
+// 📌 `when:` inside the block asks about the *response*, so it takes
+// `.status(…)` with codes or classes and `.header(…)` — not the request
+// conditions a `Route(when:)` takes. Entries run in order, and the one with no
+// `when:` matches everything, which is why it has to be written last.
+HTTPListener(on: ":8080") {
+    Site(host: "app.example.test") {
+        Route(when: .path(prefix: "/api")) {
+            Intercept {
+                // 🚨 An upstream that is down becomes a page this site owns.
+                Response(when: .status(.serverError)) { Respond(status: 503, body: "the API is taking a break") }
+
+                // 🍪 A 2xx is re-sent as 201 with the upstream's headers, minus
+                // the cookie. `CopyResponse` forwards those headers untouched,
+                // so removing one is a header operation: `ResponseHeader` is
+                // the same component the routes use.
+                Response(when: .status(.success)) {
+                    ResponseHeader(.remove("Set-Cookie"))
+                    CopyResponse(status: 201)
+                }
+
+                // 🔢 Everything else keeps its body and reports 200.
+                Response { ReplaceStatus(status: 200) }
+            }
+            Proxy(to: "127.0.0.1:9000")
+        }
+        Fallback { ServeFiles(root: "./public") }
+    }
+}
