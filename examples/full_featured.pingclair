@@ -87,7 +87,7 @@ HTTPListener(on: ":8443") {
     // already answers that one, and the loader refuses a page it shadows.
     .errorPage(for: [.status(403)], file: "./public/index.html")
 }
-.tls(.automatic(email: "admin@example.test"))
+.tls(.automatic(email: "admin@example.test"), defaultSNI: "www.example.test", renewalWindow: .ratio(0.1))
 .protocols([.http1, .http2])
 .limits(maxConnections: 4096, headerTimeout: .seconds(30))
 .accessLog(output: .file("/tmp/pingclair-access.log"), format: .console)

@@ -5,6 +5,7 @@
 
 mod conditions;
 mod handlers;
+mod tls;
 
 pub(crate) use conditions::{TRY_FILES_LABELS, is_http_condition};
 pub(crate) use handlers::{
@@ -13,10 +14,12 @@ pub(crate) use handlers::{
     RATE_LIMIT_LABELS, REDIRECT_LABELS, RESPOND_LABELS, REWRITE_LABELS, SET_VARIABLE_LABELS,
     TEMPLATES_LABELS,
 };
+pub(crate) use tls::TLS_LABELS;
 
 use super::*;
 use conditions::http_condition;
 use handlers::http_handler;
+use tls::parse_tls;
 
 /// 🏷️ The argument labels an HTTP listener accepts.
 pub(crate) const HTTP_LISTENER_LABELS: &[&str] = &["on"];
@@ -106,7 +109,11 @@ pub(super) fn http_listener(call: &Call, config: &mut PingclairConfig) -> Result
                 apply_http_limits(modifier, &mut bounds)?;
                 options.limits = Some(bounds);
             }
-            "tls" => options.tls = Some(parse_tls(modifier)?),
+            "tls" => {
+                let parsed = parse_tls(modifier, None)?;
+                options.tls = Some(parsed.config);
+                options.ocsp_stapling_off |= parsed.ocsp_stapling_off;
+            }
             "accessLog" => options.log = Some(parse_access_log(modifier)?),
             _ => return Err(modifier.at.error("unknown HTTPListener modifier")),
         }
@@ -118,7 +125,17 @@ pub(super) fn http_listener(call: &Call, config: &mut PingclairConfig) -> Result
                 .at
                 .error("HTTPListener children must be Site components"));
         }
-        servers.push(site(child, &addresses, &options)?);
+        let (server, site_ocsp) = site(child, &addresses, &options)?;
+        // 📴 `ocspStapling: .off` names a process-wide record: this build
+        // never staples, so writing it at either level records the state that
+        // is already in force.
+        if site_ocsp {
+            config.global.ocsp_stapling_off = true;
+        }
+        servers.push(server);
+    }
+    if options.ocsp_stapling_off {
+        config.global.ocsp_stapling_off = true;
     }
     if servers.is_empty() {
         return Err(call.at.error("HTTPListener must contain at least one Site"));
@@ -151,13 +168,15 @@ fn site(
     call: &Call,
     addresses: &[String],
     options: &HttpListenerOptions,
-) -> Result<ServerConfig, Error> {
+) -> Result<(ServerConfig, bool), Error> {
     call.labels(SITE_LABELS)?;
     let mut encodings = Vec::new();
     let mut error_pages: std::collections::BTreeMap<u16, String> =
         std::collections::BTreeMap::new();
     let mut page_positions = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut site_tls: Option<tls::ParsedTls> = None;
+    let mut http3: Option<(bool, Position)> = None;
     for modifier in &call.modifiers {
         // 📌 `.errorPage(...)` is the one modifier a site may repeat: its key is
         // the status it claims, not the modifier's name, and a site with
@@ -177,10 +196,15 @@ fn site(
                     page_positions.push((status, modifier.at));
                 }
             }
+            "tls" => site_tls = Some(parse_tls(modifier, options.tls.as_ref())?),
+            "http3" => {
+                modifier.leaf(&["enabled"])?;
+                http3 = Some((modifier.boolean("enabled")?, modifier.at));
+            }
             _ => {
                 return Err(modifier
                     .at
-                    .error("unknown Site modifier; expected .encode or .errorPage"));
+                    .error("unknown Site modifier; expected .encode, .errorPage, .tls or .http3"));
             }
         }
     }
@@ -260,32 +284,52 @@ fn site(
             crate::compiler::apply_site_compression(&mut route.handler);
         }
     }
+    // 🔐 A site's `.tls(...)` starts from its listener's configuration and
+    // overrides what it writes down. `.http3(enabled:)` is the one site-only
+    // setting, and it needs a TLS configuration to attach to.
+    let (mut effective_tls, ocsp_stapling_off) = match site_tls {
+        Some(parsed) => (Some(parsed.config), parsed.ocsp_stapling_off),
+        None => (options.tls.clone(), false),
+    };
+    if let Some((enabled, at)) = http3 {
+        let Some(config) = effective_tls.as_mut() else {
+            return Err(
+                at.error("http3 exists only on a TLS site; add .tls(...) here or on the listener")
+            );
+        };
+        config.http3 = enabled;
+    }
     let (name, names) = if host == "*" {
         (Some("_".to_string()), Vec::new())
     } else {
         (Some(host.clone()), vec![host])
     };
-    Ok(ServerConfig {
-        name,
-        names,
-        listen: addresses.to_vec(),
-        // 🛡️ A `.tls` listener terminates TLS; the site is not plaintext.
-        plaintext_listen: if options.tls.is_some() {
-            Vec::new()
-        } else {
-            addresses.to_vec()
+    Ok((
+        ServerConfig {
+            name,
+            names,
+            listen: addresses.to_vec(),
+            // 🛡️ A `.tls` listener (or site) terminates TLS; the site is not
+            // plaintext.
+            plaintext_listen: if effective_tls.is_some() {
+                Vec::new()
+            } else {
+                addresses.to_vec()
+            },
+            tls: effective_tls,
+            log: options.log.clone(),
+            // 🧜 `.encode(...)` is the only thing that turns compression on;
+            // the legacy gzip default on `ServerConfig` applies to old JSON
+            // only.
+            encodings,
+            limits: options.limits.clone().unwrap_or_default(),
+            routes,
+            error_routes,
+            error_pages,
+            ..ServerConfig::default()
         },
-        tls: options.tls.clone(),
-        log: options.log.clone(),
-        // 🧜 `.encode(...)` is the only thing that turns compression on; the
-        // legacy gzip default on `ServerConfig` applies to old JSON only.
-        encodings,
-        limits: options.limits.clone().unwrap_or_default(),
-        routes,
-        error_routes,
-        error_pages,
-        ..ServerConfig::default()
-    })
+        ocsp_stapling_off,
+    ))
 }
 
 /// 🏷️ The argument labels `parse_error_page` accepts, named once for the parser and `describe`.
@@ -486,51 +530,10 @@ struct HttpListenerOptions {
     limits: Option<ResourceLimitsConfig>,
     tls: Option<TlsConfig>,
     log: Option<LogConfig>,
-}
-
-/// 🔐 The `.tls(...)` variants this build serves.
-fn parse_tls(modifier: &Call) -> Result<TlsConfig, Error> {
-    let [(None, Value::Typed(variant))] = modifier.args.as_slice() else {
-        return Err(modifier
-            .at
-            .error("tls takes one variant: .automatic, .internal or .files"));
-    };
-    if modifier.body.is_some() {
-        return Err(modifier.at.error("tls does not take a block"));
-    }
-    match variant.name.as_str() {
-        "internal" => {
-            variant.leaf(&[])?;
-            Ok(TlsConfig {
-                internal: true,
-                ..TlsConfig::default()
-            })
-        }
-        "automatic" => {
-            variant.leaf(&["email"])?;
-            let acme_email = if variant.get("email").is_some() {
-                Some(variant.string("email")?)
-            } else {
-                None
-            };
-            Ok(TlsConfig {
-                auto: true,
-                acme_email,
-                ..TlsConfig::default()
-            })
-        }
-        "files" => {
-            variant.leaf(&["certificate", "key"])?;
-            Ok(TlsConfig {
-                cert: Some(variant.string("certificate")?),
-                key: Some(variant.string("key")?),
-                ..TlsConfig::default()
-            })
-        }
-        other => Err(variant.at.error(format!(
-            "unknown TLS variant '.{other}'; expected .automatic, .internal or .files"
-        ))),
-    }
+    /// 📴 Recorded from any `.tls(ocspStapling: .off)` on this listener or one
+    /// of its sites; the record is process-wide because no per-site stapling
+    /// exists to configure.
+    ocsp_stapling_off: bool,
 }
 
 /// 🏷️ The argument labels `parse_access_log` accepts, named once for the parser and `describe`.

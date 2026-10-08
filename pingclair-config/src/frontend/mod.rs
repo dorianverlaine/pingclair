@@ -35,15 +35,14 @@ pub struct Error {
     pub(crate) message: String,
 }
 
-/// 🔐 Refuses a `@Secret` value anywhere the configuration would record it.
+/// 🔐 Refuses a `@Secret` value anywhere the configuration would record it —
+/// except the one field family that stores secrets on purpose.
 ///
-/// 📌 v1 has no field that holds a secret, so every position a secret can reach
-/// is a position it would be written into — the configuration, the admin JSON,
-/// a reload, a log that dumps any of them. The attribute promises "never
-/// shown"; the way to keep that promise without a taint-tracking pass is to
-/// refuse the use, not to mask it afterwards. A field that *does* hold a secret
-/// (a DNS-01 token, say) will accept these explicitly when it lands, and this
-/// is the check that has to learn about it.
+/// 📌 The DNS-01 provider arguments are `SecretString`s: the runtime has to
+/// read them, so storing the value *is* the point and every surface that dumps
+/// configuration masks them. Anywhere else the attribute's promise ("never
+/// shown") would be broken by the write itself, so the use is refused rather
+/// than masked after the fact.
 fn reject_secret_values(call: &Call) -> Result<(), Error> {
     for (_, value) in &call.args {
         reject_secret(value)?;
@@ -61,11 +60,14 @@ fn reject_secret_values(call: &Call) -> Result<(), Error> {
 fn reject_secret(value: &Value) -> Result<(), Error> {
     match value {
         Value::Secret { at, .. } => Err(at.error(
-            "a @Secret value cannot be used yet: no field in this build holds a secret, so \
-             using it would write the value into the configuration and everything that dumps \
-             it. Declare it with a plain binding until a secret-accepting field lands",
+            "a @Secret value can only flow into a field that stores secrets — the DNS-01 \
+             provider arguments. Anywhere else it would be written into the configuration \
+             and everything that dumps it",
         )),
         Value::Array(items) => items.iter().try_for_each(reject_secret),
+        // 🔐 `.dns(...)` is the one subtree whose arguments are stored as
+        // `SecretString`s; its reader accepts the marked values explicitly.
+        Value::Typed(call) if call.name == "dns" => Ok(()),
         Value::Typed(call) | Value::Component(call) => reject_secret_values(call),
         _ => Ok(()),
     }
@@ -295,3 +297,5 @@ impl Call {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tls_tests;

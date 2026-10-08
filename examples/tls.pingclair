@@ -1,4 +1,4 @@
-// 🔐 Two listeners that terminate TLS, with the knobs the language has today.
+// 🔐 Listeners that terminate TLS, with the knobs the language has today.
 //
 // 📌 `.tls(.internal)` signs with the local authority and needs no files, which
 // is what every example and test in this repository uses: `.files(certificate:,
@@ -9,8 +9,9 @@ HTTPListener(on: ":8443") {
         Fallback { ServeFiles(root: "./public") }
     }
     .encode(.zstd, .gzip)
+    .http3(enabled: false)
 }
-.tls(.internal)
+.tls(.internal, defaultSNI: "secure.example.test", ocspStapling: .off)
 .protocols([.http1, .http2])
 .limits(headerTimeout: .seconds(30), maxConnections: 4096)
 
@@ -19,5 +20,30 @@ HTTPListener(on: ":9443") {
         Fallback { Respond(body: "issued by ACME") }
     }
 }
-.tls(.automatic(email: "admin@example.test"))
+.tls(.automatic(email: "admin@example.test"), renewalWindow: .ratio(0.1))
 .accessLog(output: .file("/tmp/pingclair-tls-access.log"), format: .json)
+
+// 🪪 Mutual TLS: the client's chain is verified against the host's trust store,
+// and the presented leaf must also be one of the files pinned here.
+HTTPListener(on: ":10443") {
+    Site(host: "mtls.example.test") {
+        Fallback { Respond(body: "client verified") }
+    }
+}
+.tls(.internal, clientAuth: .requireAndVerify(trust: .system, verifier: .leaf(.files(["./clients/alice.pem"]))))
+
+// 📡 DNS-01: the challenge record is published through Cloudflare, and the
+// token never leaves a `@Secret` binding except into the provider arguments.
+@Secret
+let cfToken = "cloudflare-api-token-placeholder"
+HTTPListener(on: ":11443") {
+    Site(host: "wildcard.example.test") {
+        Fallback { Respond(body: "wildcard certificate") }
+    }
+}
+.tls(
+    .automatic(email: "admin@example.test", challenge: .dns(.cloudflare(cfToken))),
+    resolvers: ["1.1.1.1"],
+    dnsTTL: .minutes(2),
+    propagationDelay: .seconds(5),
+)

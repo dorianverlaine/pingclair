@@ -17,7 +17,9 @@
         "cert": null,
         "key": null,
         "acme_email": "admin@example.test",
-        "http3": true
+        "http3": true,
+        "default_sni": "www.example.test",
+        "renewal_window_ratio": 0.1
       },
       "routes": [
         {

@@ -141,16 +141,17 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         name: "tls",
         kind: Kind::Modifier,
-        summary: "TLS for an HTTP listener: `.automatic`, `.internal` or `.files`.",
+        summary: "TLS for a listener or site: `.automatic`, `.internal` or `.files`, plus \
+                  named settings such as defaultSNI:, clientAuth: or renewalWindow:.",
         example: r#"HTTPListener(on: ":8443") {
     Site(host: "localhost") { Fallback { Respond(body: "hello") } }
 }
-.tls(.internal)"#,
+.tls(.automatic(email: "admin@example.com"), defaultSNI: "localhost")"#,
         refusal: r#"HTTPListener(on: ":8443") {
     Site(host: "localhost") { Fallback { Respond(body: "hello") } }
 }
-.tls(.acme(email: "admin@example.com"))"#,
-        labels: &[],
+.tls(ocspStapling: .on)"#,
+        labels: crate::frontend::http::TLS_LABELS,
     },
     Entry {
         name: "ServeFiles",
