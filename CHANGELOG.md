@@ -27,6 +27,27 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🧾 Every header-limit refusal leaves a record, on every transport
+
+An oversized header block was answered `431` on all three transports, but only
+the TCP ones left a trace: the H1/H2 refusal happens inside Pingora's early
+filter, so its record was that library's incidental line, and the HTTP/3 path
+builds its refusal itself and wrote nothing at all. An operator scraping logs
+for refusals saw every one except the QUIC ones. The refusal now writes one
+stable record where it is decided, with the transport as a field and the
+sentence H1/H2 already carried, so an existing search keeps working (#308).
+
+### 🔇 Enabling the cache no longer asks for a dictionary it cannot take
+
+The first stored response made `pingora-cache` warn that no header-compression
+dictionary was configured, naming two `set_compression_dict_*` APIs that
+nothing in a Pingclairfile can reach. The dictionary is an optional
+optimisation — without it the same zstd frame is written, with less shared
+context — so the warning asked the operator to do something impossible. It is
+re-levelled to `debug` in the log bridge: visible under `--verbose` or
+`RUST_LOG` for anyone debugging the cache, absent from a log where it is noise
+that cannot be acted on (#307).
+
 ### 🧭 A local body keeps its default `Content-Type` on HTTP/3
 
 Caddy answers `respond` and `error` with `text/plain; charset=utf-8` unless
