@@ -18,6 +18,7 @@ impl Position {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Call {
     pub name: String,
     pub args: Vec<(Option<String>, Value)>,
@@ -25,12 +26,26 @@ pub(super) struct Call {
     pub modifiers: Vec<Call>,
     pub at: Position,
 }
+
+/// 🧩 A top-level declaration is either a component or an immutable binding.
+pub(super) enum Declaration {
+    Component(Call),
+    Binding {
+        name: String,
+        value: Value,
+        at: Position,
+    },
+}
+
+#[derive(Clone)]
 pub(super) enum Value {
     String(String),
     Number(u64),
     Bool(bool),
     Array(Vec<Value>),
-    Call(Call),
+    Typed(Call),
+    Component(Call),
+    Reference { name: String, at: Position },
 }
 #[derive(PartialEq)]
 enum Token {
@@ -46,7 +61,7 @@ struct Item {
 }
 
 /// 🛡️ Limits apply before allocating tokens or descending through recursive values.
-pub(super) fn parse(source: &str) -> Result<Vec<Call>, super::Error> {
+pub(super) fn parse(source: &str) -> Result<Vec<Declaration>, super::Error> {
     let start = Position { line: 1, column: 1 };
     if source.len() > 1024 * 1024 {
         return Err(start.error("configuration exceeds 1 MiB"));
@@ -122,7 +137,7 @@ pub(super) fn parse(source: &str) -> Result<Vec<Call>, super::Error> {
                         .parse()
                         .map_err(|_| here.error("integer exceeds supported range"))?,
                 )
-            } else if "(){}[],:.".contains(ch) {
+            } else if "(){}[],:.=".contains(ch) {
                 Token::Mark(ch)
             } else {
                 return Err(here.error("unexpected character"));
@@ -141,7 +156,11 @@ pub(super) fn parse(source: &str) -> Result<Vec<Call>, super::Error> {
     };
     let mut declarations = Vec::new();
     while parser.peek() != &Token::End {
-        declarations.push(parser.call(0, true)?);
+        if parser.peek_word() == Some("let") {
+            declarations.push(parser.binding(0)?);
+        } else {
+            declarations.push(Declaration::Component(parser.call(0, true)?));
+        }
     }
     Ok(declarations)
 }
@@ -151,6 +170,12 @@ struct Parser {
 impl Parser {
     fn peek(&mut self) -> &Token {
         &self.items.peek().unwrap().token
+    }
+    fn peek_word(&mut self) -> Option<&str> {
+        match self.peek() {
+            Token::Word(word) => Some(word),
+            _ => None,
+        }
     }
     fn error(&mut self, message: &str) -> super::Error {
         self.items.peek().unwrap().at.error(message)
@@ -170,14 +195,58 @@ impl Parser {
             Err(self.error(&format!("expected '{mark}'")))
         }
     }
-    fn call(&mut self, depth: usize, block: bool) -> Result<Call, super::Error> {
+    /// 🧩 Parses `let <name> = <value|component>`; bindings live at the top level only.
+    fn binding(&mut self, depth: usize) -> Result<Declaration, super::Error> {
         if depth >= 16 {
             return Err(self.error("configuration nesting exceeds 16 levels"));
         }
+        let at = self.items.peek().unwrap().at;
+        self.items.next();
+        let identifier = self.items.next().unwrap();
+        let Token::Word(name) = identifier.token else {
+            return Err(identifier.at.error("expected binding name"));
+        };
+        self.expect('=')?;
+        let value = if matches!(self.peek(), Token::Word(_)) {
+            let item = self.items.next().unwrap();
+            let Token::Word(word) = item.token else {
+                unreachable!()
+            };
+            if word == "true" || word == "false" {
+                Value::Bool(word == "true")
+            } else if self.peek() == &Token::Mark('(') || self.peek() == &Token::Mark('{') {
+                Value::Component(self.call_with_open(word, item.at, depth + 1, true)?)
+            } else {
+                Value::Reference {
+                    name: word,
+                    at: item.at,
+                }
+            }
+        } else {
+            self.value(depth + 1)?
+        };
+        Ok(Declaration::Binding { name, value, at })
+    }
+    fn call(&mut self, depth: usize, block: bool) -> Result<Call, super::Error> {
         let item = self.items.next().unwrap();
         let Token::Word(name) = item.token else {
             return Err(item.at.error("expected declaration name"));
         };
+        if name == "let" {
+            return Err(item.at.error("let bindings must be top-level declarations"));
+        }
+        self.call_with_open(name, item.at, depth, block)
+    }
+    fn call_with_open(
+        &mut self,
+        name: String,
+        at: Position,
+        depth: usize,
+        block: bool,
+    ) -> Result<Call, super::Error> {
+        if depth >= 16 {
+            return Err(self.error("configuration nesting exceeds 16 levels"));
+        }
         let mut args = Vec::new();
         if self.take('(') {
             while !self.take(')') {
@@ -202,7 +271,7 @@ impl Parser {
                     None
                 };
                 if label.is_some() && args.iter().any(|(old, _)| old == &label) {
-                    return Err(item.at.error("duplicate argument label"));
+                    return Err(at.error("duplicate argument label"));
                 }
                 args.push((label, self.value(depth + 1)?));
                 if self.take(')') {
@@ -234,7 +303,7 @@ impl Parser {
             args,
             body,
             modifiers,
-            at: item.at,
+            at,
         })
     }
     fn value(&mut self, depth: usize) -> Result<Value, super::Error> {
@@ -242,7 +311,7 @@ impl Parser {
             return Err(self.error("configuration nesting exceeds 16 levels"));
         }
         if self.take('.') {
-            return Ok(Value::Call(self.call(depth + 1, false)?));
+            return Ok(Value::Typed(self.call(depth + 1, false)?));
         }
         if self.take('[') {
             let mut values = Vec::new();
@@ -262,7 +331,10 @@ impl Parser {
             Token::Word(value) if value == "true" || value == "false" => {
                 Ok(Value::Bool(value == "true"))
             }
-            _ => Err(item.at.error("expected a literal, array, or typed value")),
+            Token::Word(name) => Ok(Value::Reference { name, at: item.at }),
+            _ => Err(item
+                .at
+                .error("expected a literal, array, typed value, or binding")),
         }
     }
 }

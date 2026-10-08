@@ -7,7 +7,7 @@ mod syntax;
 use pingclair_core::config::{
     AdminConfig, Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher, PingclairConfig,
 };
-use syntax::{Call, Value};
+use syntax::{Call, Declaration, Value};
 
 /// 📍 Reports location and expected structure without echoing configuration values.
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +27,12 @@ pub fn is_native(source: &str) -> bool {
             .map_or("", |(_, tail)| tail)
             .trim_start();
     }
+    if rest
+        .strip_prefix("let")
+        .is_some_and(|tail| tail.starts_with(char::is_whitespace))
+    {
+        return true;
+    }
     let name_len = rest
         .bytes()
         .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
@@ -38,19 +44,28 @@ pub fn is_native(source: &str) -> bool {
 
 pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
     let declarations = syntax::parse(source)?;
+    let mut bindings = Bindings::default();
+    bindings.declare(&declarations)?;
     let mut config = PingclairConfig::default();
     let mut seen = std::collections::HashSet::new();
-    for call in &declarations {
+    for declaration in &declarations {
+        let call = match declaration {
+            Declaration::Binding { name, value, .. } => {
+                bindings.bind(name, value)?;
+                continue;
+            }
+            Declaration::Component(call) => bindings.expand_call(call)?,
+        };
         if call.name == "Pingclair" {
             return Err(call.at.error(
                 "the Pingclair(version: ...) header was removed; declare components at the top level",
             ));
         }
-        if call.name != "TCPListener" && !seen.insert(&call.name) {
+        if call.name != "TCPListener" && !seen.insert(call.name.clone()) {
             return Err(call.at.error("duplicate global declaration"));
         }
         match call.name.as_str() {
-            "TCPListener" => config.layer4.push(listener(call)?),
+            "TCPListener" => config.layer4.push(listener(&call)?),
             "Admin" => {
                 call.leaf(&["listen"])?;
                 config.admin = Some(AdminConfig {
@@ -88,6 +103,206 @@ pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
     Ok(config)
 }
 
+/// 🧩 Expansion bounds keep reuse from turning into unbounded work.
+const MAX_EXPANDED_NODES: usize = 4096;
+const MAX_EXPANDED_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Default)]
+struct Bindings {
+    names: std::collections::HashSet<String>,
+    resolved: std::collections::HashMap<String, Bound>,
+    nodes: usize,
+    bytes: usize,
+}
+
+struct Bound {
+    fragment: Fragment,
+    nodes: usize,
+    bytes: usize,
+}
+
+enum Fragment {
+    Value(Value),
+    Component(Call),
+}
+
+impl Bindings {
+    fn declare(&mut self, declarations: &[Declaration]) -> Result<(), Error> {
+        for declaration in declarations {
+            let Declaration::Binding { name, at, .. } = declaration else {
+                continue;
+            };
+            if !name.starts_with(|c: char| c.is_ascii_lowercase())
+                || matches!(name.as_str(), "let" | "true" | "false")
+            {
+                return Err(at.error(
+                    "binding names must start with a lowercase letter and cannot be reserved",
+                ));
+            }
+            if !self.names.insert(name.clone()) {
+                return Err(at.error("duplicate immutable binding"));
+            }
+        }
+        Ok(())
+    }
+
+    fn bind(&mut self, name: &str, value: &Value) -> Result<(), Error> {
+        let fragment = match value {
+            Value::Component(call) => Fragment::Component(self.expand_call(call)?),
+            other => Fragment::Value(self.expand_value(other)?),
+        };
+        let (nodes, bytes) = fragment_size(&fragment);
+        self.resolved.insert(
+            name.to_string(),
+            Bound {
+                fragment,
+                nodes,
+                bytes,
+            },
+        );
+        Ok(())
+    }
+
+    fn expand_value(&mut self, value: &Value) -> Result<Value, Error> {
+        match value {
+            Value::Reference { name, at } => {
+                let (value, nodes, bytes) = match self.resolved.get(name) {
+                    Some(Bound {
+                        fragment: Fragment::Value(value),
+                        nodes,
+                        bytes,
+                    }) => (value.clone(), *nodes, *bytes),
+                    Some(_) => {
+                        return Err(at.error("expected a value; this binding names a component"));
+                    }
+                    None => return Err(self.unresolved(name, *at)),
+                };
+                self.charge(*at, nodes, bytes)?;
+                Ok(value)
+            }
+            Value::Array(values) => Ok(Value::Array(
+                values
+                    .iter()
+                    .map(|item| self.expand_value(item))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            Value::Typed(call) => Ok(Value::Typed(self.expand_call(call)?)),
+            Value::Component(call) => Ok(Value::Component(self.expand_call(call)?)),
+            literal => Ok(literal.clone()),
+        }
+    }
+
+    fn expand_call(&mut self, call: &Call) -> Result<Call, Error> {
+        if call.args.is_empty() && call.body.is_none() && call.modifiers.is_empty() {
+            match self.resolved.get(&call.name) {
+                Some(Bound {
+                    fragment: Fragment::Component(inner),
+                    nodes,
+                    bytes,
+                }) => {
+                    let (inner, nodes, bytes) = (inner.clone(), *nodes, *bytes);
+                    self.charge(call.at, nodes, bytes)?;
+                    return Ok(inner);
+                }
+                Some(_) => {
+                    return Err(call
+                        .at
+                        .error("expected a component; this binding names a value"));
+                }
+                None => {}
+            }
+            if self.names.contains(&call.name) {
+                return Err(call.at.error("binding used before its declaration"));
+            }
+        }
+        let mut args = Vec::with_capacity(call.args.len());
+        for (label, value) in &call.args {
+            args.push((label.clone(), self.expand_value(value)?));
+        }
+        let body = match &call.body {
+            Some(children) => {
+                let mut expanded = Vec::with_capacity(children.len());
+                for child in children {
+                    expanded.push(self.expand_call(child)?);
+                }
+                Some(expanded)
+            }
+            None => None,
+        };
+        let mut modifiers = Vec::with_capacity(call.modifiers.len());
+        for modifier in &call.modifiers {
+            modifiers.push(self.expand_call(modifier)?);
+        }
+        Ok(Call {
+            name: call.name.clone(),
+            args,
+            body,
+            modifiers,
+            at: call.at,
+        })
+    }
+
+    fn charge(&mut self, at: syntax::Position, nodes: usize, bytes: usize) -> Result<(), Error> {
+        self.nodes = self.nodes.saturating_add(nodes);
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.nodes > MAX_EXPANDED_NODES || self.bytes > MAX_EXPANDED_BYTES {
+            return Err(at.error("configuration expansion exceeds 4096 components or 8 MiB"));
+        }
+        Ok(())
+    }
+
+    fn unresolved(&self, name: &str, at: syntax::Position) -> Error {
+        if self.names.contains(name) {
+            at.error("binding used before its declaration")
+        } else {
+            at.error(format!("unknown binding '{name}'"))
+        }
+    }
+}
+
+fn fragment_size(fragment: &Fragment) -> (usize, usize) {
+    let mut nodes = 0;
+    let mut bytes = 0;
+    match fragment {
+        Fragment::Value(value) => count_value(value, &mut nodes, &mut bytes),
+        Fragment::Component(call) => count_call(call, &mut nodes, &mut bytes),
+    }
+    (nodes, bytes)
+}
+
+fn count_call(call: &Call, nodes: &mut usize, bytes: &mut usize) {
+    *nodes += 1;
+    *bytes += call.name.len();
+    for (label, value) in &call.args {
+        *nodes += 1;
+        *bytes += label.as_deref().map_or(0, str::len);
+        count_value(value, nodes, bytes);
+    }
+    if let Some(children) = &call.body {
+        for child in children {
+            count_call(child, nodes, bytes);
+        }
+    }
+    for modifier in &call.modifiers {
+        count_call(modifier, nodes, bytes);
+    }
+}
+
+fn count_value(value: &Value, nodes: &mut usize, bytes: &mut usize) {
+    *nodes += 1;
+    match value {
+        Value::String(text) => *bytes += text.len(),
+        Value::Array(values) => {
+            for item in values {
+                count_value(item, nodes, bytes);
+            }
+        }
+        Value::Typed(call) | Value::Component(call) => count_call(call, nodes, bytes),
+        Value::Reference { name, .. } => *bytes += name.len(),
+        Value::Number(_) | Value::Bool(_) => {}
+    }
+}
+
 fn listener(call: &Call) -> Result<Layer4Server, Error> {
     call.labels(&["on"])?;
     let mut server = Layer4Server::new(call.string("on")?);
@@ -96,9 +311,9 @@ fn listener(call: &Call) -> Result<Layer4Server, Error> {
         match child.name.as_str() {
             "Route" | "Fallback" => server.routes.push(route(child)?),
             _ => {
-                return Err(child
-                    .at
-                    .error("TCPListener children must be Route or Fallback components"));
+                return Err(child.at.error(
+                    "TCPListener children must be Route, Fallback, or a component binding",
+                ));
             }
         }
     }
@@ -159,7 +374,7 @@ fn route(call: &Call) -> Result<Layer4Route, Error> {
         }
         let mut matcher = Layer4Matcher::default();
         if let Some(value) = call.get("when") {
-            let Value::Call(tls) = value else {
+            let Value::Typed(tls) = value else {
                 return Err(call.at.error("when requires .tls(...)"));
             };
             if tls.name != "tls" {
@@ -263,7 +478,7 @@ impl Call {
             .collect()
     }
     fn measure(&self, key: &str, bytes: bool) -> Result<u64, Error> {
-        let Some(Value::Call(value)) = self.get(key) else {
+        let Some(Value::Typed(value)) = self.get(key) else {
             return Err(self.at.error(format!("{key} requires an explicit unit")));
         };
         let [(None, Value::Number(number))] = value.args.as_slice() else {

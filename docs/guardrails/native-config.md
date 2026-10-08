@@ -36,6 +36,24 @@ may appear once. Their order does not change behavior. Modifiers on other
 component types are rejected. Defaults and runtime behavior remain those in the
 [L4 guardrail](layer4.md), including static DNS resolution and bounded dialing.
 
+File-level `let` bindings reuse values and component subtrees:
+
+```swift
+let names = ["tunnel.example"]
+let backend = Proxy(to: "127.0.0.1:10001")
+let secure = Fallback { backend }
+
+TCPListener(on: ":443") {
+    Route(when: .tls(sni: names)) { backend }
+    secure
+}
+```
+
+Bindings are immutable, declared before use, and duplicated names are refused.
+Expansion is bounded (4096 components and 8 MiB per file) and happens before
+adaptation, so the component converters see a fully expanded tree. There are no
+snippets and no parameter substitution; reuse is by name only.
+
 Durations require `.milliseconds(n)`, `.seconds(n)`, or `.minutes(n)`; sizes require
 `.bytes(n)`, `.kibibytes(n)`, or `.mebibytes(n)`. Integer multiplication is checked.
 Strings use double quotes and JSON escapes; interpolation is unavailable. Arrays

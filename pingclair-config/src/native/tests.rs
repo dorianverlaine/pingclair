@@ -138,6 +138,7 @@ fn headerless_declarations_are_detected_and_composed() {
         }
     "#;
     assert!(is_native(source));
+    assert!(is_native("let reused = \"value\""));
     let config = crate::compile(source).unwrap();
     assert!(config.global.metrics);
     assert_eq!(config.global.grace_period_secs, Some(5));
@@ -156,6 +157,60 @@ fn the_removed_version_header_is_refused_with_a_direction() {
         error.contains("header") && error.contains("top level"),
         "{error}"
     );
+}
+
+#[test]
+fn bindings_reuse_values_and_component_trees() {
+    let config = crate::compile(
+        r#"
+        let names = ["example.test"]
+        let backend = Proxy(to: "127.0.0.1:8080")
+        let secure = Fallback { backend }
+        TCPListener(on: ":9443") {
+            Route(when: .tls(sni: names)) { backend }
+            secure
+        }
+        TCPListener(on: ":9444") {
+            secure
+        }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(config.layer4.len(), 2);
+    assert_eq!(config.layer4[0].routes.len(), 2);
+    assert_eq!(config.layer4[1].routes.len(), 1);
+    assert_eq!(config.layer4[0].routes[1], config.layer4[1].routes[0]);
+    let tls = config.layer4[0].routes[0].matches[0].tls.as_ref().unwrap();
+    assert_eq!(tls.sni, vec!["example.test".to_string()]);
+}
+
+#[test]
+fn invalid_bindings_fail_closed() {
+    for source in [
+        "let x = x\nTCPListener(on: \":9443\") { Fallback { Proxy(to: \"127.0.0.1:80\") } }",
+        "let used = later\nlet later = \"value\"\nTCPListener(on: \":9443\") { Fallback { Proxy(to: \"127.0.0.1:80\") } }",
+        "let x = \"a\"\nlet x = \"b\"\nTCPListener(on: \":9443\") { Fallback { Proxy(to: \"127.0.0.1:80\") } }",
+        "let true = \"x\"\nTCPListener(on: \":9443\") { Fallback { Proxy(to: \"127.0.0.1:80\") } }",
+        "let X = \"x\"\nTCPListener(on: \":9443\") { Fallback { Proxy(to: \"127.0.0.1:80\") } }",
+        "let address = \"127.0.0.1:80\"\nTCPListener(on: \":9443\") { address }",
+        "let routes = Fallback { Proxy(to: \"127.0.0.1:80\") }\nTCPListener(on: routes) { Fallback { Proxy(to: \"127.0.0.1:80\") } }",
+        "TCPListener(on: \":9443\") { let x = Fallback { Proxy(to: \"127.0.0.1:80\") } Fallback { Proxy(to: \"127.0.0.1:80\") } }",
+    ] {
+        assert!(crate::compile(source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
+fn binding_expansion_is_bounded() {
+    let mut source = String::from(
+        "let hop = Fallback { Proxy(to: \"127.0.0.1:80\") }\nTCPListener(on: \":9443\") {\n",
+    );
+    for _ in 0..2000 {
+        source.push_str("hop\n");
+    }
+    source.push_str("}\n");
+    let error = adapt(&source).unwrap_err().to_string();
+    assert!(error.contains("expansion"), "{error}");
 }
 
 #[test]
