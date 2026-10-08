@@ -1053,14 +1053,14 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 std::fs::read_to_string(&path)
                     .map_err(|error| anyhow::anyhow!("❌ Failed to read {path}: {error}"))?
             };
-            if pingclair_config::frontend::is_native(&source) {
-                anyhow::bail!(
-                    "❌ Native configuration formatting is not supported yet; the source was not modified"
-                );
-            }
-            let directives = pingclair_config::caddyfile::parser::parse(&source)
-                .map_err(|error| anyhow::anyhow!("❌ Failed to parse {path}: {error}"))?;
-            let formatted = format_directives(&directives);
+            let formatted = if pingclair_config::frontend::is_native(&source) {
+                pingclair_config::format::format(&source)
+                    .map_err(|error| anyhow::anyhow!("❌ Failed to format {path}: {error}"))?
+            } else {
+                let directives = pingclair_config::caddyfile::parser::parse(&source)
+                    .map_err(|error| anyhow::anyhow!("❌ Failed to parse {path}: {error}"))?;
+                format_directives(&directives)
+            };
             // 🎯 `caddy fmt` is a linter as well as a formatter: it exits
             // non-zero when the input was not already formatted, which is the
             // whole mechanism behind a `caddy fmt && git diff --exit-code` gate

@@ -80,7 +80,9 @@ Both frontends produce `PingclairConfig` and use the same validation and publica
 path. `adapt` converts without provisioning validation; `validate`, `run`, and
 Admin reload validate. Admin accepts native text as `Content-Type: text/pingclair`.
 The configuration is fully compiled at load time; no component tree is interpreted
-in a TCP session. `fmt` currently refuses native input without modifying the file.
+in a TCP session. `fmt` formats native input canonically — comments preserved,
+four-space indentation, one declaration per line — and `describe` prints the
+component table the parser accepts.
 
 References: [Swift API guidelines](https://www.swift.org/documentation/api-design-guidelines/),
 [SwiftUI ViewBuilder](https://developer.apple.com/documentation/swiftui/viewbuilder),

@@ -24,6 +24,9 @@ pub(super) struct Call {
     pub args: Vec<(Option<String>, Value)>,
     pub body: Option<Vec<Call>>,
     pub modifiers: Vec<Call>,
+    pub parens: bool,
+    pub block_end: Option<Position>,
+    pub end: Position,
     pub at: Position,
 }
 
@@ -45,6 +48,7 @@ pub(super) enum Declaration {
         name: String,
         value: Value,
         at: Position,
+        end: Position,
     },
 }
 
@@ -164,6 +168,7 @@ pub(super) fn parse(source: &str) -> Result<Vec<Declaration>, crate::frontend::E
     });
     let mut parser = Parser {
         items: items.into_iter().peekable(),
+        last: start,
     };
     let mut declarations = Vec::new();
     while parser.peek() != &Token::End {
@@ -181,10 +186,16 @@ pub(super) fn parse(source: &str) -> Result<Vec<Declaration>, crate::frontend::E
 }
 struct Parser {
     items: std::iter::Peekable<std::vec::IntoIter<Item>>,
+    last: Position,
 }
 impl Parser {
     fn peek(&mut self) -> &Token {
         &self.items.peek().unwrap().token
+    }
+    fn next(&mut self) -> Item {
+        let item = self.items.next().unwrap();
+        self.last = item.at;
+        item
     }
     fn peek_word(&mut self) -> Option<&str> {
         match self.peek() {
@@ -197,7 +208,7 @@ impl Parser {
     }
     fn take(&mut self, mark: char) -> bool {
         if self.peek() == &Token::Mark(mark) {
-            self.items.next();
+            self.next();
             true
         } else {
             false
@@ -215,8 +226,8 @@ impl Parser {
         let mut attributes: Vec<Attribute> = Vec::new();
         while self.peek() == &Token::Mark('@') {
             let at = self.items.peek().unwrap().at;
-            self.items.next();
-            let item = self.items.next().unwrap();
+            self.next();
+            let item = self.next();
             let Token::Word(name) = item.token else {
                 return Err(item.at.error("expected attribute name"));
             };
@@ -231,7 +242,7 @@ impl Parser {
                             let Item {
                                 token: Token::Word(label),
                                 ..
-                            } = self.items.next().unwrap()
+                            } = self.next()
                             else {
                                 unreachable!()
                             };
@@ -270,14 +281,14 @@ impl Parser {
             return Err(self.error("configuration nesting exceeds 16 levels"));
         }
         let at = self.items.peek().unwrap().at;
-        self.items.next();
-        let identifier = self.items.next().unwrap();
+        self.next();
+        let identifier = self.next();
         let Token::Word(name) = identifier.token else {
             return Err(identifier.at.error("expected binding name"));
         };
         self.expect('=')?;
         let value = if matches!(self.peek(), Token::Word(_)) {
-            let item = self.items.next().unwrap();
+            let item = self.next();
             let Token::Word(word) = item.token else {
                 unreachable!()
             };
@@ -299,13 +310,14 @@ impl Parser {
             name,
             value,
             at,
+            end: self.last,
         })
     }
     fn call(&mut self, depth: usize, block: bool) -> Result<Call, crate::frontend::Error> {
         if self.peek() == &Token::Mark('@') {
             return Err(self.error("attributes are only allowed on top-level declarations"));
         }
-        let item = self.items.next().unwrap();
+        let item = self.next();
         let Token::Word(name) = item.token else {
             return Err(item.at.error("expected declaration name"));
         };
@@ -324,8 +336,9 @@ impl Parser {
         if depth >= 16 {
             return Err(self.error("configuration nesting exceeds 16 levels"));
         }
+        let parens = self.take('(');
         let mut args = Vec::new();
-        if self.take('(') {
+        if parens {
             while !self.take(')') {
                 if self.peek() == &Token::End {
                     return Err(self.error("unterminated argument list"));
@@ -335,7 +348,7 @@ impl Parser {
                         let Item {
                             token: Token::Word(label),
                             ..
-                        } = self.items.next().unwrap()
+                        } = self.next()
                         else {
                             unreachable!()
                         };
@@ -357,9 +370,15 @@ impl Parser {
                 self.expect(',')?;
             }
         }
+        let mut block_end = None;
         let body = if block && self.take('{') {
             let mut children = Vec::new();
-            while !self.take('}') {
+            loop {
+                if self.peek() == &Token::Mark('}') {
+                    block_end = Some(self.items.peek().unwrap().at);
+                    self.next();
+                    break;
+                }
                 if self.peek() == &Token::End {
                     return Err(self.error("unterminated configuration block"));
                 }
@@ -385,6 +404,9 @@ impl Parser {
             args,
             body,
             modifiers,
+            parens,
+            block_end,
+            end: self.last,
             at,
         })
     }
@@ -409,7 +431,7 @@ impl Parser {
             }
             return Ok(Value::Array(values));
         }
-        let item = self.items.next().unwrap();
+        let item = self.next();
         match item.token {
             Token::String(value) => Ok(Value::String(value)),
             Token::Number(value) => Ok(Value::Number(value)),

@@ -22,8 +22,8 @@ header is no longer used. TCP listeners, routes and proxies compose through
 typed arguments and listener modifiers, then use the existing common validation
 and runtime. File-level `let` bindings reuse values and component subtrees with
 bounded expansion. Existing Caddy-style files remain supported during migration.
-Admin accepts `text/pingclair`; native input is refused by `fmt` until a
-comment-preserving formatter exists.
+Admin accepts `text/pingclair`; `fmt` formats native files with comments
+preserved, and `describe` prints the component table.
 
 ### 🔌 Layer 4 TCP routing for 0.3 alpha
 

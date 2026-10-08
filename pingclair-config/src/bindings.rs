@@ -176,6 +176,9 @@ impl Bindings {
             args,
             body,
             modifiers,
+            parens: call.parens,
+            block_end: call.block_end,
+            end: call.end,
             at: call.at,
         })
     }
