@@ -138,6 +138,83 @@ pub const ENTRIES: &[Entry] = &[
 .tls(.acme(email: "admin@example.com"))"#,
     },
     Entry {
+        name: "ServeFiles",
+        kind: Kind::Component,
+        summary: "Static files: `ServeFiles(root:, browse:, index:)`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { ServeFiles(root: "./public", browse: false) }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { ServeFiles(browse: true) }
+    }
+}"#,
+    },
+    Entry {
+        name: "Proxy",
+        kind: Kind::Component,
+        summary: "Reverse proxy: `Proxy(to: \"host:port\")` or a list.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { Proxy(to: ["127.0.0.1:9000", "127.0.0.1:9001"]) }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { Proxy(to: []) }
+    }
+}"#,
+    },
+    Entry {
+        name: "Redirect",
+        kind: Kind::Component,
+        summary: "A redirect: `Redirect(to:, status:)` with a typed status.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Route(when: .path(prefix: "/old")) {
+            Redirect(to: "/new", status: .permanent)
+        }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { Redirect(to: "/new", status: .moved) }
+    }
+}"#,
+    },
+    Entry {
+        name: "Fail",
+        kind: Kind::Component,
+        summary: "Raise an error response: `Fail(status:, message:)`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { Fail(status: 503, message: "maintenance") }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { Fail(status: 999999) }
+    }
+}"#,
+    },
+    Entry {
+        name: "ServeMetrics",
+        kind: Kind::Component,
+        summary: "Answer with the Prometheus metrics endpoint.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Route(when: .path(exact: "/metrics")) { ServeMetrics() }
+    }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { ServeMetrics(unknown: true) }
+    }
+}"#,
+    },
+    Entry {
         name: "accessLog",
         kind: Kind::Modifier,
         summary: "The listener's access log: `output` and `format`.",

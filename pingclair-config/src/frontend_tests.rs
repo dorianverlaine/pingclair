@@ -340,7 +340,6 @@ fn http_shape_mistakes_fail_closed() {
         "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"hi\") } } }.limits(connections: 8)",
         "HTTPListener(on: \":8080\") { Site(host: \"*\") {} }",
         "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback {} } }",
-        "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { ServeFiles(root: \"./pub\") } } }",
         "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"hi\", status: 999999) } } }",
         "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .tls(sni: [\"x\"])) { Respond(body: \"hi\") } } }",
     ] {
@@ -693,6 +692,81 @@ fn the_rest_of_the_conditions_fail_closed() {
         "Route(when: .file(try: [\"x\"])) { Respond(body: \"m\") }",
     ] {
         let source = site(route);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
+fn http_terminals_lower_like_their_caddyfile_twins() {
+    let cases = [
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { ServeFiles(root: \"/tmp/pub\") } } }",
+            "http://:8080 {\n\troot * /tmp/pub\n\tfile_server\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Proxy(to: \"127.0.0.1:9000\") } } }",
+            "http://:8080 {\n\treverse_proxy 127.0.0.1:9000\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Proxy(to: [\"127.0.0.1:9000\", \"127.0.0.1:9001\"]) } } }",
+            "http://:8080 {\n\treverse_proxy 127.0.0.1:9000 127.0.0.1:9001\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .path(exact: \"/old\")) { Redirect(to: \"/new\", status: .permanent) } } }",
+            "http://:8080 {\n\tredir /old /new 301\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Route(when: .path(exact: \"/old\")) { Redirect(to: \"/new\") } } }",
+            "http://:8080 {\n\tredir /old /new\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Fail(status: 503, message: \"boom\") } } }",
+            "http://:8080 {\n\terror \"boom\" 503\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Fail() } } }",
+            "http://:8080 {\n\terror\n}\n",
+        ),
+        (
+            "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { ServeMetrics() } } }",
+            "http://:8080 {\n\tmetrics\n}\n",
+        ),
+    ];
+    for (native_source, legacy_source) in cases {
+        let native = crate::compile(native_source).unwrap();
+        let legacy = crate::compile(legacy_source).unwrap();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::to_value(legacy).unwrap(),
+            "{native_source}"
+        );
+    }
+}
+
+#[test]
+fn http_terminal_mistakes_fail_closed() {
+    let site = |handler: &str| {
+        format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {handler} }} }} }}"
+        )
+    };
+    for handler in [
+        "ServeFiles()",
+        "ServeFiles(root: 1)",
+        "ServeFiles(root: \"/tmp\", index: [])",
+        "ServeFiles(root: \"/tmp\", browse: 1)",
+        "Proxy()",
+        "Proxy(to: 5)",
+        "Proxy(to: [])",
+        "Proxy(to: \"127.0.0.1:9000\", extra: 1)",
+        "Redirect()",
+        "Redirect(to: \"/new\", status: .moved)",
+        "Redirect(to: \"/new\", status: 301)",
+        "Fail(status: 999999)",
+        "Fail(message: 1)",
+        "ServeMetrics(unknown: true)",
+    ] {
+        let source = site(handler);
         assert!(crate::compile(&source).is_err(), "accepted {source:?}");
     }
 }

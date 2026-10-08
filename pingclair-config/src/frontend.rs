@@ -7,10 +7,11 @@ use crate::attributes::{Attr, resolve_attribute};
 use crate::bindings::Bindings;
 use crate::syntax::{self, Call, Declaration, Position, Value};
 use pingclair_core::config::{
-    AdminConfig, HandlerConfig, IpRanges, Layer4Matcher, Layer4Route, Layer4Server,
-    Layer4TlsMatcher, ListenerOptions, LogConfig, LogFormat, LogOutput, LogRotation, Matcher,
-    MatcherCondition, PRIVATE_RANGES, PingclairConfig, ResourceLimitsConfig, RouteConfig,
-    ServerConfig, TlsConfig, normalize_listen_addr,
+    AdminConfig, CircuitBreakerConfig, HandlerConfig, IpRanges, Layer4Matcher, Layer4Route,
+    Layer4Server, Layer4TlsMatcher, ListenerOptions, LoadBalanceConfig, LogConfig, LogFormat,
+    LogOutput, LogRotation, Matcher, MatcherCondition, OverloadConfig, PRIVATE_RANGES,
+    PingclairConfig, ProxyUpstream, ResourceLimitsConfig, RetryConfig, ReverseProxyConfig,
+    RouteConfig, ServerConfig, TlsConfig, UpstreamTlsConfig, normalize_listen_addr,
 };
 
 /// 📍 Reports location and expected structure without echoing configuration values.
@@ -1001,10 +1002,198 @@ fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
                 headers: std::collections::BTreeMap::new(),
             })
         }
+        "ServeFiles" => serve_files(call),
+        "Proxy" => proxy(call),
+        "Redirect" => redirect(call),
+        "Fail" => fail(call),
+        "ServeMetrics" => serve_metrics(call),
         _ => Err(call.at.error(
-            "unknown HTTP handler; `Respond` is implemented first and the rest follow in the next batches",
+            "unknown HTTP handler; expected Respond, ServeFiles, Proxy, Redirect, Fail or ServeMetrics",
         )),
     }
+}
+
+/// 📂 `.ServeFiles(root:, browse:, index:)`: the static file handler.
+fn serve_files(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&["root", "browse", "index"])?;
+    let root = call.string("root")?;
+    let browse = if call.get("browse").is_some() {
+        call.boolean("browse")?
+    } else {
+        false
+    };
+    let index = if call.get("index").is_some() {
+        call.strings("index")?
+    } else {
+        vec!["index.html".to_string()]
+    };
+    if index.is_empty() {
+        return Err(call.at.error("index needs at least one file name"));
+    }
+    Ok(HandlerConfig::FileServer {
+        root,
+        index,
+        browse,
+        browse_limit: None,
+        // 🧜 No `Encode` component yet: the site offers no compression, which is
+        // what a Caddyfile without an `encode` directive compiles to.
+        compress: false,
+        precompressed: Vec::new(),
+        hide: Vec::new(),
+        status: None,
+        pass_thru: false,
+        canonical_uris: true,
+        etag_file_extensions: Vec::new(),
+    })
+}
+
+/// 🌐 `.Proxy(to:)`: the reverse proxy with the build's bare defaults.
+fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&["to"])?;
+    let mut upstreams = Vec::new();
+    match call.get("to") {
+        Some(Value::String(address)) => upstreams.push(address.clone()),
+        Some(Value::Array(items)) => {
+            for item in items {
+                let Value::String(address) = item else {
+                    return Err(call.at.error("to takes quoted addresses"));
+                };
+                upstreams.push(address.clone());
+            }
+        }
+        _ => {
+            return Err(call
+                .at
+                .error("Proxy requires to: \"host:port\" or to: [\"host:port\", ...]"));
+        }
+    }
+    if upstreams.is_empty() {
+        return Err(call.at.error("Proxy needs at least one upstream"));
+    }
+    let upstream_options = upstreams
+        .iter()
+        .map(|address| ProxyUpstream {
+            address: address.clone(),
+            weight: 1,
+            backup: false,
+        })
+        .collect();
+    Ok(HandlerConfig::ReverseProxy(Box::new(ReverseProxyConfig {
+        upstreams,
+        fastcgi: None,
+        dynamic_upstream: None,
+        rewrite_method: None,
+        rewrite_uri: None,
+        request_buffer_bytes: None,
+        response_buffer_bytes: None,
+        upstream_versions: None,
+        handle_response: Vec::new(),
+        subrequest: None,
+        upstream_options,
+        load_balance: LoadBalanceConfig::default(),
+        health_check: None,
+        max_fails: None,
+        fail_duration_ms: None,
+        headers_up: std::collections::BTreeMap::new(),
+        headers_down: std::collections::BTreeMap::new(),
+        headers_down_add: std::collections::BTreeMap::new(),
+        headers_down_remove: Vec::new(),
+        headers_down_default: std::collections::BTreeMap::new(),
+        headers_down_replace: Vec::new(),
+        headers_up_remove: Vec::new(),
+        headers_up_add: std::collections::BTreeMap::new(),
+        headers_up_replace: Vec::new(),
+        flush_interval: None,
+        read_timeout: None,
+        write_timeout: None,
+        connect_timeout: None,
+        first_byte_timeout: None,
+        between_reads_timeout: None,
+        retry: Box::new(RetryConfig {
+            max_attempts: 16,
+            total_timeout_ms: None,
+            backoff_ms: 0,
+            retry_match: Vec::new(),
+        }),
+        overload: Box::new(OverloadConfig {
+            max_in_flight: None,
+            max_pending: 0,
+            pending_timeout_ms: 1000,
+            upstream_max_connections: None,
+        }),
+        circuit_breaker: Box::new(CircuitBreakerConfig {
+            consecutive_failures: None,
+            error_rate_percent: None,
+            minimum_requests: 20,
+            window_requests: 100,
+            open_duration_ms: 30_000,
+            half_open_requests: 1,
+            failure_statuses: Vec::new(),
+        }),
+        upstream_tls: Box::new(UpstreamTlsConfig::default()),
+        cache: None,
+    })))
+}
+
+/// ➡️ `.Redirect(to:, status:)`: the redirect statuses the RFC names.
+fn redirect(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&["to", "status"])?;
+    let to = call.string("to")?;
+    let code = match call.get("status") {
+        None => 302,
+        Some(Value::Typed(value)) => {
+            if !value.args.is_empty() {
+                return Err(value.at.error("a redirect status takes no arguments"));
+            }
+            match value.name.as_str() {
+                "permanent" => 301,
+                "temporary" => 302,
+                "seeOther" => 303,
+                "temporaryRedirect" => 307,
+                "permanentRedirect" => 308,
+                other => {
+                    return Err(value.at.error(format!(
+                        "unknown redirect status '.{other}'; expected .permanent, .temporary, .seeOther, .temporaryRedirect or .permanentRedirect"
+                    )));
+                }
+            }
+        }
+        Some(_) => {
+            return Err(call
+                .at
+                .error("status takes a redirect status such as .permanent"));
+        }
+    };
+    Ok(HandlerConfig::Redirect { to, code })
+}
+
+/// 🚨 `.Fail(status:, message:)`: raise an error response.
+fn fail(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&["status", "message"])?;
+    let status = match call.get("status") {
+        None => 500,
+        Some(_) => u16::try_from(call.integer("status")?)
+            .map_err(|_| call.at.error("status must fit in 0..=65535"))?,
+    };
+    let message = if call.get("message").is_some() {
+        Some(call.string("message")?)
+    } else {
+        None
+    };
+    Ok(HandlerConfig::Error { status, message })
+}
+
+/// 📊 `.ServeMetrics()`: answer with the Prometheus endpoint.
+fn serve_metrics(call: &Call) -> Result<HandlerConfig, Error> {
+    call.leaf(&["disableOpenMetrics"])?;
+    let disable_openmetrics = if call.get("disableOpenMetrics").is_some() {
+        call.boolean("disableOpenMetrics")?
+    } else {
+        false
+    };
+    Ok(HandlerConfig::Metrics {
+        disable_openmetrics,
+    })
 }
 
 impl Call {
