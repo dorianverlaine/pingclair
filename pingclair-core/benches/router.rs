@@ -29,7 +29,9 @@ fn route(path: &str, matcher: Option<Matcher>) -> RouteConfig {
         path: path.to_string(),
         handler: HandlerConfig::Respond {
             status: 200,
-            body: Some(path.to_string()),
+            body: Some(pingclair_core::config::ConfigText::Template(
+                path.to_string(),
+            )),
             headers: BTreeMap::new(),
         },
         methods: None,

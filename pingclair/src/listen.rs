@@ -116,7 +116,7 @@ pub(crate) fn automatic_http_companion(
         path: "/*".to_string(),
         // 🧭 A 308 keeps POST unchanged across a permanent hop to HTTPS.
         handler: pingclair_core::config::HandlerConfig::Redirect {
-            to: redirect_target,
+            to: pingclair_core::config::ConfigText::Template(redirect_target),
             code: 308,
         },
         methods: None,

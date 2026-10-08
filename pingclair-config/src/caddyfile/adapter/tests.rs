@@ -5101,7 +5101,7 @@ mod error_directive_tests {
     use crate::compile;
     use pingclair_core::config::HandlerConfig;
 
-    fn error_of(source: &str) -> (u16, Option<String>) {
+    fn error_of(source: &str) -> (u16, Option<pingclair_core::config::ConfigText>) {
         let config = compile(source).unwrap_or_else(|error| panic!("must compile: {error}"));
         let handler = match config
             .servers

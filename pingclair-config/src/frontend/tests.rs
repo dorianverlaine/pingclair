@@ -3,6 +3,42 @@
 
 use super::*;
 
+/// 🔁 The twin comparison reads past the *encoding* of literal text.
+///
+/// A native literal and a legacy template that happens to contain no
+/// placeholders describe the same bytes at request time, and the native
+/// language deliberately spells them differently: `{"literal": "x"}` against
+/// `"x"`. Folding the literal tag away here keeps the Caddyfile useful as an
+/// oracle for everything the two languages share, while
+/// `tests/native_contracts.rs` is where the difference itself is asserted — the
+/// one place that must fail if native text starts being reinterpreted.
+fn twin(config: pingclair_core::config::PingclairConfig) -> serde_json::Value {
+    fn fold(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.len() == 1
+                    && let Some(serde_json::Value::String(text)) = map.get("literal")
+                {
+                    *value = serde_json::Value::String(text.clone());
+                    return;
+                }
+                for child in map.values_mut() {
+                    fold(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    fold(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(config).expect("the config serialises");
+    fold(&mut value);
+    value
+}
+
 const SOURCE: &str = r#"
 // 🧩 Typed components compose into a single validated configuration.
 TCPListener(on: "127.0.0.1:9443") {
@@ -47,10 +83,7 @@ fn native_components_lower_to_the_existing_validated_model() {
     }"#,
     )
     .unwrap();
-    assert_eq!(
-        serde_json::to_value(native).unwrap(),
-        serde_json::to_value(legacy).unwrap()
-    );
+    assert_eq!(twin(native), twin(legacy));
 }
 
 #[test]
@@ -295,10 +328,7 @@ fn http_listener_sites_lower_to_the_existing_validated_model() {
     )
     .unwrap();
     let legacy = crate::compile("http://:8080 {\n\trespond \"hi\" 200\n}\n").unwrap();
-    assert_eq!(
-        serde_json::to_value(native).unwrap(),
-        serde_json::to_value(legacy).unwrap()
-    );
+    assert_eq!(twin(native), twin(legacy));
 }
 
 #[test]
@@ -314,10 +344,7 @@ fn named_sites_lower_like_their_caddyfile_twin() {
     )
     .unwrap();
     let legacy = crate::compile("http://example.com:8080 {\n\trespond \"hi\"\n}\n").unwrap();
-    assert_eq!(
-        serde_json::to_value(native).unwrap(),
-        serde_json::to_value(legacy).unwrap()
-    );
+    assert_eq!(twin(native), twin(legacy));
 }
 
 #[test]
@@ -359,10 +386,7 @@ fn bind_extends_the_listener_addresses() {
     )
     .unwrap();
     let legacy = crate::compile("http://:8080, http://:8081 {\n\trespond \"hi\"\n}\n").unwrap();
-    assert_eq!(
-        serde_json::to_value(native).unwrap(),
-        serde_json::to_value(legacy).unwrap()
-    );
+    assert_eq!(twin(native), twin(legacy));
 }
 
 #[test]
@@ -380,10 +404,7 @@ fn protocols_toggle_http3_per_listener() {
         "{\n\tservers :8080 {\n\t\tprotocols h1 h2\n\t}\n}\nhttp://:8080 {\n\trespond \"hi\"\n}\n",
     )
     .unwrap();
-    assert_eq!(
-        serde_json::to_value(native).unwrap(),
-        serde_json::to_value(legacy).unwrap()
-    );
+    assert_eq!(twin(native), twin(legacy));
 }
 
 #[test]
@@ -401,10 +422,7 @@ fn limits_lower_to_the_resource_bounds() {
         "http://:9090 {\n\tlimits {\n\t\theader_timeout 30s\n\t\tmax_connections 64\n\t}\n\trespond \"hi\"\n}\n",
     )
     .unwrap();
-    assert_eq!(
-        serde_json::to_value(native).unwrap(),
-        serde_json::to_value(legacy).unwrap()
-    );
+    assert_eq!(twin(native), twin(legacy));
 }
 
 #[test]
@@ -443,11 +461,7 @@ fn tls_variants_lower_like_their_caddyfile_twins() {
     for (native_source, legacy_source) in cases {
         let native = crate::adapt(native_source).unwrap();
         let legacy = crate::adapt(legacy_source).unwrap();
-        assert_eq!(
-            serde_json::to_value(native).unwrap(),
-            serde_json::to_value(legacy).unwrap(),
-            "{native_source}"
-        );
+        assert_eq!(twin(native), twin(legacy), "{native_source}");
     }
     // 🏛️ The internal authority needs no files and no public ACME, so it also
     // passes the full validation gate.
@@ -469,20 +483,14 @@ fn access_logs_lower_like_their_caddyfile_twins() {
         "http://:8080 {\n\tlog {\n\t\toutput file /tmp/access.log\n\t\tformat json\n\t}\n\trespond \"hi\"\n}\n",
     )
     .unwrap();
-    assert_eq!(
-        serde_json::to_value(native).unwrap(),
-        serde_json::to_value(legacy).unwrap()
-    );
+    assert_eq!(twin(native), twin(legacy));
 
     let bare_native = crate::compile(
         "HTTPListener(on: \":8080\") { Site(host: \"*\") { Fallback { Respond(body: \"hi\") } } }.accessLog()",
     )
     .unwrap();
     let bare_legacy = crate::compile("http://:8080 {\n\tlog\n\trespond \"hi\"\n}\n").unwrap();
-    assert_eq!(
-        serde_json::to_value(bare_native).unwrap(),
-        serde_json::to_value(bare_legacy).unwrap()
-    );
+    assert_eq!(twin(bare_native), twin(bare_legacy));
 }
 
 #[test]
@@ -533,11 +541,7 @@ fn http_conditions_lower_like_their_caddyfile_twins() {
     for (native_source, legacy_source) in cases {
         let native = crate::compile(native_source).unwrap();
         let legacy = crate::compile(legacy_source).unwrap();
-        assert_eq!(
-            serde_json::to_value(native).unwrap(),
-            serde_json::to_value(legacy).unwrap(),
-            "{native_source}"
-        );
+        assert_eq!(twin(native), twin(legacy), "{native_source}");
     }
 }
 
@@ -638,11 +642,7 @@ fn http_header_query_and_protocol_conditions_match_their_twins() {
     for (native_source, legacy_source) in cases {
         let native = crate::compile(native_source).unwrap();
         let legacy = crate::compile(legacy_source).unwrap();
-        assert_eq!(
-            serde_json::to_value(native).unwrap(),
-            serde_json::to_value(legacy).unwrap(),
-            "{native_source}"
-        );
+        assert_eq!(twin(native), twin(legacy), "{native_source}");
     }
 }
 
@@ -665,11 +665,7 @@ fn http_address_and_variable_conditions_match_their_twins() {
     for (native_source, legacy_source) in cases {
         let native = crate::compile(native_source).unwrap();
         let legacy = crate::compile(legacy_source).unwrap();
-        assert_eq!(
-            serde_json::to_value(native).unwrap(),
-            serde_json::to_value(legacy).unwrap(),
-            "{native_source}"
-        );
+        assert_eq!(twin(native), twin(legacy), "{native_source}");
     }
 }
 
@@ -735,11 +731,7 @@ fn http_terminals_lower_like_their_caddyfile_twins() {
     for (native_source, legacy_source) in cases {
         let native = crate::compile(native_source).unwrap();
         let legacy = crate::compile(legacy_source).unwrap();
-        assert_eq!(
-            serde_json::to_value(native).unwrap(),
-            serde_json::to_value(legacy).unwrap(),
-            "{native_source}"
-        );
+        assert_eq!(twin(native), twin(legacy), "{native_source}");
     }
 }
 
@@ -815,11 +807,7 @@ fn http_pipelines_lower_like_their_caddyfile_twins() {
     for (native_source, legacy_source) in cases {
         let native = crate::compile(native_source).unwrap();
         let legacy = crate::compile(legacy_source).unwrap();
-        assert_eq!(
-            serde_json::to_value(native).unwrap(),
-            serde_json::to_value(legacy).unwrap(),
-            "{native_source}"
-        );
+        assert_eq!(twin(native), twin(legacy), "{native_source}");
     }
 }
 
@@ -933,11 +921,7 @@ fn encode_follows_the_site_coding_list() {
     for (native_source, legacy_source) in cases {
         let native = crate::compile(native_source).unwrap();
         let legacy = crate::compile(legacy_source).unwrap();
-        assert_eq!(
-            serde_json::to_value(native).unwrap(),
-            serde_json::to_value(legacy).unwrap(),
-            "{native_source}"
-        );
+        assert_eq!(twin(native), twin(legacy), "{native_source}");
     }
 
     // 🗜️ The file server follows the site's list, not its own default.
@@ -1087,11 +1071,7 @@ fn http_guards_lower_like_their_caddyfile_twins() {
     for (native_source, legacy_source) in cases {
         let native = crate::compile(&native_source).unwrap();
         let legacy = crate::compile(&legacy_source).unwrap();
-        assert_eq!(
-            serde_json::to_value(native).unwrap(),
-            serde_json::to_value(legacy).unwrap(),
-            "{native_source}"
-        );
+        assert_eq!(twin(native), twin(legacy), "{native_source}");
     }
 }
 
@@ -1239,11 +1219,7 @@ fn composed_components_lower_like_their_caddyfile_twins() {
     for (native_source, legacy_source) in cases {
         let native = crate::compile(&native_source).unwrap();
         let legacy = crate::compile(&legacy_source).unwrap();
-        assert_eq!(
-            serde_json::to_value(native).unwrap(),
-            serde_json::to_value(legacy).unwrap(),
-            "{native_source}"
-        );
+        assert_eq!(twin(native), twin(legacy), "{native_source}");
     }
 }
 
@@ -1329,11 +1305,7 @@ fn error_surfaces_lower_like_their_caddyfile_twins() {
     for (native_source, legacy_source) in cases {
         let native = crate::compile(&native_source).unwrap();
         let legacy = crate::compile(&legacy_source).unwrap();
-        assert_eq!(
-            serde_json::to_value(native).unwrap(),
-            serde_json::to_value(legacy).unwrap(),
-            "{native_source}"
-        );
+        assert_eq!(twin(native), twin(legacy), "{native_source}");
     }
 }
 
@@ -1465,10 +1437,7 @@ fn file_server_options_lower_like_their_caddyfile_twins() {
         "http://:8080 {\n\troot * ./public\n\tfile_server {\n\t\thide .git\n\t\thide *.tmp\n\t\tstatus 503\n\t\tdisable_canonical_uris\n\t\tetag_file_extensions .etag\n\t\tprecompressed br gzip\n\t\tcompress off\n\t\tbrowse {\n\t\t\tfile_limit 500\n\t\t}\n\t}\n}",
     )
     .unwrap();
-    assert_eq!(
-        serde_json::to_value(native).unwrap(),
-        serde_json::to_value(legacy).unwrap()
-    );
+    assert_eq!(twin(native), twin(legacy));
 }
 
 #[test]
@@ -1540,11 +1509,7 @@ fn file_candidates_lower_like_their_caddyfile_twins() {
     for (native_source, legacy_source) in cases {
         let native = crate::compile(&native_source).unwrap();
         let legacy = crate::compile(&legacy_source).unwrap();
-        assert_eq!(
-            serde_json::to_value(native).unwrap(),
-            serde_json::to_value(legacy).unwrap(),
-            "{native_source}"
-        );
+        assert_eq!(twin(native), twin(legacy), "{native_source}");
     }
 }
 
@@ -1633,11 +1598,7 @@ fn intercept_lowers_like_its_caddyfile_twin() {
     for (native_source, legacy_source) in cases {
         let native = crate::compile(&native_source).unwrap();
         let legacy = crate::compile(&legacy_source).unwrap();
-        assert_eq!(
-            serde_json::to_value(native).unwrap(),
-            serde_json::to_value(legacy).unwrap(),
-            "{native_source}"
-        );
+        assert_eq!(twin(native), twin(legacy), "{native_source}");
     }
 }
 
@@ -1699,10 +1660,7 @@ fn php_fastcgi_lowers_like_its_caddyfile_twin() {
     .unwrap();
     let legacy =
         crate::compile("http://:8080 {\n\tphp_fastcgi unix//run/php-fpm.sock\n}\n").unwrap();
-    assert_eq!(
-        serde_json::to_value(native).unwrap(),
-        serde_json::to_value(legacy).unwrap()
-    );
+    assert_eq!(twin(native), twin(legacy));
 }
 
 #[test]
@@ -1788,10 +1746,7 @@ fn php_fastcgi_leaves_the_static_files_to_the_next_component() {
         "http://:8080 {\n\troot * ./public\n\tphp_fastcgi unix//run/php-fpm.sock\n\tfile_server\n}\n",
     )
     .unwrap();
-    assert_eq!(
-        serde_json::to_value(native).unwrap(),
-        serde_json::to_value(legacy).unwrap()
-    );
+    assert_eq!(twin(native), twin(legacy));
 }
 
 #[test]
@@ -1850,10 +1805,7 @@ fn proxy_header_lists_lower_like_their_caddyfile_twins() {
         "http://:8080 {\n\treverse_proxy 127.0.0.1:9000 {\n\t\theader_up Host app.internal\n\t\theader_up -Cookie\n\t\theader_up X-Trace f(.)o b$1r\n\t\theader_down +X-Served-By pingclair\n\t\theader_down ?X-Def 1\n\t\theader_down -Server\n\t}\n}",
     )
     .unwrap();
-    assert_eq!(
-        serde_json::to_value(native).unwrap(),
-        serde_json::to_value(legacy).unwrap()
-    );
+    assert_eq!(twin(native), twin(legacy));
 }
 
 #[test]
@@ -1928,11 +1880,7 @@ fn proxy_balance_health_and_timeouts_lower_like_their_caddyfile_twins() {
     for (native_source, legacy_source) in cases {
         let native = crate::compile(&native_source).unwrap();
         let legacy = crate::compile(&legacy_source).unwrap();
-        assert_eq!(
-            serde_json::to_value(native).unwrap(),
-            serde_json::to_value(legacy).unwrap(),
-            "{native_source}"
-        );
+        assert_eq!(twin(native), twin(legacy), "{native_source}");
     }
 }
 
@@ -1997,10 +1945,7 @@ fn proxy_health_checks_and_versions_lower_like_their_caddyfile_twins() {
         "http://:8080 {\n\treverse_proxy 127.0.0.1:9000 {\n\t\thealth_uri /healthz\n\t\thealth_port 8080\n\t\thealth_interval 10s\n\t\thealth_timeout 2s\n\t\thealth_passes 2\n\t\thealth_fails 3\n\t\thealth_status 2xx\n\t\thealth_body ready\n\t\thealth_headers {\n\t\t\tX-Probe 1\n\t\t\tX-Probe 2\n\t\t}\n\t\ttransport http {\n\t\t\tversions 2\n\t\t}\n\t}\n}",
     )
     .unwrap();
-    assert_eq!(
-        serde_json::to_value(native).unwrap(),
-        serde_json::to_value(legacy).unwrap()
-    );
+    assert_eq!(twin(native), twin(legacy));
 }
 
 #[test]
@@ -2062,10 +2007,7 @@ fn upstream_tls_lowers_like_its_caddyfile_twin() {
         "http://:8080 {\n\treverse_proxy https://10.0.0.10:8443 {\n\t\ttransport http {\n\t\t\ttls\n\t\t\ttls_server_name app.internal\n\t\t\ttls_trusted_ca_certs ./ca.pem\n\t\t\ttls_client_auth ./c.pem ./k.pem\n\t\t}\n\t}\n}",
     )
     .unwrap();
-    assert_eq!(
-        serde_json::to_value(native).unwrap(),
-        serde_json::to_value(legacy).unwrap()
-    );
+    assert_eq!(twin(native), twin(legacy));
 }
 
 #[test]

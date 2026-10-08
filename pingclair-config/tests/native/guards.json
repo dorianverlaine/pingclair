@@ -187,7 +187,9 @@
               {
                 "type": "respond",
                 "status": 200,
-                "body": "intranet only",
+                "body": {
+                  "literal": "intranet only"
+                },
                 "headers": {}
               }
             ]
@@ -213,7 +215,9 @@
               {
                 "type": "respond",
                 "status": 200,
-                "body": "ok",
+                "body": {
+                  "literal": "ok"
+                },
                 "headers": {}
               }
             ]
@@ -232,7 +236,9 @@
           "handler": {
             "type": "error",
             "status": 404,
-            "message": "not found"
+            "message": {
+              "literal": "not found"
+            }
           },
           "methods": null,
           "matcher": null

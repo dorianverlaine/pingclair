@@ -21,7 +21,9 @@
           "handler": {
             "type": "respond",
             "status": 200,
-            "body": "hello from Pingclair",
+            "body": {
+              "literal": "hello from Pingclair"
+            },
             "headers": {}
           },
           "methods": null,

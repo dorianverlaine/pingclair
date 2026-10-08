@@ -217,7 +217,9 @@ mod tests {
                 path: "/*".to_string(),
                 handler: pingclair_core::config::HandlerConfig::Respond {
                     status: 200,
-                    body: Some("cached".to_string()),
+                    body: Some(pingclair_core::config::ConfigText::Template(
+                        "cached".to_string(),
+                    )),
                     headers: Default::default(),
                 },
                 methods: None,

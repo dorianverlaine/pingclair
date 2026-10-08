@@ -1882,7 +1882,7 @@ fn adapt_response_handler(
             };
             Ok(pingclair_core::config::HandlerConfig::Respond {
                 status: config.status,
-                body,
+                body: body.map(Into::into),
                 headers: config.headers,
             })
         }
@@ -1955,7 +1955,7 @@ fn adapt_response_handler(
             };
             Ok(pingclair_core::config::HandlerConfig::Error {
                 status: config.status,
-                message: config.message,
+                message: config.message.map(Into::into),
             })
         }
         "vars" => {

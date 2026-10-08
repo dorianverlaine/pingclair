@@ -48,7 +48,7 @@
 //! `deny_unknown_fields` cannot coexist with `#[serde(flatten)]`, which is why
 //! [`HandlerElement`] and [`NamedLogConfig`] are not on the list.
 
-use super::IpRanges;
+use super::{ConfigText, IpRanges};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -1643,7 +1643,7 @@ pub enum HandlerConfig {
 
     /// Redirect
     Redirect {
-        to: String,
+        to: ConfigText,
         #[serde(default = "default_redirect_code")]
         code: u16,
     },
@@ -1770,7 +1770,7 @@ pub enum HandlerConfig {
     Respond {
         #[serde(default = "default_status_code")]
         status: u16,
-        body: Option<String>,
+        body: Option<ConfigText>,
         #[serde(default)]
         headers: BTreeMap<String, String>,
     },
@@ -1782,7 +1782,7 @@ pub enum HandlerConfig {
         /// 💬 Message rendered as the response body; the status's canonical
         /// text is used when none is given.
         #[serde(default)]
-        message: Option<String>,
+        message: Option<ConfigText>,
     },
 
     /// Headers modification, on the **response**.

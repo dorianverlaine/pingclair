@@ -653,7 +653,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                     path: "/*".to_string(),
                     handler: HandlerConfig::Respond {
                         status: status.unwrap_or(200),
-                        body,
+                        body: body.map(pingclair_core::config::ConfigText::Template),
                         headers: headers.into_iter().collect(),
                     },
                     methods: None,

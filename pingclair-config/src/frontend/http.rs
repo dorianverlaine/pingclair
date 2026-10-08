@@ -192,11 +192,7 @@ fn site(
                 let route = error_route(child)?;
                 // 📎 Only a route that can answer shadows a page; one that
                 // stops at middleware leaves the page in place.
-                if child
-                    .block()?
-                    .iter()
-                    .any(|component| is_terminal(component))
-                {
+                if child.block()?.iter().any(is_terminal) {
                     answered_codes.extend(route.codes.iter().copied());
                     answered_hundreds.extend(route.hundreds.iter().copied());
                 }
@@ -1370,7 +1366,9 @@ fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
             };
             Ok(HandlerConfig::Respond {
                 status,
-                body: Some(call.string("body")?),
+                body: Some(pingclair_core::config::ConfigText::literal(
+                    call.string("body")?,
+                )),
                 headers: std::collections::BTreeMap::new(),
             })
         }
@@ -1499,7 +1497,9 @@ fn response_handler(call: &Call) -> Result<ResponseHandlerConfig, Error> {
                     // 📌 Optional here, unlike a route's `Respond`: a response
                     // handler that only changes the status is ordinary.
                     body: if child.get("body").is_some() {
-                        Some(child.string("body")?)
+                        Some(pingclair_core::config::ConfigText::literal(
+                            child.string("body")?,
+                        ))
                     } else {
                         None
                     },
@@ -2616,7 +2616,7 @@ fn php_fastcgi(call: &Call) -> Result<HandlerConfig, Error> {
                 )),
                 handler: HandlerConfig::Redirect {
                     to: "{http.request.orig_uri.path}/{http.request.orig_uri.prefixed_query}"
-                        .to_string(),
+                        .into(),
                     code: 308,
                 },
             });
@@ -3306,7 +3306,10 @@ fn redirect(call: &Call) -> Result<HandlerConfig, Error> {
                 .error("status takes a redirect status such as .permanent"));
         }
     };
-    Ok(HandlerConfig::Redirect { to, code })
+    Ok(HandlerConfig::Redirect {
+        to: pingclair_core::config::ConfigText::literal(to),
+        code,
+    })
 }
 
 /// 🚨 `.Fail(status:, message:)`: raise an error response.
@@ -3318,7 +3321,9 @@ fn fail(call: &Call) -> Result<HandlerConfig, Error> {
             .map_err(|_| call.at.error("status must fit in 0..=65535"))?,
     };
     let message = if call.get("message").is_some() {
-        Some(call.string("message")?)
+        Some(pingclair_core::config::ConfigText::literal(
+            call.string("message")?,
+        ))
     } else {
         None
     };

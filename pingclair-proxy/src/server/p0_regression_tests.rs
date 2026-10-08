@@ -46,7 +46,9 @@ fn original_uri_variables_are_precomputed_from_configuration() {
             path: "/*".to_string(),
             handler: HandlerConfig::Respond {
                 status: 200,
-                body: Some("ordinary response".to_string()),
+                body: Some(pingclair_core::config::ConfigText::Template(
+                    "ordinary response".to_string(),
+                )),
                 headers: BTreeMap::new(),
             },
             methods: None,
@@ -63,7 +65,9 @@ fn original_uri_variables_are_precomputed_from_configuration() {
     let HandlerConfig::Respond { body, .. } = &mut config.routes[0].handler else {
         unreachable!("the fixture is a respond handler")
     };
-    *body = Some("arrived as {http.request.orig_uri.path}".to_string());
+    *body = Some(pingclair_core::config::ConfigText::Template(
+        "arrived as {http.request.orig_uri.path}".to_string(),
+    ));
     assert!(
         ProxyState::new(config).needs_original_uri_vars,
         "a reachable placeholder must retain the original-URI map entries"

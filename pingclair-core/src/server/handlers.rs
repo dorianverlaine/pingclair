@@ -124,7 +124,7 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
         } => {
             let mut response = if let Some(body_content) = body {
                 // Clone the body content to get owned data
-                HandlerResponse::with_body(*status, Bytes::from(body_content.clone()))
+                HandlerResponse::with_body(*status, Bytes::copy_from_slice(body_content.as_str().as_bytes()))
             } else {
                 HandlerResponse::status(*status)
             };
@@ -139,7 +139,7 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
         // operator gave no message, the status's canonical text is the body,
         // matching what Caddy's default error handler writes.
         HandlerConfig::Error { status, message } => {
-            let body = message.clone().unwrap_or_else(|| {
+            let body = message.as_ref().map(|text| text.as_str().to_owned()).unwrap_or_else(|| {
                 http::StatusCode::from_u16(*status)
                     .ok()
                     .and_then(|code| code.canonical_reason().map(str::to_string))
@@ -148,7 +148,7 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             Ok(HandlerResponse::with_body(*status, Bytes::from(body)))
         }
 
-        HandlerConfig::Redirect { to, code } => Ok(HandlerResponse::redirect(to, *code)),
+        HandlerConfig::Redirect { to, code } => Ok(HandlerResponse::redirect(to.as_str(), *code)),
 
         // 🧭 Templates render in the proxy pipeline where file access and
         // response writing live; the pure core handler has nothing to do.
@@ -567,7 +567,9 @@ mod tests {
     fn test_respond_handler() {
         let config = HandlerConfig::Respond {
             status: 200,
-            body: Some("Hello, World!".to_string()),
+            body: Some(crate::config::ConfigText::Template(
+                "Hello, World!".to_string(),
+            )),
             headers: BTreeMap::new(),
         };
 
@@ -580,7 +582,9 @@ mod tests {
     fn test_error_handler_uses_status_and_message() {
         let config = HandlerConfig::Error {
             status: 403,
-            message: Some("Unauthorized".to_string()),
+            message: Some(crate::config::ConfigText::Template(
+                "Unauthorized".to_string(),
+            )),
         };
         let response = execute_handler(&config, &empty_headers()).unwrap();
         assert_eq!(response.status, StatusCode::FORBIDDEN);
@@ -604,7 +608,7 @@ mod tests {
     #[test]
     fn test_redirect_handler() {
         let config = HandlerConfig::Redirect {
-            to: "https://example.com".to_string(),
+            to: crate::config::ConfigText::Template("https://example.com".to_string()),
             code: 301,
         };
 

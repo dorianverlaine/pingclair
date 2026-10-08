@@ -259,16 +259,22 @@ pub fn evaluate_response_handlers(
                 outcome.replacement = Some(InterceptedResponse {
                     status: *status,
                     headers: response_headers,
-                    body: body.clone().unwrap_or_default().into_bytes(),
+                    body: body
+                        .as_ref()
+                        .map(|text| text.as_str().as_bytes().to_vec())
+                        .unwrap_or_default(),
                 });
             }
             HandlerConfig::Error { status, message } => {
-                let body = message.clone().unwrap_or_else(|| {
-                    http::StatusCode::from_u16(*status)
-                        .ok()
-                        .and_then(|code| code.canonical_reason().map(str::to_string))
-                        .unwrap_or_default()
-                });
+                let body = message
+                    .as_ref()
+                    .map(|text| text.as_str().to_owned())
+                    .unwrap_or_else(|| {
+                        http::StatusCode::from_u16(*status)
+                            .ok()
+                            .and_then(|code| code.canonical_reason().map(str::to_string))
+                            .unwrap_or_default()
+                    });
                 outcome.replacement = Some(InterceptedResponse {
                     status: *status,
                     headers: outcome
@@ -509,7 +515,9 @@ mod response_interception_tests {
                 },
                 HandlerConfig::Respond {
                     status: 403,
-                    body: Some("denied".to_string()),
+                    body: Some(pingclair_core::config::ConfigText::Template(
+                        "denied".to_string(),
+                    )),
                     headers: BTreeMap::new(),
                 },
             ],

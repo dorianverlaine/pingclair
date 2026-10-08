@@ -3373,8 +3373,9 @@ async fn plan_h3_handler_with_connector(
             // Until 2026-08-07 HTTP/3 wrote the raw text while H1/H2
             // resolved it, so a site served `path={path}` over HTTP/3 and
             // the value over HTTP/1 and HTTP/2.
-            let body = body.as_deref().map(|raw| {
-                let verified = raw.contains('{').then_some(verified_client_ip);
+            let body = body.as_ref().map(|raw| {
+                let verified =
+                    (raw.is_template() && raw.as_str().contains('{')).then_some(verified_client_ip);
                 resolve_caddy_placeholders(raw, request_header, verified, "https", request_vars)
                     .into_owned()
             });
@@ -3393,15 +3394,17 @@ async fn plan_h3_handler_with_connector(
             // transport and not the other is exactly the parity gap this crate
             // keeps having to close.
             if error_scope.is_none() {
-                request_vars.set_error(*status, message.as_deref());
+                request_vars.set_error(*status, message.as_ref().map(|text| text.as_str()));
             }
-            let raw = message.as_deref().unwrap_or_else(|| {
+            let default_message = pingclair_core::config::ConfigText::literal(
                 http::StatusCode::from_u16(*status)
                     .ok()
                     .and_then(|code| code.canonical_reason())
-                    .unwrap_or("")
-            });
-            let verified = raw.contains('{').then_some(verified_client_ip);
+                    .unwrap_or(""),
+            );
+            let raw = message.as_ref().unwrap_or(&default_message);
+            let verified =
+                (raw.is_template() && raw.as_str().contains('{')).then_some(verified_client_ip);
             let body = Some(
                 resolve_caddy_placeholders(raw, request_header, verified, "https", request_vars)
                     .into_owned(),
@@ -8940,7 +8943,9 @@ mod tests {
                 }),
                 HandlerElement::plain(HandlerConfig::Respond {
                     status: 200,
-                    body: Some("ok".to_string()),
+                    body: Some(pingclair_core::config::ConfigText::Template(
+                        "ok".to_string(),
+                    )),
                     headers: BTreeMap::new(),
                 }),
             ],
@@ -8999,7 +9004,9 @@ mod tests {
                 "respond",
                 HandlerConfig::Respond {
                     status: 200,
-                    body: Some("hello".to_string()),
+                    body: Some(pingclair_core::config::ConfigText::Template(
+                        "hello".to_string(),
+                    )),
                     headers: BTreeMap::new(),
                 },
             ),
@@ -9047,7 +9054,9 @@ mod tests {
         // 🎛️ The operator's own type is the answer when they write one.
         let handler = HandlerConfig::Respond {
             status: 200,
-            body: Some("{}".to_string()),
+            body: Some(pingclair_core::config::ConfigText::Template(
+                "{}".to_string(),
+            )),
             headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
         };
         let state = proxy_state(handler.clone());
@@ -9094,7 +9103,9 @@ mod tests {
                 }),
                 HandlerElement::plain(HandlerConfig::Respond {
                     status: 200,
-                    body: Some("must not run".to_string()),
+                    body: Some(pingclair_core::config::ConfigText::Template(
+                        "must not run".to_string(),
+                    )),
                     headers: BTreeMap::new(),
                 }),
             ],
@@ -9142,7 +9153,9 @@ mod tests {
                 }),
                 HandlerElement::plain(HandlerConfig::Respond {
                     status: 200,
-                    body: Some("{http.vars.who}".to_string()),
+                    body: Some(pingclair_core::config::ConfigText::Template(
+                        "{http.vars.who}".to_string(),
+                    )),
                     headers: BTreeMap::new(),
                 }),
             ],
@@ -9446,13 +9459,17 @@ mod tests {
             status_code: None,
             handlers: vec![HandlerConfig::Respond {
                 status: 201,
-                body: Some("wrapped-local".to_string()),
+                body: Some(pingclair_core::config::ConfigText::Template(
+                    "wrapped-local".to_string(),
+                )),
                 headers: BTreeMap::new(),
             }],
         }];
         let state = proxy_state(HandlerConfig::Respond {
             status: 418,
-            body: Some("original".to_string()),
+            body: Some(pingclair_core::config::ConfigText::Template(
+                "original".to_string(),
+            )),
             headers: BTreeMap::new(),
         });
         let request = RequestHeader::build(http::Method::GET, b"/probe", None).unwrap();
@@ -9500,7 +9517,9 @@ mod tests {
     async fn h3_respond_expands_placeholders_like_h1_h2() {
         let handler = HandlerConfig::Respond {
             status: 200,
-            body: Some("path={path} scheme={scheme} host={host} remote={client_ip}".to_string()),
+            body: Some(pingclair_core::config::ConfigText::Template(
+                "path={path} scheme={scheme} host={host} remote={client_ip}".to_string(),
+            )),
             headers: BTreeMap::new(),
         };
         let state = proxy_state(handler.clone());
@@ -9540,7 +9559,9 @@ mod tests {
     #[tokio::test]
     async fn h3_redirect_expands_the_verified_client_ip() {
         let handler = HandlerConfig::Redirect {
-            to: "https://{host}/from/{client_ip}".to_string(),
+            to: pingclair_core::config::ConfigText::Template(
+                "https://{host}/from/{client_ip}".to_string(),
+            ),
             code: 302,
         };
         let state = proxy_state(handler.clone());
@@ -9584,13 +9605,17 @@ mod tests {
                     },
                     HandlerConfig::Respond {
                         status: 200,
-                        body: Some("SECRET".to_string()),
+                        body: Some(pingclair_core::config::ConfigText::Template(
+                            "SECRET".to_string(),
+                        )),
                         headers: BTreeMap::new(),
                     },
                 ),
                 HandlerElement::plain(HandlerConfig::Respond {
                     status: 200,
-                    body: Some("public".to_string()),
+                    body: Some(pingclair_core::config::ConfigText::Template(
+                        "public".to_string(),
+                    )),
                     headers: BTreeMap::new(),
                 }),
             ],

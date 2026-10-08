@@ -204,7 +204,9 @@
             {
               "type": "respond",
               "status": 500,
-              "body": "something broke",
+              "body": {
+                "literal": "something broke"
+              },
               "headers": {}
             }
           ]

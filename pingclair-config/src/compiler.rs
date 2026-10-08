@@ -3255,7 +3255,7 @@ fn compile_handler(
         Handler::Respond(resp) => Ok(HandlerConfig::Respond {
             status: resp.status,
             body: resp.body.as_ref().and_then(|e| match e {
-                Expr::String(s) => Some(s.clone()),
+                Expr::String(s) => Some(s.clone().into()),
                 _ => None,
             }),
             headers: resp.headers.clone(),
@@ -3263,11 +3263,11 @@ fn compile_handler(
 
         Handler::Error(config) => Ok(HandlerConfig::Error {
             status: config.status,
-            message: config.message.clone(),
+            message: config.message.clone().map(Into::into),
         }),
 
         Handler::Redirect(redir) => Ok(HandlerConfig::Redirect {
-            to: redir.to.clone(),
+            to: redir.to.clone().into(),
             code: redir.code,
         }),
 
@@ -4111,7 +4111,9 @@ mod fail_closed_handler_tests {
     fn harmless() -> HandlerConfig {
         HandlerConfig::Respond {
             status: 200,
-            body: Some("ok".to_string()),
+            body: Some(pingclair_core::config::ConfigText::Template(
+                "ok".to_string(),
+            )),
             headers: std::collections::BTreeMap::new(),
         }
     }

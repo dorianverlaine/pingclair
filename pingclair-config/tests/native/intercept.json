@@ -34,7 +34,9 @@
                       {
                         "type": "respond",
                         "status": 503,
-                        "body": "the API is taking a break",
+                        "body": {
+                          "literal": "the API is taking a break"
+                        },
                         "headers": {}
                       }
                     ]

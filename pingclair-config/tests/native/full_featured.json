@@ -216,7 +216,9 @@
               {
                 "type": "respond",
                 "status": 201,
-                "body": "stored",
+                "body": {
+                  "literal": "stored"
+                },
                 "headers": {}
               }
             ]
@@ -359,7 +361,9 @@
             {
               "type": "respond",
               "status": 404,
-              "body": "no such route",
+              "body": {
+                "literal": "no such route"
+              },
               "headers": {}
             }
           ]
@@ -369,7 +373,9 @@
             {
               "type": "respond",
               "status": 500,
-              "body": "something broke",
+              "body": {
+                "literal": "something broke"
+              },
               "headers": {}
             }
           ]
@@ -395,7 +401,9 @@
           "path": "/*",
           "handler": {
             "type": "redirect",
-            "to": "https://www.example.test",
+            "to": {
+              "literal": "https://www.example.test"
+            },
             "code": 301
           },
           "methods": null,

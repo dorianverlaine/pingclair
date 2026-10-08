@@ -239,7 +239,7 @@ pub struct RequestContext {
     /// 🚨 Status raised by an `error` handler, awaiting error-route dispatch.
     pub error_status: Option<u16>,
     /// 💬 Message carried with the raised error status.
-    pub error_message: Option<String>,
+    pub error_message: Option<pingclair_core::config::ConfigText>,
     /// 🔎 What exactly went wrong, appended to the built-in error body when no
     /// `error_page` is configured — for a 431, which field was too large.
     /// Unlike `error_message` it never replaces the operator's page.
@@ -4485,14 +4485,14 @@ impl PingclairProxy {
         session: &mut Session,
         ctx: &mut RequestContext,
         status: u16,
-        message: Option<String>,
+        message: Option<pingclair_core::config::ConfigText>,
     ) -> PingoraResult<()> {
         let Some(message) = message else {
             self.serve_error_page(session, ctx, status).await?;
             return Ok(());
         };
         let body_bytes = {
-            let verified_client_ip = if message.contains('{') {
+            let verified_client_ip = if message.is_template() && message.as_str().contains('{') {
                 ctx.verified_client_ip.map(|ip| ip.to_string())
             } else {
                 None
@@ -4534,7 +4534,8 @@ impl PingclairProxy {
         // inside `handle_errors` renders the status that was raised rather than
         // an empty string. The response's own status is independent of it:
         // Caddy's `respond` still answers with the code it was written with.
-        ctx.request_vars.set_error(status, message.as_deref());
+        ctx.request_vars
+            .set_error(status, message.as_ref().map(|text| text.as_str()));
         // 📎 Cloned so `state` does not borrow `ctx`: the error routes below
         // need `&mut ctx` for the same handler machinery that matched them.
         let Some(state) = ctx.state.clone() else {
@@ -4697,12 +4698,14 @@ impl PingclairProxy {
                 // so this costs nothing extra) and `session` is free to be
                 // borrowed mutably for the write below.
                 let body_bytes = {
-                    let raw_body = body.as_deref().unwrap_or("");
-                    let verified_client_ip = if raw_body.contains('{') {
-                        ctx.verified_client_ip.map(|ip| ip.to_string())
-                    } else {
-                        None
-                    };
+                    let empty = pingclair_core::config::ConfigText::literal("");
+                    let raw_body = body.as_ref().unwrap_or(&empty);
+                    let verified_client_ip =
+                        if raw_body.is_template() && raw_body.as_str().contains('{') {
+                            ctx.verified_client_ip.map(|ip| ip.to_string())
+                        } else {
+                            None
+                        };
                     let resolved = resolve_caddy_placeholders(
                         raw_body,
                         session.req_header(),
@@ -4775,7 +4778,7 @@ impl PingclairProxy {
             HandlerConfig::Redirect { to, code } => {
                 // 🧭 A redirect target is a template, so `redir https://{host}{uri}`
                 // can send a client to the same resource over another scheme.
-                let verified_client_ip = if to.contains('{') {
+                let verified_client_ip = if to.is_template() && to.as_str().contains('{') {
                     ctx.verified_client_ip.map(|ip| ip.to_string())
                 } else {
                     None
@@ -4830,7 +4833,7 @@ impl PingclairProxy {
                         // skipped that route on this transport and produced a
                         // different 500 from HTTP/3 (#245).
                         ctx.error_status = Some(500);
-                        ctx.error_message = Some("Template Rendering Failed".to_string());
+                        ctx.error_message = Some("Template Rendering Failed".into());
                         return Ok(true);
                     }
                 };
@@ -6064,14 +6067,15 @@ fn record_cache_outcome(session: &Session, host: &str, route: &str) {
 ///
 /// If a placeholder references a header that doesn't exist, it resolves to
 /// an empty string (matching Caddy's behavior).
-pub(crate) fn resolve_caddy_placeholders<'a>(
-    template: &'a str,
+pub(crate) fn resolve_caddy_placeholders<'a, T: crate::config_text::TextInput + ?Sized>(
+    input: &'a T,
     req: &'a RequestHeader,
     verified_client_ip: Option<&'a str>,
     scheme: &'static str,
     vars: &crate::http_policy::RequestVars,
 ) -> std::borrow::Cow<'a, str> {
-    if !template.contains('{') {
+    let template = input.text();
+    if !input.is_template() || !template.contains('{') {
         // ⚡ OPTIMIZATION: Fast path — no placeholders, return as-is.
         return std::borrow::Cow::Borrowed(template);
     }

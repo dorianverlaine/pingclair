@@ -107,7 +107,9 @@
           "handler": {
             "type": "respond",
             "status": 200,
-            "body": "issued by ACME",
+            "body": {
+              "literal": "issued by ACME"
+            },
             "headers": {}
           },
           "methods": null,

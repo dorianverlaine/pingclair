@@ -22,7 +22,9 @@ fn generation(address: SocketAddr, body: &str) -> Vec<ServerConfig> {
                 path: "/*".to_string(),
                 handler: HandlerConfig::Respond {
                     status: 200,
-                    body: Some(body.to_string()),
+                    body: Some(pingclair_core::config::ConfigText::Template(
+                        body.to_string(),
+                    )),
                     headers: std::collections::BTreeMap::new(),
                 },
                 methods: None,

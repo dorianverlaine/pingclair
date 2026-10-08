@@ -25,7 +25,9 @@ async fn h3_exclusion_holds_for_a_mixed_case_sni() {
             path: "/*".to_string(),
             handler: HandlerConfig::Respond {
                 status: 200,
-                body: Some("kept".to_string()),
+                body: Some(pingclair_core::config::ConfigText::Template(
+                    "kept".to_string(),
+                )),
                 headers: std::collections::BTreeMap::new(),
             },
             methods: None,

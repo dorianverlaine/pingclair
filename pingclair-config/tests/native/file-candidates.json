@@ -163,7 +163,9 @@
           "handler": {
             "type": "error",
             "status": 404,
-            "message": "no such file"
+            "message": {
+              "literal": "no such file"
+            }
           },
           "methods": null,
           "matcher": null

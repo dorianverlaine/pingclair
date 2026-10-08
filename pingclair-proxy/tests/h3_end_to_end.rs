@@ -676,7 +676,9 @@ async fn h3_attempt(
 async fn h3_serves_a_request_end_to_end() {
     let server = spawn_h3_server(HandlerConfig::Respond {
         status: 200,
-        body: Some("hello over http/3".to_string()),
+        body: Some(pingclair_core::config::ConfigText::Template(
+            "hello over http/3".to_string(),
+        )),
         headers: std::collections::BTreeMap::new(),
     })
     .await;
@@ -742,7 +744,9 @@ async fn h3_reuses_one_connection_for_several_requests() {
     // down per stream and not per connection.
     let server = spawn_h3_server(HandlerConfig::Respond {
         status: 200,
-        body: Some("ok".to_string()),
+        body: Some(pingclair_core::config::ConfigText::Template(
+            "ok".to_string(),
+        )),
         headers: std::collections::BTreeMap::new(),
     })
     .await;
@@ -763,7 +767,9 @@ async fn h3_streams_a_body_larger_than_one_packet() {
     let payload = "x".repeat(512 * 1024);
     let server = spawn_h3_server(HandlerConfig::Respond {
         status: 200,
-        body: Some(payload.clone()),
+        body: Some(pingclair_core::config::ConfigText::Template(
+            payload.clone(),
+        )),
         headers: std::collections::BTreeMap::new(),
     })
     .await;
@@ -1585,7 +1591,9 @@ async fn h3_rejects_a_settings_frame_on_a_request_stream() {
     // one on a request stream must be H3_FRAME_UNEXPECTED.
     let server = spawn_h3_server(HandlerConfig::Respond {
         status: 200,
-        body: Some("ok".to_string()),
+        body: Some(pingclair_core::config::ConfigText::Template(
+            "ok".to_string(),
+        )),
         headers: std::collections::BTreeMap::new(),
     })
     .await;
@@ -1608,7 +1616,9 @@ async fn h3_rejects_a_data_frame_before_any_headers() {
     // no message to belong to.
     let server = spawn_h3_server(HandlerConfig::Respond {
         status: 200,
-        body: Some("ok".to_string()),
+        body: Some(pingclair_core::config::ConfigText::Template(
+            "ok".to_string(),
+        )),
         headers: std::collections::BTreeMap::new(),
     })
     .await;
@@ -1806,7 +1816,9 @@ async fn spawn_h3_mtls_listener(
                 path: "/*".to_string(),
                 handler: HandlerConfig::Respond {
                     status: 200,
-                    body: Some(body.to_string()),
+                    body: Some(pingclair_core::config::ConfigText::Template(
+                        body.to_string(),
+                    )),
                     headers: Default::default(),
                 },
                 methods: None,
@@ -2013,7 +2025,9 @@ async fn h3_client_auth_ca_rotation_rejects_the_previous_authority() {
                     path: "/*".to_string(),
                     handler: HandlerConfig::Respond {
                         status: 200,
-                        body: Some("secure-ok".to_string()),
+                        body: Some(pingclair_core::config::ConfigText::Template(
+                            "secure-ok".to_string(),
+                        )),
                         headers: Default::default(),
                     },
                     methods: None,
@@ -2269,7 +2283,9 @@ async fn h3_session_resumes(server: SocketAddr, sni: &str) -> bool {
 async fn h3_client_auth_turns_session_resumption_off() {
     let ordinary = spawn_h3_server(HandlerConfig::Respond {
         status: 200,
-        body: Some("ok".to_string()),
+        body: Some(pingclair_core::config::ConfigText::Template(
+            "ok".to_string(),
+        )),
         headers: Default::default(),
     })
     .await;

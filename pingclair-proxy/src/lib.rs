@@ -21,6 +21,7 @@ mod cache_key;
 mod cache_policy;
 mod cache_vary;
 pub mod client_auth;
+mod config_text;
 pub mod connection_filter;
 pub mod dns;
 pub mod drain;

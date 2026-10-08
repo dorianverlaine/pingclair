@@ -21,7 +21,9 @@
           "handler": {
             "type": "respond",
             "status": 200,
-            "body": "path",
+            "body": {
+              "literal": "path"
+            },
             "headers": {}
           },
           "methods": null,
@@ -39,7 +41,9 @@
           "handler": {
             "type": "respond",
             "status": 200,
-            "body": "host",
+            "body": {
+              "literal": "host"
+            },
             "headers": {}
           },
           "methods": null,
@@ -55,7 +59,9 @@
           "handler": {
             "type": "respond",
             "status": 200,
-            "body": "method",
+            "body": {
+              "literal": "method"
+            },
             "headers": {}
           },
           "methods": null,
@@ -73,7 +79,9 @@
           "handler": {
             "type": "respond",
             "status": 200,
-            "body": "header",
+            "body": {
+              "literal": "header"
+            },
             "headers": {}
           },
           "methods": null,
@@ -91,7 +99,9 @@
           "handler": {
             "type": "respond",
             "status": 200,
-            "body": "bearer",
+            "body": {
+              "literal": "bearer"
+            },
             "headers": {}
           },
           "methods": null,
@@ -108,7 +118,9 @@
           "handler": {
             "type": "respond",
             "status": 200,
-            "body": "query",
+            "body": {
+              "literal": "query"
+            },
             "headers": {}
           },
           "methods": null,
@@ -124,7 +136,9 @@
           "handler": {
             "type": "respond",
             "status": 200,
-            "body": "h2",
+            "body": {
+              "literal": "h2"
+            },
             "headers": {}
           },
           "methods": null,
@@ -139,7 +153,9 @@
           "handler": {
             "type": "respond",
             "status": 200,
-            "body": "intranet",
+            "body": {
+              "literal": "intranet"
+            },
             "headers": {}
           },
           "methods": null,
@@ -159,7 +175,9 @@
           "handler": {
             "type": "respond",
             "status": 200,
-            "body": "peer",
+            "body": {
+              "literal": "peer"
+            },
             "headers": {}
           },
           "methods": null,
@@ -174,7 +192,9 @@
           "handler": {
             "type": "respond",
             "status": 200,
-            "body": "tier",
+            "body": {
+              "literal": "tier"
+            },
             "headers": {}
           },
           "methods": null,
@@ -192,7 +212,9 @@
           "handler": {
             "type": "respond",
             "status": 202,
-            "body": "both",
+            "body": {
+              "literal": "both"
+            },
             "headers": {}
           },
           "methods": null,
@@ -221,7 +243,9 @@
           "handler": {
             "type": "respond",
             "status": 200,
-            "body": "up",
+            "body": {
+              "literal": "up"
+            },
             "headers": {}
           },
           "methods": null,
@@ -249,7 +273,9 @@
           "handler": {
             "type": "respond",
             "status": 200,
-            "body": "anything else",
+            "body": {
+              "literal": "anything else"
+            },
             "headers": {}
           },
           "methods": null,
@@ -266,7 +292,9 @@
           "handler": {
             "type": "error",
             "status": 404,
-            "message": "nothing matched"
+            "message": {
+              "literal": "nothing matched"
+            }
           },
           "methods": null,
           "matcher": null
