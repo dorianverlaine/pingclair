@@ -68,7 +68,7 @@ Defaults are `preread_timeout 30s`, `preread_buffer_size 16k`,
 and `proxy_half_close off`. Two buffers bound forwarding memory; the preread
 prefix may retain its configured capacity. Global HTTP listener options do not
 configure these raw TCP services. There is no UDP, TLS termination, PROXY
-protocol, wildcard SNI, load balancing or dynamic DNS in this alpha.
+protocol, wildcard SNI, weighted balancing or dynamic DNS in this alpha.
 
 
 ## 📊 Connection observability
@@ -172,3 +172,21 @@ These pre-session refusals do not produce access-log records or completed-sessio
 metrics. Limits are session counts, not socket counts: an established tunnel uses
 a downstream and an upstream socket. Deployment limits must fit the host's memory
 and file descriptor budget; the defaults do not establish measured capacity.
+
+## 🔁 Static address pools
+
+A hostname still resolves at load or reload. Its compiled pool deduplicates and
+sorts at most 64 addresses; an empty or larger pool rejects preparation. Each new
+connection rotates its starting address using one atomic increment. A literal or
+single-address pool bypasses that increment and keeps the configured total timeout.
+
+For multiple addresses, each attempt has at most two seconds, bounded by the
+remaining `proxy_connect_timeout` budget. A session tries at most four distinct
+addresses from its pool. Refused connections, network failures and timeouts may
+advance to the next address; local resource errors and unclassified failures stop
+immediately. A zero total budget refuses the dial without opening an upstream socket.
+These fixed alpha limits bound work; they are not nginx's unlimited retry defaults.
+
+Selection returns once TCP connects. Even a server-first protocol or an immediate
+post-connect reset cannot trigger replay to another peer. There is no passive
+quarantine or active health checking, and no per-I/O selection work in the relay.

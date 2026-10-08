@@ -6,6 +6,7 @@ use pingclair_core::config::{Layer4Matcher, Layer4Route, Layer4TlsMatcher};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, duplex};
 use tokio::net::TcpListener;
+use tokio::time::timeout;
 
 fn hello() -> Vec<u8> {
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(

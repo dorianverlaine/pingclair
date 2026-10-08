@@ -4,6 +4,7 @@
 use super::*;
 use pingclair_core::config::{Layer4Matcher, Layer4Route, Layer4TlsMatcher};
 use tokio::io::duplex;
+use tokio::time::timeout;
 
 #[tokio::test]
 async fn cancellation_logs_once_and_unchanged_destinations_reuse_the_writer() {

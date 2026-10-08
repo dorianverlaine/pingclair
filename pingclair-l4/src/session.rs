@@ -5,16 +5,16 @@
 
 use crate::metrics::Metrics;
 use crate::observation::{Counted, Observation, Outcome, Phase};
+use crate::upstream::Upstream;
 use crate::{Classification, ClientHello, RelayOptions, classify, relay};
 use pingclair_core::config::{IpRanges, Layer4Server, Layer4TlsMatcher};
 use pingclair_runtime::access_log::AccessLogger;
 use std::io;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio::net::TcpStream;
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::{Instant, timeout_at};
 
 struct Matcher {
     tls: Option<Layer4TlsMatcher>,
@@ -45,7 +45,7 @@ fn contains_peer(ranges: &IpRanges, peer: IpAddr) -> bool {
 
 struct Route {
     matches: Vec<Matcher>,
-    upstreams: Vec<SocketAddr>,
+    upstream: Upstream,
 }
 
 /// 🧭 Immutable state held for a connection's entire lifetime, including reloads.
@@ -106,13 +106,7 @@ impl PreparedListener {
         let mut routes = Vec::with_capacity(config.routes.len());
         let mut needs_tls = false;
         for route in &config.routes {
-            let upstreams: Vec<_> = route.upstream.to_socket_addrs()?.collect();
-            if upstreams.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    "L4 upstream resolved to no addresses",
-                ));
-            }
+            let upstream = Upstream::prepare(&route.upstream)?;
             let mut matches = Vec::with_capacity(route.matches.len());
             for matcher in &route.matches {
                 needs_tls |= matcher.tls.is_some();
@@ -121,7 +115,7 @@ impl PreparedListener {
                     peers: IpRanges::parse(matcher.remote_ip.clone()).map_err(io::Error::other)?,
                 });
             }
-            routes.push(Route { matches, upstreams });
+            routes.push(Route { matches, upstream });
         }
         let listener = pingclair_core::config::normalize_listen_addr(&config.listen);
         let logger = match previous.filter(|previous| previous.log_config == config.log) {
@@ -269,12 +263,7 @@ impl PreparedListener {
         observation.route = Some(index);
         observation.phase = Phase::Connect;
         let connect_started = LOG.then(Instant::now);
-        let connection = timeout(
-            self.connect_timeout,
-            TcpStream::connect(route.upstreams.as_slice()),
-        )
-        .await;
-        let upstream = connection??;
+        let upstream = route.upstream.connect(self.connect_timeout).await?;
         observation.connect_time = connect_started.map(|started| started.elapsed());
         observation.upstream_addr = Some(upstream.peer_addr()?);
         upstream.set_nodelay(true)?;

@@ -21,6 +21,12 @@ with a shared process ceiling of 4096. Excess connections close before session
 task or preread buffer allocation. Quotas survive route reloads; changing a
 listener quota requires restart. Admission refusals have a dedicated metric.
 
+Static hostname upstreams now use round-robin address selection. Pools contain
+at most 64 unique addresses. Multi-address dials try at most four addresses,
+with two seconds per attempt inside the configured total connect timeout.
+Single-address dials retain their configured timeout. Local resource errors
+stop immediately; established TCP sessions are never replayed to another peer.
+
 Global `layer4` blocks can forward TCP by ClientHello SNI/ALPN and peer IP.
 The independent classifier preserves TLS bytes; bounded bidirectional buffers
 preserve backpressure, and `proxy_timeout` measures inactivity. Preread timeout

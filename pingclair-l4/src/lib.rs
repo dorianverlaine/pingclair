@@ -12,4 +12,5 @@ pub use relay::{RelayOptions, relay};
 mod metrics;
 mod observation;
 mod session;
+mod upstream;
 pub use session::PreparedListener;
