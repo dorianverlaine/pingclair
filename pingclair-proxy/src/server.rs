@@ -2918,24 +2918,38 @@ impl PingclairProxy {
         // ⏱️ Pingora 0.9.0 exposes one upstream read timer for both H1/H2 phases.
         // 🌊 Preserve explicit phase timers so a response can become SSE after its header.
         let phase_read_timeout = shortest_duration(first_byte, between_reads);
-        peer.options.read_timeout = phase_read_timeout.or(read_budget);
+        peer.options.read_timeout = phase_read_timeout
+            .or(read_budget)
+            .or(Some(Self::UPSTREAM_READ_TIMEOUT));
         peer.options.write_timeout = shortest_duration(
             config
                 .and_then(|config| config.write_timeout)
                 .filter(|value| *value > 0)
                 .map(|value| Duration::from_millis(value as u64)),
             request_budget,
-        );
+        )
+        .or(Some(Self::UPSTREAM_WRITE_TIMEOUT));
         let connect_timeout = config
             .and_then(|config| config.connect_timeout)
             .filter(|value| *value > 0)
             .map(|value| Duration::from_millis(value as u64))
-            .unwrap_or(Duration::from_secs(10));
+            .unwrap_or(Self::UPSTREAM_CONNECT_TIMEOUT);
         peer.options.connection_timeout = shortest_duration(Some(connect_timeout), request_budget);
         peer.options.total_connection_timeout = peer.options.connection_timeout;
 
         Ok(peer)
     }
+
+    /// ⏱️ Upstream deadlines when the configuration names none: nginx's own,
+    /// 60 s each for connect, read and write.
+    ///
+    /// 📌 Read is the pause between two reads, reset by every byte, which is
+    /// what nginx means by `proxy_read_timeout` — not a ceiling on the whole
+    /// response. The long-connection path keeps its own rule, so a tunnel or an
+    /// SSE stream is not cut off by this.
+    const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+    const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(60);
+    const UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
     /// 🧱 Applies one virtual host's request deadlines without buffering body data.
     fn initialize_request_limits(

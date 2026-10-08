@@ -791,8 +791,17 @@ impl Default for ServerConfig {
     }
 }
 
-/// 📥 No ceiling unless a configuration asks for one, matching the format.
-fn default_body_limit() -> u64 {
+/// 📥 No ceiling unless a configuration asks for one.
+///
+/// 🤡 A megabyte was the default once, and it was wrong in production: an
+/// upload that worked in staging started answering `413` with nothing in the
+/// configuration or the startup log saying why
+/// (`test_a_site_without_request_body_has_no_body_ceiling`). Caddy serves the
+/// same request. Aligning with nginx here is a *deliberate* reversal of that
+/// decision, not a cleanup — it needs the incident answered first (a startup
+/// line naming the effective ceiling, at the very least), so it stays out of
+/// this batch.
+pub fn default_body_limit() -> u64 {
     0
 }
 

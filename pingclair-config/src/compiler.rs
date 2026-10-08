@@ -511,7 +511,9 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
         // 📥 No ceiling by default: the default belongs to the format, and the
         // format applies none. A site that wants one says so with
         // `request_body { max_size … }` or `client_max_body_size`.
-        client_max_body_size: 0,
+        // 📥 No ceiling unless the configuration names one; see
+        // `default_body_limit` for the incident behind that.
+        client_max_body_size: pingclair_core::config::default_body_limit(),
         limits: pingclair_core::config::ResourceLimitsConfig {
             header_timeout_ms: server.limits.header_timeout_ms,
             body_timeout_ms: server.limits.body_timeout_ms,
