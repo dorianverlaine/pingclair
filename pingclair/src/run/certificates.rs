@@ -201,19 +201,7 @@ pub(super) fn prepare(
     // 🚫 Refused here rather than in `validate_config` for the same reason as
     // `client_auth` and DNS-01: `adapt` translating a configuration is honest,
     // serving one it cannot honour is not.
-    let acme_server_sites: Vec<&str> = config
-        .servers
-        .iter()
-        .filter(|server| {
-            server.routes.iter().any(|route| {
-                matches!(
-                    route.handler,
-                    pingclair_core::config::HandlerConfig::AcmeServer(_)
-                )
-            })
-        })
-        .map(|server| server.name.as_deref().unwrap_or("_"))
-        .collect();
+    let acme_server_sites = acme_server_sites(config);
     if !acme_server_sites.is_empty() {
         anyhow::bail!(
             "site(s) {} configure `acme_server`, and Pingclair does not act as a certificate \
@@ -299,6 +287,48 @@ pub(super) fn prepare(
     })
 }
 
+/// 🏛️ The sites that configure an ACME server, however deeply it is wrapped.
+///
+/// 📌 The scan used to look only at a route's top-level handler, so a
+/// middleware-wrapped `acme_server` — native `SkipLog() ACMEServer()`, or a
+/// Caddyfile `route { templates; acme_server }` — started cleanly and then
+/// answered 500 per request. It has to see the same tree the request path will.
+fn acme_server_sites(config: &pingclair_core::config::PingclairConfig) -> Vec<&str> {
+    config
+        .servers
+        .iter()
+        .filter(|server| {
+            server
+                .routes
+                .iter()
+                .any(|route| configures_acme_server(&route.handler))
+                || server.error_routes.iter().any(|route| {
+                    route
+                        .handlers
+                        .iter()
+                        .any(|element| configures_acme_server(&element.handler))
+                })
+        })
+        .map(|server| server.name.as_deref().unwrap_or("_"))
+        .collect()
+}
+
+/// 🏛️ Whether a handler tree contains an ACME server, at any depth.
+fn configures_acme_server(handler: &pingclair_core::config::HandlerConfig) -> bool {
+    use pingclair_core::config::HandlerConfig;
+    match handler {
+        HandlerConfig::AcmeServer(_) => true,
+        HandlerConfig::Pipeline { handlers } | HandlerConfig::FirstMatch { handlers } => handlers
+            .iter()
+            .any(|element| configures_acme_server(&element.handler)),
+        HandlerConfig::HandlePath { handlers, .. } => handlers
+            .iter()
+            .any(|element| configures_acme_server(&element.handler)),
+        HandlerConfig::HandleErrors { errors } => errors.values().flatten().any(configures_acme_server),
+        _ => false,
+    }
+}
+
 /// 📡 Builds the DNS provider a site named, or says why it cannot be used.
 ///
 /// 🚫 One provider is implemented. Every other name upstream defines is a real
@@ -323,5 +353,44 @@ fn build_dns_provider(
         other => anyhow::bail!(
             "DNS provider `{other}` is not implemented; this build ships `cloudflare` only"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 🏛️ A wrapped ACME server is still refused at startup.
+    ///
+    /// 📌 The scan used to see only a route's top-level handler, so the shapes
+    /// below validated, started, and then answered 500 per request — a server
+    /// that looks alive to every ACME client retrying against it.
+    #[test]
+    fn a_wrapped_acme_server_is_still_refused_at_startup() {
+        let cases = [
+            // native: a middleware wraps the ACME server in one pipeline
+            "HTTPListener(on: \":8443\") {\n    Site(host: \"ca.example.test\") {\n        Fallback {\n            SkipLog()\n            ACMEServer()\n        }\n    }\n}\n.tls(.internal)\n",
+            // caddyfile: the same shape written as a route block
+            "https://ca.example.test:8443 {\n\ttls internal\n\troute {\n\t\ttemplates\n\t\tacme_server\n\t}\n}\n",
+        ];
+        for source in cases {
+            let config = pingclair_config::compile(source)
+                .expect("the shape is valid configuration; only serving it is refused");
+            assert_eq!(
+                acme_server_sites(&config),
+                ["ca.example.test"],
+                "{source}"
+            );
+        }
+    }
+
+    /// 🏛️ And a configuration without one reports nothing to refuse.
+    #[test]
+    fn an_ordinary_site_names_no_acme_server() {
+        let config = pingclair_config::compile(
+            "HTTPListener(on: \":8080\") {\n    Site(host: \"www.example.test\") {\n        Fallback { Respond(body: \"hi\") }\n    }\n}\n",
+        )
+        .expect("compiles");
+        assert!(acme_server_sites(&config).is_empty());
     }
 }
