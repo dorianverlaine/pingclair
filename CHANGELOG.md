@@ -40,6 +40,18 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🔻 A client that gives up no longer evicts a backend
+
+The health record kept after a connection was made belongs to the origin, and
+only to the origin. Pingora reports a client that closes its own HTTP/2 stream
+as `H2Error` — the same type it uses for an HTTP/2 fault from the origin — and
+the classifier read the type alone, so a cancelled request marked a healthy
+backend down for the cooldown: the two-backend route answered from one, and
+with cancellations arriving continuously, which is what a real client
+population looks like, the backends flapped. The classifier now reads the side
+Pingora records on the error, and a downstream-caused failure stays out of the
+backend's record (#305).
+
 ### 🧾 An immediately-flushed response is chunked on HTTP/1.1, so a short body stays short
 
 Immediate flushing drops the declared length so every chunk leaves as it is

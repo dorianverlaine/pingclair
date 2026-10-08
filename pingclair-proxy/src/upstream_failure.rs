@@ -169,11 +169,25 @@ pub fn classify_connect_error(error: &pingora_core::Error) -> FailureOrigin {
 ///   about the backend, and blaming it would turn one impatient client into
 ///   an outage.
 ///
+/// The error's type alone cannot make that last call, because Pingora reports
+/// a client that closes its own stream as `H2Error` — the same type it uses
+/// for an HTTP/2 fault from the origin. The `esource` it records does make
+/// the call: a `Downstream` error is the client's, whatever type it wears.
+///
 /// Unlike [`classify_connect_error`], an unrecognised type stays `Local`: a
 /// connect attempt already told us something by the time it fails, while a
 /// response-phase error can originate on either side of the proxy.
 pub fn classify_response_error(error: &pingora_core::Error) -> FailureOrigin {
     use pingora_core::ErrorType;
+
+    // 🧭 Pingora labels the side of the wire the error came from, and the
+    // label is what keeps a client's own disconnect out of the backend's
+    // health record (#262). The soak caught the cost of matching on the type
+    // alone: every cancelled stream marked an origin down, and the
+    // two-backend route answered from one until the cooldown expired.
+    if matches!(error.esource(), pingora_core::ErrorSource::Downstream) {
+        return FailureOrigin::Local;
+    }
 
     match deepest_error_type(error) {
         ErrorType::ReadError
@@ -530,5 +544,33 @@ mod tests {
                 "{etype:?} must not evict a backend"
             );
         }
+    }
+
+    /// 🧭 A client that closes its own stream is not evidence about the origin.
+    ///
+    /// Pingora reports that disconnect as `H2Error` — the type it also uses
+    /// for an HTTP/2 fault from the origin — and only `esource` separates the
+    /// two. Matching on the type alone marked an upstream down every time a
+    /// client cancelled, which the 0.2.0 soak saw as `round_robin_both`
+    /// reaching one origin for the length of the cooldown.
+    #[test]
+    fn a_downstream_response_error_is_not_evidence_about_the_origin() {
+        let mut error = Error::explain(
+            ErrorType::H2Error,
+            "Client closed H2, reason: received frame when stream half-closed",
+        );
+        error.as_down();
+        assert_eq!(classify_response_error(&error), FailureOrigin::Local);
+        assert!(!classify_response_error(&error).implicates_backend());
+
+        // 🧭 The same type from the origin still is: the source is the only
+        // difference between the two, and dropping the type match would lose
+        // a real signal along with the false one.
+        let mut from_the_origin = Error::explain(ErrorType::H2Error, "HTTP/2 protocol error");
+        from_the_origin.as_up();
+        assert_eq!(
+            classify_response_error(&from_the_origin),
+            FailureOrigin::Remote
+        );
     }
 }
