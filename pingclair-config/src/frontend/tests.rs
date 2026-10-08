@@ -1882,6 +1882,96 @@ fn proxy_header_lists_that_cannot_mean_anything_fail_closed() {
 }
 
 #[test]
+fn proxy_balance_health_and_timeouts_lower_like_their_caddyfile_twins() {
+    let cases = [
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                Proxy(
+                    to: ["127.0.0.1:9000", "127.0.0.1:9001"],
+                    loadBalance: .leastConn,
+                    tryDuration: .seconds(3),
+                    tryInterval: .milliseconds(250),
+                    maxFails: 3,
+                    failDuration: .seconds(30),
+                    flushInterval: .immediate,
+                    connectTimeout: .seconds(5),
+                    firstByteTimeout: .seconds(30),
+                    betweenReadsTimeout: .seconds(30),
+                    readTimeout: .minutes(5),
+                    writeTimeout: .minutes(5)
+                )
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\treverse_proxy 127.0.0.1:9000 127.0.0.1:9001 {\n\t\tlb_policy least_conn\n\t\tlb_try_duration 3s\n\t\tlb_try_interval 250ms\n\t\tmax_fails 3\n\t\tfail_duration 30s\n\t\tflush_interval -1\n\t\ttransport http {\n\t\t\tdial_timeout 5s\n\t\t\tresponse_header_timeout 30s\n\t\t\tbetween_reads_timeout 30s\n\t\t\tread_timeout 5m\n\t\t\twrite_timeout 5m\n\t\t}\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            // 🔑 A hashing policy names the field it hashes.
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                Proxy(to: ["127.0.0.1:9000", "127.0.0.1:9001"], loadBalance: .cookie("session"))
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\treverse_proxy 127.0.0.1:9000 127.0.0.1:9001 {\n\t\tlb_policy cookie session\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            // ⚖️ Weights are the round-robin knob, spelled as the Caddyfile's
+            // positional list.
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                Proxy(to: ["127.0.0.1:9000", "127.0.0.1:9001"], upstreamWeights: [3, 1])
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\treverse_proxy 127.0.0.1:9000 127.0.0.1:9001 {\n\t\tlb_policy weighted_round_robin 3 1\n\t}\n}"
+                .to_string(),
+        ),
+    ];
+    for (native_source, legacy_source) in cases {
+        let native = crate::compile(&native_source).unwrap();
+        let legacy = crate::compile(&legacy_source).unwrap();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::to_value(legacy).unwrap(),
+            "{native_source}"
+        );
+    }
+}
+
+#[test]
+fn proxy_tuning_that_cannot_mean_anything_fail_closed() {
+    let site = |handler: &str| {
+        format!(
+            "HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {handler} }} }} }}"
+        )
+    };
+    for handler in [
+        // 🎛️ Policies are typed values, and the hashing ones name a field.
+        "Proxy(to: \"127.0.0.1:9000\", loadBalance: \"least_conn\")",
+        "Proxy(to: \"127.0.0.1:9000\", loadBalance: .least_conn)",
+        "Proxy(to: \"127.0.0.1:9000\", loadBalance: .cookie)",
+        "Proxy(to: \"127.0.0.1:9000\", loadBalance: .cookie(\"a\", \"b\"))",
+        "Proxy(to: \"127.0.0.1:9000\", loadBalance: .ipHash(\"X-User\"))",
+        // ⚖️ Weights are one per upstream, positive, and round-robin's own.
+        "Proxy(to: [\"127.0.0.1:9000\", \"127.0.0.1:9001\"], upstreamWeights: [2])",
+        "Proxy(to: [\"127.0.0.1:9000\"], upstreamWeights: [0])",
+        "Proxy(to: [\"127.0.0.1:9000\"], upstreamWeights: [\"2\"])",
+        "Proxy(to: [\"127.0.0.1:9000\"], upstreamWeights: 2)",
+        "Proxy(to: [\"127.0.0.1:9000\"], upstreamWeights: [2], loadBalance: .leastConn)",
+        // ⏱️ Every deadline is a duration, not a bare number.
+        "Proxy(to: \"127.0.0.1:9000\", tryInterval: 250)",
+        "Proxy(to: \"127.0.0.1:9000\", tryDuration: 3)",
+        "Proxy(to: \"127.0.0.1:9000\", connectTimeout: 5)",
+        "Proxy(to: \"127.0.0.1:9000\", readTimeout: \"30s\")",
+        "Proxy(to: \"127.0.0.1:9000\", maxFails: \"3\")",
+        "Proxy(to: \"127.0.0.1:9000\", failDuration: 30)",
+        "Proxy(to: \"127.0.0.1:9000\", flushInterval: 1)",
+        "Proxy(to: \"127.0.0.1:9000\", flushInterval: .unknown)",
+    ] {
+        let source = site(handler);
+        assert!(crate::compile(&source).is_err(), "accepted {source:?}");
+    }
+}
+
+#[test]
 fn caddy_shaped_sources_are_not_native() {
     for source in [
         "{\n    email admin@example.com\n}",

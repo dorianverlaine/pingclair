@@ -2656,11 +2656,175 @@ fn php_fastcgi(call: &Call) -> Result<HandlerConfig, Error> {
 
 /// 🌐 `.Proxy(to:)`: the reverse proxy with the build's bare defaults.
 fn proxy(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(&["to", "headersUp", "headersDown"])?;
+    call.leaf(&[
+        "to",
+        "headersUp",
+        "headersDown",
+        "loadBalance",
+        "tryDuration",
+        "tryInterval",
+        "upstreamWeights",
+        "maxFails",
+        "failDuration",
+        "flushInterval",
+        "connectTimeout",
+        "firstByteTimeout",
+        "betweenReadsTimeout",
+        "readTimeout",
+        "writeTimeout",
+    ])?;
     let upstreams = upstream_addresses(call)?;
     let up = header_list(call, "headersUp", false)?;
     let down = header_list(call, "headersDown", true)?;
     let mut config = reverse_proxy(upstreams, None);
+    // 🎛️ Load balancing: the strategy, and the field the hashing strategies
+    // read their key from. `.weightedRoundRobin([2, 1])` is the Caddyfile's
+    // `lb_policy weighted_round_robin 2 1`, which is round-robin with the
+    // upstreams' weights set rather than a strategy of its own.
+    let mut policy_chosen: Option<&str> = None;
+    if let Some(value) = call.get("loadBalance") {
+        let Value::Typed(policy) = value else {
+            return Err(call
+                .at
+                .error("loadBalance takes a typed value such as .leastConn"));
+        };
+        match policy.name.as_str() {
+            "roundRobin" | "random" | "leastConn" | "ipHash" | "first" => {
+                policy.leaf(&[])?;
+                policy_chosen = Some(policy.name.as_str());
+                config.load_balance.strategy = match policy.name.as_str() {
+                    "roundRobin" => "round_robin",
+                    "leastConn" => "least_conn",
+                    "ipHash" => "ip_hash",
+                    other => other,
+                }
+                .to_string();
+            }
+            // 🔑 The hashing strategies that read a request field must name it:
+            // a cookie policy with no cookie hashes the same empty string for
+            // every client and pins the site to one upstream.
+            "header" | "cookie" | "query" => {
+                let [(None, Value::String(key))] = policy.args.as_slice() else {
+                    return Err(policy.at.error(format!(
+                        ".{} takes one name, such as .{}(\"X-User\")",
+                        policy.name, policy.name
+                    )));
+                };
+                policy_chosen = Some(policy.name.as_str());
+                config.load_balance.strategy = policy.name.clone();
+                config.load_balance.hash_key = Some(key.clone());
+            }
+            other => {
+                return Err(policy.at.error(format!(
+                    "unknown load balance policy '.{other}'; expected .roundRobin, .random, \
+                     .leastConn, .ipHash, .first, .header(\"…\"), .cookie(\"…\") or \
+                     .query(\"…\")"
+                )));
+            }
+        }
+    }
+    let mut weights_given = false;
+    if let Some(value) = call.get("upstreamWeights") {
+        weights_given = true;
+        let Value::Array(weights) = value else {
+            return Err(call
+                .at
+                .error("upstreamWeights takes an array with one weight per upstream"));
+        };
+        if weights.len() != config.upstream_options.len() {
+            return Err(call.at.error(format!(
+                "{} weights were given for {} upstreams",
+                weights.len(),
+                config.upstream_options.len()
+            )));
+        }
+        for (option, weight) in config.upstream_options.iter_mut().zip(weights) {
+            let Value::Number(weight) = weight else {
+                return Err(call.at.error("upstreamWeights takes numbers"));
+            };
+            let weight = u32::try_from(*weight)
+                .map_err(|_| call.at.error("a weight must fit in 0..=4294967295"))?;
+            // 🚫 Zero is not "no traffic yet": the runtime clamps it to one,
+            // which is the opposite of what a drained backend asked for.
+            if weight == 0 {
+                return Err(call
+                    .at
+                    .error("a weight of 0 would be clamped to 1; leave the upstream out instead"));
+            }
+            option.weight = weight;
+        }
+    }
+    // 🚫 Weights are the round-robin strategy's own knob: writing them beside
+    // another policy asks for two different things, and silently keeping one
+    // is how a drained backend goes on serving.
+    if let Some(policy) = policy_chosen
+        && policy != "roundRobin"
+        && weights_given
+    {
+        return Err(call.at.error(format!(
+            "upstreamWeights belong to .roundRobin, not .{policy}; pick one"
+        )));
+    }
+    // 📌 Weights without a policy is round-robin with weights — what the
+    // Caddyfile's `lb_policy weighted_round_robin` means — so the strategy is
+    // spelled out rather than left to a default the JSON happens to carry.
+    if weights_given && policy_chosen.is_none() {
+        config.load_balance.strategy = "round_robin".to_string();
+    }
+    // ⏱️ `lb_try_duration` and `lb_try_interval`: how long the proxy keeps
+    // trying another upstream, and how long it waits between attempts.
+    if call.get("tryDuration").is_some() {
+        config.retry.total_timeout_ms = Some(call.measure("tryDuration", false)?);
+    }
+    if call.get("tryInterval").is_some() {
+        config.retry.backoff_ms = call.measure("tryInterval", false)?;
+    }
+    // 🩺 Passive health: how many failures retire an upstream, and for how long.
+    if call.get("maxFails").is_some() {
+        config.max_fails = Some(
+            u32::try_from(call.integer("maxFails")?)
+                .map_err(|_| call.at.error("maxFails must fit in 0..=4294967295"))?,
+        );
+    }
+    if call.get("failDuration").is_some() {
+        config.fail_duration_ms = Some(call.measure("failDuration", false)?);
+    }
+    // 🚿 Streaming: `.immediate` sends bytes as they arrive; a duration batches
+    // them, which is what a proxy in front of a video file wants.
+    if let Some(value) = call.get("flushInterval") {
+        config.flush_interval = Some(match value {
+            Value::Typed(value) if value.name == "immediate" => {
+                value.leaf(&[])?;
+                -1
+            }
+            _ => i64::try_from(call.measure("flushInterval", false)?)
+                .map_err(|_| call.at.error("flushInterval exceeds the supported range"))?,
+        });
+    }
+    // ⏱️ The transport's deadlines, flat rather than nested under
+    // `transport http { … }`: they are the same five knobs either way.
+    for (label, field) in [
+        ("connectTimeout", 0usize),
+        ("firstByteTimeout", 1),
+        ("betweenReadsTimeout", 2),
+        ("readTimeout", 3),
+        ("writeTimeout", 4),
+    ] {
+        if call.get(label).is_none() {
+            continue;
+        }
+        let millis = i64::try_from(call.measure(label, false)?).map_err(|_| {
+            call.at
+                .error(format!("{label} exceeds the supported range"))
+        })?;
+        match field {
+            0 => config.connect_timeout = Some(millis),
+            1 => config.first_byte_timeout = Some(millis),
+            2 => config.between_reads_timeout = Some(millis),
+            3 => config.read_timeout = Some(millis),
+            _ => config.write_timeout = Some(millis),
+        }
+    }
     config.headers_up = up.set;
     config.headers_up_add = up.add;
     config.headers_up_remove = up.remove;

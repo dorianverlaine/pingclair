@@ -26,11 +26,6 @@
                 "set": {
                   "X-Request-Start": "pingclair"
                 },
-                "add": {
-                  "X-Forwarded-Proto": [
-                    "http"
-                  ]
-                },
                 "remove": [
                   "Cookie"
                 ]
@@ -44,14 +39,6 @@
                 "regex_replace": null
               },
               {
-                "type": "headers",
-                "set": {},
-                "remove": [],
-                "default_set": {
-                  "X-Served-By": "pingclair"
-                }
-              },
-              {
                 "type": "reverse_proxy",
                 "upstreams": [
                   "10.0.0.10:8080",
@@ -60,7 +47,7 @@
                 "upstream_options": [
                   {
                     "address": "10.0.0.10:8080",
-                    "weight": 1,
+                    "weight": 2,
                     "backup": false
                   },
                   {
@@ -70,9 +57,11 @@
                   }
                 ],
                 "load_balance": {
-                  "strategy": ""
+                  "strategy": "round_robin"
                 },
                 "health_check": null,
+                "max_fails": 3,
+                "fail_duration_ms": 30000,
                 "headers_up": {
                   "Host": "app.internal"
                 },
@@ -84,15 +73,15 @@
                   "Cookie"
                 ],
                 "flush_interval": null,
-                "read_timeout": null,
+                "read_timeout": 120000,
                 "write_timeout": null,
-                "connect_timeout": null,
+                "connect_timeout": 5000,
                 "first_byte_timeout": null,
                 "between_reads_timeout": null,
                 "retry": {
                   "max_attempts": 16,
-                  "total_timeout_ms": null,
-                  "backoff_ms": 0
+                  "total_timeout_ms": 3000,
+                  "backoff_ms": 250
                 },
                 "overload": {
                   "max_in_flight": null,
