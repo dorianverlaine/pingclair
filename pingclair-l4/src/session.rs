@@ -7,8 +7,10 @@ use crate::metrics::Metrics;
 use crate::observation::{Counted, Observation, Outcome, Phase};
 use crate::{Classification, ClientHello, RelayOptions, classify, relay};
 use pingclair_core::config::{IpRanges, Layer4Server, Layer4TlsMatcher};
+use pingclair_runtime::access_log::AccessLogger;
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
@@ -49,6 +51,9 @@ struct Route {
 /// 🧭 Immutable state held for a connection's entire lifetime, including reloads.
 pub struct PreparedListener {
     metrics: Metrics,
+    listener: String,
+    logger: Option<Arc<AccessLogger>>,
+    log_config: Option<pingclair_core::config::LogConfig>,
     routes: Vec<Route>,
     blocked: IpRanges,
     needs_tls: bool,
@@ -61,6 +66,15 @@ pub struct PreparedListener {
 impl PreparedListener {
     /// 🏗️ Resolves upstreams and compiles CIDRs before a listener or reload is published.
     pub fn prepare(config: &Layer4Server, blocked: &[String]) -> io::Result<Self> {
+        Self::prepare_with_previous(config, blocked, None)
+    }
+
+    /// ♻️ Reuses an unchanged logger so route reloads do not create writer threads.
+    pub fn prepare_with_previous(
+        config: &Layer4Server,
+        blocked: &[String],
+        previous: Option<&Self>,
+    ) -> io::Result<Self> {
         if config.preread_buffer_size == 0 || config.proxy_buffer_size == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -102,11 +116,18 @@ impl PreparedListener {
             }
             routes.push(Route { matches, upstreams });
         }
+        let listener = pingclair_core::config::normalize_listen_addr(&config.listen);
+        let logger = match previous.filter(|previous| previous.log_config == config.log) {
+            Some(previous) => previous.logger.clone(),
+            None => AccessLogger::from_config(config.log.as_ref())?
+                .filter(|logger| logger.admits_source("layer4.log.access"))
+                .map(Arc::new),
+        };
         Ok(Self {
-            metrics: Metrics::prepare(
-                &pingclair_core::config::normalize_listen_addr(&config.listen),
-                routes.len(),
-            ),
+            metrics: Metrics::prepare(&listener, routes.len()),
+            listener,
+            logger,
+            log_config: config.log.clone(),
             routes,
             needs_tls,
             blocked: IpRanges::parse(blocked.to_vec()).map_err(io::Error::other)?,
@@ -125,21 +146,32 @@ impl PreparedListener {
     pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         stream: S,
-        peer: IpAddr,
+        peer: SocketAddr,
     ) -> io::Result<()> {
-        let mut observation = Observation::new(&self.metrics);
-        let result = self.serve_inner(stream, peer, &mut observation).await;
+        let mut observation = Observation::new(&self.metrics, self.logger.is_some());
+        observation.log = self
+            .logger
+            .as_ref()
+            .map(|logger| (logger.as_ref(), self.listener.as_str(), peer));
+        // ⚡ Specialize byte accounting away when access logging is disabled.
+        let result = if self.logger.is_some() {
+            self.serve_inner::<_, true>(stream, peer.ip(), &mut observation)
+                .await
+        } else {
+            self.serve_inner::<_, false>(stream, peer.ip(), &mut observation)
+                .await
+        };
         observation.finish(&result);
         result
     }
 
-    async fn serve_inner<S: AsyncRead + AsyncWrite + Unpin>(
+    async fn serve_inner<S: AsyncRead + AsyncWrite + Unpin, const LOG: bool>(
         &self,
         stream: S,
         peer: IpAddr,
         observation: &mut Observation<'_>,
     ) -> io::Result<()> {
-        let mut stream = Counted {
+        let mut stream = Counted::<_, LOG> {
             inner: stream,
             stats: &mut observation.downstream,
             written: observation.metrics.map(|m| &m.to_client),
@@ -152,7 +184,10 @@ impl PreparedListener {
         if self.needs_tls {
             prefix
                 .try_reserve_exact(self.preread_limit)
-                .map_err(io::Error::other)?;
+                .map_err(|error| {
+                    observation.outcome = Some(Outcome::InternalError);
+                    io::Error::other(error)
+                })?;
             prefix.resize(self.preread_limit, 0);
             let deadline = Instant::now()
                 .checked_add(self.preread_timeout)
@@ -213,14 +248,18 @@ impl PreparedListener {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no L4 route matched"))?;
         observation.route = Some(index);
         observation.phase = Phase::Connect;
-        let upstream = timeout(
+        let connect_started = LOG.then(Instant::now);
+        let connection = timeout(
             self.connect_timeout,
             TcpStream::connect(route.upstreams.as_slice()),
         )
-        .await??;
+        .await;
+        let upstream = connection??;
+        observation.connect_time = connect_started.map(|started| started.elapsed());
+        observation.upstream_addr = Some(upstream.peer_addr()?);
         upstream.set_nodelay(true)?;
         observation.phase = Phase::Relay;
-        let mut upstream = Counted {
+        let mut upstream = Counted::<_, LOG> {
             inner: upstream,
             stats: &mut observation.upstream,
             written: observation.metrics.map(|m| &m.to_upstream),
@@ -232,3 +271,7 @@ impl PreparedListener {
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "session_log_tests.rs"]
+mod log_tests;

@@ -120,7 +120,6 @@ impl AccessLogger {
         if json {
             out.push('}');
         }
-        out.push('\n');
         out
     }
 }

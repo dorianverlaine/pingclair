@@ -202,7 +202,7 @@ pub(crate) fn run_server_with_adapter(
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let layer4 = Arc::new(crate::layer4::Runtime::default());
     layer4.publish(
-        crate::layer4::prepare(&config, prepared_listener_policies.keys().cloned())
+        crate::layer4::prepare(&config, &layer4, prepared_listener_policies.keys().cloned())
             .map_err(|error| anyhow::anyhow!(error.to_string()))?,
     );
     let listener_security_by_address: HashMap<String, Arc<PublishedListenerPolicy>> =

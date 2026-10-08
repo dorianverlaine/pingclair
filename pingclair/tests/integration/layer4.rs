@@ -216,3 +216,6 @@ async fn incomplete_and_oversized_hellos_close_without_fallback() {
 
 #[path = "layer4_metrics.rs"]
 mod metrics;
+
+#[path = "layer4_logs.rs"]
+mod logs;

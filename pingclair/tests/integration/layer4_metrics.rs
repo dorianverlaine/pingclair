@@ -3,7 +3,7 @@
 
 use super::*;
 
-async fn scrape(server: &TestServer) -> String {
+pub(super) async fn scrape(server: &TestServer) -> String {
     no_proxy_client()
         .get(server.url(0, "/metrics"))
         .send()
@@ -14,7 +14,7 @@ async fn scrape(server: &TestServer) -> String {
         .unwrap()
 }
 
-fn value(scrape: &str, name: &str, labels: &[&str]) -> f64 {
+pub(super) fn value(scrape: &str, name: &str, labels: &[&str]) -> f64 {
     scrape
         .lines()
         .filter(|line| {

@@ -29,6 +29,9 @@ pub struct Layer4Server {
     /// 📦 Relay buffer capacity for each direction.
     #[serde(default = "buffer_size")]
     pub proxy_buffer_size: usize,
+    /// 📝 An opt-in connection access log using the shared runtime writer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<super::LogConfig>,
     /// 🧭 Routes retain declaration order; the first match wins.
     pub routes: Vec<Layer4Route>,
 }
@@ -93,6 +96,7 @@ impl Layer4Server {
             proxy_half_close: false,
             proxy_buffer_size: buffer_size(),
             routes: Vec::new(),
+            log: None,
         }
     }
 }

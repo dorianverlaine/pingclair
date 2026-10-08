@@ -98,6 +98,26 @@ pub(super) fn adapt(d: &Directive) -> Result<Vec<Layer4Server>> {
             if !options.insert(&item.name) {
                 return Err(invalid(item, "duplicate option"));
             }
+            if item.name == "log" {
+                if !item.args.is_empty() {
+                    return Err(invalid(
+                        item,
+                        "L4 supports one unnamed log block per listener",
+                    ));
+                }
+                let block = item
+                    .block
+                    .clone()
+                    .unwrap_or(crate::parser::caddy_ast::Block {
+                        directives: Vec::new(),
+                    });
+                let log = super::logs::adapt_log_block(block)?;
+                server.log = Some(
+                    crate::compiler::compile_log(&log)
+                        .map_err(|e| invalid(item, &e.to_string()))?,
+                );
+                continue;
+            }
             if item.block.is_some() {
                 return Err(invalid(item, "option does not accept a block"));
             }

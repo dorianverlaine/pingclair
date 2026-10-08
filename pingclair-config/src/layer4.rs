@@ -39,6 +39,32 @@ fn validate_declarations(config: &PingclairConfig) -> CompileResult<()> {
     }
     let mut listeners = Vec::new();
     for server in &config.layer4 {
+        if let Some(log) = &server.log {
+            if !log.request_headers.is_empty()
+                || !log.response_headers.is_empty()
+                || log.include_tls
+                || !log.hostnames.is_empty()
+            {
+                return Err(invalid(
+                    "layer4 log cannot record HTTP headers, negotiated TLS, or select hostnames",
+                ));
+            }
+            if log
+                .level
+                .as_deref()
+                .is_some_and(|level| !level.eq_ignore_ascii_case("info"))
+            {
+                return Err(invalid("layer4 access records use level info"));
+            }
+            if log
+                .sampling
+                .is_some_and(|sampling| sampling.interval_secs == 0 || sampling.thereafter == 0)
+            {
+                return Err(invalid(
+                    "layer4 log sampling requires a positive interval and thereafter",
+                ));
+            }
+        }
         let address = normalize_listen_addr(&server.listen)
             .parse::<SocketAddr>()
             .map_err(|_| {

@@ -27,6 +27,15 @@ snapshot. Listener topology and limit changes require restart. TCP tunnels
 participate in graceful shutdown. This alpha supports static upstream addresses;
 UDP, TLS termination, PROXY protocol and dynamic DNS are outside its scope.
 
+Global `metrics` enables `l4_*` connection, traffic, duration and failure metrics
+on the existing scrape endpoint. Labels use configured listeners, route ordinals
+and fixed outcomes; client SNI never becomes a label. A listener's optional
+`log` block writes one JSON or text record when a session ends, using the shared
+bounded writer, filtering, sampling and rotation. Logging is off by default;
+HTTP header and negotiated-TLS logging options are rejected for raw TCP.
+Logger changes apply to new connections. Unchanged loggers survive route reloads
+without creating additional writer threads.
+
 📦 This section becomes `## [0.2.0]` when 0.2.0 is cut, and its text is the
 release notes of that tag. It covers every change since `v0.1.7`, including
 the three release candidates (`0.2.0-rc.1` on 2026-08-20, `0.2.0-rc.2` on

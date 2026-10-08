@@ -28,6 +28,7 @@ production deployment.
 
 🔌 The 0.3 alpha branch supports TCP forwarding with TLS ClientHello SNI/ALPN
 and source-IP routing. TLS passes through unchanged; it is not terminated.
+Opt-in connection access logs and `l4_*` metrics report traffic and session outcomes.
 See the [L4 boundaries](docs/guardrails/layer4.md) for syntax and current limits.
 
 ## ✨ Highlights

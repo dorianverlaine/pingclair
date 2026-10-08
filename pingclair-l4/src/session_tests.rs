@@ -56,7 +56,7 @@ async fn a_real_rustls_hello_reaches_the_selected_origin_unchanged() {
     });
     let session = tokio::spawn(async move {
         prepared
-            .serve(stream, "::ffff:127.0.0.1".parse().unwrap())
+            .serve(stream, "[::ffff:127.0.0.1]:1234".parse().unwrap())
             .await
     });
     client.write_all(&wire).await.unwrap();
@@ -78,8 +78,11 @@ async fn plain_input_reaches_only_the_fallback_route() {
     });
     let prepared = PreparedListener::prepare(&cfg, &[]).unwrap();
     let (mut client, stream) = duplex(32);
-    let session =
-        tokio::spawn(async move { prepared.serve(stream, "127.0.0.1".parse().unwrap()).await });
+    let session = tokio::spawn(async move {
+        prepared
+            .serve(stream, "127.0.0.1:1234".parse().unwrap())
+            .await
+    });
     client.write_all(b"plain bytes").await.unwrap();
     client.shutdown().await.unwrap();
     let (mut backend, _) = origin.accept().await.unwrap();
@@ -112,7 +115,7 @@ async fn timeout_and_overflow_do_not_dial_the_fallback() {
             .await
             .unwrap();
         let error = prepared
-            .serve(stream, "127.0.0.1".parse().unwrap())
+            .serve(stream, "127.0.0.1:1234".parse().unwrap())
             .await
             .unwrap_err();
         assert_eq!(
@@ -138,7 +141,7 @@ async fn blocked_peers_are_refused_before_any_preread_or_dial() {
         &["127.0.0.0/8".into()],
     )
     .unwrap();
-    for peer in ["127.0.0.1", "::ffff:127.0.0.1"] {
+    for peer in ["127.0.0.1:1234", "[::ffff:127.0.0.1]:1234"] {
         let (_client, stream) = duplex(8);
         assert_eq!(
             prepared

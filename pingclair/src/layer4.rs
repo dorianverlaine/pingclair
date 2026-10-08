@@ -31,6 +31,7 @@ impl Runtime {
 /// 🛡️ Checks effective HTTP companions and Admin before resolving any upstream.
 pub(crate) fn prepare(
     config: &PingclairConfig,
+    current: &Runtime,
     http_addresses: impl Iterator<Item = String>,
 ) -> Result<Generation, ConfigApplyError> {
     let mut occupied: Vec<SocketAddr> = http_addresses
@@ -42,6 +43,7 @@ pub(crate) fn prepare(
     {
         occupied.push(address);
     }
+    let previous = current.0.load();
     let mut next = HashMap::new();
     for listener in &config.layer4 {
         let address = normalize_listen_addr(&listener.listen);
@@ -59,10 +61,14 @@ pub(crate) fn prepare(
                 )));
             }
         }
-        let prepared =
-            PreparedListener::prepare(listener, &config.global.blocked_ips).map_err(|error| {
-                ConfigApplyError::invalid(format!("cannot prepare L4 listener {address}: {error}"))
-            })?;
+        let prepared = PreparedListener::prepare_with_previous(
+            listener,
+            &config.global.blocked_ips,
+            previous.get(&address).map(Arc::as_ref),
+        )
+        .map_err(|error| {
+            ConfigApplyError::invalid(format!("cannot prepare L4 listener {address}: {error}"))
+        })?;
         occupied.push(socket);
         next.insert(address, Arc::new(prepared));
     }
@@ -81,6 +87,7 @@ pub(crate) fn ensure_hot_compatible(
             .map(|listener| {
                 let mut listener = listener.clone();
                 listener.routes.clear();
+                listener.log = None;
                 listener.listen = normalize_listen_addr(&listener.listen);
                 (listener.listen.clone(), listener)
             })
@@ -135,7 +142,11 @@ impl ServerApp for App {
         if *shutdown.borrow() || pingclair_proxy::drain::is_stopping() {
             return None;
         }
-        let peer = stream.get_socket_digest()?.peer_addr()?.as_inet()?.ip();
+        let peer = stream
+            .get_socket_digest()?
+            .peer_addr()?
+            .as_inet()?
+            .to_owned();
         let prepared = self.runtime.0.load().get(&self.address)?.clone();
         if let Err(error) = prepared.serve(stream, peer).await {
             tracing::debug!(listener = %self.address, %error, "🔌 L4 connection ended");

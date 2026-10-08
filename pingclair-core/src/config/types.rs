@@ -3409,7 +3409,7 @@ fn default_hsts_preload() -> bool {
 }
 
 /// Per-server log configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogConfig {
     /// Log output destination
     pub output: LogOutput,
@@ -3561,7 +3561,7 @@ impl LogRotation {
 }
 
 /// Log output destination
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogOutput {
     File(String),
@@ -3570,7 +3570,7 @@ pub enum LogOutput {
 }
 
 /// Log format
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LogFormat {
     #[default]

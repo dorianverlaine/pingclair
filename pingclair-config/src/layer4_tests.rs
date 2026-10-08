@@ -35,6 +35,7 @@ fn layer4_adapts_complete_structure_and_round_trips_json() {
     let config = crate::adapt(SOURCE).unwrap();
     let expected = Layer4Server {
         listen: ":9443".into(),
+        log: None,
         preread_timeout_ms: 62_003,
         preread_buffer_size: 16_384,
         proxy_connect_timeout_ms: 2_000,
@@ -304,4 +305,45 @@ fn layer4_overlap_checks_use_effective_bind_and_admin_addresses() {
             .to_string()
             .contains("overlaps")
     );
+}
+
+#[test]
+fn layer4_logging_uses_the_existing_dialect_and_common_validation() {
+    let source = SOURCE.replace(
+        "proxy_timeout 10m",
+        "log {\n output file /tmp/l4-test.log\n format json\n}\nproxy_timeout 10m",
+    );
+    let config = crate::compile(&source).unwrap();
+    let log = config.layer4[0].log.as_ref().unwrap();
+    assert!(matches!(
+        log.format,
+        pingclair_core::config::LogFormat::Json
+    ));
+    assert!(
+        matches!(&log.output, pingclair_core::config::LogOutput::File(path) if path == "/tmp/l4-test.log")
+    );
+    for field in [
+        "request_headers",
+        "response_headers",
+        "hostnames",
+        "include_tls",
+        "level",
+        "sampling",
+    ] {
+        let mut document = serde_json::to_value(&config).unwrap();
+        document["layer4"][0]["log"][field] = match field {
+            "include_tls" => serde_json::json!(true),
+            "level" => serde_json::json!("debug"),
+            "sampling" => serde_json::json!({"interval_secs": 0, "first": 1, "thereafter": 1}),
+            _ => serde_json::json!(["example"]),
+        };
+        let decoded = serde_json::from_value(document).unwrap();
+        assert!(
+            crate::compiler::validate_config(&decoded).is_err(),
+            "accepted {field}"
+        );
+    }
+    assert!(crate::compile(&SOURCE.replace("proxy_timeout 10m", "log audit")).is_err());
+    assert!(crate::compile(&SOURCE.replace("proxy_timeout 10m", "log\nlog")).is_err());
+    assert!(crate::compile(&SOURCE.replace("proxy_timeout 10m", "log")).is_ok());
 }

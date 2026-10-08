@@ -2809,7 +2809,7 @@ fn validate_upstream_tls(tls: &pingclair_core::config::UpstreamTlsConfig) -> Com
     Ok(())
 }
 
-fn compile_log(log: &LogBlock) -> CompileResult<LogConfig> {
+pub(crate) fn compile_log(log: &LogBlock) -> CompileResult<LogConfig> {
     let output = match &log.output {
         LogOutput::File(path) => CoreLogOutput::File(path.clone()),
         LogOutput::Stdout => CoreLogOutput::Stdout,

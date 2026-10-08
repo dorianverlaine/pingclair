@@ -434,7 +434,7 @@ impl ConfigPublisher for RuntimeListeners {
         let next = prepare_listener_policies(config, self.automatic_http_available)?;
         let current = self.current.read();
         self.ensure_hot_compatible(&current, config, &next)?;
-        let prepared_l4 = crate::layer4::prepare(config, next.keys().cloned())?;
+        let prepared_l4 = crate::layer4::prepare(config, &self.layer4, next.keys().cloned())?;
         let prepared_manual_certs = self.prepare_manual_certs(config)?;
         let previous_manual_names: Vec<String> = current
             .config

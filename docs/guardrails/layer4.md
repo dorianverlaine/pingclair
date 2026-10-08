@@ -69,3 +69,85 @@ and `proxy_half_close off`. Two buffers bound forwarding memory; the preread
 prefix may retain its configured capacity. Global HTTP listener options do not
 configure these raw TCP services. There is no UDP, TLS termination, PROXY
 protocol, wildcard SNI, load balancing or dynamic DNS in this alpha.
+
+
+## 📊 Connection observability
+
+The shared `pingclair-runtime` registry and access-log writer serve both HTTP
+and TCP. L4 owns its counters and session outcomes; it never imports the HTTP
+proxy. Metric handles and logging policy are prepared before accepting traffic.
+The forwarding loop neither builds labels nor formats logs. Disabling logs
+removes their per-I/O byte accounting through compile-time specialization;
+disabling both logs and metrics also skips observation clock reads. Route-only
+reloads reuse unchanged loggers, including their writer and sampling window.
+
+```caddyfile
+{
+    auto_https off
+    metrics
+    layer4 {
+        :9443 {
+            log {
+                output file ./l4-access.log
+                format json
+            }
+            route {
+                proxy 127.0.0.1:8443
+            }
+        }
+    }
+}
+http://127.0.0.1:9090 {
+    metrics /metrics
+}
+```
+
+`metrics` uses the existing collection switch and scrape endpoint. Each
+connection captures that switch at admission, so an existing connection can
+finish its accounting after collection is disabled by reload. No client IP,
+SNI, ALPN or resolved upstream address becomes a metric label. Listener labels
+are normalized configured addresses; route labels are one-based declaration
+ordinals, with `none` before selection. Counters are process-lifetime history,
+so changing what a route ordinal means does not reset its accumulated values.
+
+| Metric | Additional labels | Meaning |
+| --- | --- | --- |
+| `l4_connections_total` | `route`, `outcome` | Sessions that have ended, including cancellation |
+| `l4_active_connections` | None | Accepted sessions still in progress |
+| `l4_bytes_total` | `direction` | Successful destination writes, visible before EOF |
+| `l4_connection_duration_seconds` | None | Session lifetime histogram, including preread and connect |
+| `l4_preread_failures_total` | `reason` | Timeout, overflow, I/O error or declined TLS-shaped input |
+| `l4_upstream_connect_failures_total` | `reason` | Failed session dials, classified as timeout or I/O error |
+
+Every family also has a `listener` label. Byte directions are
+`client_to_upstream` and `upstream_to_client`; replayed preread bytes count once,
+when written upstream. `declined_tls` is a diagnostic, not necessarily a rejected
+connection: unsupported or malformed TLS-shaped input may still use a non-TLS
+route. It does not claim that every declined input is malformed.
+
+Access logging is off unless the listener declares `log`. Bare `log` uses text
+on stdout; a block uses the existing output, format, field deletion, sampling
+and rotation syntax. This alpha supports one unnamed logger per L4 listener;
+named global channel references are rejected. The namespace is
+`layer4.log.access`. HTTP headers, hostname selection, negotiated TLS fields and
+levels other than `info` are rejected by common validation, including JSON loads.
+Changing a logger affects new sessions; established sessions retain the old one.
+A configured destination that cannot be opened rejects startup or reload.
+
+JSON records contain `ts` (session start), `protocol`, `listener`, `remote_addr`,
+`remote_port`, `route` when selected, `outcome`, `status`, `bytes_received`,
+`bytes_sent`, `session_time`, `upstream_bytes_received` and `upstream_bytes_sent`.
+A successful dial also provides `upstream_addr` and `upstream_connect_time`.
+Durations use seconds. Received and sent byte fields describe actual successful
+socket I/O, so bytes read but never forwarded can differ. Text uses the same
+fields as escaped key/value pairs. Neither format records payloads or TLS names.
+Sampling and a full queue may drop records; the shared
+`pingclair_access_log_dropped_total` counts queue drops.
+
+Status follows [nginx stream](https://nginx.org/en/docs/stream/ngx_stream_core_module.html#variables),
+not HTTP responses on the TCP wire: `403` is a blocked peer, `400` is preread
+overflow, `502` is no selected/reachable upstream, and `500` is cancellation or
+an internal allocation failure. Normal completion, client EOF/I/O termination
+and idle/preread timeout use `200`; the explicit `outcome` distinguishes them.
+The meanings of session byte fields and durations follow
+[nginx stream logging](https://nginx.org/en/docs/stream/ngx_stream_log_module.html).

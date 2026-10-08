@@ -9,10 +9,10 @@ async fn partial_writes_and_cancellation_preserve_live_accounting() {
     pingclair_runtime::metrics::configure(true);
     let metrics = Metrics::prepare("cancel-test", 1);
     let (mut client, stream) = duplex(3);
-    let mut observation = Observation::new(&metrics);
+    let mut observation = Observation::new(&metrics, false);
     assert_eq!(metrics.active.get(), 1);
     {
-        let mut counted = Counted {
+        let mut counted = Counted::<_, true> {
             inner: stream,
             stats: &mut observation.downstream,
             written: Some(&metrics.to_client),
@@ -57,10 +57,11 @@ async fn partial_writes_and_cancellation_preserve_live_accounting() {
 fn disabling_collection_does_not_unbalance_an_existing_session() {
     pingclair_runtime::metrics::configure(true);
     let metrics = Metrics::prepare("reload-test", 1);
-    let active = Observation::new(&metrics);
+    let active = Observation::new(&metrics, false);
     pingclair_runtime::metrics::configure(false);
-    let disabled = Observation::new(&metrics);
+    let disabled = Observation::new(&metrics, false);
     assert!(disabled.metrics.is_none());
+    assert!(disabled.started.is_none());
     drop(disabled);
     assert_eq!(metrics.active.get(), 1);
     drop(active);

@@ -2632,6 +2632,8 @@ dependencies = [
  "prometheus",
  "proptest",
  "rustls",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

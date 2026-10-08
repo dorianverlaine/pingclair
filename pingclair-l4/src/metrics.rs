@@ -133,7 +133,8 @@ impl Metrics {
             | Outcome::NoRoute
             | Outcome::RelayTimeout
             | Outcome::RelayError
-            | Outcome::Cancelled => {}
+            | Outcome::Cancelled
+            | Outcome::InternalError => {}
         }
     }
 }
