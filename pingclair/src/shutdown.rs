@@ -41,10 +41,27 @@ use crate::systemd::notify_systemd_stopping;
 /// ⏱️ How long a shutdown that served a request gives the transports to put
 /// queued bytes on the wire before the process exits.
 ///
-/// One scheduling round of the connection tasks is normally enough, and this
-/// bound is the room a loaded machine needs for it. It is deliberately not the
-/// configured grace period: that sleeps even when nothing is left to do.
-const FLUSH_BUDGET: Duration = Duration::from_millis(100);
+/// 📌 This waits for the *tail*, not for the response. The in-flight count
+/// reaches zero when the proxy has handed the last chunk to its transport, so
+/// what is left is whatever the HTTP/2 codec, TLS and the socket buffer are
+/// still holding — hundreds of kilobytes, not the body. The bound is therefore
+/// sized by "a few hundred kilobytes on a busy machine", which is why it is a
+/// second rather than a scheduling round.
+///
+/// 🧭 It was 100 ms until the 2026-10-09 postmerge run on aarch64 (run
+/// 37909489493), where a 4 MiB HTTP/2 response had 3 876 087 bytes delivered
+/// and the rest cut. The same tail exists on a busy production host, and the
+/// cost of being wrong here is a truncated response; the cost of the bound is
+/// paid only by a shutdown that served something.
+///
+/// 🚫 It is deliberately not the configured grace period: that sleeps even
+/// when nothing is left to do. A bound is not a proof: the transports never
+/// tell us the tail is gone, so this is sized for a tail — a few hundred
+/// kilobytes in the codec, TLS and the socket buffer — on a machine that is
+/// busy with other work. The engineering memory records the deterministic
+/// alternative (wait on the connection tasks, not on a clock) and why it is a
+/// redesign rather than another number here.
+const FLUSH_BUDGET: Duration = Duration::from_secs(1);
 
 /// 🛑 Listens for every way to ask this process to stop, from startup on.
 ///
@@ -187,7 +204,10 @@ pub(crate) async fn drain_then_exit(
     // (#313). A shutdown that served nothing pays nothing; one that did pays
     // this bound, far below any configured grace period.
     if running > 0 {
-        tokio::time::sleep(FLUSH_BUDGET).await;
+        // 📌 An operator who set the grace period to zero asked for an
+        // immediate exit, so that is what they get: the bound never outlives
+        // the period it exists inside.
+        tokio::time::sleep(FLUSH_BUDGET.min(grace)).await;
     }
     if stopped.cut > 0 {
         tracing::warn!(

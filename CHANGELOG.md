@@ -145,7 +145,9 @@ and the TLS layer buffers one more. The process left in between, so a stream
 the origin had already answered was closed with its response still in
 userspace — five runs out of seven in the black-box suite. A shutdown that
 served a request now gives the transports a bounded moment to flush before the
-process exits; one that served nothing pays nothing (#313).
+process exits; one that served nothing pays nothing, and the moment is one
+second — enough for the tail a loaded machine can hold, and paid only when a
+request was in flight (#313).
 
 ### 🗄️ `header_up` takes the same shapes as `header_down`
 
