@@ -273,6 +273,9 @@ addresses from its pool. Refused connections, network failures and timeouts may
 advance to the next address; local resource errors and unclassified failures stop
 immediately. A zero total budget refuses the dial without opening an upstream socket.
 These fixed alpha limits bound work; they are not nginx's unlimited retry defaults.
+Local descriptor, memory/buffer and unavailable-address failures also produce
+a process-wide warning at most once per 30 seconds. The warning uses a fixed
+reason and OS error number, without a destination-derived metric label.
 
 Selection returns once TCP connects. Even a server-first protocol or an immediate
 post-connect reset cannot trigger replay to another peer. There is no passive

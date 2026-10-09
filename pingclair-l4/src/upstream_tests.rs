@@ -92,6 +92,19 @@ async fn refused_addresses_are_tried_once_with_a_four_attempt_ceiling() {
         assert_eq!(error.kind(), kind);
         assert_eq!(attempts.lock().unwrap().len(), 1);
     }
+    #[cfg(unix)]
+    for code in [libc::EMFILE, libc::ENFILE] {
+        attempts.lock().unwrap().clear();
+        let error = pool
+            .connect_with(Duration::from_secs(5), |address| {
+                attempts.lock().unwrap().push(address.port());
+                std::future::ready(Err::<(), _>(io::Error::from_raw_os_error(code)))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(code));
+        assert_eq!(attempts.lock().unwrap().len(), 1);
+    }
 }
 
 #[tokio::test(start_paused = true)]

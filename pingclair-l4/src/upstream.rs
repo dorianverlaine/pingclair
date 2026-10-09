@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::{Instant, timeout_at};
 
+#[path = "upstream/alerts.rs"]
+mod alerts;
+
 pub(crate) struct Upstream {
     addresses: Box<[SocketAddr]>,
     cursor: AtomicUsize,
@@ -109,6 +112,7 @@ where
                         | io::ErrorKind::NetworkUnreachable
                         | io::ErrorKind::HostUnreachable
                 ) {
+                    alerts::warn_if_local(&error);
                     return Err(error);
                 }
                 last = error;
