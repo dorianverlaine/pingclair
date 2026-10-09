@@ -162,11 +162,27 @@ HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
             1.0
         );
         assert_eq!(slow.read(&mut [0]).await.unwrap(), 0);
-        let mut next = TcpStream::connect(server.listener_address(0, 1))
-            .await
-            .unwrap();
-        next.write_all(&hello()).await.unwrap();
-        let _accepted = origin.accept().await.unwrap();
+        // ♻️ EOF can arrive before the session drops its admission permit.
+        loop {
+            let mut next = TcpStream::connect(server.listener_address(0, 1))
+                .await
+                .unwrap();
+            if next.write_all(&hello()).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            let mut byte = [0];
+            tokio::select! {
+                accepted = origin.accept() => {
+                    let _accepted = accepted.unwrap();
+                    break;
+                }
+                result = next.read(&mut byte) => {
+                    assert!(matches!(result, Ok(0)) || result.is_err());
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
     })
     .await
     .unwrap();
