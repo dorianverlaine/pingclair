@@ -48,12 +48,17 @@ struct Route {
     upstream: Upstream,
 }
 
-/// 🧭 Immutable state held for a connection's entire lifetime, including reloads.
-pub struct PreparedListener {
+struct SessionPolicy {
     metrics: Metrics,
-    max_connections: usize,
     listener: String,
     logger: Option<Arc<AccessLogger>>,
+    relay: RelayOptions,
+}
+
+/// 🧭 Routing is retained through dial; established streams keep only session policy.
+pub struct PreparedListener {
+    policy: Arc<SessionPolicy>,
+    max_connections: usize,
     log_config: Option<pingclair_core::config::LogConfig>,
     routes: Vec<Route>,
     blocked: IpRanges,
@@ -61,7 +66,6 @@ pub struct PreparedListener {
     preread_limit: usize,
     preread_timeout: Duration,
     connect_timeout: Duration,
-    relay: RelayOptions,
 }
 
 impl PreparedListener {
@@ -125,16 +129,23 @@ impl PreparedListener {
         }
         let listener = pingclair_core::config::normalize_listen_addr(&config.listen);
         let logger = match previous.filter(|previous| previous.log_config == config.log) {
-            Some(previous) => previous.logger.clone(),
+            Some(previous) => previous.policy.logger.clone(),
             None => AccessLogger::from_config(config.log.as_ref())?
                 .filter(|logger| logger.admits_source("layer4.log.access"))
                 .map(Arc::new),
         };
         Ok(Self {
-            metrics: Metrics::prepare(&listener, routes.len()),
+            policy: Arc::new(SessionPolicy {
+                metrics: Metrics::prepare(&listener, routes.len()),
+                listener,
+                logger,
+                relay: RelayOptions {
+                    buffer_size: config.proxy_buffer_size,
+                    idle_timeout: Duration::from_millis(config.proxy_timeout_ms),
+                    half_close: config.proxy_half_close,
+                },
+            }),
             max_connections: config.max_connections,
-            listener,
-            logger,
             log_config: config.log.clone(),
             routes,
             needs_tls,
@@ -142,11 +153,6 @@ impl PreparedListener {
             preread_limit: config.preread_buffer_size,
             preread_timeout: Duration::from_millis(config.preread_timeout_ms),
             connect_timeout: Duration::from_millis(config.proxy_connect_timeout_ms),
-            relay: RelayOptions {
-                buffer_size: config.proxy_buffer_size,
-                idle_timeout: Duration::from_millis(config.proxy_timeout_ms),
-                half_close: config.proxy_half_close,
-            },
         })
     }
 
@@ -158,23 +164,24 @@ impl PreparedListener {
     /// 📊 Counts pre-session refusals without allocating an access-log entry.
     pub fn record_admission_rejection(&self) {
         if pingclair_runtime::metrics::enabled() {
-            self.metrics.rejected.inc();
+            self.policy.metrics.rejected.inc();
         }
     }
 
     /// 🌊 Classifies and routes one raw stream without decrypting or constructing HTTP.
     pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
-        &self,
+        self: Arc<Self>,
         stream: S,
         peer: SocketAddr,
     ) -> io::Result<()> {
-        let mut observation = Observation::new(&self.metrics, self.logger.is_some());
-        observation.log = self
+        let policy = self.policy.clone();
+        let mut observation = Observation::new(&policy.metrics, policy.logger.is_some());
+        observation.log = policy
             .logger
             .as_ref()
-            .map(|logger| (logger.as_ref(), self.listener.as_str(), peer));
+            .map(|logger| (logger.as_ref(), policy.listener.as_str(), peer));
         // ⚡ Specialize byte accounting away when access logging is disabled.
-        let result = if self.logger.is_some() {
+        let result = if policy.logger.is_some() {
             self.serve_inner::<_, true>(stream, peer.ip(), &mut observation)
                 .await
         } else {
@@ -186,7 +193,7 @@ impl PreparedListener {
     }
 
     async fn serve_inner<S: AsyncRead + AsyncWrite + Unpin, const LOG: bool>(
-        &self,
+        self: Arc<Self>,
         stream: S,
         peer: IpAddr,
         observation: &mut Observation<'_>,
@@ -273,13 +280,16 @@ impl PreparedListener {
         observation.connect_time = connect_started.map(|started| started.elapsed());
         observation.upstream_addr = Some(upstream.peer_addr()?);
         upstream.set_nodelay(true)?;
+        let relay_options = self.policy.relay;
+        // 🧹 Old generations and dynamic pools cannot be pinned by a long-lived relay.
+        drop(self);
         observation.phase = Phase::Relay;
         let mut upstream = Counted::<_, LOG> {
             inner: upstream,
             stats: &mut observation.upstream,
             written: observation.metrics.map(|m| &m.to_upstream),
         };
-        relay(&mut stream, &mut upstream, prefix, self.relay).await
+        relay(&mut stream, &mut upstream, prefix, relay_options).await
     }
 }
 

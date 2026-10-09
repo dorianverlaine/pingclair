@@ -57,7 +57,7 @@ async fn a_real_rustls_hello_reaches_the_selected_origin_unchanged() {
         socket.write_all(b"origin").await.unwrap();
     });
     let session = tokio::spawn(async move {
-        prepared
+        Arc::new(prepared)
             .serve(stream, "[::ffff:127.0.0.1]:1234".parse().unwrap())
             .await
     });
@@ -82,7 +82,7 @@ async fn plain_input_reaches_only_the_fallback_route() {
     let prepared = PreparedListener::prepare(&cfg, &[]).unwrap();
     let (mut client, stream) = duplex(32);
     let session = tokio::spawn(async move {
-        prepared
+        Arc::new(prepared)
             .serve(stream, "127.0.0.1:1234".parse().unwrap())
             .await
     });
@@ -118,7 +118,7 @@ async fn timeout_and_overflow_do_not_dial_the_fallback() {
             })
             .await
             .unwrap();
-        let error = prepared
+        let error = Arc::new(prepared)
             .serve(stream, "127.0.0.1:1234".parse().unwrap())
             .await
             .unwrap_err();
@@ -145,10 +145,12 @@ async fn blocked_peers_are_refused_before_any_preread_or_dial() {
         &["127.0.0.0/8".into()],
     )
     .unwrap();
+    let prepared = Arc::new(prepared);
     for peer in ["127.0.0.1:1234", "[::ffff:127.0.0.1]:1234"] {
         let (_client, stream) = duplex(8);
         assert_eq!(
             prepared
+                .clone()
                 .serve(stream, peer.parse().unwrap())
                 .await
                 .unwrap_err()
@@ -156,4 +158,36 @@ async fn blocked_peers_are_refused_before_any_preread_or_dial() {
             io::ErrorKind::PermissionDenied
         );
     }
+}
+
+#[tokio::test]
+async fn an_established_relay_releases_its_route_generation() {
+    timeout(Duration::from_secs(3), async {
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = config(origin.local_addr().unwrap());
+        config.routes[0].matches.clear();
+        let prepared = Arc::new(PreparedListener::prepare(&config, &[]).unwrap());
+        let weak = Arc::downgrade(&prepared);
+        let (mut client, stream) = duplex(32);
+        let session = tokio::spawn(async move {
+            prepared
+                .serve(stream, "127.0.0.1:1234".parse().unwrap())
+                .await
+        });
+        let (mut backend, _) = origin.accept().await.unwrap();
+        backend.write_all(b"ready").await.unwrap();
+        let mut ready = [0; 5];
+        client.read_exact(&mut ready).await.unwrap();
+        assert_eq!(&ready, b"ready");
+        assert!(weak.upgrade().is_none());
+        client.write_all(b"retained stream").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        backend.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"retained stream");
+        backend.shutdown().await.unwrap();
+        session.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
 }

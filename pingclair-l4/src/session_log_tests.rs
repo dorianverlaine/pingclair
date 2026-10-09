@@ -30,12 +30,14 @@ async fn cancellation_logs_once_and_unchanged_destinations_reuse_the_writer() {
     config.routes[0].upstream = "127.0.0.1:2".into();
     let next = PreparedListener::prepare_with_previous(&config, &[], Some(&first)).unwrap();
     assert!(Arc::ptr_eq(
-        first.logger.as_ref().unwrap(),
-        next.logger.as_ref().unwrap()
+        first.policy.logger.as_ref().unwrap(),
+        next.policy.logger.as_ref().unwrap()
     ));
     let (_client, stream) = duplex(1);
     {
-        let connection = first.serve(stream, "127.0.0.1:1234".parse().unwrap());
+        let connection = first
+            .clone()
+            .serve(stream, "127.0.0.1:1234".parse().unwrap());
         tokio::pin!(connection);
         // ⏳ Poll the future into preread, then drop its owner to cancel it.
         assert!(
@@ -44,7 +46,7 @@ async fn cancellation_logs_once_and_unchanged_destinations_reuse_the_writer() {
                 .is_err()
         );
     }
-    first.logger.as_ref().unwrap().flush();
+    first.policy.logger.as_ref().unwrap().flush();
     let contents = std::fs::read_to_string(path).unwrap();
     assert_eq!(contents.lines().count(), 1);
     let entry: serde_json::Value = serde_json::from_str(&contents).unwrap();
