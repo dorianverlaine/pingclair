@@ -54,58 +54,74 @@ impl Upstream {
         self.connect_with(budget, TcpStream::connect).await
     }
 
-    async fn connect_with<F, Fut, T>(&self, budget: Duration, mut dial: F) -> io::Result<T>
+    async fn connect_with<F, Fut, T>(&self, budget: Duration, dial: F) -> io::Result<T>
     where
         F: FnMut(SocketAddr) -> Fut,
         Fut: Future<Output = io::Result<T>>,
     {
-        let deadline = Instant::now() + budget;
-        let count = self.addresses.len();
-        // ⚡ A single upstream avoids shared cursor contention and keeps its original timeout.
-        let start = if count == 1 {
-            0
-        } else {
-            self.cursor.fetch_add(1, Ordering::Relaxed) % count
-        };
-        let attempt_budget = if count == 1 {
-            budget
-        } else {
-            budget.min(Duration::from_secs(2))
-        };
-        let mut last = io::ErrorKind::TimedOut.into();
-        for offset in 0..count.min(4) {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            let attempt_deadline = deadline.min(now + attempt_budget);
-            match timeout_at(
-                attempt_deadline,
-                dial(self.addresses[(start + offset) % count]),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => return Ok(stream),
-                Ok(Err(error)) => {
-                    // 🛡️ Unknown or local resource errors must not amplify into more socket attempts.
-                    if !matches!(
-                        error.kind(),
-                        io::ErrorKind::ConnectionRefused
-                            | io::ErrorKind::ConnectionReset
-                            | io::ErrorKind::ConnectionAborted
-                            | io::ErrorKind::TimedOut
-                            | io::ErrorKind::NetworkUnreachable
-                            | io::ErrorKind::HostUnreachable
-                    ) {
-                        return Err(error);
-                    }
-                    last = error;
-                }
-                Err(_) => last = io::ErrorKind::TimedOut.into(),
-            }
-        }
-        Err(last)
+        connect_with(&self.addresses, &self.cursor, budget, || true, dial).await
     }
+}
+
+/// 🔁 Both sources share connection-only fallback and the same total deadline.
+pub(crate) async fn connect_with<F, Fut, T>(
+    addresses: &[SocketAddr],
+    cursor: &AtomicUsize,
+    budget: Duration,
+    available: impl Fn() -> bool,
+    mut dial: F,
+) -> io::Result<T>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: Future<Output = io::Result<T>>,
+{
+    if addresses.is_empty() {
+        return Err(io::ErrorKind::AddrNotAvailable.into());
+    }
+    let deadline = Instant::now() + budget;
+    let count = addresses.len();
+    // ⚡ A single upstream avoids shared cursor contention and keeps its original timeout.
+    let start = if count == 1 {
+        0
+    } else {
+        cursor.fetch_add(1, Ordering::Relaxed) % count
+    };
+    let attempt_budget = if count == 1 {
+        budget
+    } else {
+        budget.min(Duration::from_secs(2))
+    };
+    let mut last = io::ErrorKind::TimedOut.into();
+    for offset in 0..count.min(4) {
+        if !available() {
+            return Err(io::ErrorKind::AddrNotAvailable.into());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let attempt_deadline = deadline.min(now + attempt_budget);
+        match timeout_at(attempt_deadline, dial(addresses[(start + offset) % count])).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => {
+                // 🛡️ Unknown or local resource errors must not amplify into more socket attempts.
+                if !matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::NetworkUnreachable
+                        | io::ErrorKind::HostUnreachable
+                ) {
+                    return Err(error);
+                }
+                last = error;
+            }
+            Err(_) => last = io::ErrorKind::TimedOut.into(),
+        }
+    }
+    Err(last)
 }
 
 #[cfg(test)]
