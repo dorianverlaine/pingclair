@@ -261,6 +261,14 @@
   and `CertificateRequest` has not been sent, so one `CompiledClientAuth` attaches
   to both.
 
+- 🔎 **An unchanged client-auth policy must keep its security revision.** Compare
+  the compiled modes, all SNI rows (including open exceptions), and certificate
+  content captured while building the trust store and pinned set. Comparing paths
+  misses same-path rotation; reopening files for comparison can observe different
+  content from the store that will enforce the policy. System trust uses lazy
+  directory lookups, so it conservatively advances the revision on each reload.
+  Keep this comparison on the publication path, never on requests (#321).
+
 - 🔄 **Reloading the mTLS trust pool must carry a generation, not just swap the
   callback.** TCP keep-alive and QUIC connections may have completed their
   handshake before the reload; letting only new handshakes read the new CA leaves

@@ -19,6 +19,7 @@ The post-merge HTTP/3 workflow runs both client matrices.
 | Upstream reuse | Eight consumed responses reuse origin sockets, confirmed by repeated peer addresses and matching TCP accept counts below eight. |
 | Local exhaustion | A barrier starts 64 concurrent streams with a descriptor ceiling applied only to Pingclair. Logs must prove a local resource failure; the backend must remain eligible and answer an immediate follow-up. |
 | Invalid fields | Raw QPACK sends forbidden connection fields without net/http normalization. Each receives remote `H3_MESSAGE_ERROR`; the connection remains usable. |
+| Client-auth reload | Persistent H1, H2, and H3 connections survive identical and response-only reloads; changing the mode or replacing CA or pinned-leaf files at the same path still returns 421. Covers signal reload and Admin `/load` with a Pingclairfile. |
 | Graceful shutdown | SIGTERM produces GOAWAY refusal of new streams while an admitted request completes, followed by `H3_NO_ERROR` and successful process exit. |
 
 Each fixture has fresh ports, a random readiness token, a short-lived trusted

@@ -101,6 +101,14 @@ Linux; a long download or event stream holds it open until it finishes or
 the new process instead of being refused. Restart for what a reload cannot
 do, such as moving a listener to another address or upgrading the binary.
 
+🔐 On a listener with client authentication, an unchanged compiled policy keeps
+existing connections usable across reloads. Changing the mode, loaded CA
+certificates, pinned leaves, or site authentication mapping makes old connections
+answer `421` until the client reconnects. Replacing a certificate file at the same
+path counts as a change. Policies that verify against system trust still require
+reconnection on every reload because their lazily loaded roots cannot be compared
+completely at configuration time.
+
 🧩 Ownership of the running configuration moves with the first configuration
 change made through the Admin API's `/load`: while the process is still
 serving the file it started with, `SIGUSR1` reloads that file; after an API

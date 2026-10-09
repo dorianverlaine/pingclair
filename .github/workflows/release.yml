@@ -148,8 +148,17 @@ jobs:
             echo "::error::binary reports ${version_output}, expected ${GITHUB_REF_NAME}"
             exit 1
           fi
+          # 🔐 `validate` loads manual certificate files the way `run` does
+          # (#218), so an empty placeholder is refused by name. A throwaway
+          # self-signed pair for the example's name is enough, exactly as
+          # `docker.yml` generates one before validating the same example.
           sudo mkdir -p /etc/pingclair/certs
-          sudo touch /etc/pingclair/certs/example.com.pem /etc/pingclair/certs/example.com.key
+          sudo openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -nodes -days 1 -subj "/CN=example.com" \
+            -addext "subjectAltName=DNS:example.com" \
+            -keyout /etc/pingclair/certs/example.com.key \
+            -out /etc/pingclair/certs/example.com.pem
+          sudo chmod 0644 /etc/pingclair/certs/example.com.key /etc/pingclair/certs/example.com.pem
           "$binary" validate examples/full_featured.pingclair
 
       - name: Package and checksum
@@ -226,9 +235,25 @@ jobs:
           # section, written into it by scripts/cut-release.sh. A commit log
           # would not work here: earlier release commits are off main, so no
           # previous tag is an ancestor of this one.
+          #
+          # ✂️ The section documents every change in full, which is hundreds
+          # of kilobytes by the time a minor release is cut — GitHub refuses a
+          # body over 125,000 characters, and a release page nobody can scroll
+          # is not much better. The page keeps the section's opening
+          # paragraphs and one line per entry, taken from its `###` headings;
+          # the full text stays in CHANGELOG.md, linked below.
+          notes_file="$(mktemp)"
+          git tag --list "$version" --format='%(contents)' | awk '
+            BEGIN { intro = 1 }
+            /^### / { if (intro) print ""; intro = 0; print "- " substr($0, 5); next }
+            intro { print }
+          ' >"$notes_file"
+          printf -- '---\n\nEvery entry in full, with its reasoning and the issue behind it, is in [CHANGELOG.md](%s/%s/blob/%s/CHANGELOG.md).\n' \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_SHA" >>"$notes_file"
+
           gh release create "$version" "${assets[@]}" \
             --title "Pingclair $version" \
-            --notes-from-tag \
+            --notes-file "$notes_file" \
             "${flags[@]}"
 
   publish-image:
@@ -286,12 +311,16 @@ jobs:
             echo "::error::image reports ${version_output}, expected ${{ needs.verify-tag.outputs.version }}"
             exit 1
           fi
-          # 🔐 The example names a certificate and a key, and validation is
-          # fail-closed about paths it cannot open, so the smoke run needs the
-          # two files to exist. Empty stubs are enough: only their presence is
-          # checked here.
+          # 🔐 The example names a certificate and a key, and `validate` loads
+          # them the way `run` does (#218): an empty stub is refused by name.
+          # The same throwaway self-signed pair the binary smoke above uses.
           certs="$(mktemp -d)"
-          touch "$certs/example.com.pem" "$certs/example.com.key"
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -nodes -days 1 -subj "/CN=example.com" \
+            -addext "subjectAltName=DNS:example.com" \
+            -keyout "$certs/example.com.key" \
+            -out "$certs/example.com.pem"
+          chmod 0644 "$certs/example.com.key" "$certs/example.com.pem"
           docker run --rm \
             -v "$PWD/examples:/examples:ro" \
             -v "$certs:/etc/pingclair/certs:ro" \

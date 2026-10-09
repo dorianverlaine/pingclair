@@ -59,10 +59,9 @@ HTTP header and negotiated-TLS logging options are rejected for raw TCP.
 Logger changes apply to new connections. Unchanged loggers survive route reloads
 without creating additional writer threads.
 
-📦 This section becomes `## [0.2.0]` when 0.2.0 is cut, and its text is the
-release notes of that tag. It covers every change since `v0.1.7`, including
-the three release candidates (`0.2.0-rc.1` on 2026-08-20, `0.2.0-rc.2` on
-2026-09-19, `0.2.0-rc.3`).
+📦 0.2.0 covers every change since `v0.1.7`, including the three release
+candidates (`0.2.0-rc.1` on 2026-08-20, `0.2.0-rc.2` on 2026-09-19,
+`0.2.0-rc.3`).
 
 0.2.0 is the release where a Caddyfile means what it means upstream. Route
 selection, address parsing, matchers, compression, request limits and the TLS
@@ -71,6 +70,20 @@ refused by name instead of being accepted and ignored. The same release makes
 the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
+
+### 🔁 Unrelated reloads preserve connections on client-auth listeners
+
+Every reload advanced the client-auth security revision, so even a header-only
+change made existing H1, H2, and H3 connections answer `421`. Reload now compares
+the compiled authentication modes, site mappings, loaded CA certificates, and
+pinned leaves before advancing that revision. Unchanged policies retain their
+connections while the new routes become visible; changed trust material still
+requires a new handshake, including certificates replaced at the same file path.
+Server certificate caches advance separately so manual server certificate rotation
+still reaches the first new connection.
+System trust remains conservative: its lazy directory lookups cannot be fully
+compared at load time, so verifying policies using it still invalidate old
+connections on every reload (#321).
 
 ### 🛡️ A guard written with a `not` matcher keeps its exemption
 

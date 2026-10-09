@@ -743,7 +743,14 @@ pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
         Handler::BasicAuth(_) => "basic_auth",
         Handler::Templates => "templates",
         Handler::Handle(_) | Handler::HandleGroup(_) => "handle",
-        Handler::HandlePath { .. } => "handle_path",
+        // 🛣️ `handle_path` is `handle` with the matched prefix stripped, and
+        // the reference sorts both kinds of route group together by matcher
+        // specificity: `caddy adapt` puts `handle_path /api/*` ahead of a
+        // bare `handle`, and ahead of `handle /*`. Ranking the two one
+        // directive apart instead let any `handle` — a bare fallback is the
+        // usual one — run first and shadow every `handle_path` beside it
+        // (found migrating the octopus CUPS front door, 2026-10-09).
+        Handler::HandlePath { .. } => "handle",
         // 🐘 `php_fastcgi` expands to a pipeline too, but it ranks as itself,
         // after `respond`; ranking it as `route` let it answer requests a
         // `respond` beside it should (issue #18). Its expansion always ends

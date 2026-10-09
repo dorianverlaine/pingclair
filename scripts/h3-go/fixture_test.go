@@ -50,16 +50,23 @@ type session struct {
 
 // 🧰 A fixture owns one child process, isolated credentials, and its log file.
 type fixture struct {
-	command   *exec.Cmd
-	done      chan struct{}
-	waitError error
-	logPath   string
-	address   string
-	tls       *tls.Config
-	ready     string
+	command    *exec.Cmd
+	done       chan struct{}
+	waitError  error
+	logPath    string
+	address    string
+	tls        *tls.Config
+	ready      string
+	configPath string
 }
 
 func start(t *testing.T, routes string, descriptors int) (*fixture, *session) {
+	t.Helper()
+	return startConfigured(t, routes, descriptors, func(config string) string { return config })
+}
+
+// 🧾 Keep protocol probes on the same process and readiness harness.
+func startConfigured(t *testing.T, routes string, descriptors int, configure func(string) string) (*fixture, *session) {
 	t.Helper()
 	binary := os.Getenv("PINGCLAIR_BINARY")
 	if binary == "" {
@@ -92,11 +99,12 @@ https://%s:%d {
  %s
 }
 `, host, tcp.Addr().(*net.TCPAddr).Port, cert, key, token, token, routes)
+	config = configure(config)
 	configPath := filepath.Join(root, "Pingclairfile")
 	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
-	f := &fixture{done: make(chan struct{}), logPath: filepath.Join(root, "server.log"), address: address, ready: token,
+	f := &fixture{done: make(chan struct{}), logPath: filepath.Join(root, "server.log"), address: address, ready: token, configPath: configPath,
 		tls: &tls.Config{RootCAs: roots, ServerName: host, NextProtos: []string{http3.NextProtoH3}, MinVersion: tls.VersionTLS13}}
 	arguments := []string{binary, "run", configPath}
 	if descriptors > 0 {

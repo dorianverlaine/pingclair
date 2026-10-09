@@ -25,6 +25,38 @@ fn branch(path: &str, handler: HandlerConfig) -> HandlerElement {
     )
 }
 
+/// 🛣️ A specific `handle_path` answers before a bare `handle`.
+///
+/// `caddy adapt` sorts every route group by matcher specificity, so
+/// `handle_path /duplex/*` comes first and a bare `handle` — the site's
+/// fallback — comes last. Ranking `handle_path` one directive later than
+/// `handle` let the fallback run first and shadow the `handle_path`
+/// entirely, which made the directive unusable beside one (found migrating
+/// the octopus CUPS front door, 2026-10-09).
+#[test]
+fn a_specific_handle_path_outranks_a_bare_handle() {
+    for fallback in ["handle", "handle /*"] {
+        let config = crate::compile(&format!(
+            "example.com {{\n handle_path /duplex/* {{\n respond \"duplex\"\n }}\n {fallback} {{\n respond \"fallback\"\n }}\n}}"
+        ))
+        .expect("configuration compiles");
+        let routes = &config.servers[0].routes;
+        assert_eq!(
+            routes[0].path,
+            "/duplex/*",
+            "`{fallback}` shadowed the specific handle_path; order: {:?}",
+            routes
+                .iter()
+                .map(|route| route.path.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(&routes[0].handler, HandlerConfig::HandlePath { .. }),
+            "the first route must be the handle_path, not {fallback}"
+        );
+    }
+}
+
 #[test]
 fn nested_handle_groups_preserve_sorted_bodies_and_scope() {
     let header = compiled_handler("handle {\n header X-Selected yes\n}");
