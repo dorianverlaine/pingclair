@@ -90,6 +90,9 @@ Linux; a long download or event stream holds it open until it finishes or
 the new process instead of being refused. Restart for what a reload cannot
 do, such as moving a listener to another address or upgrading the binary.
 
+🪵 A reload can add a named access-log channel and attach sites to it in the
+same configuration. Logging begins with the new routes; no restart is needed.
+
 🔐 On a listener with client authentication, an unchanged compiled policy keeps
 existing connections usable across reloads. Changing the mode, loaded CA
 certificates, pinned leaves, or site authentication mapping makes old connections

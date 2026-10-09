@@ -26,6 +26,13 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🪵 Newly declared access-log channels work on reload
+
+Reload registers named access-log channels before building site routes, including
+the first listeners loaded through the Admin API. Previously, a channel declared
+by the reload could create its file but receive no access records until restart
+(#322).
+
 ### 🔁 Unrelated reloads preserve connections on client-auth listeners
 
 Every reload advanced the client-auth security revision, so even a header-only
