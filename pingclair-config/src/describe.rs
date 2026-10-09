@@ -87,12 +87,14 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         name: "Proxy",
         kind: Kind::Component,
-        summary: "The upstream connection: `Proxy(to: \"host:port\")`.",
+        summary: "A TCP upstream: exactly one static `to:` or DNS `dynamic: .a(...)`; valid and stale bound snapshot lifetime.",
         example: r#"TCPListener(on: "127.0.0.1:9443") {
-    Fallback { Proxy(to: "127.0.0.1:8080") }
+    Fallback {
+        Proxy(dynamic: .a("backend.example.test", port: 443, versions: .ip, valid: .seconds(30), stale: .seconds(60)))
+    }
 }"#,
         refusal: r#"TCPListener(on: "127.0.0.1:9443") {
-    Fallback { Proxy(to: 8080) }
+    Fallback { Proxy(to: "127.0.0.1:8080", dynamic: .a("backend.example.test", port: 443)) }
 }"#,
         labels: crate::frontend::tcp::L4_PROXY_LABELS,
     },

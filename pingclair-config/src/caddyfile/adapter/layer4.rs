@@ -8,6 +8,8 @@ use crate::caddyfile::parser::caddy_ast::Directive;
 use pingclair_core::config::{Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher};
 use std::collections::{HashMap, HashSet};
 
+mod dynamic;
+
 type Result<T> = std::result::Result<T, AdapterError>;
 
 fn invalid(d: &Directive, reason: &str) -> AdapterError {
@@ -86,13 +88,11 @@ pub(super) fn adapt(d: &Directive) -> Result<Vec<Layer4Server>> {
                 if proxy.name != "proxy" {
                     return Err(unsupported(proxy));
                 }
-                if proxy.block.is_some() {
-                    return Err(unsupported(proxy));
-                }
+                let (upstream, dynamic) = dynamic::source(proxy)?;
                 server.routes.push(Layer4Route {
-                    dynamic: None,
+                    dynamic,
                     matches: sets,
-                    upstream: expect_one_argument(proxy)?.into(),
+                    upstream,
                 });
                 continue;
             }

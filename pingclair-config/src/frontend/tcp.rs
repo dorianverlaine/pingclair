@@ -11,6 +11,8 @@
 use super::log::{LogScope, parse_log};
 use super::*;
 
+mod dynamic;
+
 /// 🏷️ The argument labels a TCP listener accepts.
 pub(crate) const TCP_LISTENER_LABELS: &[&str] = &["on"];
 
@@ -22,9 +24,8 @@ pub(crate) const TCP_LIMIT_LABELS: &[&str] = &["maxConnections", "preread", "rel
 pub(crate) const TCP_TIMEOUT_LABELS: &[&str] = &["preread", "connect", "idle"];
 pub(crate) const TCP_HALF_CLOSE_LABELS: &[&str] = &["enabled"];
 
-/// 🏷️ What an L4 `Proxy` accepts: a destination and nothing else — the
-/// dynamic sources and header policy are HTTP-proxy vocabulary.
-pub(crate) const L4_PROXY_LABELS: &[&str] = &["to"];
+/// 🏷️ A TCP proxy selects exactly one static or dynamic address source.
+pub(crate) const L4_PROXY_LABELS: &[&str] = &["to", "dynamic"];
 
 pub(super) fn listener(call: &Call) -> Result<Layer4Server, Error> {
     call.labels(TCP_LISTENER_LABELS)?;
@@ -105,10 +106,19 @@ pub(super) fn route(call: &Call) -> Result<Layer4Route, Error> {
         return Err(proxy.at.error("expected Proxy(to: ...)"));
     }
     proxy.leaf(L4_PROXY_LABELS)?;
+    let (upstream, dynamic) = match (proxy.get("to"), proxy.get("dynamic")) {
+        (Some(_), None) => (proxy.string("to")?, None),
+        (None, Some(source)) => (String::new(), Some(dynamic::parse(source, proxy.at)?)),
+        (None, None) | (Some(_), Some(_)) => {
+            return Err(proxy
+                .at
+                .error("TCP Proxy requires exactly one source: to: or dynamic:"));
+        }
+    };
     Ok(Layer4Route {
-        dynamic: None,
+        dynamic,
         matches,
-        upstream: proxy.string("to")?,
+        upstream,
     })
 }
 
