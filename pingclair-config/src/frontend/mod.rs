@@ -196,18 +196,16 @@ pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
                 config.global.grace_period_secs = Some(millis / 1000);
             }
             "TrustedProxies" => {
-                call.leaf(TRUSTED_PROXIES_LABELS)?;
-                if call.get("ranges").is_none() && call.get("headers").is_none() {
-                    return Err(call
-                        .at
-                        .error("TrustedProxies needs ranges:, headers:, or both"));
+                let trusted = parse_trusted_proxies(&call, "TrustedProxies")?;
+                if let Some(ranges) = trusted.ranges {
+                    config.global.trusted_proxies = ranges;
                 }
-                if let Some(ranges) = call.get("ranges") {
-                    config.global.trusted_proxies = parse_ranges(ranges, call.at)?;
+                if let Some(headers) = trusted.headers {
+                    config.global.client_ip_headers = headers;
                 }
-                if let Some(headers) = call.get("headers") {
-                    config.global.client_ip_headers = parse_header_names(headers, call.at)?;
-                }
+            }
+            "UnderscoreHeaders" => {
+                config.global.expected_underscore_headers = parse_underscore_headers(&call)?;
             }
             "Storage" => {
                 call.leaf(STORAGE_LABELS)?;
@@ -306,16 +304,17 @@ pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
             _ => {
                 return Err(call.at.error(
                     "unknown global declaration; expected TCPListener, HTTPListener, Admin, \
-                     Metrics, Shutdown, TrustedProxies, Storage, Log or AutomaticTLS",
+                     Metrics, Shutdown, TrustedProxies, UnderscoreHeaders, Storage, Log or \
+                     AutomaticTLS",
                 ));
             }
         }
     }
     // 📌 A file is allowed to hold nothing but declarations: `Admin`, `Metrics`,
-    // `Shutdown`, `TrustedProxies`, `Storage`, `Log` and `AutomaticTLS` are
-    // options of the server, not of a listener, and a directory splits them
-    // into their own file. Whether the *merged* result can serve anything is a
-    // question for the runtime.
+    // `Shutdown`, `TrustedProxies`, `UnderscoreHeaders`, `Storage`, `Log` and
+    // `AutomaticTLS` are options of the server, not of a listener, and a
+    // directory splits them into their own file. Whether the *merged* result
+    // can serve anything is a question for the runtime.
     Ok(config)
 }
 
@@ -355,6 +354,81 @@ fn parse_ranges(value: &Value, at: Position) -> Result<Vec<String>, Error> {
         }
     }
     Ok(ranges)
+}
+
+/// 🛡️ The two halves a trust list names.
+///
+/// 📌 `None` is "this label was not written", which is what makes a listener
+/// modifier able to replace half of the global list and keep the other half.
+pub(super) struct TrustedProxiesArgs {
+    pub(super) ranges: Option<Vec<String>>,
+    pub(super) headers: Option<Vec<String>>,
+}
+
+/// 🛡️ Reads `ranges:` and `headers:` for `TrustedProxies(…)` and for the
+/// listener modifier `.trustedProxies(…)`.
+///
+/// 🚫 One grammar, one implementation: the two spellings sit at different
+/// levels, and a value rule that lived in only one of them would let the same
+/// line mean two things depending on where it was written.
+fn parse_trusted_proxies(call: &Call, what: &str) -> Result<TrustedProxiesArgs, Error> {
+    call.leaf(TRUSTED_PROXIES_LABELS)?;
+    if call.get("ranges").is_none() && call.get("headers").is_none() {
+        return Err(call
+            .at
+            .error(format!("{what} needs ranges:, headers:, or both")));
+    }
+    Ok(TrustedProxiesArgs {
+        ranges: call
+            .get("ranges")
+            .map(|value| parse_ranges(value, call.at))
+            .transpose()?,
+        headers: call
+            .get("headers")
+            .map(|value| parse_header_names(value, call.at))
+            .transpose()?,
+    })
+}
+
+/// 🛡️ The allowlist `UnderscoreHeaders([…])` declares and `.underscoreHeaders([…])`
+/// overrides with: exactly one array of header names, each an exact name or a
+/// trailing-star prefix.
+///
+/// 📌 The entries are checked here, where the line is, *and* by
+/// [`crate::underscore_headers::validate`], which every configuration path
+/// goes through: the Admin JSON path never sees a `Position`.
+pub(super) fn parse_underscore_headers(call: &Call) -> Result<Vec<String>, Error> {
+    if call.body.is_some() {
+        return Err(call.at.error("the underscore allowlist takes no block"));
+    }
+    if !call.modifiers.is_empty() {
+        return Err(call.at.error("the underscore allowlist takes no modifiers"));
+    }
+    let [(None, Value::Array(items))] = call.args.as_slice() else {
+        return Err(call.at.error(
+            "expected one array of quoted header names, for example [\"X_Probe\", \"Webhook_*\"]",
+        ));
+    };
+    if items.is_empty() {
+        return Err(call.at.error(
+            "an empty allowlist is not accepted: name at least one header that survives, or \
+             leave the declaration out",
+        ));
+    }
+    let mut names = Vec::with_capacity(items.len());
+    for item in items {
+        let Value::String(name) = item else {
+            return Err(call.at.error("the list takes quoted header names"));
+        };
+        if !crate::underscore_headers::well_formed(name) {
+            return Err(call.at.error(format!(
+                "`{name}` {}",
+                crate::underscore_headers::ENTRY_REQUIREMENT
+            )));
+        }
+        names.push(name.clone());
+    }
+    Ok(names)
 }
 
 /// 🛡️ `headers:` names the request headers a trusted proxy may set the client

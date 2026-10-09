@@ -514,9 +514,20 @@
       "X-Forwarded-For",
       "X-Real-IP"
     ],
+    "expected_underscore_headers": [
+      "X_Probe",
+      "Webhook_*"
+    ],
     "listener_options": {
       ":8443": {
-        "http3": false
+        "expected_underscore_headers": [
+          "Webhook_*"
+        ],
+        "http3": false,
+        "client_ip_headers": [
+          "X-Forwarded-For",
+          "X-Real-IP"
+        ]
       }
     },
     "upstream_keepalive_pool_size": null,

@@ -110,6 +110,14 @@ pub(super) fn http_listener(call: &Call, config: &mut PingclairConfig) -> Result
                 apply_http_limits(modifier, &mut bounds)?;
                 options.limits = Some(bounds);
             }
+            "underscoreHeaders" => {
+                options.underscore_headers = Some(parse_underscore_headers(modifier)?);
+            }
+            "trustedProxies" => {
+                let trusted = parse_trusted_proxies(modifier, "trustedProxies")?;
+                options.trusted_proxies = trusted.ranges;
+                options.client_ip_headers = trusted.headers;
+            }
             "tls" => {
                 let parsed = parse_tls(modifier, None)?;
                 options.tls = Some(parsed.config);
@@ -141,20 +149,27 @@ pub(super) fn http_listener(call: &Call, config: &mut PingclairConfig) -> Result
     if servers.is_empty() {
         return Err(call.at.error("HTTPListener must contain at least one Site"));
     }
-    if let Some(http3) = protocols {
+    // 🧭 One listener's options, gathered from every modifier above. Written
+    // under each address the listener serves, because that is what the runtime
+    // and the Admin JSON look them up by.
+    let listener_options = ListenerOptions {
+        expected_underscore_headers: options.underscore_headers.clone(),
+        http3: protocols,
+        trusted_proxies: options.trusted_proxies.clone(),
+        client_ip_headers: options.client_ip_headers.clone(),
+        ..ListenerOptions::default()
+    };
+    if listener_options != ListenerOptions::default() {
         for key in keys {
             if config.global.listener_options.contains_key(&key) {
                 return Err(call
                     .at
                     .error(format!("listener options for '{key}' are already declared")));
             }
-            config.global.listener_options.insert(
-                key,
-                ListenerOptions {
-                    http3: Some(http3),
-                    ..ListenerOptions::default()
-                },
-            );
+            config
+                .global
+                .listener_options
+                .insert(key, listener_options.clone());
         }
     }
     config.servers.extend(servers);
@@ -531,6 +546,14 @@ struct HttpListenerOptions {
     limits: Option<ResourceLimitsConfig>,
     tls: Option<TlsConfig>,
     log: Option<LogConfig>,
+    /// 🛡️ Underscore-named fields this listener keeps; `None` inherits the
+    /// file-level `UnderscoreHeaders([…])`.
+    underscore_headers: Option<Vec<String>>,
+    /// 🛡️ Proxies this listener believes and the fields it reads the client
+    /// address from. Each half is `None` when the modifier did not name it, so
+    /// the other half still comes from the file-level `TrustedProxies(…)`.
+    trusted_proxies: Option<Vec<String>>,
+    client_ip_headers: Option<Vec<String>>,
     /// 📴 Recorded from any `.tls(ocspStapling: .off)` on this listener or one
     /// of its sites; the record is process-wide because no per-site stapling
     /// exists to configure.

@@ -19,6 +19,13 @@ let api = .path(prefix: "/api")
 Metrics(enabled: true)
 Shutdown(grace: .seconds(10))
 TrustedProxies(ranges: [.privateRanges], headers: [.xForwardedFor, .xRealIP])
+
+// 🛡️ Underscore-named request fields are dropped before routing unless a
+// listener lists them: a CGI backend folds `x_probe` and `x-probe` onto one
+// variable, so the underscore spelling is the alias an attacker picks. This
+// declaration is the default; a listener's `.underscoreHeaders(…)` replaces it
+// for that socket.
+UnderscoreHeaders(["X_Probe", "Webhook_*"])
 Storage(root: "./.pingclair-store")
 Log(output: .file("/tmp/pingclair-process.log"), level: .info)
 AutomaticTLS(mode: .automatic, httpPort: 80, httpsPort: 443)
@@ -94,6 +101,11 @@ HTTPListener(on: ":8443") {
 }
 .tls(.automatic(email: "admin@example.test"), defaultSNI: "www.example.test", renewalWindow: .ratio(0.1))
 .protocols([.http1, .http2])
+// 🛡️ Only the half a modifier writes is replaced: this listener keeps a
+// narrower allowlist than the file-level one, and keeps the file-level ranges
+// while reading the client address from the two fields it names.
+.underscoreHeaders(["Webhook_*"])
+.trustedProxies(headers: [.xForwardedFor, .xRealIP])
 .limits(maxConnections: 4096, headerTimeout: .seconds(30))
 .accessLog(
     output: .file("/tmp/pingclair-access.log"),

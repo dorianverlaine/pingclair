@@ -277,6 +277,38 @@ pub const ENTRIES: &[Entry] = &[
         labels: crate::frontend::log::SESSION_LOG_LABELS,
     },
     Entry {
+        name: "underscoreHeaders",
+        kind: Kind::Modifier,
+        summary: "The fields this listener keeps when their name carries an underscore, \
+                  replacing the file-level `UnderscoreHeaders(…)` for this socket. Each entry \
+                  is an exact name or a trailing-star prefix.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") { Fallback { Respond(body: "hello") } }
+}
+.underscoreHeaders(["X_Probe", "Webhook_*"])"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") { Fallback { Respond(body: "hello") } }
+}
+.underscoreHeaders("X_Probe")"#,
+        labels: &[],
+    },
+    Entry {
+        name: "trustedProxies",
+        kind: Kind::Modifier,
+        summary: "Who stands in front of this listener: `ranges:` names the proxies it \
+                  believes, `headers:` the fields it reads the client address from. A label \
+                  that is not written keeps the file-level `TrustedProxies(…)` value.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") { Fallback { Respond(body: "hello") } }
+}
+.trustedProxies(ranges: ["10.0.0.0/8"], headers: [.xForwardedFor, .xRealIP])"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") { Fallback { Respond(body: "hello") } }
+}
+.trustedProxies(ranges: [])"#,
+        labels: crate::frontend::TRUSTED_PROXIES_LABELS,
+    },
+    Entry {
         name: "RequestHeader",
         kind: Kind::Component,
         summary: "Sets request headers for later components: `.set`, `.append`, `.remove`, `.replace`.",
@@ -735,6 +767,22 @@ TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#
         labels: crate::frontend::TRUSTED_PROXIES_LABELS,
     },
     Entry {
+        name: "UnderscoreHeaders",
+        kind: Kind::Component,
+        summary: "The request fields a listener keeps when their name carries an underscore; \
+                  everything else is dropped before routing. One array of exact names or \
+                  trailing-star prefixes.",
+        example: r#"UnderscoreHeaders(["X_Probe", "Webhook_*"])
+HTTPListener(on: ":8080") {
+    Site(host: "*") { Fallback { Respond(body: "hello") } }
+}"#,
+        refusal: r#"UnderscoreHeaders([])
+HTTPListener(on: ":8080") {
+    Site(host: "*") { Fallback { Respond(body: "hello") } }
+}"#,
+        labels: &[],
+    },
+    Entry {
         name: "Storage",
         kind: Kind::Component,
         summary: "Where certificates, ACME account keys and the internal CA live.",
@@ -999,6 +1047,15 @@ mod tests {
             let entry = find(name).unwrap_or_else(|| panic!("{name} is not described"));
             assert!(entry.labels.is_empty(), "{name} should name no arguments");
         }
+        // 📌 One entry takes an argument *without* a label, which neither loop
+        // can express: `UnderscoreHeaders([…])` is one array whose entries are
+        // the value, and a `headers:` label would collide with the typed
+        // `headers:` of `TrustedProxies(…)`. The example carries the shape.
+        let allowlist = find("UnderscoreHeaders").expect("described");
+        assert!(
+            allowlist.labels.is_empty(),
+            "the allowlist takes one positional array"
+        );
     }
 
     #[test]

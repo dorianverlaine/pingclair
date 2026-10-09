@@ -5074,6 +5074,117 @@ HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
     assert!(content.contains("\"x-trace\":\"trace-7\""), "{content}");
 }
 
+/// 🛡️ Two listener-level decisions reach the real socket: which underscore
+/// names survive, and whose forwarded client address is believed.
+///
+/// 📌 Both are per-listener on purpose. One listener inherits the file-level
+/// allowlist and trusts the peer in front of it; the other replaces the
+/// allowlist with its own and trusts nobody.
+#[tokio::test]
+async fn test_native_listener_trust_and_allowlist_reach_the_socket() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 🔎 An origin that answers with the fields these assertions read.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let origin = listener.local_addr().unwrap();
+    let origin_task = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0u8; 16384];
+            let read = stream.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
+            let mut lines: Vec<String> = request
+                .lines()
+                .skip(1)
+                .take_while(|line| !line.is_empty())
+                .filter(|line| {
+                    let name = line.split(':').next().unwrap_or_default();
+                    ["x_probe", "webhook_event", "x-forwarded-for", "x-real-ip"].contains(&name)
+                })
+                .map(str::to_owned)
+                .collect();
+            lines.sort();
+            let body = lines.join("\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    let config = format!(
+        r#"
+UnderscoreHeaders(["X_Probe"])
+HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
+    Site(host: "*") {{
+        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
+            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
+        }}
+        Fallback {{ Proxy(to: "{origin}") }}
+    }}
+}}
+.trustedProxies(ranges: ["127.0.0.1/32"], headers: [.xRealIP])
+
+HTTPListener(on: "127.0.0.1:__PINGCLAIR_TEST_HTTP_PORT__") {{
+    Site(host: "*") {{
+        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
+            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
+        }}
+        Fallback {{ Proxy(to: "{origin}") }}
+    }}
+}}
+.underscoreHeaders(["Webhook_*"])
+"#
+    );
+    let mut server = TestServer::new_native(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let probe = |url: String| {
+        let client = no_proxy_client();
+        async move {
+            client
+                .get(url)
+                .header("X_Probe", "kept")
+                .header("Webhook_Event", "kept")
+                .header("X-Real-IP", "203.0.113.8")
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        }
+    };
+
+    // 🧭 The first listener keeps the file-level allowlist and believes the
+    // address `X-Real-IP` names, because it stated the ranges and the field.
+    let trusted = probe(server.url(0, "/")).await;
+    assert!(trusted.contains("x_probe: kept"), "{trusted}");
+    assert!(!trusted.contains("webhook_event"), "{trusted}");
+    assert!(trusted.contains("x-real-ip: 203.0.113.8"), "{trusted}");
+    assert!(
+        trusted.contains("x-forwarded-for: 203.0.113.8"),
+        "{trusted}"
+    );
+
+    // 🛡️ The second replaced the allowlist (so `X_Probe` is gone) and trusts
+    // no peer, so the same spoofed field is overwritten with the real one.
+    let second = format!("http://{}/", server.listener_address(0, 1));
+    let untrusted = probe(second).await;
+    assert!(untrusted.contains("webhook_event: kept"), "{untrusted}");
+    assert!(!untrusted.contains("x_probe"), "{untrusted}");
+    assert!(untrusted.contains("x-real-ip: 127.0.0.1"), "{untrusted}");
+    assert!(
+        untrusted.contains("x-forwarded-for: 127.0.0.1"),
+        "{untrusted}"
+    );
+    origin_task.await.unwrap();
+}
+
 /// 🧭 The native `Intercept` covers the Caddyfile's proxy-scoped
 /// `handle_response`: the same upstream response comes out rewritten the same
 /// way on both.

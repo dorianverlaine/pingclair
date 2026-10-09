@@ -56,6 +56,26 @@ fn a_global_option_declared_twice_is_refused_with_both_names() {
         .to_string();
     assert!(error.contains("Metrics"), "{error}");
     assert!(error.contains("00-globals.pingclair"), "{error}");
+
+    // 🛡️ And it is the *declaration* that is counted, not the value: two files
+    // stating the same allowlist are two files setting one option, and the
+    // second would have to win for the rule to be anything else.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let one = write(
+        dir.path(),
+        "00-allowlist.pingclair",
+        "UnderscoreHeaders([\"X_Probe\"])\n",
+    );
+    let two = write(
+        dir.path(),
+        "10-allowlist.pingclair",
+        "UnderscoreHeaders([\"X_Probe\"])\n",
+    );
+    let error = pingclair_config::compile_multiple_files(&[one, two])
+        .expect_err("two files may not both declare the allowlist")
+        .to_string();
+    assert!(error.contains("UnderscoreHeaders"), "{error}");
+    assert!(error.contains("10-allowlist.pingclair"), "{error}");
 }
 
 /// 🗂️ A file may hold nothing but declarations.

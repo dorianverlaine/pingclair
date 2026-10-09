@@ -6,6 +6,26 @@
 use crate::compiler::{CompileError, CompileResult};
 use pingclair_core::config::PingclairConfig;
 
+/// 🏷️ What one allowlist entry has to be, in the words both readers use.
+///
+/// 📌 The native frontend points at the offending line, the shared validator
+/// cannot (it sees a `PingclairConfig`, not a file). They still say the same
+/// thing about the same rule, because a rule stated twice drifts.
+pub(crate) const ENTRY_REQUIREMENT: &str =
+    "must be an ASCII header name containing `_`, with at most one trailing `*`";
+
+/// 🛡️ Whether one allowlist entry is well-formed.
+///
+/// 📌 The frontend and the shared validator both call this: the frontend so
+/// the error can carry a position, the validator because the Admin JSON path
+/// never goes through the frontend at all.
+pub(crate) fn well_formed(entry: &str) -> bool {
+    let name = entry.strip_suffix('*').unwrap_or(entry);
+    name.contains('_')
+        && !name.contains('*')
+        && http::HeaderName::from_bytes(name.as_bytes()).is_ok()
+}
+
 pub(crate) fn validate(config: &PingclairConfig) -> CompileResult<()> {
     let lists = std::iter::once(&config.global.expected_underscore_headers).chain(
         config
@@ -16,14 +36,10 @@ pub(crate) fn validate(config: &PingclairConfig) -> CompileResult<()> {
     );
     for entries in lists {
         for entry in entries {
-            let name = entry.strip_suffix('*').unwrap_or(entry);
-            if !name.contains('_')
-                || name.contains('*')
-                || http::HeaderName::from_bytes(name.as_bytes()).is_err()
-            {
+            if !well_formed(entry) {
                 return Err(CompileError::InvalidServer {
                     message: format!(
-                        "expected_underscore_headers entry `{entry}` must be an ASCII header name containing `_`, with at most one trailing `*`"
+                        "expected_underscore_headers entry `{entry}` {ENTRY_REQUIREMENT}"
                     ),
                 });
             }

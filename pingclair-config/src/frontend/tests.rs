@@ -407,6 +407,183 @@ fn protocols_toggle_http3_per_listener() {
     assert_eq!(twin(native), twin(legacy));
 }
 
+/// 🛡️ The file-level allowlist is the Caddyfile `servers { … }` option: the
+/// names it lists survive, everything else with an underscore goes.
+#[test]
+fn underscore_allowlist_matches_the_servers_block() {
+    let native = crate::compile(
+        r#"
+        UnderscoreHeaders(["X_Probe", "Webhook_*"])
+        HTTPListener(on: ":8080") {
+            Site(host: "*") { Fallback { Respond(body: "hi") } }
+        }
+        "#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "{\n\tservers {\n\t\texpected_underscore_headers X_Probe Webhook_*\n\t}\n}\nhttp://:8080 {\n\trespond \"hi\"\n}\n",
+    )
+    .unwrap();
+    assert_eq!(twin(native), twin(legacy));
+}
+
+/// 🛡️ The two listener modifiers are the addressed `servers <address>` block:
+/// same fields, same values, one socket.
+#[test]
+fn listener_trust_and_allowlist_match_the_addressed_servers_block() {
+    let native = crate::compile(
+        r#"
+        HTTPListener(on: ":8080") {
+            Site(host: "*") { Fallback { Respond(body: "hi") } }
+        }
+        .underscoreHeaders(["Other_Field"])
+        .trustedProxies(ranges: ["10.0.0.0/8"], headers: [.xRealIP])
+        "#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "{\n\tservers :8080 {\n\t\texpected_underscore_headers Other_Field\n\t\ttrusted_proxies static 10.0.0.0/8\n\t\tclient_ip_headers X-Real-IP\n\t}\n}\nhttp://:8080 {\n\trespond \"hi\"\n}\n",
+    )
+    .unwrap();
+    assert_eq!(twin(native), twin(legacy));
+    // 🧭 The documented example is the same shape `/documentation` checks.
+    assert!(
+        crate::compile(
+            r#"UnderscoreHeaders(["X_Probe", "Webhook_*"])
+HTTPListener(on: ":8443") {
+    Site(host: "*") { Fallback { Respond(body: "hi") } }
+}
+.underscoreHeaders(["X_Probe"])
+.trustedProxies(headers: [.xForwardedFor])"#
+        )
+        .is_ok()
+    );
+}
+
+/// 🧭 A listener modifier replaces only the half it names: the label it does
+/// not write still comes from the file-level declaration.
+#[test]
+fn listener_trust_replaces_only_the_half_it_names() {
+    let config = crate::compile(
+        r#"
+        TrustedProxies(ranges: ["10.0.0.0/8"], headers: [.xRealIP])
+        UnderscoreHeaders(["Global_Field", "X_Probe"])
+        HTTPListener(on: ":8080") {
+            Site(host: "*") { Fallback { Respond(body: "hi") } }
+        }
+        .underscoreHeaders(["Other_Field"])
+        .trustedProxies(headers: [.xForwardedFor])
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        config.global.expected_underscore_headers,
+        ["Global_Field", "X_Probe"]
+    );
+    assert_eq!(config.global.trusted_proxies, ["10.0.0.0/8"]);
+    assert_eq!(config.global.client_ip_headers, ["X-Real-IP"]);
+    let options = &config.global.listener_options[":8080"];
+    assert_eq!(
+        options.expected_underscore_headers.as_deref(),
+        Some(["Other_Field".to_owned()].as_slice())
+    );
+    assert_eq!(
+        options.client_ip_headers.as_deref(),
+        Some(["X-Forwarded-For".to_owned()].as_slice())
+    );
+    // 🚫 The half that was not written stays `None`, which is what lets the
+    // runtime fall back to the global list instead of an empty one.
+    assert_eq!(options.trusted_proxies, None);
+}
+
+#[test]
+fn underscore_and_trust_spellings_fail_closed() {
+    let listener = r#"
+        HTTPListener(on: ":8080") {
+            Site(host: "*") { Fallback { Respond(body: "hi") } }
+        }
+    "#;
+    for declaration in [
+        // 📐 The declaration takes one unnamed array, nothing else.
+        r#"UnderscoreHeaders("X_Probe")"#,
+        r#"UnderscoreHeaders([])"#,
+        r#"UnderscoreHeaders([1])"#,
+        r#"UnderscoreHeaders(headers: ["X_Probe"])"#,
+        r#"UnderscoreHeaders(["X_Probe"], ["Y_Field"])"#,
+        // 🚫 Each entry must be a name an underscore guard could act on.
+        r#"UnderscoreHeaders(["x-probe"])"#,
+        r#"UnderscoreHeaders(["*"])"#,
+        r#"UnderscoreHeaders(["x_*_bad"])"#,
+        r#"UnderscoreHeaders(["X_ Probe"])"#,
+        r#"UnderscoreHeaders(["X_Probe"]) { }"#,
+        r#"UnderscoreHeaders(["X_Probe"]).unknown(1)"#,
+    ] {
+        assert!(
+            crate::compile(&format!("{declaration}\n{listener}")).is_err(),
+            "accepted {declaration}"
+        );
+    }
+    for modifier in [
+        // 📐 One unnamed array, and only one.
+        ".underscoreHeaders()",
+        ".underscoreHeaders([])",
+        r#".underscoreHeaders("X_Probe")"#,
+        r#".underscoreHeaders(["X_Probe"], ["Y_Field"])"#,
+        r#".underscoreHeaders(["x-probe"])"#,
+        r#".underscoreHeaders(["X_Probe"]).underscoreHeaders(["Y_Field"])"#,
+        // 🛡️ A trust list needs at least one label, and each half keeps the
+        // value rules the global declaration has.
+        ".trustedProxies()",
+        r#".trustedProxies(ranges: [])"#,
+        r#".trustedProxies(headers: [])"#,
+        r#".trustedProxies(ranges: "10.0.0.0/8")"#,
+        r#".trustedProxies(ranges: ["not-a-cidr"])"#,
+        r#".trustedProxies(proxies: ["10.0.0.0/8"])"#,
+        r#".trustedProxies(headers: [.nope])"#,
+        r#".trustedProxies(ranges: ["10.0.0.0/8"]).trustedProxies(headers: [.xRealIP])"#,
+    ] {
+        assert!(
+            crate::compile(&format!("{listener}{modifier}")).is_err(),
+            "accepted {modifier}"
+        );
+    }
+    // 📌 The spellings belong to the HTTP listener; a TCP listener has neither
+    // the request fields nor the client-address decision.
+    assert!(
+        crate::compile(
+            r#"TCPListener(on: "127.0.0.1:9443") {
+    Fallback { Proxy(to: "127.0.0.1:8080") }
+}
+.underscoreHeaders(["X_Probe"])"#
+        )
+        .is_err()
+    );
+}
+
+/// 📍 A bad entry is refused where it was written, not at startup.
+#[test]
+fn a_bad_allowlist_entry_points_at_the_declaration() {
+    let error = crate::adapt(
+        r#"
+UnderscoreHeaders([
+    "Webhook_*",
+    "x-probe",
+])
+HTTPListener(on: ":8080") {
+    Site(host: "*") { Fallback { Respond(body: "hi") } }
+}
+"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("line 2:1:"), "{error}");
+    assert!(error.contains("x-probe"), "{error}");
+    assert!(
+        error.contains("containing `_`"),
+        "the message must say what an entry is: {error}"
+    );
+}
+
 #[test]
 fn limits_lower_to_the_resource_bounds() {
     let native = crate::compile(
