@@ -9,103 +9,11 @@ use hickory_resolver::config::{
     ConnectionConfig, LookupIpStrategy, NameServerConfig, ProtocolConfig, ResolveHosts,
     ResolverConfig,
 };
-use hickory_resolver::proto::op::{Message, OpCode, ResponseCode};
-use hickory_resolver::proto::rr::{
-    Name, RData, Record, RecordType,
-    rdata::{A, AAAA, CNAME},
-};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use hickory_resolver::proto::op::ResponseCode;
+use hickory_resolver::proto::rr::{Name, RData, Record, RecordType, rdata::CNAME};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::task::JoinHandle;
 use tokio::time::timeout;
-
-struct Dns {
-    address: SocketAddr,
-    queries: Arc<Mutex<Vec<(Name, RecordType)>>>,
-    task: JoinHandle<()>,
-}
-
-impl Dns {
-    async fn new(reply: impl Fn(&Message) -> Message + Send + 'static) -> Self {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let address = socket.local_addr().unwrap();
-        let queries = Arc::new(Mutex::new(Vec::new()));
-        let seen = Arc::clone(&queries);
-        let task = tokio::spawn(async move {
-            let mut wire = [0; 65535];
-            loop {
-                let (length, peer) = socket.recv_from(&mut wire).await.unwrap();
-                let query = Message::from_vec(&wire[..length]).unwrap();
-                seen.lock().unwrap().push((
-                    query.queries[0].name().clone(),
-                    query.queries[0].query_type(),
-                ));
-                socket
-                    .send_to(&reply(&query).to_vec().unwrap(), peer)
-                    .await
-                    .unwrap();
-            }
-        });
-        Self {
-            address,
-            queries,
-            task,
-        }
-    }
-
-    fn resolver(&self, strategy: LookupIpStrategy) -> TokioResolver {
-        let mut udp = ConnectionConfig::new(ProtocolConfig::Udp);
-        udp.port = self.address.port();
-        let mut tcp = ConnectionConfig::new(ProtocolConfig::Tcp);
-        tcp.port = self.address.port();
-        let config = ResolverConfig::from_parts(
-            None,
-            Vec::new(),
-            vec![NameServerConfig::new(
-                self.address.ip(),
-                true,
-                vec![udp, tcp],
-            )],
-        );
-        let mut builder = TokioResolver::builder_with_config(config, Default::default());
-        let options = builder.options_mut();
-        options.cache_size = 0;
-        options.preserve_intermediates = true;
-        options.use_hosts_file = ResolveHosts::Never;
-        options.ip_strategy = strategy;
-        options.attempts = 1;
-        options.num_concurrent_reqs = 1;
-        options.max_active_requests = 1;
-        options.timeout = Duration::from_secs(5);
-        builder.build().unwrap()
-    }
-}
-
-impl Drop for Dns {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-fn response(query: &Message) -> Message {
-    let mut reply = Message::response(query.id, OpCode::Query);
-    reply.metadata.recursion_desired = query.recursion_desired;
-    reply.metadata.recursion_available = true;
-    reply.add_queries(query.queries.clone());
-    reply
-}
-
-fn address(reply: &mut Message, name: Name, ttl: u32, kind: RecordType) {
-    let data = match kind {
-        RecordType::A => RData::A(A(Ipv4Addr::new(203, 0, 113, 10))),
-        RecordType::AAAA => RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
-        _ => panic!("unexpected address family"),
-    };
-    reply.add_answer(Record::from_rdata(name, ttl, data));
-}
 
 #[tokio::test]
 async fn cname_ttl_is_preserved_across_separate_queries() {
@@ -235,24 +143,6 @@ async fn negative_answers_are_distinct_from_transient_failures() {
     .unwrap();
 }
 
-async fn tcp_query(stream: &mut TcpStream) -> Message {
-    let length = stream.read_u16().await.unwrap();
-    let mut wire = vec![0; usize::from(length)];
-    stream.read_exact(&mut wire).await.unwrap();
-    Message::from_vec(&wire).unwrap()
-}
-
-async fn truncated_dns() -> (Dns, TcpListener) {
-    let dns = Dns::new(|query| {
-        let mut reply = response(query);
-        reply.metadata.truncation = true;
-        reply
-    })
-    .await;
-    let tcp = TcpListener::bind(dns.address).await.unwrap();
-    (dns, tcp)
-}
-
 #[tokio::test]
 async fn truncated_udp_retries_over_tcp_on_the_same_explicit_port() {
     timeout(Duration::from_secs(3), async {
@@ -317,4 +207,37 @@ async fn cancellation_drops_the_scoped_resolver_and_its_tcp_work() {
     })
     .await
     .unwrap();
+}
+
+#[path = "support/dns.rs"]
+mod fixture;
+use fixture::*;
+
+impl Dns {
+    fn resolver(&self, strategy: LookupIpStrategy) -> TokioResolver {
+        let mut udp = ConnectionConfig::new(ProtocolConfig::Udp);
+        udp.port = self.address.port();
+        let mut tcp = ConnectionConfig::new(ProtocolConfig::Tcp);
+        tcp.port = self.address.port();
+        let config = ResolverConfig::from_parts(
+            None,
+            Vec::new(),
+            vec![NameServerConfig::new(
+                self.address.ip(),
+                true,
+                vec![udp, tcp],
+            )],
+        );
+        let mut builder = TokioResolver::builder_with_config(config, Default::default());
+        let options = builder.options_mut();
+        options.cache_size = 0;
+        options.preserve_intermediates = true;
+        options.use_hosts_file = ResolveHosts::Never;
+        options.ip_strategy = strategy;
+        options.attempts = 1;
+        options.num_concurrent_reqs = 1;
+        options.max_active_requests = 1;
+        options.timeout = Duration::from_secs(5);
+        builder.build().unwrap()
+    }
 }
