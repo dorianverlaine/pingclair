@@ -517,6 +517,9 @@ fn underscore_and_trust_spellings_fail_closed() {
         r#"UnderscoreHeaders(["X_ Probe"])"#,
         r#"UnderscoreHeaders(["X_Probe"]) { }"#,
         r#"UnderscoreHeaders(["X_Probe"]).unknown(1)"#,
+        // 🚫 The Caddyfile's spelling is the compatibility layer's, not a
+        // second native one: one directive, one spelling.
+        r#"underscore_headers(["X_Probe"])"#,
     ] {
         assert!(
             crate::compile(&format!("{declaration}\n{listener}")).is_err(),
@@ -541,6 +544,10 @@ fn underscore_and_trust_spellings_fail_closed() {
         r#".trustedProxies(proxies: ["10.0.0.0/8"])"#,
         r#".trustedProxies(headers: [.nope])"#,
         r#".trustedProxies(ranges: ["10.0.0.0/8"]).trustedProxies(headers: [.xRealIP])"#,
+        // 🚫 As above: the snake case names the Caddyfile option, and the
+        // native listener has exactly one spelling per decision.
+        r#".underscore_headers(["X_Probe"])"#,
+        r#".trusted_proxies(ranges: ["10.0.0.0/8"])"#,
     ] {
         assert!(
             crate::compile(&format!("{listener}{modifier}")).is_err(),
