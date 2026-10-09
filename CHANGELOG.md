@@ -40,6 +40,20 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🛡️ Underscore-named request fields can be allowlisted
+
+A request field containing an underscore was dropped before routing on every
+transport, because a CGI or FastCGI backend folds `x_probe` and `x-probe` onto
+the same variable — an injection path onto the identity headers `forward_auth
+copy_headers` is supposed to own. Caddy's `expected_underscore_headers` server
+option is now implemented: names listed in `servers { … }` survive on every
+listener, a `servers <address> { … }` block overrides that list for one
+listener, and a trailing `*` matches a prefix. The hyphenated spelling of an
+allowlisted name is dropped so the alias cannot reach the same variable by the
+other route, and a repeated allowlisted field drops every occurrence rather
+than the extra one. Without the option the default is unchanged: nothing with
+an underscore (#295).
+
 ### 🪵 Newly declared access-log channels work on reload
 
 Reload registers named access-log channels before building site routes, including

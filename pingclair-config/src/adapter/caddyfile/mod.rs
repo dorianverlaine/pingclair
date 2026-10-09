@@ -56,6 +56,7 @@ mod route_order;
 mod scoped_middleware;
 mod sites;
 mod tls;
+mod underscore_headers;
 
 #[cfg(test)]
 mod block_matcher_tests;

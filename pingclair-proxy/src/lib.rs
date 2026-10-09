@@ -29,6 +29,7 @@ pub mod encoding;
 mod error_routes;
 mod fastcgi;
 mod h3_header_deadline;
+mod header_alias;
 mod header_limits;
 pub mod header_timeout;
 pub mod health_check;
