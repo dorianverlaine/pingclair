@@ -361,6 +361,7 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
 
     config.global.trusted_proxies = global.trusted_proxies.clone();
     config.global.client_ip_headers = global.client_ip_headers.clone();
+    config.global.expected_underscore_headers = global.expected_underscore_headers.clone();
     config.global.storage_path = global.storage_path.clone();
 
     // 🚰 Left as `None` when unset, which is not "unconfigured" but the actual
@@ -409,11 +410,13 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
                 || options.http3.is_some()
                 || options.trusted_proxies.is_some()
                 || options.client_ip_headers.is_some()
+                || options.expected_underscore_headers.is_some()
         })
         .map(|(address, options)| {
             (
                 address.clone(),
                 pingclair_core::config::ListenerOptions {
+                    expected_underscore_headers: options.expected_underscore_headers.clone(),
                     proxy_protocol: options.proxy_protocol,
                     http3: options.http3,
                     trusted_proxies: options.trusted_proxies.clone(),
@@ -1019,6 +1022,7 @@ fn validate_cache_ceiling_agrees(config: &PingclairConfig) -> CompileResult<()> 
 }
 
 pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
+    crate::underscore_headers::validate(config)?;
     for server in &config.servers {
         pingclair_core::server::Router::validate_paths(&server.routes).map_err(|error| {
             CompileError::InvalidRoute {

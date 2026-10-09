@@ -80,6 +80,8 @@ pub struct GlobalBlock {
     pub trusted_proxies: Vec<String>,
     /// 🛡️ Headers a trusted proxy may name the client in (`client_ip_headers`).
     pub client_ip_headers: Vec<String>,
+    /// 🛡️ Underscore-named request fields preserved on every listener by default.
+    pub expected_underscore_headers: Vec<String>,
     /// 🔄 Upstream re-resolution interval in seconds; `Some(0)` disables it.
     /// `None` means the directive was absent and the default applies.
     pub dns_refresh_secs: Option<u64>,
@@ -136,6 +138,8 @@ pub struct GlobalBlock {
 /// than applying it to all of them.
 #[derive(Debug, Clone, Default)]
 pub struct ListenerOptions {
+    /// 🛡️ Underscore-named request fields preserved on this listener.
+    pub expected_underscore_headers: Option<Vec<String>>,
     /// 🔌 Whether this listener requires a PROXY protocol header before HTTP.
     pub proxy_protocol: Option<bool>,
     /// 🌐 Whether this listener offers HTTP/3.

@@ -112,6 +112,11 @@ pub(super) fn group_by_address(
                     listener_policy,
                 )
                 .reading_client_ip_from(client_ip_headers)
+                .expecting_underscore_headers(
+                    addressed
+                        .and_then(|options| options.expected_underscore_headers.as_deref())
+                        .unwrap_or(&config.global.expected_underscore_headers),
+                )
             });
 
             // Track what sites are bound to what addresses
@@ -151,6 +156,11 @@ pub(super) fn group_by_address(
                     listener_policy,
                 )
                 .reading_client_ip_from(&config.global.client_ip_headers)
+                .expecting_underscore_headers(
+                    pingclair_core::config::listener_options_for(listener_options, &addr)
+                        .and_then(|options| options.expected_underscore_headers.as_deref())
+                        .unwrap_or(&config.global.expected_underscore_headers),
+                )
             });
             binding_info.entry(addr).or_default().push(format!(
                 "{} (automatic HTTP)",

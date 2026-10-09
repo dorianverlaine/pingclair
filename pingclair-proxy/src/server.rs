@@ -1938,6 +1938,8 @@ pub struct PingclairProxy {
     pub alt_svc: Arc<ArcSwap<Option<crate::alt_svc::Advertisement>>>,
     /// 🛡️ Immutable policy used by every protocol to resolve client identity.
     trusted_proxies: Arc<TrustedProxyPolicy>,
+    /// 🛡️ Precomputed listener allowlist shared by every transport.
+    pub(crate) header_alias_policy: Arc<crate::header_alias::HeaderAliasPolicy>,
     /// 🧭 Trusted transport claims keyed by the private ingress tunnel sockets.
     proxy_protocol_registry: Arc<crate::proxy_protocol::ProxyProtocolRegistry>,
     /// 🚫 Rejects TCP requests that bypass the required external PROXY ingress.
@@ -1962,6 +1964,7 @@ impl Default for PingclairProxy {
             tls_manager: None,
             alt_svc: Arc::new(ArcSwap::from_pointee(None)),
             trusted_proxies: Arc::new(TrustedProxyPolicy::from_rules(&[])),
+            header_alias_policy: Arc::default(),
             proxy_protocol_registry: Arc::new(
                 crate::proxy_protocol::ProxyProtocolRegistry::default(),
             ),
@@ -2057,6 +2060,7 @@ impl PingclairProxy {
             tls_manager: Some(tls_manager),
             alt_svc: Arc::new(ArcSwap::from_pointee(None)),
             trusted_proxies: Arc::new(TrustedProxyPolicy::from_rules(&[])),
+            header_alias_policy: Arc::default(),
             proxy_protocol_registry: Arc::new(
                 crate::proxy_protocol::ProxyProtocolRegistry::default(),
             ),
@@ -2101,6 +2105,7 @@ impl PingclairProxy {
             tls_manager: Some(tls_manager),
             alt_svc: Arc::new(ArcSwap::from_pointee(None)),
             trusted_proxies: Arc::new(TrustedProxyPolicy::from_rules(trusted_proxies)),
+            header_alias_policy: Arc::default(),
             proxy_protocol_registry: Arc::new(
                 crate::proxy_protocol::ProxyProtocolRegistry::default(),
             ),
@@ -7077,23 +7082,11 @@ impl ProxyHttp for PingclairProxy {
             }
         }
 
-        // 🛡️ GHSA-f59h-q822-g45g: a header name containing `_` aliases its
-        // hyphenated CGI/FastCGI form, so a client could inject the exact
-        // identity headers `forward_auth copy_headers` is supposed to own.
-        // Drop underscore-named headers before anything routes on them,
-        // matching Caddy's default.
-        let underscore_headers =
-            crate::http_policy::underscore_named_fields(&session.req_header().headers);
-        if !underscore_headers.is_empty() {
-            // 👁️ The drop used to be invisible at every log level, which is
-            // what made "the field is simply gone" a support-ticket mystery
-            // (#269).
-            tracing::debug!(
-                fields = ?underscore_headers,
-                "🚫 Dropped underscore-named request fields before routing"
-            );
-        }
-        for name in underscore_headers {
+        // 🛡️ Apply the listener allowlist before routing; CGI sinks retain their own guard.
+        let dropped = self
+            .header_alias_policy
+            .dropped(session.req_header().headers.iter().map(|(name, _)| name));
+        for name in dropped {
             session.req_header_mut().remove_header(name.as_str());
         }
 

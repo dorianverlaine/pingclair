@@ -1724,18 +1724,9 @@ pub(crate) fn connection_named_fields(headers: &HeaderMap) -> Vec<Box<str>> {
 /// Such a name aliases its hyphenated form in every CGI/FastCGI environment —
 /// `x_probe` and `x-probe` both become `HTTP_X_PROBE` — so a client could
 /// inject the identity headers `forward_auth copy_headers` is supposed to own.
-/// The policy is one drop, before anything routes, on every transport (#269).
+/// The listener allowlist decides which names survive before routing (#295).
 pub(crate) fn underscore_named(name: &[u8]) -> bool {
     name.contains(&b'_')
-}
-
-/// 🛡️ The names in `headers` that [`underscore_named`] refuses.
-pub(crate) fn underscore_named_fields(headers: &HeaderMap) -> Vec<String> {
-    headers
-        .keys()
-        .filter(|name| underscore_named(name.as_str().as_bytes()))
-        .map(|name| name.as_str().to_string())
-        .collect()
 }
 
 /// ✂️ The value with its leading and trailing SP/HTAB removed.
@@ -3373,13 +3364,6 @@ mod outbound_filter_tests {
         ] {
             assert_eq!(underscore_named(name.as_bytes()), dropped, "{name}");
         }
-
-        let headers = client_headers(&[
-            ("x_probe", "present"),
-            ("x-probe", "present"),
-            ("content-type", "text/plain"),
-        ]);
-        assert_eq!(underscore_named_fields(&headers), vec!["x_probe"]);
     }
 
     /// 🔗 A field named by `Connection` is dropped, whatever it is called.

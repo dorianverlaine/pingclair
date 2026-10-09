@@ -263,6 +263,10 @@ mod ip_matchers;
 #[path = "integration/client_ip_headers.rs"]
 mod client_ip_headers;
 
+// 🛡️ Which underscore-named fields an origin is allowed to receive.
+#[path = "integration/underscore_headers.rs"]
+mod underscore_headers;
+
 // 🙈 What the admin API's configuration reads show of a configured secret.
 #[path = "integration/admin_secrets.rs"]
 mod admin_secrets;
