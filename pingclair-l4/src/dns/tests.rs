@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-use super::resolver::{Answer, Failure, Resolver};
+use super::*;
 use hickory_resolver::proto::op::ResponseCode;
 use hickory_resolver::proto::rr::{
     Name, RData, Record, RecordType,
     rdata::{A, CNAME},
 };
-use pingclair_core::config::{Layer4Dns, Layer4IpVersions};
+use pingclair_core::config::Layer4IpVersions;
 use std::net::Ipv4Addr;
-use std::net::SocketAddr;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
-use tokio::time::{Instant, timeout};
+use tokio::time::timeout;
 
 #[path = "../../tests/support/dns.rs"]
 mod fixture;
@@ -34,6 +32,13 @@ fn config(dns: SocketAddr) -> Layer4Dns {
 async fn lookup(resolver: &Resolver) -> Result<Answer, Failure> {
     let (_cancel, receiver) = watch::channel(false);
     resolver.lookup(receiver).await
+}
+
+fn source(config: &Layer4Dns) -> Source {
+    DnsRuntime::default()
+        .prepare(vec![])
+        .source(config)
+        .unwrap()
 }
 
 #[tokio::test]
@@ -250,6 +255,251 @@ async fn aborting_the_outer_query_still_closes_scoped_transport_work() {
         {
             tokio::task::yield_now().await;
         }
+    })
+    .await
+    .unwrap();
+}
+
+fn publish(source: &Source, ttl: Duration) {
+    source
+        .0
+        .apply(Ok(Answer {
+            addresses: vec!["203.0.113.10:443".parse().unwrap()],
+            fresh: Instant::now() + ttl,
+        }))
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn hard_deadlines_are_checked_at_dial_without_scheduler_help_or_failure_extension() {
+    let mut config = config("127.0.0.1:53".parse().unwrap());
+    config.stale_ms = 2000;
+    let source = source(&config);
+    publish(&source, Duration::ZERO);
+    let hard = source.0.snapshot.load().as_ref().unwrap().hard;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(
+        source.0.apply(Err(Failure::Transient)),
+        Err(Failure::Transient)
+    );
+    assert_eq!(source.0.snapshot.load().as_ref().unwrap().hard, hard);
+    source
+        .connect_with(Duration::from_secs(5), |_| std::future::ready(Ok(())))
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(
+        source
+            .connect_with(Duration::from_secs(5), |_| std::future::ready(Ok(())))
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::AddrNotAvailable
+    );
+    config.valid_ms = Some(1000);
+    config.stale_ms = 0;
+    let source = super::tests::source(&config);
+    publish(&source, Duration::from_secs(50));
+    let snapshot = source.0.snapshot.load_full().unwrap();
+    assert_eq!(snapshot.hard - snapshot.success, Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn forbidden_mixed_answers_and_authoritative_negatives_revoke_the_whole_pool() {
+    let source = source(&config("127.0.0.1:53".parse().unwrap()));
+    for failure in [Failure::Empty, Failure::NxDomain, Failure::Invalid] {
+        publish(&source, Duration::from_secs(30));
+        let epoch = source.0.epoch.load(Ordering::Acquire);
+        assert_eq!(source.0.apply(Err(failure)), Err(failure));
+        assert!(source.0.snapshot.load().is_none());
+        assert_ne!(source.0.epoch.load(Ordering::Acquire), epoch);
+    }
+    publish(&source, Duration::from_secs(30));
+    assert_eq!(
+        source.0.apply(Ok(Answer {
+            addresses: vec![
+                "203.0.113.10:443".parse().unwrap(),
+                "127.0.0.1:443".parse().unwrap()
+            ],
+            fresh: Instant::now() + Duration::from_secs(30)
+        })),
+        Err(Failure::Invalid)
+    );
+    assert!(source.0.snapshot.load().is_none());
+}
+
+#[tokio::test]
+async fn retries_use_one_snapshot_but_recheck_revocation_before_every_attempt() {
+    let source = source(&config("127.0.0.1:53".parse().unwrap()));
+    source
+        .0
+        .apply(Ok(Answer {
+            addresses: vec![
+                "203.0.113.10:443".parse().unwrap(),
+                "203.0.113.11:443".parse().unwrap(),
+            ],
+            fresh: Instant::now() + Duration::from_secs(30),
+        }))
+        .unwrap();
+    let attempts = AtomicUsize::new(0);
+    let error = source
+        .connect_with(Duration::from_secs(5), |_| {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            source.0.revoke();
+            std::future::ready(Err::<(), _>(io::ErrorKind::ConnectionRefused.into()))
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (error.kind(), attempts.load(Ordering::Relaxed)),
+        (io::ErrorKind::AddrNotAvailable, 1)
+    );
+}
+
+#[tokio::test]
+async fn preparing_a_reload_cannot_mutate_pools_and_only_full_policies_reuse_snapshots() {
+    let runtime = DnsRuntime::default();
+    let config = config("127.0.0.1:53".parse().unwrap());
+    let mut draft = runtime.prepare(vec![]);
+    let first = draft.source(&config).unwrap();
+    assert!(Arc::ptr_eq(&first.0, &draft.source(&config).unwrap().0));
+    publish(&first, Duration::from_secs(30));
+    runtime.publish(draft);
+    let mut failed_reload = runtime.prepare(vec![]);
+    let same = failed_reload.source(&config).unwrap();
+    assert!(Arc::ptr_eq(&first.0, &same.0));
+    let mut changed = config.clone();
+    changed.stale_ms = 0;
+    let new = failed_reload.source(&changed).unwrap();
+    assert!(!Arc::ptr_eq(&first.0, &new.0));
+    assert!(new.0.snapshot.load().is_none());
+    drop(failed_reload);
+    assert!(first.0.snapshot.load().is_some());
+    let mut changed_own = runtime.prepare(vec!["127.0.0.1:443".parse().unwrap()]);
+    assert!(!Arc::ptr_eq(
+        &first.0,
+        &changed_own.source(&config).unwrap().0
+    ));
+    runtime.publish(runtime.prepare(vec![]));
+    assert!(first.0.snapshot.load().is_none());
+}
+
+#[tokio::test]
+async fn removed_pools_cancel_immediately_and_retired_transports_hold_the_global_budget() {
+    timeout(Duration::from_secs(5), async {
+        let (dns, tcp) = truncated_dns().await;
+        let runtime = Arc::new(DnsRuntime::default());
+        let mut draft = runtime.prepare(vec![]);
+        let mut all = Vec::new();
+        for index in 0..20 {
+            let mut config = config(dns.address);
+            config.name = format!("old-{index}.test");
+            all.push(draft.source(&config).unwrap());
+        }
+        runtime.publish(draft);
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let running = runtime.clone();
+        let coordinator = tokio::spawn(async move {
+            running
+                .run(async {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+        let mut peers = Vec::new();
+        for _ in 0..8 {
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            tcp_query(&mut stream).await;
+            peers.push(stream);
+        }
+        assert_eq!(dns.queries.lock().unwrap().len(), 8);
+        let mut draft = runtime.prepare(vec![]);
+        let mut config = config(dns.address);
+        config.name = "replacement.test".into();
+        let replacement = draft.source(&config).unwrap();
+        runtime.publish(draft);
+        assert!(
+            all.iter()
+                .filter_map(|source| source.0.cancel.lock().unwrap().clone())
+                .all(|cancel| *cancel.borrow())
+        );
+        all.push(replacement);
+        loop {
+            let live = all
+                .iter()
+                .filter(|source| source.0.cancel.lock().unwrap().is_some())
+                .count();
+            assert!(live <= 8, "{live} DNS jobs including retired workers");
+            if live == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        for mut peer in peers {
+            assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+        }
+        let (mut replacement, _) = tcp.accept().await.unwrap();
+        tcp_query(&mut replacement).await;
+        stop.send(()).unwrap();
+        coordinator.await.unwrap();
+        assert_eq!(replacement.read(&mut [0]).await.unwrap(), 0);
+        assert!(all.last().unwrap().0.snapshot.load().is_none());
+        assert_eq!(dns.queries.lock().unwrap().len(), 9);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn established_relay_drops_the_route_generation_and_dynamic_pool() {
+    use pingclair_core::config::{Layer4Dynamic, Layer4Route, Layer4Server};
+    timeout(Duration::from_secs(3), async {
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = origin.local_addr().unwrap();
+        let mut config = config("127.0.0.1:53".parse().unwrap());
+        config.port = address.port();
+        config.allow_ip = Some(vec!["127.0.0.1/32".into()]);
+        let runtime = DnsRuntime::default();
+        let mut draft = runtime.prepare(vec![]);
+        let source = draft.source(&config).unwrap();
+        source
+            .0
+            .apply(Ok(Answer {
+                addresses: vec![address],
+                fresh: Instant::now() + Duration::from_secs(30),
+            }))
+            .unwrap();
+        let weak_pool = Arc::downgrade(&source.0);
+        drop(source);
+        let mut listener = Layer4Server::new("127.0.0.1:9443".into());
+        listener.proxy_half_close = true;
+        listener.routes.push(Layer4Route {
+            matches: vec![],
+            upstream: String::new(),
+            dynamic: Some(Layer4Dynamic::A(config)),
+        });
+        let prepared = Arc::new(
+            crate::PreparedListener::prepare_with_dns(&listener, &[], None, &mut draft).unwrap(),
+        );
+        let weak_listener = Arc::downgrade(&prepared);
+        runtime.publish(draft);
+        let (mut client, stream) = tokio::io::duplex(32);
+        let session = tokio::spawn(prepared.serve(stream, "127.0.0.1:1234".parse().unwrap()));
+        let (mut backend, _) = origin.accept().await.unwrap();
+        backend.write_all(b"ready").await.unwrap();
+        let mut bytes = [0; 5];
+        client.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"ready");
+        assert!(weak_listener.upgrade().is_none());
+        runtime.publish(runtime.prepare(vec![]));
+        assert!(weak_pool.upgrade().is_none());
+        client.write_all(b"still connected").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        backend.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"still connected");
+        backend.shutdown().await.unwrap();
+        session.await.unwrap().unwrap();
     })
     .await
     .unwrap();

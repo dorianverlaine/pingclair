@@ -3,11 +3,12 @@
 
 //! 🔌 Load-time routing state and the bounded preread-to-relay connection path.
 
+use crate::dns::{DnsPreparation, Source};
 use crate::metrics::Metrics;
 use crate::observation::{Counted, Observation, Outcome, Phase};
 use crate::upstream::Upstream;
 use crate::{Classification, ClientHello, RelayOptions, classify, relay};
-use pingclair_core::config::{IpRanges, Layer4Server, Layer4TlsMatcher};
+use pingclair_core::config::{IpRanges, Layer4Dynamic, Layer4Server, Layer4TlsMatcher};
 use pingclair_runtime::access_log::AccessLogger;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -45,7 +46,21 @@ fn contains_peer(ranges: &IpRanges, peer: IpAddr) -> bool {
 
 struct Route {
     matches: Vec<Matcher>,
-    upstream: Upstream,
+    upstream: Destination,
+}
+
+enum Destination {
+    Static(Upstream),
+    Dynamic(Source),
+}
+
+impl Destination {
+    async fn connect(&self, budget: Duration) -> io::Result<tokio::net::TcpStream> {
+        match self {
+            Self::Static(upstream) => upstream.connect(budget).await,
+            Self::Dynamic(source) => source.connect(budget).await,
+        }
+    }
 }
 
 struct SessionPolicy {
@@ -80,6 +95,25 @@ impl PreparedListener {
         blocked: &[String],
         previous: Option<&Self>,
     ) -> io::Result<Self> {
+        Self::prepare_inner(config, blocked, previous, None)
+    }
+
+    /// 🌐 Compiles dynamic sources into a draft owned by the executable's DNS coordinator.
+    pub fn prepare_with_dns(
+        config: &Layer4Server,
+        blocked: &[String],
+        previous: Option<&Self>,
+        dns: &mut DnsPreparation,
+    ) -> io::Result<Self> {
+        Self::prepare_inner(config, blocked, previous, Some(dns))
+    }
+
+    fn prepare_inner(
+        config: &Layer4Server,
+        blocked: &[String],
+        previous: Option<&Self>,
+        mut dns: Option<&mut DnsPreparation>,
+    ) -> io::Result<Self> {
         if config.max_connections == 0 || config.max_connections > 4096 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -110,13 +144,24 @@ impl PreparedListener {
         let mut routes = Vec::with_capacity(config.routes.len());
         let mut needs_tls = false;
         for route in &config.routes {
-            if route.dynamic.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "dynamic L4 runtime is not connected",
-                ));
-            }
-            let upstream = Upstream::prepare(&route.upstream)?;
+            let upstream = match (&route.dynamic, route.upstream.is_empty()) {
+                (None, false) => Destination::Static(Upstream::prepare(&route.upstream)?),
+                (Some(Layer4Dynamic::A(config)), true) => {
+                    let dns = dns.as_deref_mut().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "dynamic L4 requires the DNS coordinator",
+                        )
+                    })?;
+                    Destination::Dynamic(dns.source(config)?)
+                }
+                (None, true) | (Some(_), false) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "L4 route requires exactly one upstream source",
+                    ));
+                }
+            };
             let mut matches = Vec::with_capacity(route.matches.len());
             for matcher in &route.matches {
                 needs_tls |= matcher.tls.is_some();

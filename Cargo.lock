@@ -2628,6 +2628,7 @@ dependencies = [
 name = "pingclair-l4"
 version = "0.0.0"
 dependencies = [
+ "arc-swap",
  "hickory-resolver",
  "ipnet",
  "pingclair-core",
@@ -2638,6 +2639,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

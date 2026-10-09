@@ -212,3 +212,22 @@ resolver ownership to the bounded job when using this evidence.
 These are dependency checks, not evidence of dynamic routing. They do not prove
 address policy, stale deadlines, CNAME limits, scheduler bounds, reload behavior,
 or Linux resource usage. Static upstreams still resolve only at load or reload.
+
+## 🌐 Dynamic pool ownership
+
+Dynamic preparation uses `DnsPreparation` and `PreparedListener::prepare_with_dns`.
+It must receive every known local HTTP, TCP and Admin destination, including local
+addresses covered by wildcard listeners. Failed preparation activates no work.
+Publish the complete draft through the process-owned `DnsRuntime`; run its single
+coordinator with the executable's shutdown future.
+
+DNS jobs use Hickory's raw query interface so CNAME traversal has an explicit
+eight-hop ceiling and A/AAAA share one five-second deadline. The task scope joins
+transport workers before a normal or retired job releases its slot; dropping an
+outer future still aborts that scope. Removed pools are revoked and canceled at
+publication, with their draining jobs included in the eight-job process limit.
+
+Address policy and deadlines apply before publication and every dial attempt.
+Transient failures cannot extend the hard deadline; authoritative negatives and
+invalid updates revoke the whole pool. Relay retains session logging and metrics
+policy, but releases routing generations, pools and address snapshots after dial.

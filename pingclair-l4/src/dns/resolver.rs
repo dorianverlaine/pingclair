@@ -33,11 +33,19 @@ pub(super) struct Answer {
     pub fresh: Instant,
 }
 
+#[derive(PartialEq, Eq)]
+pub(super) struct Endpoint {
+    address: SocketAddr,
+    tcp: bool,
+    bind: Option<SocketAddr>,
+}
+
 pub(super) struct Resolver {
     name: Name,
     port: u16,
     versions: Layer4IpVersions,
     servers: Vec<NameServerConfig>,
+    pub endpoints: Vec<Endpoint>,
     context: Arc<PoolContext>,
 }
 
@@ -78,6 +86,20 @@ impl Resolver {
                 "DNS policy requires 1 to 4 resolvers",
             ));
         }
+        let mut endpoints = Vec::new();
+        for server in &servers {
+            for connection in &server.connections {
+                let tcp = match connection.protocol {
+                    ProtocolConfig::Udp => false,
+                    ProtocolConfig::Tcp => true,
+                };
+                endpoints.push(Endpoint {
+                    address: SocketAddr::new(server.ip, connection.port),
+                    tcp,
+                    bind: connection.bind_addr,
+                });
+            }
+        }
         let mut options = ResolverOpts::default();
         options.timeout = Duration::from_secs(5);
         options.attempts = 1;
@@ -93,6 +115,7 @@ impl Resolver {
             port: config.port,
             versions: config.versions,
             servers,
+            endpoints,
             context,
         })
     }

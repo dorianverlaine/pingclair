@@ -9,8 +9,8 @@ pub use hello::{Classification, ClientHello, classify};
 mod relay;
 pub use relay::{RelayOptions, relay};
 
-#[cfg(test)]
 mod dns;
+pub use dns::{DnsPreparation, DnsRuntime};
 
 mod metrics;
 mod observation;
