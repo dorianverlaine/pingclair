@@ -354,7 +354,10 @@ preview can never become what a download link or `docker pull` resolves to.
 refuses a malformed version, a version not newer than the newest release tag,
 a dirty tree, and a base branch that differs from its remote copy. The tag's
 message is the `[Unreleased]` section of `CHANGELOG.md`, and that becomes the
-GitHub release notes, so write the changelog first.
+GitHub release notes, so write the changelog first. GitHub refuses a release
+body over 125,000 characters, so a section that big is published up to a
+paragraph boundary with a link to the rest of `CHANGELOG.md`; nothing is lost
+from the repository's own record.
 
 A stable release or a preview, from `main`:
 

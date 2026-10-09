@@ -235,9 +235,32 @@ jobs:
           # section, written into it by scripts/cut-release.sh. A commit log
           # would not work here: earlier release commits are off main, so no
           # previous tag is an ancestor of this one.
+          #
+          # 📏 GitHub refuses a release body longer than 125,000 characters,
+          # and a section that documents every change since the last stable
+          # release can outgrow it (0.2.0's is 293,635). Keep whole paragraphs
+          # up to a safe cap and point at the changelog for the rest, so a
+          # long release publishes instead of failing at the last step.
+          notes_file="$(mktemp)"
+          git tag --list "$version" --format='%(contents)' >"$notes_file"
+          limit=120000
+          if [ "$(wc -c <"$notes_file")" -gt "$limit" ]; then
+            LC_ALL=C awk -v limit="$limit" '
+              BEGIN { RS = ""; ORS = "\n\n" }
+              total + length($0) + 2 > limit { exit }
+              { print; total += length($0) + 2 }
+            ' "$notes_file" >"${notes_file}.capped"
+            {
+              cat "${notes_file}.capped"
+              printf -- '---\n\nThis page carries the first %s characters of the %s changelog; the complete list is in [CHANGELOG.md](%s/%s/blob/%s/CHANGELOG.md).\n' \
+                "$limit" "$version" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_SHA"
+            } >"${notes_file}.full"
+            mv "${notes_file}.full" "${notes_file}"
+          fi
+
           gh release create "$version" "${assets[@]}" \
             --title "Pingclair $version" \
-            --notes-from-tag \
+            --notes-file "$notes_file" \
             "${flags[@]}"
 
   publish-image:
