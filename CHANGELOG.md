@@ -14,10 +14,9 @@ fact.
 
 ## [Unreleased]
 
-📦 This section becomes `## [0.2.0]` when 0.2.0 is cut, and its text is the
-release notes of that tag. It covers every change since `v0.1.7`, including
-the three release candidates (`0.2.0-rc.1` on 2026-08-20, `0.2.0-rc.2` on
-2026-09-19, `0.2.0-rc.3`).
+📦 0.2.0 covers every change since `v0.1.7`, including the three release
+candidates (`0.2.0-rc.1` on 2026-08-20, `0.2.0-rc.2` on 2026-09-19,
+`0.2.0-rc.3`).
 
 0.2.0 is the release where a Caddyfile means what it means upstream. Route
 selection, address parsing, matchers, compression, request limits and the TLS
