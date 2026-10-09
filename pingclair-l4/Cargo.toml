@@ -19,11 +19,17 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+divan = "0.1.21"
 serde_json = "1"
 tempfile = "3"
 rustls.workspace = true
 proptest = "1"
 tokio = { workspace = true, features = ["test-util"] }
+
+# ⚡ Compile the private source modules directly without expanding the production API.
+[[bench]]
+name = "address_sources"
+harness = false
 
 [lints]
 workspace = true

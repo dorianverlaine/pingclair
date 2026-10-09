@@ -234,3 +234,6 @@ impl DnsRuntime {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod benchmarks;

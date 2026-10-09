@@ -69,6 +69,10 @@ bench *args:
 bench-smoke:
     just bench -- --test
 
+# 🐧 Measure bounded L4 admission, DNS retirement and RSS/FD on Linux with a release binary.
+l4-resources *args:
+    python3 scripts/test-l4-dns-resources.py "$@"
+
 # 🛰️ Run the full HTTP/3 functional matrix against a fresh release binary.
 h3:
     cargo +{{ rust }} build --release --locked

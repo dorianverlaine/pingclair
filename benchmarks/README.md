@@ -7,6 +7,36 @@ The reusable measurement harness lives in `benchmarks/aws-h3/`. Per-run
 evidence is kept only in the local `benchmarks/results/` directory, which is
 not committed.
 
+## 🔌 L4 address selection and resource bounds
+
+`just bench -- dns::benchmarks` compares the private production static single-address
+path with dynamic one- and four-address snapshots, using one, four and eight
+concurrent workers. Pools and per-worker timer drivers are initialized outside
+timing. Each iteration includes timer-context entry, snapshot/deadline/cursor work
+and an immediately ready injected dial; it performs no DNS or socket I/O.
+Divan's allocator profiler measures timed allocations. These results describe
+source selection overhead, not whole-server throughput or network latency.
+
+On an idle Linux host, supply a freshly built release binary to the resource drill:
+
+```bash
+just l4-resources --binary /path/to/release/pingclair --commit FULL_COMMIT_SHA \
+    --results /tmp/l4-resource-run --sessions 128 --reloads 64 --tls
+```
+
+The drill holds two listeners' quotas across route reloads, checks excess admission,
+and retires controlled pending DNS TCP work while streams remain connected.
+It records RSS, descriptors, sessions, queries and peak DNS TCP concurrency,
+then checks that sessions and DNS sockets drain and descriptors return near baseline.
+`--tls` sends a complete ClientHello before forwarding; without it, routes use
+plain TCP. All endpoints are unique localhost ports and cleanup targets only
+the child created by the drill. Results directories must be new, so failed
+evidence cannot be overwritten. Preserve the harness, full source SHA, binary
+hash, toolchain and build settings with each run; `--profile` records supplied
+build metadata. Keep the output in the local evidence ledger and exclude test
+TLS storage when copying it. This bounded workload does not validate the default
+4096 process ceiling as a safe production capacity.
+
 ## 📏 What has to be true before a number counts
 
 Three rules, and every one of them exists because the harness produced a
