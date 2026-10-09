@@ -59,17 +59,7 @@ HTTP header and negotiated-TLS logging options are rejected for raw TCP.
 Logger changes apply to new connections. Unchanged loggers survive route reloads
 without creating additional writer threads.
 
-📦 0.2.0 covers every change since `v0.1.7`, including the three release
-candidates (`0.2.0-rc.1` on 2026-08-20, `0.2.0-rc.2` on 2026-09-19,
-`0.2.0-rc.3`).
-
-0.2.0 is the release where a Caddyfile means what it means upstream. Route
-selection, address parsing, matchers, compression, request limits and the TLS
-store now follow Caddy's rules, and a directive that is not implemented is
-refused by name instead of being accepted and ignored. The same release makes
-the HTTP layer conform to the RFCs it implements — caching, conditional and
-range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
-makes startup, reload and shutdown fail closed and drop no request.
+## [0.2.2]
 
 ### 🛡️ Underscore-named request fields can be allowlisted
 
@@ -91,6 +81,34 @@ Reload registers named access-log channels before building site routes, includin
 the first listeners loaded through the Admin API. Previously, a channel declared
 by the reload could create its file but receive no access records until restart
 (#322).
+
+## [0.2.1]
+
+### 🛣️ A `handle_path` beside a bare `handle` answers the requests it matches
+
+`handle_path` ranked one directive after `handle`, so any `handle` beside it
+ran first — and a bare `handle` is the site's fallback, which shadows
+everything below it. A `handle_path /duplex/*` next to `handle { … }` never
+matched a single request: the fallback answered them all. The reference sorts
+both kinds of route group together by matcher specificity, and the two
+directives differ only in whether the matched prefix is stripped, so
+`handle_path` now ranks as `handle` and the specific route wins on path length
+as usual. Found while migrating a CUPS front door off nginx, whose config had
+to be written as `handle` + `uri strip_prefix` to work at all.
+
+## [0.2.0]
+
+📦 0.2.0 covers every change since `v0.1.7`, including the three release
+candidates (`0.2.0-rc.1` on 2026-08-20, `0.2.0-rc.2` on 2026-09-19,
+`0.2.0-rc.3`).
+
+0.2.0 is the release where a Caddyfile means what it means upstream. Route
+selection, address parsing, matchers, compression, request limits and the TLS
+store now follow Caddy's rules, and a directive that is not implemented is
+refused by name instead of being accepted and ignored. The same release makes
+the HTTP layer conform to the RFCs it implements — caching, conditional and
+range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
+makes startup, reload and shutdown fail closed and drop no request.
 
 ### 🔁 Unrelated reloads preserve connections on client-auth listeners
 
@@ -3132,8 +3150,6 @@ reproduction; the workaround, where there is one, is in the issue.
   by an ignored one that is ready to enable when the dependency forwards it.
 - **HTTP/3 transport-parameter checks** fail 18 of 77 h3spec cases; the fix
   belongs in the QUIC library (#282).
-- **A wildcard site's manual certificate** is not served for the names it
-  covers over TCP; `tls internal` is not affected (#285).
 - **A request's trailer fields are discarded on HTTP/1**, so an `aws-chunked`
   upload's checksum never reaches the origin while the client is answered
   normally. The dependency's HTTP/1 body reader parses the trailer section to
@@ -4961,7 +4977,10 @@ where nginx is still ahead.
   ever produced a measurement from a run where the component it patched was
   the saturated resource.
 
-[Unreleased]: https://github.com/dorianverlaine/pingclair/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/dorianverlaine/pingclair/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/dorianverlaine/pingclair/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/dorianverlaine/pingclair/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/dorianverlaine/pingclair/compare/v0.1.7...v0.2.0
 
 ### 🎨 `fmt` is a check, and its flags are Caddy's
 

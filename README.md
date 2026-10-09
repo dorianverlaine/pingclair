@@ -21,13 +21,17 @@ QUIC, automatic HTTPS, health-aware load balancing, and configuration reloads.
 The primary configuration format is the Pingclairfile, a deliberately bounded
 implementation of commonly used Caddyfile syntax. Unsupported Caddy features
 are rejected during configuration loading rather than accepted as no-ops.
+The 0.3 development line on `main` adds a native declarative language beside
+it; the Caddy-style frontend remains supported.
 
-Pingclair is currently distributed as a release candidate. Review the
+The latest release is `v0.2.2`, the newest patch on the 0.2 line. Review the
 [project status](https://pingclair.com/project/status/) before using it for a
-production deployment.
+production deployment. Pingclair is pre-1.0: a minor version is where breaking
+changes live, and a patch release promises nothing breaks.
 
-🔌 The 0.3 alpha branch supports TCP forwarding with TLS ClientHello SNI/ALPN
-and source-IP routing. TLS passes through unchanged; it is not terminated.
+🔌 The 0.3 development line on `main` supports TCP forwarding with TLS
+ClientHello SNI/ALPN and source-IP routing. TLS passes through unchanged; it is
+not terminated.
 Opt-in connection access logs and `l4_*` metrics report traffic and session outcomes.
 L4 admission defaults to 1024 sessions per listener (`max_connections`) and
 a fixed process ceiling of 4096 sessions, including preread and upstream dialing.
@@ -69,9 +73,8 @@ and `pc` commands:
 curl -fsSL https://pingclair.com/install.sh | sudo bash
 ```
 
-The current release is `v0.2.0-rc.3`. It is a release candidate, not a stable
-release. The `v0.1.x` line is unmaintained and should not be used for a new
-deployment.
+The current release is `v0.2.2`, a patch on the 0.2 line. The `v0.1.x` line is
+unmaintained and should not be used for a new deployment.
 
 After installation, inspect the service before loading a configuration:
 
@@ -255,15 +258,15 @@ The repository [changelog](CHANGELOG.md) records upgrade-relevant changes on
 `main` and between releases. It should be read before changing a deployed
 version.
 
-Documentation is published in English, Simplified Chinese, and Traditional
-Chinese. The English pages define the terminology when translations differ;
-all three editions describe the same commands and configuration surface.
+Documentation is published in English and Traditional Chinese. The English
+pages define the terminology when translations differ; both editions describe
+the same commands and configuration surface.
 
 ## 📌 Release status
 
-The latest published version is `v0.2.0-rc.3`. The source tree may contain
-unreleased behavior, so release documentation and `main` must not be treated as
-interchangeable.
+The latest published version is `v0.2.2`. `main` carries the 0.3 development
+line, so the source tree contains behavior the published release does not;
+release documentation describes the published release, not `main`.
 
 Important boundaries include:
 
