@@ -354,6 +354,8 @@ pub(crate) fn run_server_with_adapter(
         admin_listener_available,
         active_document,
     ));
+    let dns_runtime = layer4.clone();
+    let l4_dns = bg_handle.spawn(async move { dns_runtime.run_dns().await });
     let config_publisher: Arc<dyn pingclair_proxy::server::ConfigPublisher> =
         Arc::new(RuntimeListeners::new(
             RuntimePublisherInputs {
@@ -430,6 +432,7 @@ pub(crate) fn run_server_with_adapter(
     bg_handle.spawn(crate::shutdown::drain_then_exit(
         server.watch_execution_phase(),
         Duration::from_secs(grace_period_secs),
+        l4_dns,
     ));
 
     println!("🚀 Pingclair running...");

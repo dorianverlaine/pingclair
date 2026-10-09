@@ -169,6 +169,7 @@ impl ShutdownSignalWatch for SignalWatch {
 pub(crate) async fn drain_then_exit(
     mut phases: broadcast::Receiver<ExecutionPhase>,
     grace: Duration,
+    l4_dns: tokio::task::JoinHandle<()>,
 ) -> ! {
     loop {
         match phases.recv().await {
@@ -195,6 +196,10 @@ pub(crate) async fn drain_then_exit(
     // because a QUIC client is not told when a process exits and would wait
     // out its idle timeout instead.
     let stopped = pingclair_proxy::drain::stop(grace).await;
+    // 🧹 The coordinator cancels DNS and joins its transport scopes before process exit.
+    if let Err(error) = l4_dns.await {
+        tracing::error!(%error, "🚫 L4 DNS coordinator ended unexpectedly");
+    }
     // 🧼 The count reaches zero when the proxy has *handed* the response to
     // its transport, which is not the same as the bytes being on the wire:
     // an HTTP/1 response is written synchronously, while the HTTP/2 codec

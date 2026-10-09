@@ -73,11 +73,14 @@ ipnet.workspace = true
 
 
 [target.'cfg(unix)'.dependencies]
+# 🌐 Enumerates local addresses covered by wildcard listeners for L4 DNS policy.
+nix = { version = "=0.31.3", features = ["net"] }
 tikv-jemallocator = "0.6"
 # 📐 `getrlimit` for the startup descriptor-budget warning (issue #33).
 libc.workspace = true
 
 [dev-dependencies]
+hickory-resolver.workspace = true
 # default-features = false: reqwest's default-tls (native-tls) pulls in
 # openssl-sys on Linux, whose OpenSSL symbols collide with quiche's statically
 # linked BoringSSL at link time (undefined SSL_CTX_ctrl etc. in CI). rustls is

@@ -5,30 +5,45 @@
 
 use arc_swap::ArcSwap;
 use pingclair_core::config::{PingclairConfig, covering_wildcard, normalize_listen_addr};
-use pingclair_l4::PreparedListener;
+use pingclair_l4::{DnsPreparation, DnsRuntime, PreparedListener};
 use pingclair_proxy::server::ConfigApplyError;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+mod destinations;
 mod listener;
 pub(crate) use listener::register;
 
 pub(crate) type Generation = HashMap<String, Arc<PreparedListener>>;
 
+pub(crate) struct PreparedGeneration {
+    listeners: Generation,
+    dns: DnsPreparation,
+}
+
 /// 📦 New connections load one generation; established tunnels retain their own state.
-pub(crate) struct Runtime(ArcSwap<Generation>, Arc<Semaphore>);
+pub(crate) struct Runtime(ArcSwap<Generation>, Arc<Semaphore>, DnsRuntime);
 
 impl Default for Runtime {
     fn default() -> Self {
-        Self(ArcSwap::default(), Arc::new(Semaphore::new(4096)))
+        Self(
+            ArcSwap::default(),
+            Arc::new(Semaphore::new(4096)),
+            DnsRuntime::default(),
+        )
     }
 }
 
 impl Runtime {
-    pub(crate) fn publish(&self, next: Generation) {
-        self.0.store(Arc::new(next));
+    pub(crate) fn publish(&self, next: PreparedGeneration) {
+        self.0.store(Arc::new(next.listeners));
+        self.2.publish(next.dns);
+    }
+
+    pub(crate) async fn run_dns(&self) {
+        self.2.run(pingclair_proxy::drain::stopping()).await;
     }
 }
 
@@ -37,7 +52,7 @@ pub(crate) fn prepare(
     config: &PingclairConfig,
     current: &Runtime,
     http_addresses: impl Iterator<Item = String>,
-) -> Result<Generation, ConfigApplyError> {
+) -> Result<PreparedGeneration, ConfigApplyError> {
     let mut occupied: Vec<SocketAddr> = http_addresses
         .filter_map(|address| address.parse().ok())
         .collect();
@@ -47,8 +62,6 @@ pub(crate) fn prepare(
     {
         occupied.push(address);
     }
-    let previous = current.0.load();
-    let mut next = HashMap::new();
     for listener in &config.layer4 {
         let address = normalize_listen_addr(&listener.listen);
         let socket: SocketAddr = address
@@ -65,18 +78,40 @@ pub(crate) fn prepare(
                 )));
             }
         }
-        let prepared = PreparedListener::prepare_with_previous(
+        occupied.push(socket);
+    }
+    let has_dynamic = config
+        .layer4
+        .iter()
+        .flat_map(|listener| &listener.routes)
+        .any(|route| route.dynamic.is_some());
+    let own = if has_dynamic {
+        destinations::known(&occupied).map_err(|error| {
+            ConfigApplyError::invalid(format!("cannot prepare L4 local destinations: {error}"))
+        })?
+    } else {
+        occupied
+    };
+    let mut dns = current.2.prepare(own);
+    let previous = current.0.load();
+    let mut next = HashMap::new();
+    for listener in &config.layer4 {
+        let address = normalize_listen_addr(&listener.listen);
+        let prepared = PreparedListener::prepare_with_dns(
             listener,
             &config.global.blocked_ips,
             previous.get(&address).map(Arc::as_ref),
+            &mut dns,
         )
         .map_err(|error| {
             ConfigApplyError::invalid(format!("cannot prepare L4 listener {address}: {error}"))
         })?;
-        occupied.push(socket);
         next.insert(address, Arc::new(prepared));
     }
-    Ok(next)
+    Ok(PreparedGeneration {
+        listeners: next,
+        dns,
+    })
 }
 
 /// ♻️ Routes may change live; socket topology and listener limits require a restart.

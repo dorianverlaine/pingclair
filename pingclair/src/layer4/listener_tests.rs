@@ -16,6 +16,7 @@ async fn process_quota_is_shared_and_released_across_listeners() {
         let runtime = Arc::new(Runtime(
             arc_swap::ArcSwap::default(),
             Arc::new(Semaphore::new(1)),
+            pingclair_l4::DnsRuntime::default(),
         ));
         let origin = AsyncListener::bind("127.0.0.1:0").await.unwrap();
         let (stop, watch) = tokio::sync::watch::channel(false);
@@ -49,7 +50,10 @@ async fn process_quota_is_shared_and_released_across_listeners() {
                 listener.start_service(None, watch, 1).await;
             }));
         }
-        runtime.publish(generation);
+        runtime.publish(super::super::PreparedGeneration {
+            listeners: generation,
+            dns: runtime.2.prepare(vec![]),
+        });
         let mut first = TcpStream::connect(&addresses[0]).await.unwrap();
         let (mut backend, _) = origin.accept().await.unwrap();
         backend.write_all(b"a").await.unwrap();
