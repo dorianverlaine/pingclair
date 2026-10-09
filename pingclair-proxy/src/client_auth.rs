@@ -54,7 +54,7 @@ use boring::error::ErrorStack;
 use boring::ex_data::Index;
 use boring::ssl::{Ssl, SslAlert, SslRef, SslVerifyError, SslVerifyMode};
 use boring::stack::{Stack, StackRef};
-use boring::x509::store::{X509Store, X509StoreBuilder};
+use boring::x509::store::X509Store;
 use boring::x509::{X509, X509StoreContext, X509StoreContextRef};
 use foreign_types::ForeignTypeRef as _;
 use pingclair_core::config::{ClientAuthConfig, ClientAuthMode, TrustPool};
@@ -64,6 +64,12 @@ use std::sync::{Arc, OnceLock};
 use crate::listener_generation::{ListenerGeneration, RouteTable};
 
 use base64::Engine as _;
+
+mod policy_identity;
+use policy_identity::{CompiledTrust, TrustStoreBuilder};
+
+#[cfg(test)]
+mod reload_tests;
 
 /// 🛡️ How deeply `trust_pool combined { … }` may nest before we refuse.
 ///
@@ -84,6 +90,9 @@ pub struct CompiledClientAuth {
     /// `None` for the two modes that never build a chain, which is what makes
     /// `request` and `require` cheap: no store is loaded and none is consulted.
     trust: Option<X509Store>,
+
+    /// 🔎 The exact loaded roots, absent when system lookups remain lazy.
+    trust_roots: Option<Vec<Vec<u8>>>,
 
     /// 🍃 Leaves pinned individually, in DER, sorted so the check is a binary
     /// search rather than a scan. Empty means "no pinning", which is the case
@@ -127,15 +136,17 @@ impl CompiledClientAuth {
 
         let pinned_leaves = compile_pinned_leaves(config)?;
 
-        let trust = if verifies {
-            Some(compile_trust_store(config)?)
+        let (trust, trust_roots) = if verifies {
+            let compiled = compile_trust_store(config)?;
+            (Some(compiled.store), compiled.roots)
         } else {
-            None
+            (None, Some(Vec::new()))
         };
 
         Ok(Self {
             verify_mode,
             trust,
+            trust_roots,
             pinned_leaves,
         })
     }
@@ -347,12 +358,21 @@ impl ClientAuthTable {
 pub struct ListenerSecuritySnapshot {
     client_auth: Arc<ClientAuthTable>,
     revision: u64,
+    certificate_revision: u64,
 }
 
 impl ListenerSecuritySnapshot {
     /// 🗺️ Returns the precompiled SNI-to-client-auth table for this generation.
     pub fn client_auth(&self) -> &ClientAuthTable {
         &self.client_auth
+    }
+
+    /// 🔐 Invalidates parsed server certificates independently of client trust.
+    ///
+    /// A manual server certificate can rotate while client authentication stays
+    /// unchanged, so its cache must advance on every publication.
+    pub fn certificate_revision(&self) -> u64 {
+        self.certificate_revision
     }
 
     /// 🔢 Returns the generation recorded on a connection at its handshake.
@@ -366,10 +386,11 @@ impl ListenerSecuritySnapshot {
 /// Both halves live in one [`ListenerGeneration`] behind one `ArcSwap`, so a
 /// reload replaces them with a single pointer swap and no reader can observe
 /// one half from the old configuration and the other from the new. That is
-/// why nothing here refuses requests during a reload. Connections that began
-/// under an earlier generation carry its revision and are refused on mutual-TLS
-/// listeners afterwards, so a trust-pool rotation cannot leave a keep-alive or
-/// QUIC connection authorised by stale credentials.
+/// why publication itself needs no refusal window. Connections carry the
+/// security revision from their handshake; it advances only when the compiled
+/// policy changes or its system trust sources cannot be compared safely. A
+/// trust-pool rotation therefore still refuses stale keep-alive and QUIC
+/// connections, while unrelated reloads preserve explicit client-auth policies.
 pub struct PublishedListenerPolicy {
     current: ArcSwap<ListenerGeneration>,
     client_auth_reload_capable: bool,
@@ -402,6 +423,7 @@ impl PublishedListenerPolicy {
                 security: Arc::new(ListenerSecuritySnapshot {
                     client_auth,
                     revision: 0,
+                    certificate_revision: 0,
                 }),
                 routes: Arc::new(RouteTable::default()),
             }),
@@ -457,14 +479,20 @@ impl PublishedListenerPolicy {
 
     /// 📣 Publishes the next generation: new routes and a new client-auth table at once.
     ///
-    /// The revision always advances, so every connection admitted before this
-    /// call is asked to reconnect on a mutual-TLS listener.
+    /// 🔐 Preserve connections when the complete authentication policy compares
+    /// equal. Routes still publish with the new table in one atomic swap.
     pub fn publish(&self, client_auth: Arc<ClientAuthTable>, routes: Arc<RouteTable>) {
-        let revision = self.current.load().security.revision.wrapping_add(1);
+        let current = self.current.load();
+        let revision = if current.security.client_auth.same_policy(&client_auth) {
+            current.security.revision
+        } else {
+            current.security.revision.wrapping_add(1)
+        };
         self.current.store(Arc::new(ListenerGeneration {
             security: Arc::new(ListenerSecuritySnapshot {
                 client_auth,
                 revision,
+                certificate_revision: current.security.certificate_revision.wrapping_add(1),
             }),
             routes,
         }));
@@ -627,8 +655,8 @@ fn compile_pinned_leaves(config: &ClientAuthConfig) -> Result<Vec<Vec<u8>>, Stri
 }
 
 /// 🏛️ Assembles the store a verifying mode checks client chains against.
-fn compile_trust_store(config: &ClientAuthConfig) -> Result<X509Store, String> {
-    let mut builder = X509StoreBuilder::new()
+fn compile_trust_store(config: &ClientAuthConfig) -> Result<CompiledTrust, String> {
+    let mut builder = TrustStoreBuilder::new()
         .map_err(|error| format!("could not create a client trust store: {error}"))?;
     let mut named_anything = false;
 
@@ -670,7 +698,7 @@ fn compile_trust_store(config: &ClientAuthConfig) -> Result<X509Store, String> {
 
 /// 🧩 Folds one trust pool — possibly a tree of them — into the store.
 fn add_trust_pool(
-    builder: &mut X509StoreBuilder,
+    builder: &mut TrustStoreBuilder,
     pool: &TrustPool,
     depth: usize,
 ) -> Result<(), String> {
@@ -781,7 +809,7 @@ fn decode_der(encoded: &str) -> Result<Vec<u8>, String> {
 }
 
 /// 📜 Parses DER and adds it, so a bad certificate is named at startup.
-fn add_der(builder: &mut X509StoreBuilder, der: &[u8]) -> Result<(), String> {
+fn add_der(builder: &mut TrustStoreBuilder, der: &[u8]) -> Result<(), String> {
     let certificate =
         X509::from_der(der).map_err(|error| format!("not a DER certificate: {error}"))?;
     builder
@@ -794,7 +822,7 @@ mod tests {
     use super::*;
 
     /// 🏛️ Generates a throwaway CA and one leaf it signed, both in PEM.
-    fn ca_and_leaf() -> (String, String) {
+    pub(super) fn ca_and_leaf() -> (String, String) {
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         ca_params
@@ -816,7 +844,7 @@ mod tests {
         (ca.pem(), leaf.pem())
     }
 
-    fn der_base64(pem: &str) -> String {
+    pub(super) fn der_base64(pem: &str) -> String {
         let certificate = X509::from_pem(pem.as_bytes()).expect("pem");
         base64::engine::general_purpose::STANDARD.encode(certificate.to_der().expect("der"))
     }

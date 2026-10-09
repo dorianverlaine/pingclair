@@ -27,6 +27,20 @@ the HTTP layer conform to the RFCs it implements — caching, conditional and
 range requests, interim responses, stream errors on HTTP/2 and HTTP/3 — and
 makes startup, reload and shutdown fail closed and drop no request.
 
+### 🔁 Unrelated reloads preserve connections on client-auth listeners
+
+Every reload advanced the client-auth security revision, so even a header-only
+change made existing H1, H2, and H3 connections answer `421`. Reload now compares
+the compiled authentication modes, site mappings, loaded CA certificates, and
+pinned leaves before advancing that revision. Unchanged policies retain their
+connections while the new routes become visible; changed trust material still
+requires a new handshake, including certificates replaced at the same file path.
+Server certificate caches advance separately so manual server certificate rotation
+still reaches the first new connection.
+System trust remains conservative: its lazy directory lookups cannot be fully
+compared at load time, so verifying policies using it still invalidate old
+connections on every reload (#321).
+
 ### 🛡️ A guard written with a `not` matcher keeps its exemption
 
 `compose_site_routes` copies a scoped line into every answering route it could

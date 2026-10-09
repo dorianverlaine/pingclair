@@ -51,8 +51,8 @@ struct CachedSslCert {
     pkey: PKey<Private>,
     /// Unix timestamp when this cache entry expires
     expires_at: u64,
-    /// 🔢 Records the listener-policy generation that resolved this certificate.
-    security_revision: u64,
+    /// 🔢 Tracks reloads even when client authentication remains unchanged.
+    certificate_revision: u64,
 }
 
 /// Cache TTL for parsed certificates (1 hour)
@@ -225,7 +225,7 @@ impl TlsAccept for DynamicCertResolver {
         // from `default_sni`. A client that named nothing has authorised
         // nothing, so it falls to the catch-all policy — and the SNI-against-
         // Host check at the HTTP layer refuses it any named site afterwards.
-        let security_revision = if let Some(listener_policy) = &self.listener_policy {
+        let certificate_revision = if let Some(listener_policy) = &self.listener_policy {
             // 📦 One complete generation, published atomically, so a reload
             // never leaves a handshake without a policy to admit it under.
             let snapshot = listener_policy.handshake_snapshot();
@@ -239,7 +239,7 @@ impl TlsAccept for DynamicCertResolver {
             {
                 policy.install(ssl);
             }
-            snapshot.revision()
+            snapshot.certificate_revision()
         } else {
             0
         };
@@ -265,7 +265,7 @@ impl TlsAccept for DynamicCertResolver {
             let cache = self.ssl_cache.read();
             if let Some(cached) = cache.get(sni)
                 && cached.expires_at > current_time
-                && cached.security_revision == security_revision
+                && cached.certificate_revision == certificate_revision
             {
                 // Cache hit - use cached BoringSSL objects
                 tracing::debug!("🚀 Using cached cert for {}", sni);
@@ -306,7 +306,7 @@ impl TlsAccept for DynamicCertResolver {
                 chain,
                 pkey,
                 expires_at,
-                security_revision,
+                certificate_revision,
             };
 
             self.ssl_cache.write().insert(sni.to_string(), cached_entry);
