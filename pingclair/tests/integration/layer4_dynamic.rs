@@ -340,3 +340,6 @@ async fn caddy_dns_truncation_uses_tcp_and_closes_its_scoped_socket() {
 
 #[path = "layer4_dns_metrics.rs"]
 mod metrics;
+
+#[path = "layer4_dns_contracts.rs"]
+mod contracts;

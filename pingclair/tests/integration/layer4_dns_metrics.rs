@@ -6,14 +6,19 @@
 use super::super::metrics::{scrape, value};
 use super::*;
 
-fn observed(config: String) -> String {
+pub(super) fn observed(config: String) -> String {
     format!("Metrics(enabled: true)\n{config}").replace(
         "Site(host: \"*\") { Fallback",
         "Site(host: \"*\") { Route(when: .path(exact: \"/metrics\")) { ServeMetrics() } Fallback",
     )
 }
 
-async fn wait_value(server: &TestServer, name: &str, labels: &[&str], expected: f64) -> String {
+pub(super) async fn wait_value(
+    server: &TestServer,
+    name: &str,
+    labels: &[&str],
+    expected: f64,
+) -> String {
     timeout(Duration::from_secs(12), async {
         loop {
             let text = scrape(server).await;
