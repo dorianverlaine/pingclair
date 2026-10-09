@@ -2628,6 +2628,7 @@ dependencies = [
 name = "pingclair-l4"
 version = "0.0.0"
 dependencies = [
+ "hickory-resolver",
  "pingclair-core",
  "pingclair-runtime",
  "prometheus",

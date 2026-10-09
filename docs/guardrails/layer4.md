@@ -190,3 +190,25 @@ These fixed alpha limits bound work; they are not nginx's unlimited retry defaul
 Selection returns once TCP connects. Even a server-first protocol or an immediate
 post-connect reset cannot trigger replay to another peer. There is no passive
 quarantine or active health checking, and no per-I/O selection work in the relay.
+
+## 🌐 DNS dependency verification
+
+The dynamic-upstream design requires asynchronous, cancelable DNS work before
+new syntax can be exposed. Controlled wire tests in
+`pingclair-l4/tests/resolver_contract.rs` exercise Hickory 0.26.3 without public
+DNS, HTTP proxies, or the host's search domains.
+
+The 2026-10-09 checks establish that `TokioResolver::lookup` preserves CNAME
+records and their minimum TTL when `preserve_intermediates` is enabled, keeps
+TTL zero, and makes fresh queries with `cache_size = 0`. `Ipv4Only` and
+`Ipv6Only` issue only their selected family. Negative answers are distinguishable
+from SERVFAIL, and a truncated UDP reply retries over TCP on the configured port.
+
+Cancellation drops both the query and its scoped resolver. The TCP peer sees
+EOF, and the runtime returns to its previous background-task count. Keeping a
+resolver alive beyond a canceled job is outside that test's guarantee; scope
+resolver ownership to the bounded job when using this evidence.
+
+These are dependency checks, not evidence of dynamic routing. They do not prove
+address policy, stale deadlines, CNAME limits, scheduler bounds, reload behavior,
+or Linux resource usage. Static upstreams still resolve only at load or reload.
