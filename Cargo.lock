@@ -2629,6 +2629,7 @@ name = "pingclair-l4"
 version = "0.0.0"
 dependencies = [
  "hickory-resolver",
+ "ipnet",
  "pingclair-core",
  "pingclair-runtime",
  "prometheus",

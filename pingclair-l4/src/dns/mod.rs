@@ -3,6 +3,7 @@
 
 //! 🌐 Scoped DNS jobs verified before activating the background coordinator.
 
+mod policy;
 mod resolver;
 mod tasks;
 
