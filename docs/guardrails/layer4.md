@@ -1,6 +1,6 @@
 # 🔌 Layer 4 implementation boundaries
 
-The 0.3 alpha branch routes raw TCP using complete TLS ClientHello metadata
+The 0.3 line on `main` routes raw TCP using complete TLS ClientHello metadata
 and peer addresses. TLS remains end to end. Issue #183 provides background;
 nginx source and tested behavior decide semantics when early issue prose differs.
 

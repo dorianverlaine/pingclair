@@ -51,6 +51,33 @@ fn files_in(directory: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// 📄 Every Markdown file below a directory, at any depth.
+///
+/// 📌 `docs/guardrails/` is where the subsystem documents live, and a
+/// configuration written there is as copyable as one in the README. The
+/// non-recursive listing this replaced read `docs/` only, so every block under
+/// `docs/guardrails/` was unchecked prose.
+fn markdown_files_under(directory: &Path) -> Vec<PathBuf> {
+    fn walk(directory: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "md") {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(directory, &mut found);
+    found.sort();
+    found
+}
+
 /// 📂 Every configuration file below a directory, at any depth.
 ///
 /// Only the names that carry a language: an example's images and prose live
@@ -197,18 +224,22 @@ fn every_documented_configuration_still_compiles() {
                 .is_some_and(|name| name.starts_with("README") && name.ends_with(".md"))
         })
         .collect();
-    documents.extend(files_in(&root.join("docs")).into_iter().filter(|path| {
-        // 🚫 The Caddyfile audit documents are deliberately full of
-        // configs that must NOT compile: every block there is either a
-        // reproduction of a rejected Caddy feature or a red-flag
-        // example. Only the user-facing manual (READMEs plus the
-        // shipped STATUS/GUARDRAILS prose) is covered here.
-        path.extension().is_some_and(|ext| ext == "md")
-            && !path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("CADDYFILE"))
-    }));
+    documents.extend(
+        markdown_files_under(&root.join("docs"))
+            .into_iter()
+            .filter(|path| {
+                // 🚫 The Caddyfile audit documents are deliberately full of
+                // configs that must NOT compile: every block there is either a
+                // reproduction of a rejected Caddy feature or a red-flag
+                // example. Everything else under `docs/` — guardrails and the
+                // index included — is the shipped manual, and is covered.
+                path.extension().is_some_and(|ext| ext == "md")
+                    && !path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("CADDYFILE"))
+            }),
+    );
 
     // Verification
     let mut broken = Vec::new();
