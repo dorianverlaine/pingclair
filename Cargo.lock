@@ -2513,7 +2513,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pingclair"
-version = "0.0.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2557,7 +2557,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-api"
-version = "0.0.0"
+version = "0.2.1"
 dependencies = [
  "arc-swap",
  "boring",
@@ -2577,7 +2577,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-config"
-version = "0.0.0"
+version = "0.2.1"
 dependencies = [
  "http",
  "ipnet",
@@ -2591,7 +2591,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-core"
-version = "0.0.0"
+version = "0.2.1"
 dependencies = [
  "argon2",
  "base64",
@@ -2614,7 +2614,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-fastcgi"
-version = "0.0.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "tokio",
@@ -2623,7 +2623,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-plugin"
-version = "0.0.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "pingclair-core",
@@ -2632,7 +2632,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-proxy"
-version = "0.0.0"
+version = "0.2.1"
 dependencies = [
  "arc-swap",
  "async-recursion",
@@ -2680,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-runtime"
-version = "0.0.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "crossbeam-queue",
@@ -2697,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-static"
-version = "0.0.0"
+version = "0.2.1"
 dependencies = [
  "arc-swap",
  "async-compression",
@@ -2715,7 +2715,7 @@ dependencies = [
 
 [[package]]
 name = "pingclair-tls"
-version = "0.0.0"
+version = "0.2.1"
 dependencies = [
  "arc-swap",
  "async-trait",
