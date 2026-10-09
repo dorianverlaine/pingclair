@@ -22,6 +22,9 @@ mod admin_reload;
 #[path = "integration/metrics_reload.rs"]
 mod metrics_reload;
 
+#[path = "integration/log_channel_reload.rs"]
+mod log_channel_reload;
+
 #[path = "integration/admin_compat.rs"]
 mod admin_compat;
 #[path = "integration/encode.rs"]
