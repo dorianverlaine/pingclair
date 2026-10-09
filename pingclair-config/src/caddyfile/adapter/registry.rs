@@ -142,6 +142,7 @@ pub(super) static GLOBAL_OPTIONS: &[Spec] = &[
     implemented("dns"),
     implemented("dns_refresh"),
     implemented("email"),
+    implemented("expected_underscore_headers"),
     implemented("grace_period"),
     implemented("http_port"),
     implemented("https_port"),

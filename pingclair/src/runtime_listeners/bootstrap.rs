@@ -52,6 +52,14 @@ impl BootstrapRuntime {
                 trusted,
                 false,
                 policy.clone(),
+            )
+            .expecting_underscore_headers(
+                pingclair_core::config::listener_options_for(
+                    &config.global.listener_options,
+                    address,
+                )
+                .and_then(|options| options.expected_underscore_headers.as_deref())
+                .unwrap_or(&config.global.expected_underscore_headers),
             );
             for server in &prepared.servers {
                 proxy.add_server(server.clone());

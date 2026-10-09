@@ -25,6 +25,9 @@ mod admin_reload;
 #[path = "integration/metrics_reload.rs"]
 mod metrics_reload;
 
+#[path = "integration/log_channel_reload.rs"]
+mod log_channel_reload;
+
 #[path = "integration/admin_compat.rs"]
 mod admin_compat;
 #[path = "integration/encode.rs"]
@@ -262,6 +265,10 @@ mod ip_matchers;
 // 🛡️ Which headers may name the client behind a trusted proxy.
 #[path = "integration/client_ip_headers.rs"]
 mod client_ip_headers;
+
+// 🛡️ Which underscore-named fields an origin is allowed to receive.
+#[path = "integration/underscore_headers.rs"]
+mod underscore_headers;
 
 // 🙈 What the admin API's configuration reads show of a configured secret.
 #[path = "integration/admin_secrets.rs"]

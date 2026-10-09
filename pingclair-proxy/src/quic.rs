@@ -675,7 +675,15 @@ struct H3Request {
 /// (§4.4); it is accepted here so the handler can refuse it with 405, and a
 /// `CONNECT` that sends either field is malformed. Extended CONNECT (RFC 9220)
 /// is refused by rejecting `:protocol`: this server never offers it.
+#[cfg(test)]
 fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
+    parse_h3_request_with_policy(list, &crate::header_alias::HeaderAliasPolicy::default())
+}
+
+fn parse_h3_request_with_policy(
+    list: &[quiche::h3::Header],
+    policy: &crate::header_alias::HeaderAliasPolicy,
+) -> Option<H3Request> {
     let mut method = None;
     let mut path = None;
     let mut authority = None;
@@ -732,18 +740,6 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
             b"te" if !h.value().trim_ascii().eq_ignore_ascii_case(b"trailers") => return None,
             _ => {}
         }
-        // 🛡️ An underscore aliases the hyphenated spelling in every CGI
-        // environment (`x_probe` and `x-probe` both become `HTTP_X_PROBE`),
-        // which is the injection the H1/H2 filter refuses before routing.
-        // Same policy, applied at the same point, or one configuration routes
-        // two ways (#269).
-        if crate::http_policy::underscore_named(name) {
-            tracing::debug!(
-                field = %String::from_utf8_lossy(name),
-                "🚫 Dropped an underscore-named request field"
-            );
-            continue;
-        }
         // 🛡️ A name that is not a token, or a value carrying NUL, CR or LF,
         // makes the field invalid and the message malformed (RFC 9114 §4.1.2).
         // Both used to be repaired instead: an unparseable name was dropped and
@@ -754,6 +750,12 @@ fn parse_h3_request(list: &[quiche::h3::Header]) -> Option<H3Request> {
             http::HeaderName::from_bytes(name).ok()?,
             http::HeaderValue::from_bytes(h.value()).ok()?,
         ));
+    }
+
+    // 🛡️ Inspect all occurrences before keeping an allowlisted name: duplicates drop together.
+    let dropped = policy.dropped(headers.iter().map(|(name, _)| name));
+    if !dropped.is_empty() {
+        headers.retain(|(name, _)| !dropped.contains(name));
     }
 
     // 🔌 RFC 9114 §4.4: a `CONNECT` carries only `:method` and `:authority`,
@@ -2013,7 +2015,7 @@ impl H3App {
             return;
         }
 
-        let Some(req) = parse_h3_request(&list) else {
+        let Some(req) = parse_h3_request_with_policy(&list, &self.proxy.header_alias_policy) else {
             tracing::debug!("🚫 H3: malformed request headers on stream {}", stream_id);
             self.reset_malformed_request(qconn, stream_id);
             return;

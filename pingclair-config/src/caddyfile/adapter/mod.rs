@@ -59,6 +59,7 @@ mod route_order;
 mod scoped_middleware;
 mod sites;
 mod tls;
+mod underscore_headers;
 
 pub use ranges::expand_upstream_port_ranges;
 

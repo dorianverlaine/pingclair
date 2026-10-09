@@ -244,9 +244,14 @@ jobs:
           # the full text stays in CHANGELOG.md, linked below.
           notes_file="$(mktemp)"
           git tag --list "$version" --format='%(contents)' | awk '
-            BEGIN { intro = 1 }
-            /^### / { if (intro) print ""; intro = 0; print "- " substr($0, 5); next }
-            intro { print }
+            BEGIN { intro = 1; intro_shown = 0 }
+            /^### / {
+              if (intro && intro_shown) print ""
+              intro = 0
+              print "- " substr($0, 5)
+              next
+            }
+            intro { print; if ($0 != "") intro_shown = 1 }
           ' >"$notes_file"
           printf -- '---\n\nEvery entry in full, with its reasoning and the issue behind it, is in [CHANGELOG.md](%s/%s/blob/%s/CHANGELOG.md).\n' \
             "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_SHA" >>"$notes_file"

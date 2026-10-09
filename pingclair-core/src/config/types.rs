@@ -91,6 +91,9 @@ pub struct PingclairConfig {
 /// in the first case and is overridden in the second.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ListenerOptions {
+    /// 🛡️ Underscore-named request fields this listener preserves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_underscore_headers: Option<Vec<String>>,
     /// 🔌 Whether this listener requires a PROXY protocol header before HTTP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_protocol: Option<bool>,
@@ -224,6 +227,10 @@ pub struct GlobalConfig {
     /// untouched.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_ip_headers: Vec<String>,
+
+    /// 🛡️ Exact names or trailing-star prefixes allowed through the underscore guard.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_underscore_headers: Vec<String>,
 
     /// 🧭 Options an addressed `servers <address> { … }` block set, keyed by
     /// the address the operator wrote.
@@ -489,6 +496,7 @@ impl Default for GlobalConfig {
             blocked_ips: Vec::new(),
             trusted_proxies: Vec::new(),
             client_ip_headers: Vec::new(),
+            expected_underscore_headers: Vec::new(),
             listener_options: BTreeMap::new(),
             upstream_keepalive_pool_size: None,
             http3: true,

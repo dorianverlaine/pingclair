@@ -461,6 +461,10 @@ impl ConfigPublisher for RuntimeListeners {
             })
             .transpose()
             .map_err(|error| ConfigApplyError::invalid(error.to_string()))?;
+        // 🪵 Sites resolve named channels while building their states, including
+        // the first listeners loaded through Admin. Register destinations before
+        // either path builds routes so this generation can actually write to them.
+        pingclair_runtime::access_log::register_channels(&config.logging.channels);
         #[cfg(unix)]
         let bootstrap_listeners = if current.listeners.is_empty() && !next.is_empty() {
             self.bootstrap.prepare(config, &next, &self.tls_manager)?
@@ -536,7 +540,6 @@ impl ConfigPublisher for RuntimeListeners {
                 .insert(listener.address.clone(), listener.policy.clone());
             self.bootstrap.start(listener);
         }
-        pingclair_runtime::access_log::register_channels(&config.logging.channels);
         // 🔁 A reload that adds or removes `metrics` takes effect here, not at
         // the next restart.
         pingclair_proxy::metrics::configure(config.global.metrics);

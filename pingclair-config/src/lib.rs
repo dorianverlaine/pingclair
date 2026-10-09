@@ -36,6 +36,7 @@ mod layer4;
 mod retired_placeholders;
 mod shared_ports;
 mod syntax;
+mod underscore_headers;
 mod upstream_weights;
 
 pub use caddyfile::parser::{
@@ -357,6 +358,7 @@ fn merge_globals(
         blocked_ips,
         trusted_proxies,
         client_ip_headers,
+        expected_underscore_headers,
         listener_options,
         upstream_keepalive_pool_size,
         http3,
@@ -476,6 +478,19 @@ fn merge_globals(
             claims.claim("client_ip_headers", path)?;
         }
         into.client_ip_headers = client_ip_headers;
+    }
+    if !expected_underscore_headers.is_empty() {
+        if !into.expected_underscore_headers.is_empty()
+            && into.expected_underscore_headers != expected_underscore_headers
+        {
+            return Err(FullCompileError::Compile(pingclair_config_compile_error(
+                format!(
+                    "`expected_underscore_headers` is set differently in more than one file (seen again in {})",
+                    path.display()
+                ),
+            )));
+        }
+        into.expected_underscore_headers = expected_underscore_headers;
     }
 
     // 🧭 One listener's options per address, accumulated like the channels in
@@ -2701,7 +2716,8 @@ mod directory_merge_tests {
             "00-globals.caddyfile",
             "{\n    http_port 8080\n    https_port 8443\n    metrics\n\
              \x20   trusted_proxies 10.0.0.0/8\n    dns_refresh 90s\n\
-             \x20   servers {\n        protocols h1 h2\n    }\n}\n",
+             \x20   servers {\n        protocols h1 h2\n\
+             \x20       expected_underscore_headers X_Probe\n    }\n}\n",
         );
         let site = write(
             dir.path(),
@@ -2725,6 +2741,43 @@ mod directory_merge_tests {
         assert!(
             !merged.global.http3,
             "`protocols h1 h2` was dropped, so HTTP/3 stayed on"
+        );
+        assert_eq!(
+            merged.global.expected_underscore_headers,
+            vec!["X_Probe".to_string()],
+            "expected_underscore_headers was dropped"
+        );
+    }
+
+    /// 🛡️ Two files disagreeing about the underscore allowlist are refused,
+    /// the way `client_ip_headers` already is: a silent last-one-wins would
+    /// drop the first file's names without saying so.
+    #[test]
+    fn two_files_disagreeing_about_the_underscore_allowlist_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = write(
+            dir.path(),
+            "00-allowlist.caddyfile",
+            "{\n    servers {\n        expected_underscore_headers X_Probe\n    }\n}\n",
+        );
+        let second = write(
+            dir.path(),
+            "10-allowlist.caddyfile",
+            "{\n    servers {\n        expected_underscore_headers X_Other\n    }\n}\n",
+        );
+        let site = write(
+            dir.path(),
+            "20-site.caddyfile",
+            "http://:9000 {\n    respond \"ok\"\n}\n",
+        );
+
+        let error = compile_multiple_files(&[first, second, site])
+            .expect_err("two allowlists must not merge silently");
+        assert!(
+            error
+                .to_string()
+                .contains("expected_underscore_headers` is set differently"),
+            "unexpected error: {error}"
         );
     }
 

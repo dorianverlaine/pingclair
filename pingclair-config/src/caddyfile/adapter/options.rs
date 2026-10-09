@@ -345,6 +345,9 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 "client_ip_headers" => {
                     global.client_ip_headers = parse_client_ip_headers(&sub.args)?;
                 }
+                "expected_underscore_headers" => {
+                    global.expected_underscore_headers = super::underscore_headers::parse(&sub)?;
+                }
                 // 📡 `dns <provider> [args…]` names the provider used both for
                 // DNS-01 challenges and, upstream, for general resolution. We
                 // only have the first meaning, which is why `acme_dns` below
@@ -667,6 +670,10 @@ pub(super) fn expand_servers_block(
                 "client_ip_headers" => {
                     options.client_ip_headers = Some(parse_client_ip_headers(&child.args)?);
                 }
+                "expected_underscore_headers" => {
+                    options.expected_underscore_headers =
+                        Some(super::underscore_headers::parse(child)?);
+                }
                 // 🚫 Everything else has no meaning for one listener — `admin`,
                 // `email`, `pki`, `storage` are process-wide — or is a setting
                 // this build does not implement at all. Applying it to every
@@ -679,7 +686,7 @@ pub(super) fn expand_servers_block(
                         format!("global: servers {address} {{ {other} }}"),
                         format!(
                             "only `listener_wrappers`, `protocols`, `trusted_proxies`, \
-                             `client_ip_headers` and `metrics` can be set for one listener; `{other}` is process-wide, \
+                             `client_ip_headers`, `expected_underscore_headers` and `metrics` can be set for one listener; `{other}` is process-wide, \
                              so write it without an address (`servers {{ {other} … }}`) to apply \
                              it to every listener"
                         ),
