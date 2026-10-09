@@ -5151,6 +5151,68 @@ http://__PINGCLAIR_TEST_LISTEN__ {{
     upstream_task.await.unwrap();
 }
 
+/// 🐘 A `php_fastcgi` expansion leaves static files to the file server beside
+/// it.
+///
+/// 📌 Every file server in a pipeline used to stand down whenever the pipeline
+/// held *any* reverse proxy, matched or not; `/plain.txt` then fell through to
+/// upstream selection and failed closed with a 502 ("A FastCGI route reached
+/// HTTP upstream selection"). The stand-down is armed by an actual handoff now.
+#[tokio::test]
+async fn test_php_fastcgi_leaves_static_files_to_the_file_server() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("plain.txt"), "static-ok").unwrap();
+    let root = dir.path().display();
+
+    let native_config = format!(
+        r#"
+HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
+    Site(host: "*") {{
+        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
+            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
+        }}
+        Fallback {{
+            PHPFastCGI(to: "unix//tmp/pingclair-no-such-fpm.sock", root: "{root}")
+            ServeFiles(root: "{root}")
+        }}
+    }}
+}}
+"#
+    );
+    let legacy_config = format!(
+        r#"
+http://__PINGCLAIR_TEST_LISTEN__ {{
+    @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+    respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+    root * {root}
+    php_fastcgi unix//tmp/pingclair-no-such-fpm.sock
+    file_server
+}}
+"#
+    );
+    let mut native = TestServer::new_native(&native_config);
+    let mut legacy = TestServer::new_pingclairfile(&legacy_config);
+    assert!(
+        native.wait_until_ready().await,
+        "native server failed to start"
+    );
+    assert!(
+        legacy.wait_until_ready().await,
+        "caddyfile server failed to start"
+    );
+
+    for (label, server) in [("native", &native), ("caddyfile", &legacy)] {
+        let response = no_proxy_client()
+            .get(server.url(0, "/plain.txt"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{label}");
+        assert_eq!(response.text().await.unwrap(), "static-ok", "{label}");
+    }
+}
+
 /// 🗄️ `header_up` takes the same shapes `header_down` does.
 ///
 /// The request half used to know only set and delete — `+Name` reached the

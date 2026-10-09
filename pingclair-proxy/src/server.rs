@@ -6,8 +6,8 @@
 //! 🌐 This module implements the core reverse proxy using Pingora's ProxyHttp trait.
 
 use pingclair_core::config::{
-    AccessControlConfig, CacheConfig, HandlerConfig, ResourceLimitsConfig, RetryConfig,
-    ReverseProxyConfig, ServerConfig,
+    AccessControlConfig, CacheConfig, HandlerConfig, HandlerElement, ResourceLimitsConfig,
+    RetryConfig, ReverseProxyConfig, ServerConfig,
 };
 use pingclair_core::server::{
     CompiledMatcher, MatcherPrecompile, MatcherRequest, MatcherVerdict, RequestAddresses, Router,
@@ -4616,6 +4616,48 @@ impl PingclairProxy {
         evaluate_verdict(compiled, &mut request)
     }
 
+    /// 🧭 Whether this pipeline holds an HTTP reverse proxy that will take the
+    /// request, at any depth.
+    ///
+    /// 📌 Only an HTTP proxy counts. A FastCGI proxy answers here and now, so
+    /// a file server beside it can never shadow one — and when its element
+    /// matcher declines, the file server is exactly what should serve the file
+    /// (that is the `php_fastcgi` + static-files shape). For an HTTP proxy the
+    /// element matcher decides: a matcher-less proxy always takes the request,
+    /// a guarded one only when its matcher matches.
+    fn pipeline_has_matching_http_proxy(
+        &self,
+        handlers: &[HandlerElement],
+        precompile: Option<&MatcherPrecompile>,
+        session: &Session,
+        ctx: &mut RequestContext,
+        path: &str,
+    ) -> bool {
+        for (index, element) in handlers.iter().enumerate() {
+            let node = precompile.and_then(|node| node.children.get(index));
+            match &element.handler {
+                HandlerConfig::ReverseProxy(config) if config.fastcgi.is_none() => {
+                    if matches!(
+                        self.element_matcher_matches(node, session, ctx, path),
+                        MatcherVerdict::Match
+                    ) {
+                        return true;
+                    }
+                }
+                HandlerConfig::Pipeline { handlers }
+                | HandlerConfig::FirstMatch { handlers }
+                | HandlerConfig::HandlePath { handlers, .. }
+                    if self
+                        .pipeline_has_matching_http_proxy(handlers, node, session, ctx, path) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// 🗂️ Runs the `file` matcher for the JSON-only `try_files` handler.
     ///
     /// Returns the URI path to rewrite to, or `None` when no candidate exists.
@@ -5135,14 +5177,11 @@ impl PingclairProxy {
             }
             HandlerConfig::Pipeline { handlers } => {
                 let mut current_path = path.to_string();
-                // 🧭 Caddy's directive order runs `reverse_proxy` before
-                // `file_server`; in Pingclair the proxy executes in the
-                // Pingora phase after local handlers, so a file server in
-                // the same chain must stand down or it would shadow the
-                // proxy for every request.
-                let has_proxy = handlers
-                    .iter()
-                    .any(|element| contains_reverse_proxy(&element.handler));
+                // 🧭 A file server must not shadow a proxy in the same chain:
+                // the proxy runs in Pingora's upstream phase, after local
+                // handlers. The answer is computed at most once per request,
+                // the first time a file server is actually reached.
+                let mut shadowed_by_proxy: Option<bool> = None;
                 for (index, element) in handlers.iter().enumerate() {
                     let handler = &element.handler;
                     let element_precompile = precompile.and_then(|node| node.children.get(index));
@@ -5161,8 +5200,24 @@ impl PingclairProxy {
                             return Ok(true);
                         }
                     }
-                    if has_proxy && matches!(handler, HandlerConfig::FileServer { .. }) {
-                        continue;
+                    if matches!(handler, HandlerConfig::FileServer { .. }) {
+                        let shadowed = match shadowed_by_proxy {
+                            Some(value) => value,
+                            None => {
+                                let value = self.pipeline_has_matching_http_proxy(
+                                    handlers,
+                                    precompile,
+                                    session,
+                                    ctx,
+                                    &current_path,
+                                );
+                                shadowed_by_proxy = Some(value);
+                                value
+                            }
+                        };
+                        if shadowed {
+                            continue;
+                        }
                     }
                     if self
                         .handle_config(
