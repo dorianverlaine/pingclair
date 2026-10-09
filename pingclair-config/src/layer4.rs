@@ -21,6 +21,7 @@ pub(crate) fn validate(config: &PingclairConfig) -> CompileResult<()> {
 }
 
 fn validate_declarations(config: &PingclairConfig) -> CompileResult<()> {
+    crate::layer4_dynamic::validate_pools(config)?;
     let mut http: Vec<String> = config
         .servers
         .iter()
@@ -115,6 +116,7 @@ fn validate_declarations(config: &PingclairConfig) -> CompileResult<()> {
             if route.matches.is_empty() && index + 1 != server.routes.len() {
                 return Err(invalid("layer4 unconditional route must be last"));
             }
+            crate::layer4_dynamic::validate_source(route)?;
             let upstream = &route.upstream;
             let valid = upstream
                 .parse::<SocketAddr>()
@@ -128,7 +130,7 @@ fn validate_declarations(config: &PingclairConfig) -> CompileResult<()> {
                             && port.parse::<u16>().is_ok_and(|p| p != 0)
                     })
                 });
-            if !valid {
+            if route.dynamic.is_none() && !valid {
                 return Err(invalid(format!(
                     "layer4 proxy requires one static host:port, got {upstream}"
                 )));

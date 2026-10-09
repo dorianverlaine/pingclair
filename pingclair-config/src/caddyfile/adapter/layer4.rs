@@ -90,6 +90,7 @@ pub(super) fn adapt(d: &Directive) -> Result<Vec<Layer4Server>> {
                     return Err(unsupported(proxy));
                 }
                 server.routes.push(Layer4Route {
+                    dynamic: None,
                     matches: sets,
                     upstream: expect_one_argument(proxy)?.into(),
                 });

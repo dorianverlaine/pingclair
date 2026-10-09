@@ -29,6 +29,7 @@ fn config(address: SocketAddr) -> Layer4Server {
     let mut config = Layer4Server::new("127.0.0.1:9443".into());
     config.proxy_half_close = true;
     config.routes.push(Layer4Route {
+        dynamic: None,
         matches: vec![Layer4Matcher {
             tls: Some(Layer4TlsMatcher {
                 sni: vec!["EXAMPLE.test".into()],
@@ -74,6 +75,7 @@ async fn plain_input_reaches_only_the_fallback_route() {
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut cfg = config("127.0.0.1:1".parse().unwrap());
     cfg.routes.push(Layer4Route {
+        dynamic: None,
         matches: vec![],
         upstream: origin.local_addr().unwrap().to_string(),
     });
@@ -102,6 +104,7 @@ async fn timeout_and_overflow_do_not_dial_the_fallback() {
         cfg.preread_timeout_ms = 20;
         cfg.preread_buffer_size = 32;
         cfg.routes.push(Layer4Route {
+            dynamic: None,
             matches: vec![],
             upstream: origin.local_addr().unwrap().to_string(),
         });

@@ -46,6 +46,7 @@ fn layer4_adapts_complete_structure_and_round_trips_json() {
         proxy_buffer_size: 32_768,
         routes: vec![
             Layer4Route {
+                dynamic: None,
                 matches: vec![Layer4Matcher {
                     tls: Some(Layer4TlsMatcher {
                         sni: vec!["EXAMPLE.test".into()],
@@ -56,6 +57,7 @@ fn layer4_adapts_complete_structure_and_round_trips_json() {
                 upstream: "backend.example:443".into(),
             },
             Layer4Route {
+                dynamic: None,
                 matches: vec![],
                 upstream: "127.0.0.1:8443".into(),
             },

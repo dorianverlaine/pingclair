@@ -106,6 +106,7 @@ pub(super) fn route(call: &Call) -> Result<Layer4Route, Error> {
     }
     proxy.leaf(L4_PROXY_LABELS)?;
     Ok(Layer4Route {
+        dynamic: None,
         matches,
         upstream: proxy.string("to")?,
     })

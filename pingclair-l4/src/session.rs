@@ -106,6 +106,12 @@ impl PreparedListener {
         let mut routes = Vec::with_capacity(config.routes.len());
         let mut needs_tls = false;
         for route in &config.routes {
+            if route.dynamic.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "dynamic L4 runtime is not connected",
+                ));
+            }
             let upstream = Upstream::prepare(&route.upstream)?;
             let mut matches = Vec::with_capacity(route.matches.len());
             for matcher in &route.matches {

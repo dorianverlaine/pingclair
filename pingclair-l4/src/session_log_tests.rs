@@ -19,6 +19,7 @@ async fn cancellation_logs_once_and_unchanged_destinations_reuse_the_writer() {
         .unwrap(),
     );
     config.routes.push(Layer4Route {
+        dynamic: None,
         upstream: "127.0.0.1:1".into(),
         matches: vec![Layer4Matcher {
             tls: Some(Layer4TlsMatcher::default()),

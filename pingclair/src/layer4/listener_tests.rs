@@ -28,6 +28,7 @@ async fn process_quota_is_shared_and_released_across_listeners() {
             let address = socket.local_addr().unwrap().to_string();
             let mut config = Layer4Server::new(address.clone());
             config.routes.push(Layer4Route {
+                dynamic: None,
                 matches: vec![],
                 upstream: origin.local_addr().unwrap().to_string(),
             });

@@ -47,7 +47,11 @@ pub struct Layer4Route {
     #[serde(default)]
     pub matches: Vec<Layer4Matcher>,
     /// 📍 One static host and port; resolution belongs to provisioning.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub upstream: String,
+    /// 🌐 An opt-in DNS source, mutually exclusive with a static upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic: Option<super::Layer4Dynamic>,
 }
 
 /// 🔎 Conditions within a set are ANDed; values within a condition are ORed.

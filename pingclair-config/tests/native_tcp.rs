@@ -19,6 +19,7 @@ fn tcp_limits_use_the_same_connection_label_as_http() {
     expected.preread_buffer_size = 8192;
     expected.proxy_buffer_size = 32768;
     expected.routes = vec![pingclair_core::config::Layer4Route {
+        dynamic: None,
         matches: vec![],
         upstream: "127.0.0.1:18443".into(),
     }];
