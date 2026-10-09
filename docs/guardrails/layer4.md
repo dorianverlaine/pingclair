@@ -68,7 +68,80 @@ Defaults are `preread_timeout 30s`, `preread_buffer_size 16k`,
 and `proxy_half_close off`. Two buffers bound forwarding memory; the preread
 prefix may retain its configured capacity. Global HTTP listener options do not
 configure these raw TCP services. There is no UDP, TLS termination, PROXY
-protocol, wildcard SNI, weighted balancing or dynamic DNS in this alpha.
+protocol, wildcard SNI or weighted balancing in this alpha.
+
+## 🌐 Explicit dynamic DNS sources
+
+Native TCP routes select exactly one `to:` or `dynamic:` source:
+
+```swift
+TCPListener(on: ":9443") {
+    Route(when: .tls(sni: ["local.example.test"])) {
+        Proxy(to: "127.0.0.1:8443")
+    }
+    Fallback {
+        Proxy(dynamic: .a("backend.example.test", port: 443, versions: .ip,
+            valid: .seconds(30), stale: .seconds(60)))
+    }
+}
+```
+
+The equivalent Caddy-style source is:
+
+```caddyfile
+{
+    layer4 {
+        :9443 {
+            @local tls sni local.example.test
+            route @local {
+                proxy 127.0.0.1:8443
+            }
+            route {
+                proxy {
+                    dynamic a {
+                        name backend.example.test
+                        port 443
+                        versions ip
+                        valid 30s
+                        stale 60s
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+The source requires a fixed ASCII DNS name and nonzero port. `versions` accepts
+`ipv4`, `ipv6` or `ip` (both, the default); native cases have a leading dot.
+Omitting `valid` preserves the minimum answer and CNAME TTL, including zero.
+An explicit positive `valid` overrides freshness. `stale` adds at most 300 seconds
+to that freshness deadline and defaults to 60 seconds; transient errors cannot
+move either deadline. Empty answers, NXDOMAIN, oversized answers and forbidden
+destinations revoke the whole pool. DNS unavailability refuses new connections
+to that route without delaying startup or affecting other routes and live tunnels.
+
+Optional `resolvers` accepts one through four numeric IP or IP:port endpoints
+(port 53 when omitted); otherwise the operating system resolver configuration
+is used without a public fallback.
+DNS jobs bypass search domains and caches. Up to 256 distinct complete source
+policies share one coordinator, with at most eight jobs across active and retired
+generations, one job per pool and at least one second between starts. A job has
+one five-second deadline, at most eight CNAME hops and 64 unique addresses.
+Transient errors back off with bounded jitter. Truncated UDP replies use TCP.
+
+By default, only public destinations are allowed. A nonempty native
+`allowIP: ["10.0.0.0/8"]` or Caddy `allow_ip 10.0.0.0/8` explicitly permits
+listed non-public ranges. Loopback and link-local access require CIDRs confined
+to those classes; a broad CIDR cannot grant them incidentally. Unspecified,
+multicast and known local HTTP, L4 or Admin destinations remain forbidden.
+Wildcard listener policy includes local interface addresses enumerated during
+preparation. Address policy rejects the entire answer if any address is forbidden.
+Changing resolver, lifetime, family or destination policy cannot reuse an old
+snapshot. Failed reload preparation leaves the published configuration intact.
+
+L4 sources support A/AAAA only. HTTP `refresh`, `grace`, `dialTimeout` and SRV
+options are refused here; listener connect timeouts own the dial budget.
 
 
 ## 📊 Connection observability
@@ -209,9 +282,12 @@ EOF, and the runtime returns to its previous background-task count. Keeping a
 resolver alive beyond a canceled job is outside that test's guarantee; scope
 resolver ownership to the bounded job when using this evidence.
 
-These are dependency checks, not evidence of dynamic routing. They do not prove
-address policy, stale deadlines, CNAME limits, scheduler bounds, reload behavior,
-or Linux resource usage. Static upstreams still resolve only at load or reload.
+These dependency checks establish resolver behavior. Separate pool tests cover
+address policy, deadlines, scheduler bounds and cancellation. Real-binary tests
+in `pingclair/tests/integration/layer4_dynamic.rs` cover both DSLs, address updates,
+reload, stale expiry, local route availability and TCP socket cleanup. They do
+not establish Linux resource capacity. Static upstreams still resolve only at
+load or reload.
 
 ## 🌐 Dynamic pool ownership
 

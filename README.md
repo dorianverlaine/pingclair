@@ -37,6 +37,9 @@ L4 admission defaults to 1024 sessions per listener (`max_connections`) and
 a fixed process ceiling of 4096 sessions, including preread and upstream dialing.
 Static hostname pools rotate new connections across resolved addresses, with
 bounded fallback only before TCP establishment.
+Explicit dynamic A/AAAA sources refresh in the background and enforce TTL,
+stale deadlines and destination policy. DNS failure leaves unrelated local routes
+available, and established tunnels keep their connected streams.
 A [native declarative language](docs/guardrails/native-config.md) introduces
 Swift-inspired labels and SwiftUI-inspired TCP components in 0.3 alpha.
 TCP uses `.limits(maxConnections:)`, matching HTTP, and typed source-IP

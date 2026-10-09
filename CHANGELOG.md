@@ -45,6 +45,20 @@ with two seconds per attempt inside the configured total connect timeout.
 Single-address dials retain their configured timeout. Local resource errors
 stop immediately; established TCP sessions are never replayed to another peer.
 
+Explicit DNS sources are available as native
+`Proxy(dynamic: .a("backend.example.test", port: 443))` and Caddy-style
+`proxy { dynamic a { ... } }`. A fixed name and port are required. Optional
+`resolvers`, `versions`, `valid`, `stale` and `allowIP` (`allow_ip` in Caddy)
+configure address families, snapshot lifetime and non-public destination policy.
+Static `to:` addresses keep their load-time resolution behavior.
+
+One process-owned coordinator bounds DNS work across reloads. TTL or `valid`
+sets freshness; `stale` defaults to 60 seconds and cannot exceed 300 seconds.
+Transient failures never extend the hard deadline. Authoritative negatives,
+empty answers and invalid address updates revoke the whole pool for new dials.
+Local routes remain available during DNS failure. Established tunnels retain
+their streams and release the old route generation after connecting.
+
 Global `layer4` blocks can forward TCP by ClientHello SNI/ALPN and peer IP.
 The independent classifier preserves TLS bytes; bounded bidirectional buffers
 preserve backpressure, and `proxy_timeout` measures inactivity. Preread timeout
@@ -52,9 +66,9 @@ or overflow closes the connection without using a fallback. Buffer units follow
 nginx: `16k` is 16,384 bytes. `proxy_half_close on` permits replies after EOF.
 
 Route reloads apply to new connections while existing tunnels keep their
-snapshot. Listener topology and limit changes require restart. TCP tunnels
-participate in graceful shutdown. This alpha supports static upstream addresses;
-UDP, TLS termination, PROXY protocol and dynamic DNS are outside its scope.
+streams. Listener topology and limit changes require restart. TCP tunnels
+participate in graceful shutdown. UDP, TLS termination and PROXY protocol
+are outside this alpha's scope.
 
 Global `metrics` enables `l4_*` connection, traffic, duration and failure metrics
 on the existing scrape endpoint. Labels use configured listeners, route ordinals
