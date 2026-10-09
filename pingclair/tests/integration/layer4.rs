@@ -222,3 +222,6 @@ mod logs;
 
 #[path = "layer4_admission.rs"]
 mod admission;
+
+#[path = "layer4_native.rs"]
+mod native;

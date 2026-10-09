@@ -265,10 +265,10 @@ impl Bindings {
 fn is_condition_fragment(fragment: &Fragment) -> bool {
     matches!(
         fragment,
-        // 🌐 Both families: `.tls(sni:, alpn:)` routes a TCP listener, and the
+        // 🌐 Both families: `.tls(sni:, alpn:)` and `.from([...])` route TCP, and the
         // HTTP conditions are the rest of the list.
         Fragment::Value(Value::Typed(call))
-            if call.name == "tls" || crate::frontend::is_http_condition(&call.name)
+            if matches!(call.name.as_str(), "tls" | "from") || crate::frontend::is_http_condition(&call.name)
     )
 }
 

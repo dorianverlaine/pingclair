@@ -38,19 +38,22 @@ TCPListener(on: ":443") {
         Proxy(to: "fallback.example:443")
     }
 }
-.limits(connections: 1024, preread: .kibibytes(16), relay: .kibibytes(16))
+.limits(maxConnections: 1024, preread: .kibibytes(16), relay: .kibibytes(16))
 .timeouts(preread: .seconds(30), connect: .seconds(5), idle: .minutes(5))
 .halfClose(enabled: true)
 ```
 
 `TCPListener` contains ordered `Route` and `Fallback` components. A `Route`
-takes `when: .tls(sni: [...], alpn: [...])`, `from: ["CIDR", ...]`, or both.
-Conditions combine with AND; values within an array combine with OR. `.tls()`
+takes `when: .tls(sni: [...], alpn: [...])` or `when: .from(["CIDR", ...])`.
+Use `.all([.tls(...), .from([...])])` to require both, and `.any([...])` for
+alternative matcher sets. Each set accepts one TLS and one peer condition;
+repeating a field in `.all` is refused rather than changing AND into OR.
+Expansion is bounded to 4096 matcher sets. Values within a field combine with OR. `.tls()`
 requires a ClientHello without selecting a particular name. Each route contains
 exactly one `Proxy(to: "host:port")`. `Fallback` is unconditional and must come
 last.
 
-L4 listener modifiers are `.limits(connections:, preread:, relay:)`,
+L4 listener modifiers are `.limits(maxConnections:, preread:, relay:)`,
 `.timeouts(preread:, connect:, idle:)` and `.halfClose(enabled:)`. Each modifier
 may appear once, and their order does not change behavior. Defaults and runtime
 behavior remain those in the [L4 guardrail](layer4.md), including static DNS

@@ -42,12 +42,12 @@ fn twin(config: pingclair_core::config::PingclairConfig) -> serde_json::Value {
 const SOURCE: &str = r#"
 // 🧩 Typed components compose into a single validated configuration.
 TCPListener(on: "127.0.0.1:9443") {
-    Route(when: .tls(sni: ["example.test"], alpn: ["h2"]), from: ["127.0.0.0/8"]) {
+    Route(when: .all([.tls(sni: ["example.test"], alpn: ["h2"]), .from(["127.0.0.0/8"])])) {
         Proxy(to: "127.0.0.1:8443")
     }
     Fallback { Proxy(to: "127.0.0.1:8080") }
 }
-.limits(connections: 128, preread: .kibibytes(16), relay: .bytes(1024))
+.limits(maxConnections: 128, preread: .kibibytes(16), relay: .bytes(1024))
 .timeouts(connect: .seconds(5), idle: .minutes(5))
 .halfClose(enabled: true)
 "#;
@@ -90,8 +90,11 @@ fn native_components_lower_to_the_existing_validated_model() {
 fn malformed_or_ambiguous_composition_is_rejected_without_falling_back() {
     for (old, new) in [
         ("TCPListener(on:", "Listener(on:"),
-        ("connections: 128", "connections: 128, connections: 128"),
-        ("connections: 128", "connections: 0"),
+        (
+            "maxConnections: 128",
+            "maxConnections: 128, maxConnections: 128",
+        ),
+        ("maxConnections: 128", "maxConnections: 0"),
         ("connect: .seconds(5)", "connect: 5"),
         ("connect: .seconds(5)", "connect: .kibibytes(5)"),
         (
@@ -120,7 +123,10 @@ fn malformed_or_ambiguous_composition_is_rejected_without_falling_back() {
 
 #[test]
 fn diagnostics_name_the_file_without_echoing_literal_values() {
-    let source = SOURCE.replace("connections: 128", "connections: \"do-not-print-this\"");
+    let source = SOURCE.replace(
+        "maxConnections: 128",
+        "maxConnections: \"do-not-print-this\"",
+    );
     let error = crate::compile_named(&source, Some(std::path::Path::new("edge.pingclair")))
         .unwrap_err()
         .to_string();
@@ -138,7 +144,7 @@ fn diagnostics_name_the_file_without_echoing_literal_values() {
 
 #[test]
 fn adaptation_and_validation_remain_distinct() {
-    let source = SOURCE.replace("connections: 128", "connections: 0");
+    let source = SOURCE.replace("maxConnections: 128", "maxConnections: 0");
     let adapted = crate::adapt(&source).unwrap();
     assert!(crate::compiler::validate_config(&adapted).is_err());
 }
@@ -304,7 +310,7 @@ fn invalid_attributes_fail_closed() {
 fn modifiers_must_follow_the_block() {
     let source = r#"
         TCPListener(on: "127.0.0.1:9443")
-            .limits(connections: 8) {
+            .limits(maxConnections: 8) {
             Fallback { Proxy(to: "127.0.0.1:8080") }
         }
     "#;

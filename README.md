@@ -39,6 +39,8 @@ Static hostname pools rotate new connections across resolved addresses, with
 bounded fallback only before TCP establishment.
 A [native declarative language](docs/guardrails/native-config.md) introduces
 Swift-inspired labels and SwiftUI-inspired TCP components in 0.3 alpha.
+TCP uses `.limits(maxConnections:)`, matching HTTP, and typed source-IP
+conditions such as `Route(when: .from(["10.0.0.0/8"]))`.
 See the [L4 boundaries](docs/guardrails/layer4.md) for syntax and current limits.
 
 ## ✨ Highlights

@@ -383,12 +383,12 @@ mod tests {
         let source = "TCPListener(on: \"127.0.0.1:9443\") {\n\
                       Route(when: .tls(sni: [\"a.test\"])) { Proxy(to: \"127.0.0.1:10001\") }\n\
                       Fallback { Proxy(to: \"127.0.0.1:10002\") }\n\
-                      }.limits(connections: 128)\n";
+                      }.limits(maxConnections: 128)\n";
         let expected = "TCPListener(on: \"127.0.0.1:9443\") {\n\
                         \x20   Route(when: .tls(sni: [\"a.test\"])) { Proxy(to: \"127.0.0.1:10001\") }\n\
                         \x20   Fallback { Proxy(to: \"127.0.0.1:10002\") }\n\
                         }\n\
-                        .limits(connections: 128)\n";
+                        .limits(maxConnections: 128)\n";
         let formatted = format(source).unwrap();
         assert_eq!(formatted, expected);
         assert_eq!(format(&formatted).unwrap(), formatted);

@@ -56,14 +56,14 @@ pub const ENTRIES: &[Entry] = &[
         refusal: r#"TCPListener(on: "127.0.0.1:9443") {
     Unknown { Proxy(to: "127.0.0.1:8080") }
 }"#,
-        labels: crate::frontend::tcp::L4_ROUTE_LABELS,
+        labels: crate::frontend::tcp::TCP_LISTENER_LABELS,
     },
     Entry {
         name: "Route",
         kind: Kind::Component,
-        summary: "A conditional route: L4 takes `when:`/`from:` plus one `Proxy`; HTTP takes a typed `when:` condition.",
+        summary: "A conditional route: L4 takes a typed `when:` condition plus one `Proxy`; HTTP takes a typed `when:` condition.",
         example: r#"TCPListener(on: "127.0.0.1:9443") {
-    Route(when: .tls(sni: ["example.test"]), from: ["127.0.0.0/8"]) {
+    Route(when: .all([.tls(sni: ["example.test"]), .from(["127.0.0.0/8"])])) {
         Proxy(to: "127.0.0.1:8443")
     }
 }"#,
@@ -813,12 +813,12 @@ HTTPListener(on: ":8080") {
         example: r#"TCPListener(on: "127.0.0.1:9443") {
     Fallback { Proxy(to: "127.0.0.1:8080") }
 }
-.limits(connections: 1024, preread: .kibibytes(16), relay: .kibibytes(16))"#,
+.limits(maxConnections: 1024, preread: .kibibytes(16), relay: .kibibytes(16))"#,
         refusal: r#"TCPListener(on: "127.0.0.1:9443") {
     Fallback { Proxy(to: "127.0.0.1:8080") }
 }
-.limits(connections: 0)"#,
-        labels: &[],
+.limits(maxConnections: 0)"#,
+        labels: crate::frontend::tcp::TCP_LIMIT_LABELS,
     },
     Entry {
         name: "timeouts",
@@ -832,7 +832,7 @@ HTTPListener(on: ":8080") {
     Fallback { Proxy(to: "127.0.0.1:8080") }
 }
 .timeouts(connect: 5)"#,
-        labels: &[],
+        labels: crate::frontend::tcp::TCP_TIMEOUT_LABELS,
     },
     Entry {
         name: "halfClose",
@@ -846,7 +846,7 @@ HTTPListener(on: ":8080") {
     Fallback { Proxy(to: "127.0.0.1:8080") }
 }
 .halfClose(enabled: 1)"#,
-        labels: &[],
+        labels: crate::frontend::tcp::TCP_HALF_CLOSE_LABELS,
     },
     Entry {
         name: "Matcher",

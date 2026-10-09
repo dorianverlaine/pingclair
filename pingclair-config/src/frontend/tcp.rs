@@ -15,7 +15,12 @@ use super::*;
 pub(crate) const TCP_LISTENER_LABELS: &[&str] = &["on"];
 
 /// 🏷️ The labels an L4 route accepts (`Fallback` takes none).
-pub(crate) const L4_ROUTE_LABELS: &[&str] = &["when", "from"];
+pub(crate) const L4_ROUTE_LABELS: &[&str] = &["when"];
+
+/// 🏷️ Listener policies share their labels with the language catalogue.
+pub(crate) const TCP_LIMIT_LABELS: &[&str] = &["maxConnections", "preread", "relay"];
+pub(crate) const TCP_TIMEOUT_LABELS: &[&str] = &["preread", "connect", "idle"];
+pub(crate) const TCP_HALF_CLOSE_LABELS: &[&str] = &["enabled"];
 
 /// 🏷️ What an L4 `Proxy` accepts: a destination and nothing else — the
 /// dynamic sources and header policy are HTTP-proxy vocabulary.
@@ -41,9 +46,9 @@ pub(super) fn listener(call: &Call) -> Result<Layer4Server, Error> {
         }
         match child.name.as_str() {
             "limits" => {
-                child.leaf(&["connections", "preread", "relay"])?;
-                if child.get("connections").is_some() {
-                    server.max_connections = usize::try_from(child.integer("connections")?)
+                child.leaf(TCP_LIMIT_LABELS)?;
+                if child.get("maxConnections").is_some() {
+                    server.max_connections = usize::try_from(child.integer("maxConnections")?)
                         .map_err(|_| child.at.error("connection count exceeds platform range"))?;
                 }
                 if child.get("preread").is_some() {
@@ -57,7 +62,7 @@ pub(super) fn listener(call: &Call) -> Result<Layer4Server, Error> {
                 }
             }
             "timeouts" => {
-                child.leaf(&["preread", "connect", "idle"])?;
+                child.leaf(TCP_TIMEOUT_LABELS)?;
                 if child.get("preread").is_some() {
                     server.preread_timeout_ms = child.measure("preread", false)?;
                 }
@@ -69,7 +74,7 @@ pub(super) fn listener(call: &Call) -> Result<Layer4Server, Error> {
                 }
             }
             "halfClose" => {
-                child.leaf(&["enabled"])?;
+                child.leaf(TCP_HALF_CLOSE_LABELS)?;
                 server.proxy_half_close = child.boolean("enabled")?;
             }
             "sessionLog" => server.log = Some(parse_log(child, LogScope::TcpSession)?),
@@ -86,29 +91,11 @@ pub(super) fn route(call: &Call) -> Result<Layer4Route, Error> {
         call.labels(&[])?;
     } else {
         call.labels(L4_ROUTE_LABELS)?;
-        if call.args.is_empty() {
-            return Err(call
-                .at
-                .error("route requires when or from; use Fallback for an unconditional route"));
-        }
-        let mut matcher = Layer4Matcher::default();
-        if let Some(value) = call.get("when") {
-            let Value::Typed(tls) = value else {
-                return Err(call.at.error("when requires .tls(...)"));
-            };
-            if tls.name != "tls" {
-                return Err(tls
-                    .at
-                    .error("unsupported route condition; expected .tls(...)"));
-            }
-            tls.leaf(&["sni", "alpn"])?;
-            matcher.tls = Some(Layer4TlsMatcher {
-                sni: tls.strings("sni")?,
-                alpn: tls.strings("alpn")?,
-            });
-        }
-        matcher.remote_ip = call.strings("from")?;
-        matches.push(matcher);
+        let value = call.get("when").ok_or_else(|| {
+            call.at
+                .error("route requires when; use Fallback for an unconditional route")
+        })?;
+        matches = condition(value, call.at)?;
     }
     let body = call.block()?;
     let [proxy] = body else {
@@ -122,4 +109,108 @@ pub(super) fn route(call: &Call) -> Result<Layer4Route, Error> {
         matches,
         upstream: proxy.string("to")?,
     })
+}
+
+fn condition(value: &Value, at: Position) -> Result<Vec<Layer4Matcher>, Error> {
+    let Value::Typed(call) = value else {
+        return Err(
+            at.error("TCP when requires .tls(...), .from([...]), .all([...]) or .any([...])")
+        );
+    };
+    call.no_modifiers()?;
+    if call.body.is_some() {
+        return Err(call.at.error("a condition does not accept a block"));
+    }
+    match call.name.as_str() {
+        "tls" => {
+            call.leaf(&["sni", "alpn"])?;
+            Ok(vec![Layer4Matcher {
+                tls: Some(Layer4TlsMatcher {
+                    sni: call.strings("sni")?,
+                    alpn: call.strings("alpn")?,
+                }),
+                ..Default::default()
+            }])
+        }
+        "from" => {
+            let [(None, Value::Array(values))] = call.args.as_slice() else {
+                return Err(call
+                    .at
+                    .error("from requires one nonempty array of IP addresses or CIDRs"));
+            };
+            if values.is_empty() {
+                return Err(call
+                    .at
+                    .error("from requires at least one IP address or CIDR"));
+            }
+            let remote_ip = values
+                .iter()
+                .map(|value| match value {
+                    Value::String(value) => Ok(value.clone()),
+                    _ => Err(call.at.error("from requires IP address or CIDR strings")),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(vec![Layer4Matcher {
+                remote_ip,
+                ..Default::default()
+            }])
+        }
+        "all" | "any" => {
+            let [(None, Value::Array(values))] = call.args.as_slice() else {
+                return Err(call
+                    .at
+                    .error("all and any require one nonempty array of conditions"));
+            };
+            if values.is_empty() {
+                return Err(call.at.error("all and any require at least one condition"));
+            }
+            let mut result = if call.name == "all" {
+                vec![Layer4Matcher::default()]
+            } else {
+                Vec::new()
+            };
+            for value in values {
+                let alternatives = condition(value, call.at)?;
+                if call.name == "any" {
+                    if result.len() + alternatives.len() > 4096 {
+                        return Err(call
+                            .at
+                            .error("TCP condition expansion exceeds 4096 matcher sets"));
+                    }
+                    result.extend(alternatives);
+                } else {
+                    if result.len().saturating_mul(alternatives.len()) > 4096 {
+                        return Err(call
+                            .at
+                            .error("TCP condition expansion exceeds 4096 matcher sets"));
+                    }
+                    let mut combined = Vec::new();
+                    for left in &result {
+                        for right in &alternatives {
+                            // 🛡️ The shared schema has one TLS and one peer condition per set.
+                            // Repeated fields cannot be concatenated: that would turn AND into OR.
+                            if (left.tls.is_some() && right.tls.is_some())
+                                || (!left.remote_ip.is_empty() && !right.remote_ip.is_empty())
+                            {
+                                return Err(call.at.error("a TCP all condition accepts one tls and one from condition per matcher set"));
+                            }
+                            combined.push(Layer4Matcher {
+                                tls: left.tls.clone().or_else(|| right.tls.clone()),
+                                remote_ip: if left.remote_ip.is_empty() {
+                                    right.remote_ip.clone()
+                                } else {
+                                    left.remote_ip.clone()
+                                },
+                            });
+                        }
+                    }
+                    result = combined;
+                }
+            }
+            Ok(result)
+        }
+        _ => Err(call
+            .at
+            .error("unsupported TCP condition; expected .tls, .from, .all or .any")),
+    }
 }

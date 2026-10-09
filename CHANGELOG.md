@@ -26,6 +26,12 @@ expansion. Existing Caddy-style files remain supported during migration. Admin
 accepts `text/pingclair`; `fmt` formats native files with comments preserved,
 and `describe` prints the component table.
 
+TCP limits now use `.limits(maxConnections:)`, the same label as HTTP.
+Source-IP routes use `when: .from([...])`; `.all` combines TLS and source IP,
+and `.any` selects alternative matcher sets. The alpha spellings `connections:`
+and route-level `from:` are refused. `describe TCPListener` now reports `on:`;
+TCP policy modifiers report their parser's argument labels.
+
 ### 🔌 Layer 4 TCP routing for 0.3 alpha
 
 L4 listeners now enforce `max_connections` (default 1024, range 1–4096),
