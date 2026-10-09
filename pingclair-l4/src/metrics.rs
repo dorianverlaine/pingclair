@@ -16,6 +16,7 @@ struct Collectors {
     active: IntGaugeVec,
     preread: IntCounterVec,
     connect: IntCounterVec,
+    attempts: IntCounterVec,
     bytes: IntCounterVec,
     duration: HistogramVec,
 }
@@ -49,8 +50,13 @@ static COLLECTORS: LazyLock<Collectors> = LazyLock::new(|| {
         ),
         connect: counters(
             "l4_upstream_connect_failures_total",
-            "Failed upstream connection attempts per session.",
+            "TCP sessions ending in an upstream connection failure.",
             &["listener", "reason"],
+        ),
+        attempts: counters(
+            "l4_upstream_connect_attempts_total",
+            "TCP connection attempts, including address fallback, by configured route.",
+            &["listener", "route"],
         ),
         bytes: counters(
             "l4_bytes_total",
@@ -73,6 +79,7 @@ static COLLECTORS: LazyLock<Collectors> = LazyLock::new(|| {
         Box::new(collectors.rejected.clone()),
         Box::new(collectors.preread.clone()),
         Box::new(collectors.connect.clone()),
+        Box::new(collectors.attempts.clone()),
         Box::new(collectors.bytes.clone()),
         Box::new(collectors.duration.clone()),
     ] {
@@ -93,6 +100,7 @@ pub(crate) struct Metrics {
     pub declined: IntCounter,
     preread: [IntCounter; 3],
     connect: [IntCounter; 2],
+    attempts: Vec<IntCounter>,
 }
 
 impl Metrics {
@@ -123,7 +131,17 @@ impl Metrics {
                 .map(|reason| c.preread.with_label_values(&[listener, reason])),
             connect: ["timeout", "io_error"]
                 .map(|reason| c.connect.with_label_values(&[listener, reason])),
+            attempts: (1..=routes)
+                .map(|route| {
+                    c.attempts
+                        .with_label_values(&[listener, &route.to_string()])
+                })
+                .collect(),
         }
+    }
+
+    pub fn attempts(&self, route: usize) -> &IntCounter {
+        &self.attempts[route]
     }
 
     pub fn finish(&self, route: Option<usize>, outcome: Outcome, seconds: f64) {

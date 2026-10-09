@@ -7,7 +7,6 @@ use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout_at};
 
 pub(crate) struct Upstream {
@@ -50,11 +49,7 @@ impl Upstream {
     }
 
     /// 🔌 Returns at TCP establishment; relay errors never re-enter address selection.
-    pub async fn connect(&self, budget: Duration) -> io::Result<TcpStream> {
-        self.connect_with(budget, TcpStream::connect).await
-    }
-
-    async fn connect_with<F, Fut, T>(&self, budget: Duration, dial: F) -> io::Result<T>
+    pub(crate) async fn connect_with<F, Fut, T>(&self, budget: Duration, dial: F) -> io::Result<T>
     where
         F: FnMut(SocketAddr) -> Fut,
         Fut: Future<Output = io::Result<T>>,

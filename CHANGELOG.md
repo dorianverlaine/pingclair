@@ -58,6 +58,11 @@ Transient failures never extend the hard deadline. Authoritative negatives,
 empty answers and invalid address updates revoke the whole pool for new dials.
 Local routes remain available during DNS failure. Established tunnels retain
 their streams and release the old route generation after connecting.
+DNS refresh reasons and pool availability are exposed through the existing
+metrics endpoint. Availability expires at the hard deadline without client
+traffic. A separate upstream-attempt counter includes pre-connect address
+fallback; unreachable pools do not count as socket attempts. All new labels
+use configured listener addresses, route ordinals and fixed reasons.
 
 Global `layer4` blocks can forward TCP by ClientHello SNI/ALPN and peer IP.
 The independent classifier preserves TLS bytes; bounded bidirectional buffers

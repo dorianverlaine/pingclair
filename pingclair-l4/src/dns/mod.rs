@@ -3,6 +3,7 @@
 
 //! 🌐 Immutable address snapshots and one bounded DNS coordinator across reloads.
 
+mod metrics;
 mod policy;
 mod resolver;
 mod tasks;
@@ -94,12 +95,7 @@ impl Pool {
 pub(crate) struct Source(Arc<Pool>);
 
 impl Source {
-    pub async fn connect(&self, budget: Duration) -> io::Result<tokio::net::TcpStream> {
-        self.connect_with(budget, tokio::net::TcpStream::connect)
-            .await
-    }
-
-    async fn connect_with<F, Fut, T>(&self, budget: Duration, dial: F) -> io::Result<T>
+    pub(crate) async fn connect_with<F, Fut, T>(&self, budget: Duration, dial: F) -> io::Result<T>
     where
         F: FnMut(SocketAddr) -> Fut,
         Fut: Future<Output = io::Result<T>>,
@@ -127,9 +123,15 @@ pub struct DnsPreparation {
     previous: Arc<Vec<Arc<Pool>>>,
     pools: Vec<Arc<Pool>>,
     own: Vec<SocketAddr>,
+    observers: Vec<metrics::Binding>,
 }
 
 impl DnsPreparation {
+    pub(crate) fn observe(&mut self, source: &Source, listener: &str, route: usize) {
+        self.observers
+            .push(metrics::Binding::prepare(source.0.clone(), listener, route));
+    }
+
     pub(crate) fn source(&mut self, config: &Layer4Dns) -> io::Result<Source> {
         if let Some(pool) = self.pools.iter().find(|pool| pool.config == *config) {
             return Ok(Source(pool.clone()));
@@ -173,6 +175,7 @@ pub struct DnsRuntime {
     changed: Notify,
     started: AtomicBool,
     publication: Mutex<()>,
+    observers: ArcSwap<Vec<metrics::Binding>>,
 }
 
 impl DnsRuntime {
@@ -187,12 +190,14 @@ impl DnsRuntime {
             previous: self.active.load_full(),
             pools: Vec::new(),
             own,
+            observers: Vec::new(),
         }
     }
 
     /// ♻️ Activates a validated draft and immediately revokes removed pools.
     pub fn publish(&self, next: DnsPreparation) {
         let _publication = self.publication.lock().expect("DNS publication");
+        let observers = next.observers;
         let next = Arc::new(next.pools);
         let previous = self.active.swap(next.clone());
         for pool in previous
@@ -200,11 +205,21 @@ impl DnsRuntime {
             .filter(|pool| !next.iter().any(|new| Arc::ptr_eq(pool, new)))
         {
             pool.revoke();
-            if let Some(cancel) = pool.cancel.lock().expect("DNS job cancellation").as_ref() {
-                let _ = cancel.send(true);
-            }
+            self.cancel(pool);
+        }
+        for binding in self.observers.swap(Arc::new(observers)).iter() {
+            binding.clear();
         }
         self.changed.notify_one();
+    }
+
+    fn cancel(&self, pool: &Arc<Pool>) {
+        if let Some(cancel) = pool.cancel.lock().expect("DNS job cancellation").as_ref()
+            && !*cancel.borrow()
+        {
+            self.record_refresh(pool, Err(Failure::Cancelled));
+            let _ = cancel.send(true);
+        }
     }
 
     /// 🧹 Stops scheduling on shutdown and joins every retired DNS transport worker.

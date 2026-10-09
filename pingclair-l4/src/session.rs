@@ -10,6 +10,7 @@ use crate::upstream::Upstream;
 use crate::{Classification, ClientHello, RelayOptions, classify, relay};
 use pingclair_core::config::{IpRanges, Layer4Dynamic, Layer4Server, Layer4TlsMatcher};
 use pingclair_runtime::access_log::AccessLogger;
+use prometheus::IntCounter;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -55,10 +56,20 @@ enum Destination {
 }
 
 impl Destination {
-    async fn connect(&self, budget: Duration) -> io::Result<tokio::net::TcpStream> {
+    async fn connect(
+        &self,
+        budget: Duration,
+        attempts: Option<&IntCounter>,
+    ) -> io::Result<tokio::net::TcpStream> {
+        let dial = |address| {
+            if let Some(attempts) = attempts {
+                attempts.inc();
+            }
+            tokio::net::TcpStream::connect(address)
+        };
         match self {
-            Self::Static(upstream) => upstream.connect(budget).await,
-            Self::Dynamic(source) => source.connect(budget).await,
+            Self::Static(upstream) => upstream.connect_with(budget, dial).await,
+            Self::Dynamic(source) => source.connect_with(budget, dial).await,
         }
     }
 }
@@ -143,7 +154,8 @@ impl PreparedListener {
         }
         let mut routes = Vec::with_capacity(config.routes.len());
         let mut needs_tls = false;
-        for route in &config.routes {
+        let listener = pingclair_core::config::normalize_listen_addr(&config.listen);
+        for (index, route) in config.routes.iter().enumerate() {
             let upstream = match (&route.dynamic, route.upstream.is_empty()) {
                 (None, false) => Destination::Static(Upstream::prepare(&route.upstream)?),
                 (Some(Layer4Dynamic::A(config)), true) => {
@@ -153,7 +165,9 @@ impl PreparedListener {
                             "dynamic L4 requires the DNS coordinator",
                         )
                     })?;
-                    Destination::Dynamic(dns.source(config)?)
+                    let source = dns.source(config)?;
+                    dns.observe(&source, &listener, index);
+                    Destination::Dynamic(source)
                 }
                 (None, true) | (Some(_), false) => {
                     return Err(io::Error::new(
@@ -172,7 +186,6 @@ impl PreparedListener {
             }
             routes.push(Route { matches, upstream });
         }
-        let listener = pingclair_core::config::normalize_listen_addr(&config.listen);
         let logger = match previous.filter(|previous| previous.log_config == config.log) {
             Some(previous) => previous.policy.logger.clone(),
             None => AccessLogger::from_config(config.log.as_ref())?
@@ -321,7 +334,11 @@ impl PreparedListener {
         observation.route = Some(index);
         observation.phase = Phase::Connect;
         let connect_started = LOG.then(Instant::now);
-        let upstream = route.upstream.connect(self.connect_timeout).await?;
+        let attempts = observation.metrics.map(|metrics| metrics.attempts(index));
+        let upstream = route
+            .upstream
+            .connect(self.connect_timeout, attempts)
+            .await?;
         observation.connect_time = connect_started.map(|started| started.elapsed());
         observation.upstream_addr = Some(upstream.peer_addr()?);
         upstream.set_nodelay(true)?;

@@ -3,7 +3,7 @@
 
 //! 🌐 A single fair scheduler retains retired jobs until their transport tasks drain.
 
-use super::{DnsRuntime, Failure, Pool};
+use super::{DnsRuntime, Failure, Pool, metrics::reason};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -35,7 +35,11 @@ impl Entry {
         }
     }
 
-    fn finish(&mut self, result: Result<super::Answer, Failure>, jitter: &mut u64) {
+    fn finish(
+        &mut self,
+        result: Result<super::Answer, Failure>,
+        jitter: &mut u64,
+    ) -> Result<(), Failure> {
         self.cancel = None;
         let result = self.pool.apply(result);
         let now = Instant::now();
@@ -76,18 +80,7 @@ impl Entry {
             self.logged = Some(now);
         }
         self.state = Some(result);
-    }
-}
-
-fn reason(result: Result<(), Failure>) -> &'static str {
-    match result {
-        Ok(()) => "available",
-        Err(Failure::Empty) => "empty",
-        Err(Failure::NxDomain) => "nxdomain",
-        Err(Failure::Transient) => "transient",
-        Err(Failure::Timeout) => "timeout",
-        Err(Failure::Invalid) => "invalid",
-        Err(Failure::Cancelled) => "cancelled",
+        result
     }
 }
 
@@ -98,9 +91,10 @@ impl Drop for Shutdown<'_> {
         let _publication = self.0.publication.lock().expect("DNS publication");
         for pool in self.0.active.load().iter() {
             pool.revoke();
-            if let Some(cancel) = pool.cancel.lock().expect("DNS job cancellation").as_ref() {
-                let _ = cancel.send(true);
-            }
+            self.0.cancel(pool);
+        }
+        for binding in self.0.observers.load().iter() {
+            binding.clear();
         }
     }
 }
@@ -130,6 +124,7 @@ pub(super) async fn run(runtime: &DnsRuntime, stop: impl Future<Output = ()> + S
             }
             active = next;
         }
+        let metrics_deadline = runtime.metrics_deadline();
         let now = Instant::now();
         for offset in 0..entries.len() {
             let index = (cursor + offset) % entries.len();
@@ -171,6 +166,7 @@ pub(super) async fn run(runtime: &DnsRuntime, stop: impl Future<Output = ()> + S
         } else {
             now + Duration::from_secs(3600)
         };
+        let wake = metrics_deadline.map_or(wake, |deadline| wake.min(deadline));
         tokio::select! {
             biased;
             _ = &mut stop => break,
@@ -183,7 +179,8 @@ pub(super) async fn run(runtime: &DnsRuntime, stop: impl Future<Output = ()> + S
                         if let Some(entry) = entries.iter_mut().find(|entry| Arc::ptr_eq(&pool, &entry.pool)) {
                             // ♻️ Publication may precede this completion event; check the current generation.
                             if runtime.active.load().iter().any(|active| Arc::ptr_eq(active, &pool)) {
-                                entry.finish(result, &mut jitter);
+                                let result = entry.finish(result, &mut jitter);
+                                runtime.record_refresh(&pool, result);
                             }
                         }
                     }

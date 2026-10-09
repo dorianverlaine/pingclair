@@ -58,6 +58,14 @@ async fn live_bytes_and_active_sessions_are_visible_before_eof() {
         assert_eq!(
             value(
                 &live,
+                "l4_upstream_connect_attempts_total",
+                &["route=\"1\""]
+            ),
+            1.0
+        );
+        assert_eq!(
+            value(
+                &live,
                 "l4_bytes_total",
                 &["direction=\"client_to_upstream\""]
             ),

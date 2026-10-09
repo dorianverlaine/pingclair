@@ -120,7 +120,10 @@ async fn real_tcp_connections_rotate_and_return_the_selected_stream() {
     let peers = [first, second];
     let mut selected = Vec::new();
     for _ in 0..2 {
-        let mut client = pool.connect(Duration::from_secs(2)).await.unwrap();
+        let mut client = pool
+            .connect_with(Duration::from_secs(2), tokio::net::TcpStream::connect)
+            .await
+            .unwrap();
         let address = client.peer_addr().unwrap();
         selected.push(address);
         let peer = peers
@@ -160,7 +163,10 @@ async fn unavailable_socket_falls_back_to_a_live_origin() {
         Ordering::Relaxed,
     );
     // 🧪 A bound socket without listen can time out instead of refusing on macOS.
-    let client = pool.connect(Duration::from_secs(5)).await.unwrap();
+    let client = pool
+        .connect_with(Duration::from_secs(5), tokio::net::TcpStream::connect)
+        .await
+        .unwrap();
     assert_eq!(client.peer_addr().unwrap(), ready);
     let _accepted = origin.accept().await.unwrap();
 }

@@ -191,12 +191,26 @@ so changing what a route ordinal means does not reset its accumulated values.
 | `l4_connection_duration_seconds` | None | Session lifetime histogram, including preread and connect |
 | `l4_preread_failures_total` | `reason` | Timeout, overflow, I/O error or declined TLS-shaped input |
 | `l4_upstream_connect_failures_total` | `reason` | Failed session dials, classified as timeout or I/O error |
+| `l4_upstream_connect_attempts_total` | `route` | Address attempts started by static or dynamic routes, including fallback |
+| `l4_dns_refreshes_total` | `route`, `reason` | Completed or retired DNS jobs observed by that route |
+| `l4_dns_pool_available` | `route` | A usable DNS snapshot exists before its hard deadline |
 
 Every family also has a `listener` label. Byte directions are
 `client_to_upstream` and `upstream_to_client`; replayed preread bytes count once,
 when written upstream. `declined_tls` is a diagnostic, not necessarily a rejected
 connection: unsupported or malformed TLS-shaped input may still use a non-TLS
 route. It does not claim that every declined input is malformed.
+
+DNS refresh reasons are `available`, `empty`, `nxdomain`, `transient`, `timeout`,
+`invalid` and `cancelled`. Identical full source policies may share a DNS job;
+each configured route observes its result. `available` means a valid answer was
+published, while a transient failure may leave a stale snapshot usable. The
+availability gauge expires without client traffic and becomes zero when its
+source is removed or shutdown begins. Preparing a failed reload cannot clear
+the published gauge. DNS names, resolved addresses and generations are never
+labels. Counters follow the collection switch; availability represents current
+published state. Removed route series remain at zero availability, with their
+process-lifetime counter history preserved.
 
 Access logging is off unless the listener declares `log`. Bare `log` uses text
 on stdout; a block uses the existing output, format, field deletion, sampling
