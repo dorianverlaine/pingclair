@@ -14,6 +14,20 @@ fact.
 
 ## [Unreleased]
 
+### 🛣️ A `handle_path` beside a bare `handle` answers the requests it matches
+
+`handle_path` ranked one directive after `handle`, so any `handle` beside it
+ran first — and a bare `handle` is the site's fallback, which shadows
+everything below it. A `handle_path /duplex/*` next to `handle { … }` never
+matched a single request: the fallback answered them all. The reference sorts
+both kinds of route group together by matcher specificity, and the two
+directives differ only in whether the matched prefix is stripped, so
+`handle_path` now ranks as `handle` and the specific route wins on path length
+as usual. Found while migrating a CUPS front door off nginx, whose config had
+to be written as `handle` + `uri strip_prefix` to work at all.
+
+## [0.2.0]
+
 📦 0.2.0 covers every change since `v0.1.7`, including the three release
 candidates (`0.2.0-rc.1` on 2026-08-20, `0.2.0-rc.2` on 2026-09-19,
 `0.2.0-rc.3`).
