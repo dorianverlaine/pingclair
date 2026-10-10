@@ -79,13 +79,29 @@ pub async fn tcp_query(stream: &mut TcpStream) -> Message {
     Message::from_vec(&wire).unwrap()
 }
 
+/// 🧷 A fixture that answers over UDP **and** holds the TCP side of the same
+/// address, which is what the truncated-answer path needs.
+///
+/// 📌 The port is whatever the UDP socket's ephemeral assignment returned, and
+/// the TCP bind can lose it to another process in between: `EADDRINUSE` on a
+/// loaded CI runner, observed on 2026-10-10 in the aarch64 shard. Retrying the
+/// pair is the fix — the collision is per attempt, the property under test (one
+/// address, both transports) is unchanged, and five attempts make the race
+/// negligible. A failure that is not a lost port still panics at once, so a
+/// real defect is not hidden behind the retry.
 pub async fn truncated_dns() -> (Dns, TcpListener) {
-    let dns = Dns::new(|query| {
-        let mut reply = response(query);
-        reply.metadata.truncation = true;
-        reply
-    })
-    .await;
-    let tcp = TcpListener::bind(dns.address).await.unwrap();
-    (dns, tcp)
+    for _ in 0..5 {
+        let dns = Dns::new(|query| {
+            let mut reply = response(query);
+            reply.metadata.truncation = true;
+            reply
+        })
+        .await;
+        match TcpListener::bind(dns.address).await {
+            Ok(tcp) => return (dns, tcp),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("TCP side of the DNS fixture: {error}"),
+        }
+    }
+    panic!("the UDP-assigned port stayed taken across five attempts");
 }
