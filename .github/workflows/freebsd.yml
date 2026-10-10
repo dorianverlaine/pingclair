@@ -16,7 +16,7 @@ on:
         options:
           - debug
           - release
-        default: debug
+        default: release
         required: false
 
 permissions:
@@ -106,7 +106,12 @@ jobs:
             "${BIN}" run examples/basic.pingclair > /tmp/pingclair-smoke.log 2>&1 &
             SERVER_PID=$!
             TRIES=0
-            until curl -fsS -H 'Host: example.test' http://127.0.0.1:8080/ -o /tmp/pingclair-body; do
+            # 🌐 `:8080` resolves to the IPv6 wildcard, and FreeBSD keeps such
+            # a socket IPv6-only by default (`net.inet6.ip6.v6only=1`) where
+            # Linux and macOS map IPv4 into it; `::1` reaches the listener on
+            # every platform, so the smoke test asks the socket, not the
+            # platform's default.
+            until curl -fsS -H 'Host: example.test' 'http://[::1]:8080/' -o /tmp/pingclair-body; do
               TRIES=$((TRIES + 1))
               if [ "${TRIES}" -gt 30 ]; then
                 echo "🚫 The server never answered; its log follows"
