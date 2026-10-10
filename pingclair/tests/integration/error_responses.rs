@@ -223,11 +223,10 @@ async fn test_431_names_the_single_field_that_is_too_large() {
 ///
 /// `max_header_bytes` bounds the whole head. The request line is read before
 /// any field, and asking a client to shrink a field it never sent would be a
-/// lie — nginx answers `414` for a request line its buffer cannot hold
-/// (`large_client_header_buffers`), and RFC 9112 §3 points at the same status
-/// for a request-target longer than the server will parse. Before this the
-/// line was counted by nothing (#326), so a 256 KiB URI was admitted with
-/// `200` while the option reported nothing.
+/// lie — RFC 9112 §3 points at `414` for a request-target longer than the
+/// server will parse, and the recorded reference reading bounds the line the
+/// same way. Before this the line was counted by nothing (#326), so a 256 KiB
+/// URI was admitted with `200` while the option reported nothing.
 #[tokio::test]
 async fn test_414_when_the_request_line_alone_exceeds_the_head_budget() {
     let mut server = TestServer::new_pingclairfile(&header_limited_site(""));

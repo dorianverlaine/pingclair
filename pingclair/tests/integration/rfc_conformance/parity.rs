@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-//! 🤝 Cross-server parity: properties wanted because another server has them,
-//! not because a clause of an RFC demands them.
+//! 🤝 Cross-server parity: properties wanted because a reference implementation
+//! has them, not because a clause of an RFC demands them.
 //!
-//! They live in this tree deliberately: a difference from the semantic
-//! reference (nginx, per `docs/guardrails/config.md`) is a finding — just a
+//! They live in this tree deliberately: a difference from the recorded
+//! reference reading (`docs/guardrails/config.md`) is a finding — just a
 //! lower-priority one than a protocol violation — and a test is the cheapest
-//! way to record that it was seen rather than missed. Each doc comment says
-//! which server the expectation below was measured against; the ones recorded
-//! while Caddy was the reference are re-based one at a time, and say so until
-//! they are.
+//! way to record that it was seen rather than missed. Each doc comment says what
+//! this build does; the readings and measurements behind the expectations are
+//! recorded in the engineering memory repository.
 
 use super::{ScriptedUpstream, TestServer, raw_http1, site};
 use crate::{no_proxy_client, read_until_marker};
@@ -19,14 +18,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// 🧩 An unknown `{placeholder}` is left as written.
 ///
-/// Caddy's replacer keeps a name it does not know, which is why a body
-/// containing literal braces — JSON, JavaScript, documentation — survives it.
-/// Replacing the unknown name with nothing is the one answer that silently
-/// changes content the operator wrote.
+/// A body containing literal braces — JSON, JavaScript, documentation — must
+/// survive, and replacing the unknown name with nothing is the one answer that
+/// silently changes content the operator wrote.
 ///
-/// 📌 This is the **frozen Caddyfile dialect's** replacer rule, not a decision
-/// about new surface: the native language has no interpolation in literals
-/// (`Format` carries dynamic values), so nothing here constrains it.
+/// 📌 This is the **frozen compatibility dialect's** replacer rule, not a
+/// decision about new surface: the native language has no interpolation in
+/// literals (`Format` carries dynamic values), so nothing here constrains it.
 #[tokio::test]
 async fn test_unknown_placeholder_is_preserved() {
     let mut server = TestServer::new_pingclairfile(&site(r#"respond "open {brace} close""#));
@@ -49,14 +47,12 @@ async fn test_unknown_placeholder_is_preserved() {
 /// 🗜️ A ranged request for a precompressed file ranges over the compressed
 /// representation.
 ///
-/// Caddy answers `206` with `Content-Encoding: gzip` and a `Content-Range` over
-/// the sidecar's length, so the representation a client negotiated is the one it
-/// ranges over. The first version of this comment claimed nginx does the
-/// opposite; a measurement against 1.31.6 refuted it — `gzip_static on` answers
-/// `206`, `Content-Encoding: gzip`, `Content-Range: bytes 0-9/56` over a 56-byte
-/// sidecar — and the source says the same thing:
-/// `ngx_http_gzip_static_module.c:250` sets `r->allow_ranges = 1` on the sidecar
-/// it serves. Both references do what this test pins.
+/// This build answers `206` with `Content-Encoding: gzip` and a `Content-Range`
+/// over the sidecar's length, so the representation a client negotiated is the
+/// one it ranges over; the recorded reference reading does the same, and both
+/// the measurement and the source line behind that claim live in the memory
+/// repository (the first version of this comment asserted the opposite and was
+/// wrong).
 #[tokio::test]
 async fn test_precompressed_range_uses_the_compressed_representation() {
     use std::io::Write;
@@ -96,9 +92,9 @@ async fn test_precompressed_range_uses_the_compressed_representation() {
 
 /// 🌊 A response with a known length still leaves the proxy as it is produced.
 ///
-/// Caddy and nginx both stream a body whose length is declared; this check asks
-/// the same of Pingclair, because a bounded event stream that declares its length
-/// is otherwise silent until it ends. The origin here writes one event, waits,
+/// A body whose length is declared must still leave the proxy as it is
+/// produced; this check asks that of Pingclair, because a bounded event stream
+/// that declares its length is otherwise silent until it ends. The origin here writes one event, waits,
 /// then writes a second, and the assertion is about the first event's *arrival*
 /// rather than the response's contents.
 #[tokio::test]
@@ -155,14 +151,13 @@ async fn test_known_length_body_arrives_before_it_ends() {
 
 /// 🧯 A truncated upstream still answers an HTTP/2 client.
 ///
-/// Caddy's fix for this (caddyserver/caddy#7845) passes along the response head
-/// it already formed; a stream reset with no status at all leaves the client —
-/// and the operator reading the access log — with nothing to act on.
+/// The response head the proxy already formed is passed along; a stream reset
+/// with no status at all leaves the client — and the operator reading the access
+/// log — with nothing to act on.
 ///
-/// ⏳ Re-base owed: measured against Caddy so far. nginx's h2 side of this —
-/// whether the status reaches the client before the stream is reset — has not
-/// been compared yet; the differential harness in `pingclair-tests` is where
-/// that measurement belongs.
+/// ⏳ The h2 side of this has not been compared against the recorded reading
+/// yet; the differential harness in `pingclair-tests` is where that measurement
+/// belongs.
 #[tokio::test]
 async fn test_truncated_upstream_answers_an_h2_client() {
     let upstream = ScriptedUpstream::start(
@@ -215,13 +210,9 @@ async fn test_truncated_upstream_answers_an_h2_client() {
 /// immediate flushing drops the length so each chunk leaves as it is written
 /// (#247), and a response whose head declares neither `Content-Length` nor
 /// `Transfer-Encoding` is delimited by the close — which turns the very break
-/// the client must notice into a clean end. Caddy relays the head it formed
-/// with chunked framing instead, so the missing terminating chunk stays
-/// visible.
-///
-/// 📌 nginx shares the rule that decides this: a proxied response whose length
-/// is unknown to it is framed chunked to an HTTP/1.1 client, so a break before
-/// the terminating chunk stays visible there too.
+/// the client must notice into a clean end. This build relays the head it
+/// formed with chunked framing instead, so the missing terminating chunk stays
+/// visible — the rule the recorded reference reading applies as well.
 #[tokio::test]
 async fn test_truncated_flushing_response_is_not_a_clean_h1_end() {
     let upstream = ScriptedUpstream::start(
@@ -266,8 +257,8 @@ async fn test_truncated_flushing_response_is_not_a_clean_h1_end() {
 /// (#247). A lengthless HTTP/1.1 response is close-delimited unless its head
 /// says chunked, and a close-delimited response ends the connection: without
 /// that framing every proxied response would pay a fresh TCP and TLS
-/// handshake. Caddy and nginx both frame it as chunked and keep the
-/// connection, and the second request on this one is the check.
+/// handshake. The recorded reference readings frame it as chunked and keep the
+/// connection too, and the second request on this one is the check.
 #[tokio::test]
 async fn test_flushing_route_keeps_its_h1_connection() {
     let upstream = ScriptedUpstream::start(
@@ -315,15 +306,13 @@ async fn test_flushing_route_keeps_its_h1_connection() {
 
 /// ⚖️ A zero weight means the upstream is not chosen.
 ///
-/// No RFC clause covers load-balancer weights, so this is a parity check against
-/// Caddy (which excludes a zero-weight upstream, caddyserver/caddy#6357) *and* the
-/// repository's own fail-closed rule: an operator draining a backend for a
-/// cutover is entitled to have the configuration mean what it says, and a
-/// silently clamped weight is the one answer that satisfies neither reading.
+/// No RFC clause covers load-balancer weights, so this is the repository's own
+/// fail-closed rule: an operator draining a backend for a cutover is entitled to
+/// have the configuration mean what it says, and a silently clamped weight is
+/// the one answer that satisfies nobody.
 ///
-/// 📌 nginx agrees, from the source: `ngx_http_upstream_round_robin.c:190–192`
-/// copies `weight` into `effective_weight`, so a zero-weight peer never wins a
-/// round — the same exclusion, reached by the same reading of the number.
+/// 📌 The recorded reference reading agrees, from its source; both the source
+/// line and the reading live in the memory repository.
 #[tokio::test]
 async fn test_zero_weight_upstream_receives_no_traffic() {
     let drained = ScriptedUpstream::start(
@@ -366,7 +355,7 @@ async fn test_zero_weight_upstream_receives_no_traffic() {
 /// Multiple cookies cannot be folded into one field (RFC 6265 §3 forbids it) and
 /// repeated fields are ordinary HTTP (RFC 9110 §5.3), so a site that configures
 /// two cookies has no way to express itself if the compiled shape keeps one value
-/// per name. Caddy's block form emits both.
+/// per name. The block form emits both.
 #[tokio::test]
 async fn test_header_block_keeps_every_set_cookie() {
     let mut server = TestServer::new_pingclairfile(&site(
@@ -391,17 +380,13 @@ async fn test_header_block_keeps_every_set_cookie() {
 /// 🏷️ An upstream's `Server` field line reaches the client unchanged, and a
 /// response this server wrote itself carries ours.
 ///
-/// Caddy sets its own `Server` before the handler chain runs
-/// (`modules/caddyhttp/server.go`) and its proxy then copies the upstream's
-/// headers over it, so what a client sees is the origin's product string when
-/// there is one and `Caddy` when there is not. This server inserted
-/// `Pingclair` over whatever arrived, which is why monitoring that identifies
-/// an origin, or a mixed fleet comparing nodes, saw something different
-/// (#159).
+/// What a client sees is the origin's product string when there is one, and
+/// this build's own when there is not. This server used to insert `Pingclair`
+/// over whatever arrived, which is why monitoring that identifies an origin, or
+/// a mixed fleet comparing nodes, saw something different (#159).
 ///
-/// 📌 nginx does the same two things: its upstream header table copies `Server`
-/// into the response (`ngx_http_upstream.c:240–244`), and a locally generated
-/// response carries its own product string (measured: `Server: nginx/1.31.6`).
+/// 📌 The recorded reference reading does the same two things; its source lines
+/// and the measurement are in the memory repository.
 #[tokio::test]
 async fn test_the_upstreams_server_header_survives_the_proxy() {
     let upstream = ScriptedUpstream::start(
@@ -468,13 +453,11 @@ async fn test_a_local_response_carries_our_server_header() {
 
 /// ✅ `header X v` produces one field line, even when the origin sent its own.
 ///
-/// This is the recorded decision from pingclair#272: Caddy keeps both values,
-/// this server replaces, and the verb says what it does. nginx keeps both too
-/// (`ngx_http_add_header`, `ngx_http_headers_filter_module.c:568`, pushes onto
-/// the response without touching the upstream's), and replacing a field there
-/// takes `proxy_hide_header` plus `add_header` — so the difference is kept on
-/// purpose rather than by accident. The test exists so the choice is visible to
-/// whoever next reads the compatibility note.
+/// This is the recorded decision from pingclair#272: this server replaces, and
+/// the verb says what it does; repeated values are what `+` is for. The
+/// reference readings keep both values instead, so the difference is deliberate
+/// and the ADR records why. The test exists so the choice is visible to whoever
+/// next reads the compatibility note.
 #[tokio::test]
 async fn test_header_set_yields_one_field_line() {
     let upstream = ScriptedUpstream::start(
@@ -504,10 +487,10 @@ async fn test_header_set_yields_one_field_line() {
 
 /// 🧭 `uri` resolves placeholders in every operand, not just `replace`.
 ///
-/// A Caddyfile that migrates cleanly and then strips nothing sends traffic to a
-/// path the operator did not write — and `validate` says the file is fine. Caddy
-/// resolves these operands, so a `strip_prefix` containing a named-matcher
-/// capture is a directive that either works or should be refused.
+/// A configuration that loads cleanly and then strips nothing sends traffic to
+/// a path the operator did not write — and `validate` says the file is fine. A
+/// `strip_prefix` containing a named-matcher capture either resolves or should
+/// be refused.
 #[tokio::test]
 async fn test_uri_strip_prefix_resolves_placeholders() {
     let upstream = ScriptedUpstream::start(
@@ -600,12 +583,10 @@ async fn recording_origin() -> (
 /// announce it with `x-amz-trailer` rather than `Trailer:`, so the quiet path is
 /// the one real clients take.
 ///
-/// 📌 nginx's model for when #257 is fixed: it reads request trailers and does
-/// not forward them by default — `proxy_pass_trailers on` is the opt-in
-/// (`ngx_http_proxy_module.c:385`, since 1.27.2) — and nginx/nginx#778 is the
-/// same silent-drop report this test pins. So the reference agrees that
-/// forwarding is opt-in; what it does not settle is what the *declared* case
-/// should answer, which is ours to decide.
+/// 📌 Forwarding request trailers is an opt-in in the recorded reference
+/// reading as well, and the same silent-drop report exists there; what the
+/// reference does not settle is what the *declared* case should answer, which is
+/// ours to decide. The reading is in the memory repository.
 #[tokio::test]
 #[ignore = "pingclair#257 — the trailer is dropped and the request is answered 200"]
 async fn test_undeclared_request_trailer_is_not_silently_dropped() {
@@ -640,10 +621,10 @@ async fn test_undeclared_request_trailer_is_not_silently_dropped() {
 /// 🩺 A backend that keeps failing in the response phase stops being chosen.
 ///
 /// No RFC clause covers load-balancer health, so this is the repository's own
-/// fail-closed rule plus Caddy/nginx parity: nginx ejects after `max_fails`
-/// within `fail_timeout`, and Caddy lets the operator configure `max_fails`
-/// and `fail_duration` — both of which are honoured now. The check asks for
-/// the modest version: after a first failure, stop sending it new traffic.
+/// fail-closed rule, matching the recorded reference reading: a peer is ejected
+/// after a small number of failures within a window, and both numbers are
+/// configurable. The check asks for the modest version: after a first failure,
+/// stop sending it new traffic.
 #[tokio::test]
 async fn test_a_truncating_backend_stops_receiving_traffic() {
     let truncating = ScriptedUpstream::start(

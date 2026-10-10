@@ -9,7 +9,8 @@
 //! HTTP/3 pseudo-headers (`:method`, `:target`, `:authority`, `:scheme`), which
 //! the field iterator never sees. Before the head was counted, a 256 KiB
 //! request-target was admitted with `200` while `max_header_bytes` reported
-//! nothing (#326); nginx bounds the line itself and answers `414`.
+//! nothing (#326); the request line is now bounded by the same option and
+//! answered `414` on its own (the recorded reference reading agrees).
 //!
 //! RFC 6585 §5 separates two reasons for a 431: the fields together are too
 //! large, or one field alone is. In the second case the response should say
@@ -20,8 +21,7 @@
 //!
 //! 🚦 The head bytes decide the status on their own: over the budget before a
 //! single field is read is `414`, which is what the request-target deserves
-//! (RFC 9112 §3, and nginx's answer for a line its buffer cannot hold), while
-//! an over-budget total that is mostly fields stays `431`.
+//! (RFC 9112 §3), while an over-budget total that is mostly fields stays `431`.
 //!
 //! 🏎️ One pass, no allocation: this runs on every request of a site that
 //! configured a limit. The field name is copied only when a 431 is sent.
@@ -53,8 +53,8 @@ pub(crate) enum HeaderLimitBreach<'a> {
     /// The bytes outside the field lines — the HTTP/1 request line, or the
     /// HTTP/2 and HTTP/3 pseudo-headers — exceed `max_header_bytes` on their
     /// own. Answering 431 here would tell a client to shrink a field it never
-    /// sent, so this case is `414`, the status nginx reserves for a
-    /// request-target it will not parse.
+    /// sent, so this case is `414`, the status RFC 9112 §3 points at for a
+    /// request-target the server will not parse.
     RequestLineTooLarge,
     /// More field lines than `max_headers` allows.
     TooMany,
