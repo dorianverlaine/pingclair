@@ -4,7 +4,6 @@
 //! 🛡️ Common dynamic L4 validation for every configuration entry point.
 
 use crate::compiler::{CompileError, CompileResult};
-use ipnet::{IpNet, Ipv4Net};
 use pingclair_core::config::{Layer4Dns, Layer4Dynamic, Layer4Route, PingclairConfig};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -95,37 +94,11 @@ fn validate_dns(dns: &Layer4Dns) -> CompileResult<()> {
                 "layer4 dynamic allow_ip requires a nonempty CIDR list",
             ));
         }
+        // 🛡️ One rule, one implementation: the runtime re-checks the same ranges
+        // before it publishes an answer, through this same function.
         for range in ranges {
-            let mut net = range
-                .parse::<IpNet>()
-                .map_err(|_| invalid("layer4 dynamic allow_ip requires CIDRs"))?;
-            // 🌐 Mapped IPv6 cannot bypass the same policy applied to canonical IPv4 answers.
-            if let IpNet::V6(v6) = net {
-                let mapped: IpNet = "::ffff:0:0/96".parse().expect("literal CIDR");
-                if net.contains(&mapped.network()) || mapped.contains(&net.network()) {
-                    if v6.prefix_len() < 96 {
-                        return Err(invalid(
-                            "layer4 dynamic allow_ip cannot broadly cover IPv4-mapped IPv6",
-                        ));
-                    }
-                    net = Ipv4Net::new(
-                        v6.network().to_ipv4_mapped().expect("mapped subnet"),
-                        v6.prefix_len() - 96,
-                    )
-                    .expect("IPv4 prefix")
-                    .into();
-                }
-            }
-            for class in ["127.0.0.0/8", "169.254.0.0/16", "::1/128", "fe80::/10"] {
-                let class: IpNet = class.parse().expect("literal CIDR");
-                if (net.contains(&class.network()) || class.contains(&net.network()))
-                    && !class.contains(&net)
-                {
-                    return Err(invalid(
-                        "layer4 dynamic allow_ip covering loopback or link-local must fit entirely within that class",
-                    ));
-                }
-            }
+            pingclair_core::config::allowance(range)
+                .map_err(|error| invalid(format!("layer4 dynamic allow_ip {error}")))?;
         }
     }
     Ok(())

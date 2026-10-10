@@ -3,6 +3,7 @@
 
 //! Configuration types and management
 
+mod address_policy;
 mod bind;
 mod ip_ranges;
 mod layer4;
@@ -13,6 +14,10 @@ mod shared_ports;
 mod text;
 mod types;
 
+pub use address_policy::{
+    InvalidAllowance, NONPUBLIC_RANGES, PUBLIC_EXCEPTIONS, SENSITIVE_RANGES, allowance,
+    is_public_unicast,
+};
 pub use bind::{bind_listeners, bind_socket_host};
 pub use ip_ranges::{InvalidIpRange, IpRanges, PRIVATE_RANGES};
 pub use layer4::{Layer4Matcher, Layer4Route, Layer4Server, Layer4TlsMatcher};
