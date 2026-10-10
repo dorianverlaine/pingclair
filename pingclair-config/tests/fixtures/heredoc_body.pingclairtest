@@ -45,6 +45,7 @@ example.com {
         "body_timeout_ms": null,
         "idle_timeout_ms": null,
         "request_timeout_ms": null,
+        "send_timeout_ms": null,
         "max_header_count": null,
         "max_header_bytes": null,
         "max_connections": null,

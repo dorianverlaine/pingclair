@@ -114,6 +114,9 @@ mod retry_idempotency;
 #[path = "integration/retry_attempts.rs"]
 mod retry_attempts;
 
+#[path = "integration/send_timeout.rs"]
+mod send_timeout;
+
 // 🔪 Responses that fail after they started live beside this file too.
 #[path = "integration/started_response.rs"]
 mod started_response;

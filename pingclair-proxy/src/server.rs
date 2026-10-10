@@ -2991,11 +2991,17 @@ impl PingclairProxy {
                 .unwrap_or(crate::body_timeout::DEFAULT_BODY_TIMEOUT),
         );
         session.as_mut().set_read_timeout(read_timeout);
+        // 📮 The downstream write timeout: a route's own declaration wins, an
+        // idle timeout stands in for it, and otherwise the site's `sendTimeout`
+        // (60s by default) bounds the pause between two consecutive writes. A
+        // client that reads slowly is never cut; one that stops reading is,
+        // instead of holding the connection and its buffers until it leaves.
         session.as_mut().set_write_timeout(
             route_timeouts
                 .write_ms
                 .map(Duration::from_millis)
-                .or_else(|| limits.idle_timeout_ms.map(Duration::from_millis)),
+                .or_else(|| limits.idle_timeout_ms.map(Duration::from_millis))
+                .or_else(|| crate::send_timeout::downstream_write_timeout(limits)),
         );
         session.as_mut().set_total_drain_timeout(read_timeout);
         // 🔌 Preserve the parser's decision to close HTTP/1.0 or explicitly

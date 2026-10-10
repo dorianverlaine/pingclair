@@ -598,6 +598,23 @@ HTTPListener(on: ":8080") {
 }
 
 #[test]
+fn send_timeout_is_spellable_and_zero_disables_it() {
+    let site =
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback { Respond(body: "hi") } } }"#;
+    let bounded = crate::compile(&format!("{site}.limits(sendTimeout: .seconds(2))")).unwrap();
+    assert_eq!(bounded.servers[0].limits.send_timeout_ms, Some(2_000));
+
+    // 📮 Zero is the reference's "off": the bound exists but is disabled.
+    let off = crate::compile(&format!("{site}.limits(sendTimeout: .milliseconds(0))")).unwrap();
+    assert_eq!(off.servers[0].limits.send_timeout_ms, Some(0));
+
+    // 🧱 And the shared validation still holds the ceiling.
+    assert!(crate::compile(&format!("{site}.limits(sendTimeout: .hours(9000))")).is_err());
+    // 🚫 Durations need a unit.
+    assert!(crate::compile(&format!("{site}.limits(sendTimeout: 2)")).is_err());
+}
+
+#[test]
 fn limits_lower_to_the_resource_bounds() {
     let native = crate::compile(
         r#"

@@ -570,6 +570,7 @@ pub(crate) const HTTP_LIMITS_LABELS: &[&str] = &[
     "bodyTimeout",
     "idleTimeout",
     "requestTimeout",
+    "sendTimeout",
     "maxHeaders",
     "maxHeaderBytes",
     "maxConnections",
@@ -597,6 +598,11 @@ fn apply_http_limits(call: &Call, limits: &mut ResourceLimitsConfig) -> Result<(
     }
     if call.get("requestTimeout").is_some() {
         limits.request_timeout_ms = Some(call.measure("requestTimeout", false)?);
+    }
+    // 📮 The pause between two consecutive response writes; `.seconds(0)`
+    // disables the bound, the way the reference's `send_timeout 0` does.
+    if call.get("sendTimeout").is_some() {
+        limits.send_timeout_ms = Some(call.measure("sendTimeout", false)?);
     }
     if call.get("maxHeaders").is_some() {
         limits.max_header_count = Some(http_count(call, "maxHeaders")?);

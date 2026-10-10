@@ -60,6 +60,17 @@ so the cap only binds when a pool has more peers than it allows; measured tests
 pin both the once-per-peer property (five refused peers → five dials → `502`)
 and the cap (two attempts → two dials).
 
+### 📮 A stalled client gives up its connection
+
+`.limits(sendTimeout: .seconds(n))` bounds the pause between two consecutive
+writes of a response — the reference's `send_timeout`, 60 seconds by default
+and `sendTimeout: .milliseconds(0)` to turn it off. It is per write, not per
+response: a client that reads slowly is never cut, while one that stops reading
+stops holding a connection, its buffers and its admission slot. Measured
+integration tests pin the stalled case, the slow case, and the off switch.
+HTTP/3 does not go through this session and is bounded by its QUIC idle timeout
+instead (#58).
+
 ### 🔌 Layer 4 TCP routing for 0.3 alpha
 
 L4 listeners now enforce `max_connections` (default 1024, range 1–4096),

@@ -522,6 +522,9 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
             body_timeout_ms: server.limits.body_timeout_ms,
             idle_timeout_ms: server.limits.idle_timeout_ms,
             request_timeout_ms: server.limits.request_timeout_ms,
+            // 📮 The compatibility dialect does not spell this one: new limits
+            // options are native-only (docs/guardrails/config.md, 2026-10-10).
+            send_timeout_ms: None,
             max_header_count: server.limits.max_header_count,
             max_header_bytes: server.limits.max_header_bytes,
             max_connections: server.limits.max_connections,
@@ -1272,6 +1275,10 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
                 "long_connections.request_timeout_ms",
                 limits.long_connections.request_timeout_ms,
             ),
+            // 📮 Zero is off here as well: the reference disables its send
+            // timeout the same way, and a request-time bound of "never" is a
+            // choice the operator is allowed to make.
+            ("send_timeout_ms", limits.send_timeout_ms),
         ] {
             if value.is_some_and(|value| value > 31_536_000_000) {
                 return Err(CompileError::InvalidServer {

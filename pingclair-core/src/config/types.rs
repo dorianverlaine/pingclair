@@ -825,6 +825,12 @@ pub struct ResourceLimitsConfig {
     pub idle_timeout_ms: Option<u64>,
     /// ⌛ Maximum wall-clock duration after request headers are accepted.
     pub request_timeout_ms: Option<u64>,
+    /// 📮 Maximum pause between two consecutive writes of a response.
+    ///
+    /// The reference's `send_timeout`: it bounds a *stalled* reader, not the
+    /// length of a response — a slow client that keeps reading is never cut.
+    /// `None` uses the process default (60s); `Some(0)` disables the bound.
+    pub send_timeout_ms: Option<u64>,
     /// 🧾 Maximum number of decoded request fields, excluding pseudo-headers.
     pub max_header_count: Option<usize>,
     /// 📏 Maximum decoded request-header bytes, including names and values.
