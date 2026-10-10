@@ -1,0 +1,123 @@
+name: FreeBSD
+
+# 🧭 A manual portability probe: build the server and boot it inside a real
+# FreeBSD VM on a GitHub-hosted runner. QEMU reaches KVM speed only when the
+# guest architecture matches the runner's, so this guest is FreeBSD/amd64 on
+# an x86_64 runner — every other architecture falls back to full emulation
+# and is not worth a gate. Nothing calls this workflow yet; it is dispatched
+# by hand while the FreeBSD story is being explored.
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Cargo profile to build
+        type: choice
+        options:
+          - debug
+          - release
+        default: debug
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: freebsd-${{ github.ref }}-${{ inputs.profile }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: FreeBSD build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 📦 The action boots a real FreeBSD image under QEMU and runs these
+      # scripts over ssh inside it; the workspace rides along through rsync.
+      - name: Build and boot the server in FreeBSD
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        with:
+          release: "15.1"
+          # 🧠 BoringSSL's C++ compilations peak above the action's 6 GB
+          # default when four of them overlap, and the host has 16 GB.
+          mem: "8192"
+          prepare: |
+            set -e
+            pkg install -y cmake ninja perl5 gmake pkgconf git curl
+          run: |
+            set -e
+
+            echo "🖥️ The guest"
+            uname -a
+            freebsd-version -ku
+            sysctl hw.ncpu hw.physmem
+            df -h /
+
+            # 🦀 FreeBSD has no rustup host builds, so the pinned 1.99.0
+            # toolchain arrives as the official bundle, checked against the
+            # hash rust-lang.org publishes for it.
+            echo "🦀 Installing Rust"
+            fetch -q -o /tmp/rust.tar.xz https://static.rust-lang.org/dist/rust-1.99.0-x86_64-unknown-freebsd.tar.xz
+            got=$(sha256 -q /tmp/rust.tar.xz)
+            [ "${got}" = "5ec01753738592b7781a7a39228f1e8a6f9f5e01a2cd6be4736e8b4239b0b986" ]
+            mkdir -p /tmp/rust
+            tar -xJf /tmp/rust.tar.xz -C /tmp/rust --strip-components=1
+            /tmp/rust/install.sh --prefix=/usr/local --disable-ldconfig --components=rustc,cargo,rust-std-x86_64-unknown-freebsd
+            export PATH=/usr/local/bin:${PATH}
+            rustc --version
+            cargo --version
+
+            # ⚙️ boring-sys drives BoringSSL through CMake, and FreeBSD make
+            # is not GNU make; Ninja is installed above for exactly this.
+            export CMAKE_GENERATOR=Ninja
+            export CARGO_INCREMENTAL=0
+
+            echo "🔨 Building"
+            if [ "${{ inputs.profile }}" = "release" ]; then
+              cargo build --locked --release -p pingclair
+              BIN=target/release/pingclair
+            else
+              cargo build --locked -p pingclair
+              BIN=target/debug/pingclair
+            fi
+            "${BIN}" --version
+
+            echo "🧾 Validating the examples"
+            "${BIN}" validate examples/basic.pingclair
+            "${BIN}" validate examples/full_featured.pingclair
+
+            echo "🚀 Booting examples/basic.pingclair"
+            "${BIN}" run examples/basic.pingclair > /tmp/pingclair-smoke.log 2>&1 &
+            SERVER_PID=$!
+            TRIES=0
+            until curl -fsS -H 'Host: example.test' http://127.0.0.1:8080/ -o /tmp/pingclair-body; do
+              TRIES=$((TRIES + 1))
+              if [ "${TRIES}" -gt 30 ]; then
+                echo "🚫 The server never answered; its log follows"
+                cat /tmp/pingclair-smoke.log
+                exit 1
+              fi
+              sleep 1
+            done
+            grep -q "hello from Pingclair" /tmp/pingclair-body
+            kill "${SERVER_PID}" 2>/dev/null || true
+            wait "${SERVER_PID}" 2>/dev/null || true
+
+            # 📦 One file rides the workspace sync back to the runner; the
+            # compiler's gigabytes stay in the VM.
+            mkdir -p freebsd-dist
+            cp "${BIN}" freebsd-dist/pingclair
+            sha256 freebsd-dist/pingclair > freebsd-dist/pingclair.sha256
+            cp /tmp/pingclair-smoke.log freebsd-dist/smoke.log
+            rm -rf target
+
+      - name: Upload the FreeBSD build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pingclair-freebsd-15.1-amd64-${{ inputs.profile }}
+          path: freebsd-dist/
+          if-no-files-found: error

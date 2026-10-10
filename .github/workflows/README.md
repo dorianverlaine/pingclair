@@ -31,6 +31,7 @@ workflow, so a red result never masks another.
 | `docs-lint.yml` | workflow_call | Markdown structure check via markdownlint-cli2 |
 | `blob-size-policy.yml` | workflow_call | 512 KB blob budget with an explicit allowlist |
 | `h3.yml` | workflow_call, dispatch | HTTP/3 curl interoperability and Go behavioral matrices |
+| `freebsd.yml` | workflow_dispatch | Manual portability probe: builds the server and boots an example inside a real FreeBSD VM |
 | `release.yml` | push tag | Tag verification, native builds, checksums, multi-arch image |
 
 ## Rules for adding or changing checks
