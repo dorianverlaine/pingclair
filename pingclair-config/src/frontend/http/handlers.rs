@@ -1749,7 +1749,13 @@ fn proxy_timeouts(modifier: &Call, config: &mut ReverseProxyConfig) -> Result<()
 
 /// \(\u{1f501}\) `.retry(tryDuration:, tryInterval:, maxFails:, failDuration:)`.
 fn proxy_retry(modifier: &Call, config: &mut ReverseProxyConfig) -> Result<(), Error> {
-    modifier.leaf(&["tryDuration", "tryInterval", "maxFails", "failDuration"])?;
+    modifier.leaf(&[
+        "tryDuration",
+        "tryInterval",
+        "maxFails",
+        "failDuration",
+        "maxAttempts",
+    ])?;
     if modifier.args.is_empty() {
         return Err(modifier.at.error("retry needs at least one setting"));
     }
@@ -1767,6 +1773,16 @@ fn proxy_retry(modifier: &Call, config: &mut ReverseProxyConfig) -> Result<(), E
     }
     if modifier.get("failDuration").is_some() {
         config.fail_duration_ms = Some(modifier.measure("failDuration", false)?);
+    }
+    if modifier.get("maxAttempts").is_some() {
+        let attempts = modifier.integer("maxAttempts")?;
+        // 🧱 The same 1..=16 range the shared validation enforces, stated
+        // here so the refusal carries the line the operator wrote.
+        if !(1..=16).contains(&attempts) {
+            return Err(modifier.at.error("maxAttempts must be between 1 and 16"));
+        }
+        config.retry.max_attempts = usize::try_from(attempts)
+            .map_err(|_| modifier.at.error("maxAttempts exceeds the platform range"))?;
     }
     Ok(())
 }

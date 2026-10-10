@@ -81,7 +81,7 @@
                 "first_byte_timeout": null,
                 "between_reads_timeout": null,
                 "retry": {
-                  "max_attempts": 16,
+                  "max_attempts": 4,
                   "total_timeout_ms": 3000,
                   "backoff_ms": 250
                 },

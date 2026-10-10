@@ -49,6 +49,17 @@ already used. HTTP/2 still cannot carry a hint — Pingora's h2 session ignores
 informational responses by design — so hints reach HTTP/1.1 and HTTP/3 clients
 only (#207).
 
+### 🔁 `maxAttempts` is spellable
+
+`.retry(maxAttempts: N)` sets the cap on upstream attempts (1..=16) that the
+runtime already read from JSON and that the compatibility dialect already
+spelled as `retry { max_attempts N }` — the last runtime knob of the retry
+policy without a native spelling. With the default policy a connect failure is
+retried once per distinct peer and a failing peer stays in the passive cooldown,
+so the cap only binds when a pool has more peers than it allows; measured tests
+pin both the once-per-peer property (five refused peers → five dials → `502`)
+and the cap (two attempts → two dials).
+
 ### 🔌 Layer 4 TCP routing for 0.3 alpha
 
 L4 listeners now enforce `max_connections` (default 1024, range 1–4096),

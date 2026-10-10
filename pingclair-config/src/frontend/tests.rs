@@ -2187,6 +2187,39 @@ fn proxy_header_lists_that_cannot_mean_anything_fail_closed() {
 }
 
 #[test]
+fn retry_max_attempts_is_spellable_and_bounded() {
+    let native = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+            Proxy(to: ["127.0.0.1:9000", "127.0.0.1:9001"]).retry(maxAttempts: 2)
+        } } }"#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "http://:8080 {\n\treverse_proxy 127.0.0.1:9000 127.0.0.1:9001 {\n\t\tretry {\n\t\t\tmax_attempts 2\n\t\t}\n\t}\n}",
+    )
+    .unwrap();
+    assert_eq!(twin(native), twin(legacy));
+
+    // 🧱 The range is the same one the shared validation enforces (1..=16),
+    // refused here so the message carries the line the operator wrote.
+    for setting in [
+        "maxAttempts: 0",
+        "maxAttempts: 17",
+        "maxAttempts: .seconds(1)",
+    ] {
+        assert!(
+            crate::compile(&format!(
+                r#"HTTPListener(on: ":8080") {{ Site(host: "*") {{ Fallback {{
+                    Proxy(to: "127.0.0.1:9000").retry({setting})
+                }} }} }}"#
+            ))
+            .is_err(),
+            "accepted {setting}"
+        );
+    }
+}
+
+#[test]
 fn proxy_balance_health_and_timeouts_lower_like_their_caddyfile_twins() {
     let cases = [
         (

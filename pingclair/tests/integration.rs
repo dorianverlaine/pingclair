@@ -111,6 +111,9 @@ mod content_negotiation;
 #[path = "integration/retry_idempotency.rs"]
 mod retry_idempotency;
 
+#[path = "integration/retry_attempts.rs"]
+mod retry_attempts;
+
 // 🔪 Responses that fail after they started live beside this file too.
 #[path = "integration/started_response.rs"]
 mod started_response;

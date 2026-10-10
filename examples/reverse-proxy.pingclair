@@ -15,6 +15,7 @@ HTTPListener(on: ":8080") {
             .retry(
                 tryDuration: .seconds(3),
                 tryInterval: .milliseconds(250),
+                maxAttempts: 4,
                 maxFails: 3,
                 failDuration: .seconds(30),
             )
