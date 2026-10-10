@@ -64,7 +64,18 @@ fn soft_descriptor_limit() -> Option<u64> {
     };
     // 🛡️ `getrlimit` only writes into the struct it is handed.
     let status = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
-    (status == 0 && limit.rlim_cur != libc::RLIM_INFINITY).then_some(limit.rlim_cur)
+    if status != 0 || limit.rlim_cur == libc::RLIM_INFINITY {
+        return None;
+    }
+    // 🧭 `rlim_t` is u64 on Linux and macOS but i64 on the FreeBSD family, so
+    // the checked conversion is a real question there and an identity here;
+    // spelling both keeps it from reading as a useless conversion on the
+    // unsigned platforms.
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+    let soft = u64::try_from(limit.rlim_cur).ok();
+    #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly")))]
+    let soft = Some(limit.rlim_cur);
+    soft
 }
 
 /// 📌 Elsewhere there is no `RLIMIT_NOFILE` to compare against.
