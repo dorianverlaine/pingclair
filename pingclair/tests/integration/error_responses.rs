@@ -176,25 +176,21 @@ fn header_limited_site(extra: &str) -> String {
 }
 
 /// 🔢 The same site with only the field-count ceiling configured.
-fn field_count_limited_site() -> String {
-    format!(
-        r#"
-        {{
-            admin off
-        }}
+const FIELD_COUNT_LIMITED_SITE: &str = r#"
+    {
+        admin off
+    }
 
-        :__PINGCLAIR_TEST_PORT__ {{
-            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
-            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+    :__PINGCLAIR_TEST_PORT__ {
+        @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+        respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
 
-            limits {{
-                max_headers 10
-            }}
-            respond "admitted"
-        }}
-        "#
-    )
-}
+        limits {
+            max_headers 10
+        }
+        respond "admitted"
+    }
+    "#;
 
 /// 🔢 A field-count ceiling works on its own.
 ///
@@ -205,7 +201,7 @@ fn field_count_limited_site() -> String {
 /// (#328). H1 is the witness here.
 #[tokio::test]
 async fn test_max_headers_alone_still_refuses_too_many_fields() {
-    let mut server = TestServer::new_pingclairfile(&field_count_limited_site());
+    let mut server = TestServer::new_pingclairfile(FIELD_COUNT_LIMITED_SITE);
     assert!(server.wait_until_ready().await, "server failed to start");
 
     let client = no_proxy_client();
