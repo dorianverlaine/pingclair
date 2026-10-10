@@ -117,13 +117,20 @@ pub(crate) fn check<'a>(
     count: usize,
     fields: impl Iterator<Item = (&'a str, usize)>,
 ) -> Option<HeaderLimitBreach<'a>> {
-    let limit = limits.max_header_bytes?;
-    if head > limit {
+    let byte_limit = limits.max_header_bytes;
+    // 🚦 With a byte budget, the request line is read before the fields and
+    // decides first.
+    if let Some(limit) = byte_limit
+        && head > limit
+    {
         return Some(HeaderLimitBreach::RequestLineTooLarge);
     }
     if limits.max_header_count.is_some_and(|limit| count > limit) {
         return Some(HeaderLimitBreach::TooMany);
     }
+    // 🧾 Either limit stands alone: a site may set the count and nothing else,
+    // in which case the count above was the whole check (#328).
+    let limit = byte_limit?;
     let (total, largest) = fields.fold(
         (head, None::<(&str, usize)>),
         |(total, largest), (name, value_len)| {
@@ -273,6 +280,25 @@ mod tests {
         assert_eq!(
             run(&limits, &[("a", 100), ("b", 1)]),
             Some(HeaderLimitBreach::TooMany)
+        );
+    }
+
+    /// 🔢 A field-count ceiling works on its own.
+    ///
+    /// Count once sat behind the byte budget's early return, so a site that set
+    /// only `max_headers` silently lost the ceiling on every transport (#328).
+    #[test]
+    fn a_count_budget_alone_is_still_enforced() {
+        let count_only = limits(Some(10), None);
+        assert_eq!(
+            check(&count_only, 40, 11, std::iter::empty()),
+            Some(HeaderLimitBreach::TooMany)
+        );
+        assert_eq!(check(&count_only, 40, 10, std::iter::empty()), None);
+        // 📌 Neither budget set is still a no-op.
+        assert_eq!(
+            check(&limits(None, None), 40, 1_000, std::iter::empty()),
+            None
         );
     }
 

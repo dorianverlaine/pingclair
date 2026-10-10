@@ -175,6 +175,57 @@ fn header_limited_site(extra: &str) -> String {
     )
 }
 
+/// 🔢 The same site with only the field-count ceiling configured.
+fn field_count_limited_site() -> String {
+    format!(
+        r#"
+        {{
+            admin off
+        }}
+
+        :__PINGCLAIR_TEST_PORT__ {{
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            limits {{
+                max_headers 10
+            }}
+            respond "admitted"
+        }}
+        "#
+    )
+}
+
+/// 🔢 A field-count ceiling works on its own.
+///
+/// The count used to be compared before the byte budget was read; moving the
+/// request line to the front of the check left the count behind the budget's
+/// early return, so a site that set only `max_headers` silently lost the
+/// ceiling — on every transport, because all three share this one check
+/// (#328). H1 is the witness here.
+#[tokio::test]
+async fn test_max_headers_alone_still_refuses_too_many_fields() {
+    let mut server = TestServer::new_pingclairfile(&field_count_limited_site());
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    let mut request = client.get(server.url(0, "/"));
+    for index in 0..12 {
+        request = request.header(format!("X-Pad-{index}"), "v");
+    }
+    let refused = request.send().await.unwrap();
+    assert_eq!(refused.status(), 431);
+
+    let admitted = client
+        .get(server.url(0, "/"))
+        .header("X-Pad-0", "v")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admitted.status(), 200);
+    assert_eq!(admitted.text().await.unwrap(), "admitted");
+}
+
 /// 🔎 A 431 names the one field that was too large.
 ///
 /// RFC 6585 §5 asks for the field's name when a single field is at fault.
