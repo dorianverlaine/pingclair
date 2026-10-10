@@ -49,7 +49,10 @@ jobs:
             set -e
             # 🐚 bash is not in the FreeBSD base system, and the official Rust
             # installer re-execs itself through `#!/usr/bin/env bash`.
-            pkg install -y bash cmake ninja perl5 gmake pkgconf git curl
+            # 🧩 bindgen, which boring-sys always runs, needs libclang; the
+            # base system ships clang but not libclang.so, so the llvm
+            # metaport supplies it.
+            pkg install -y bash cmake ninja perl5 gmake pkgconf git curl llvm
           run: |
             set -e
 
@@ -77,6 +80,13 @@ jobs:
             # is not GNU make; Ninja is installed above for exactly this.
             export CMAKE_GENERATOR=Ninja
             export CARGO_INCREMENTAL=0
+
+            # 🧩 Point bindgen at the libclang the llvm package installed; the
+            # path carries the package's version number, so ask the disk.
+            libclang=$(find /usr/local -maxdepth 4 -name 'libclang.so*' -print -quit)
+            [ -n "${libclang}" ]
+            export LIBCLANG_PATH=$(dirname "${libclang}")
+            echo "🧩 LIBCLANG_PATH=${LIBCLANG_PATH}"
 
             echo "🔨 Building"
             if [ "${{ inputs.profile }}" = "release" ]; then
