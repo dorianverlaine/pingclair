@@ -785,6 +785,21 @@ HTTPListener(on: ":8080") {
         labels: &[],
     },
     Entry {
+        name: "BlockedIPs",
+        kind: Kind::Component,
+        summary: "Peers refused before anything is read, on HTTP and L4 alike: one array of \
+                  addresses, CIDRs or `.privateRanges`.",
+        example: r#"BlockedIPs(["192.0.2.0/24", "203.0.113.7"])
+HTTPListener(on: ":8080") {
+    Site(host: "*") { Fallback { Respond(body: "hello") } }
+}"#,
+        refusal: r#"BlockedIPs([])
+HTTPListener(on: ":8080") {
+    Site(host: "*") { Fallback { Respond(body: "hello") } }
+}"#,
+        labels: &[],
+    },
+    Entry {
         name: "Storage",
         kind: Kind::Component,
         summary: "Where certificates, ACME account keys and the internal CA live.",

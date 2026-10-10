@@ -32,6 +32,12 @@ and `.any` selects alternative matcher sets. The alpha spellings `connections:`
 and route-level `from:` are refused. `describe TCPListener` now reports `on:`;
 TCP policy modifiers report their parser's argument labels.
 
+`BlockedIPs([...])` is the native spelling of the deny list the configuration
+model already carried: addresses, CIDRs or `.privateRanges`, the same values
+`TrustedProxies(ranges:)` takes. A matching peer is refused before anything is
+read, on HTTP and L4 alike; the compatibility dialect keeps refusing to spell
+it (#325).
+
 ### 🔌 Layer 4 TCP routing for 0.3 alpha
 
 L4 listeners now enforce `max_connections` (default 1024, range 1–4096),

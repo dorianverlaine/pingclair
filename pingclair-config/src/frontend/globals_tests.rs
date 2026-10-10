@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-//! 🌐 Contract tests for the global declarations: `TrustedProxies`, `Storage`,
-//! `Log` and `AutomaticTLS` — Caddyfile twins for the shared capabilities and
-//! native-only refusals.
+//! 🌐 Contract tests for the global declarations: `TrustedProxies`,
+//! `BlockedIPs`, `Storage`, `Log` and `AutomaticTLS` — twins for the shared
+//! capabilities and native-only refusals for the rest.
 
 use super::*;
 
@@ -36,6 +36,60 @@ fn trusted_proxies_lowers_like_its_caddyfile_twin() {
         std::iter::once("10.0.0.0/8".to_string())
             .chain(PRIVATE_RANGES.iter().map(|range| (*range).to_string()))
             .collect::<Vec<_>>()
+    );
+}
+
+/// 🛡️ `BlockedIPs([…])` is the native spelling of the shared deny list.
+///
+/// The list existed in the configuration model and the compiler validated it,
+/// but no language could set it until this declaration (pingclair #325); it
+/// takes the same values `TrustedProxies(ranges:)` does.
+#[test]
+fn blocked_ips_are_spellable_and_reach_the_shared_list() {
+    let config = native("BlockedIPs([\"192.0.2.0/24\", \"203.0.113.7\", .privateRanges])\n");
+    assert_eq!(config.global.blocked_ips[0], "192.0.2.0/24");
+    assert_eq!(config.global.blocked_ips[1], "203.0.113.7");
+    assert_eq!(
+        config.global.blocked_ips.len(),
+        2 + PRIVATE_RANGES.len(),
+        "`.privateRanges` expands like it does everywhere else"
+    );
+
+    let listener = r#"BlockedIPs(["192.0.2.0/24"])
+HTTPListener(on: ":8080") {
+    Site(host: "*") { Fallback { Respond(body: "hi") } }
+}"#;
+    assert!(crate::compile(listener).is_ok());
+}
+
+#[test]
+fn blocked_ips_mistakes_fail_closed() {
+    let listener = r#"
+        HTTPListener(on: ":8080") {
+            Site(host: "*") { Fallback { Respond(body: "hi") } }
+        }
+    "#;
+    for declaration in [
+        "BlockedIPs([])",
+        "BlockedIPs(\"192.0.2.1\")",
+        "BlockedIPs([\"nope\"])",
+        "BlockedIPs([\"192.0.2.1\"], [\"203.0.113.7\"])",
+        "BlockedIPs(ips: [\"192.0.2.1\"])",
+        "BlockedIPs([\"192.0.2.1\"]) { }",
+        "BlockedIPs([\"192.0.2.1\"]).unknown(1)",
+    ] {
+        assert!(
+            crate::compile(&format!("{declaration}\n{listener}")).is_err(),
+            "accepted {declaration}"
+        );
+    }
+    // 📍 The entry is refused where it was written, not at startup.
+    let error = crate::adapt("BlockedIPs([\"192.0.2.0/24\", \"nope\"])")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("contains invalid IP or CIDR `nope`"),
+        "{error}"
     );
 }
 

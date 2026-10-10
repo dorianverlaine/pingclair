@@ -204,6 +204,9 @@ pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
                     config.global.client_ip_headers = headers;
                 }
             }
+            "BlockedIPs" => {
+                config.global.blocked_ips = parse_network_list(&call)?;
+            }
             "UnderscoreHeaders" => {
                 config.global.expected_underscore_headers = parse_underscore_headers(&call)?;
             }
@@ -304,28 +307,33 @@ pub(super) fn adapt(source: &str) -> Result<PingclairConfig, Error> {
             _ => {
                 return Err(call.at.error(
                     "unknown global declaration; expected TCPListener, HTTPListener, Admin, \
-                     Metrics, Shutdown, TrustedProxies, UnderscoreHeaders, Storage, Log or \
-                     AutomaticTLS",
+                     Metrics, Shutdown, TrustedProxies, BlockedIPs, UnderscoreHeaders, \
+                     Storage, Log or AutomaticTLS",
                 ));
             }
         }
     }
     // 📌 A file is allowed to hold nothing but declarations: `Admin`, `Metrics`,
     // `Shutdown`, `TrustedProxies`, `UnderscoreHeaders`, `Storage`, `Log` and
-    // `AutomaticTLS` are options of the server, not of a listener, and a
-    // directory splits them into their own file. Whether the *merged* result
-    // can serve anything is a question for the runtime.
+    // `AutomaticTLS` (and `BlockedIPs`) are options of the server, not of a
+    // listener, and a directory splits them into their own file. Whether the
+    // *merged* result can serve anything is a question for the runtime.
     Ok(config)
 }
 
 /// 🌐 `ranges:` accepts CIDR strings and `.privateRanges`, which expands to the
 /// six prefixes every other private-range spelling uses.
-fn parse_ranges(value: &Value, at: Position) -> Result<Vec<String>, Error> {
+///
+/// 📌 `what` names the declaration the message should point at, because two of
+/// them take this list: `TrustedProxies(ranges:)` and `BlockedIPs([…])`.
+fn parse_ranges(value: &Value, what: &str, at: Position) -> Result<Vec<String>, Error> {
     let Value::Array(items) = value else {
-        return Err(at.error("ranges takes an array of CIDR strings or .privateRanges"));
+        return Err(at.error(format!(
+            "{what} takes an array of CIDR strings or .privateRanges"
+        )));
     };
     if items.is_empty() {
-        return Err(at.error("ranges must not be empty"));
+        return Err(at.error(format!("{what} must not be empty")));
     }
     let mut ranges = Vec::new();
     for item in items {
@@ -334,7 +342,7 @@ fn parse_ranges(value: &Value, at: Position) -> Result<Vec<String>, Error> {
                 if text.parse::<ipnet::IpNet>().is_err()
                     && text.parse::<std::net::IpAddr>().is_err()
                 {
-                    return Err(at.error(format!("ranges contains invalid IP or CIDR `{text}`")));
+                    return Err(at.error(format!("{what} contains invalid IP or CIDR `{text}`")));
                 }
                 ranges.push(text.clone());
             }
@@ -349,11 +357,33 @@ fn parse_ranges(value: &Value, at: Position) -> Result<Vec<String>, Error> {
                 )));
             }
             _ => {
-                return Err(at.error("ranges takes an array of CIDR strings or .privateRanges"));
+                return Err(at.error(format!(
+                    "{what} takes an array of CIDR strings or .privateRanges"
+                )));
             }
         }
     }
     Ok(ranges)
+}
+
+/// 🛡️ `BlockedIPs([…])`: one unnamed array of the same values `ranges:` takes.
+///
+/// 📌 Values are addresses, CIDRs or `.privateRanges`; the shared validation
+/// re-checks every entry at load, and the runtime refuses a matching peer
+/// before it reads anything on HTTP and L4 alike.
+fn parse_network_list(call: &Call) -> Result<Vec<String>, Error> {
+    if call.body.is_some() {
+        return Err(call.at.error("BlockedIPs takes no block"));
+    }
+    if !call.modifiers.is_empty() {
+        return Err(call.at.error("BlockedIPs takes no modifiers"));
+    }
+    let [(None, value)] = call.args.as_slice() else {
+        return Err(call
+            .at
+            .error("BlockedIPs takes one array of IP addresses, CIDRs or .privateRanges"));
+    };
+    parse_ranges(value, "BlockedIPs", call.at)
 }
 
 /// 🛡️ The two halves a trust list names.
@@ -381,7 +411,7 @@ fn parse_trusted_proxies(call: &Call, what: &str) -> Result<TrustedProxiesArgs, 
     Ok(TrustedProxiesArgs {
         ranges: call
             .get("ranges")
-            .map(|value| parse_ranges(value, call.at))
+            .map(|value| parse_ranges(value, "ranges", call.at))
             .transpose()?,
         headers: call
             .get("headers")
