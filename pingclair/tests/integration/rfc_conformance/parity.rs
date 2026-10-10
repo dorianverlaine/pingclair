@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-//! 🤝 Cross-server parity: properties wanted because Caddy or nginx has them,
+//! 🤝 Cross-server parity: properties wanted because another server has them,
 //! not because a clause of an RFC demands them.
 //!
-//! They live in this tree deliberately. The authority order here is
-//! RFC > Caddy > nginx, so "we differ from Caddy" is still a finding — just a
-//! lower-priority one than a protocol violation. A test is the cheapest way to
-//! record that the difference was seen rather than missed, and the doc comment
-//! says plainly which server it is measured against.
+//! They live in this tree deliberately: a difference from the semantic
+//! reference (nginx, per `docs/guardrails/config.md`) is a finding — just a
+//! lower-priority one than a protocol violation — and a test is the cheapest
+//! way to record that it was seen rather than missed. Each doc comment says
+//! which server the expectation below was measured against; the ones recorded
+//! while Caddy was the reference are re-based one at a time, and say so until
+//! they are.
 
 use super::{ScriptedUpstream, TestServer, raw_http1, site};
 use crate::{no_proxy_client, read_until_marker};

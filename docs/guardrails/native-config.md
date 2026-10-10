@@ -13,7 +13,11 @@ reinterpreted as a Caddyfile. There is no version header.
 One concept has exactly one spelling. The names the Caddyfile uses belong to
 the compatibility frontend, which stays supported during migration; the native
 frontend refuses them instead of growing aliases. Both frontends produce the
-same `PingclairConfig` through one validation and publication path.
+same `PingclairConfig` through one validation and publication path. That
+compatibility frontend is **frozen**: it keeps accepting the syntax it accepts
+today, and a new feature never adds a Caddyfile spelling for it — the native
+language is where new surface lands, and behaviour follows nginx rather than
+Caddy (`docs/guardrails/config.md`).
 
 `pingclair describe` prints the catalogue the parser accepts — every component,
 modifier and attribute, each with an example and a refusal — and

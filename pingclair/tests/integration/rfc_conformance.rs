@@ -4,10 +4,10 @@
 //! 📜 RFC conformance: one requirement per test, cited by the section that
 //! decides it.
 //!
-//! This repository's authority order is **RFC > Caddy > nginx**, so a test here
-//! names the clause it pins and never another server's behaviour. A property
-//! that only exists because Caddy or nginx does it differently lives in
-//! `parity`, and says so in its own doc comment.
+//! This repository's authority order is **RFC > nginx**
+//! (`docs/guardrails/config.md`), so a test here names the clause it pins and
+//! never another server's behaviour. A property that only exists because
+//! another server has it lives in `parity`, and says so in its own doc comment.
 //!
 //! 🚧 A requirement the current build does not meet is marked `#[ignore]` with
 //! the tracking issue in the attribute, because a conformance test for an

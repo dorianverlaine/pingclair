@@ -104,24 +104,34 @@
 
 ## 📜 Authority when servers disagree (2026-10-06)
 
-Pingclair answers a request the way a Caddyfile author expects, but "Caddy does
-it" is not what settles an argument. The order is **RFC > Caddy > nginx**:
+Pingclair's behaviour is decided by this project, and "another server does it"
+is not what settles an argument. The order is **RFC > nginx**:
 
-1. **An RFC requirement wins outright, Caddy included.** A response that breaks a
+1. **An RFC requirement wins outright, nginx included.** A response that breaks a
    `MUST`/`SHOULD` is a defect here even when the reference implementation has
-   the same one — "Caddy does it too" is a description of the world, not a
+   the same one — "the reference does it too" is a description of the world, not a
    defence of the behaviour. Open examples from the 2026-10-06 audit: a `CONNECT`
    that matches no site answered `200` with a reusable connection where
    RFC 9110 §9.3.6 and §8.6 require a refusal that ends it (#283, since fixed); a proxied `204`
    forwarded with `Content-Length` on HTTP/1.1 (§8.6, #270); a field named in the
    upstream's `Connection` header passed on to the client (§7.6.1, #263); field
    values padded with SP/HTAB emitted on HTTP/2 and HTTP/3 (§8.2.1, #256).
-2. **Otherwise Caddy is the reference**, because running a Caddyfile unchanged is
-   the product. A difference a configuration can reach is a compatibility gap
-   (issue template 🧩), not a preference to be argued case by case.
-3. **nginx is the tiebreaker of last resort**, and more often a source of a good
-   idea than an authority: when its behaviour is the stricter or the safer of the
-   two, say so in the issue rather than treating "nginx does it" as the reason.
+2. **Otherwise nginx is the semantic reference** (2026-10-10, from the 0.3 line
+   on). When nginx's behaviour and ours differ and a configuration can reach the
+   difference, the default answer is nginx's; the issue records what nginx does
+   and where it was read from, the way every rejection note has to. The tree to
+   read is the local checkout of `nginx/nginx` (mainline,
+   `release-1.31.6-19-g2b5c2b605` at the time of writing) — for ACME and
+   OpenTelemetry the OSS tree has no module, so the reference is the project's
+   own companion module (`nginx/nginx-acme`, `nginxinc/nginx-otel`) and its
+   directive set. Where we deliberately differ, the divergence is written down
+   as deliberate, with the reason.
+3. **The Caddyfile frontend is a frozen migration layer.** It keeps accepting
+   the syntax it accepts today and lowers it into the same `PingclairConfig`, so
+   an existing file keeps running. It does not grow: **a new feature gets a
+   native spelling only**, and a Caddyfile that uses a directive this build does
+   not accept is refused rather than taught. Caddy is where a migrated file's
+   *spelling* comes from; it is not a reason for behaviour.
 
 > 🎯 **The operable rule**: a test that pins protocol behaviour cites the RFC
 > clause, never another server. `pingclair/tests/integration/rfc_conformance/`

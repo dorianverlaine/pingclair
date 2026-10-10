@@ -233,7 +233,7 @@
 
 Protocol behaviour is tested in `pingclair/tests/integration/rfc_conformance/`,
 one requirement per test, and each test cites the clause that decides it. The
-authority order lives in `config.md` (RFC > Caddy > nginx); what belongs here is
+authority order lives in `config.md` (RFC > nginx); what belongs here is
 the mechanic that makes it work:
 
 - **An ignored test is the outstanding list.** A requirement the build does not
