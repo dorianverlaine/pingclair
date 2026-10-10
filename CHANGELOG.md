@@ -71,6 +71,15 @@ integration tests pin the stalled case, the slow case, and the off switch.
 HTTP/3 does not go through this session and is bounded by its QUIC idle timeout
 instead (#58).
 
+### 📏 Unconfigured sites get the reference's header bounds
+
+A site that configured no `limits` was unbounded: any head, any number of
+fields. It now runs under the reference's defaults — four 8 KiB buffers are
+32 KiB of head (the request line included, since #326) and 1000 fields. An
+explicit `0` turns either bound off, this project's spelling for "off"
+everywhere else; the reference instead refuses every field at `max_headers 0`,
+a difference the engineering memory records (#58).
+
 ### 🔌 Layer 4 TCP routing for 0.3 alpha
 
 L4 listeners now enforce `max_connections` (default 1024, range 1–4096),

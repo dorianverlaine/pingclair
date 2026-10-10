@@ -222,6 +222,60 @@ async fn test_max_headers_alone_still_refuses_too_many_fields() {
     assert_eq!(admitted.text().await.unwrap(), "admitted");
 }
 
+/// 📏 A site that configured nothing still has the reference's bounds.
+///
+/// `large_client_header_buffers 4 8k` is 32 KiB of head and `max_headers` is
+/// 1000 fields, so an unconfigured site is no longer unbounded: a 40 KiB head
+/// is refused, while a heavy but realistic browser head — long user agent,
+/// client hints, several kilobytes of cookies — passes with room to spare.
+#[tokio::test]
+async fn test_default_header_bounds_apply_without_configuration() {
+    let config = r#"
+        {
+            admin off
+        }
+
+        :__PINGCLAIR_TEST_PORT__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+            respond "admitted"
+        }
+    "#;
+    let mut server = TestServer::new_pingclairfile(config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+    let client = no_proxy_client();
+
+    // 🧱 40 KiB of padding is over the 32 KiB default.
+    let refused = client
+        .get(server.url(0, "/"))
+        .header("X-Pad", "x".repeat(40 * 1024))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 431);
+
+    // 🍪 A realistic heavy head: browser user agent and hints, plus the
+    // several-kilobyte cookie jar a logged-in site tends to carry.
+    let cookies = (0..8)
+        .map(|index| format!("session_{index}={}", "y".repeat(600)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let admitted = client
+        .get(server.url(0, "/"))
+        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        .header("Accept-Language", "zh-TW,zh;q=0.9,en;q=0.8")
+        .header("Cookie", cookies)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        admitted.status(),
+        200,
+        "a realistic browser head must fit the defaults"
+    );
+}
+
 /// 🔎 A 431 names the one field that was too large.
 ///
 /// RFC 6585 §5 asks for the field's name when a single field is at fault.

@@ -1286,20 +1286,20 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
                 });
             }
         }
-        if limits
-            .max_header_count
-            .is_some_and(|value| value == 0 || value > 256)
-        {
+        // 🔢 Zero turns the ceiling off, as it does everywhere else in this
+        // project; the reference instead refuses every field at
+        // `max_headers 0`, a difference the engineering memory records (#58).
+        if limits.max_header_count.is_some_and(|value| value > 4096) {
             return Err(CompileError::InvalidServer {
-                message: "max_header_count must be between 1 and 256".to_string(),
+                message: "max_header_count must be off, zero, or between 1 and 4096".to_string(),
             });
         }
         if limits
             .max_header_bytes
-            .is_some_and(|value| value == 0 || value > 1_048_575)
+            .is_some_and(|value| value > 1_048_575)
         {
             return Err(CompileError::InvalidServer {
-                message: "max_header_bytes must be between 1 and 1048575".to_string(),
+                message: "max_header_bytes must be off, zero, or between 1 and 1048575".to_string(),
             });
         }
         if limits.max_connections == Some(0) {

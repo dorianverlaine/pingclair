@@ -25,6 +25,13 @@
 //!
 //! 🏎️ One pass, no allocation: this runs on every request of a site that
 //! configured a limit. The field name is copied only when a 431 is sent.
+//!
+//! 📏 A site that configures nothing now runs under the reference's own
+//! defaults — `large_client_header_buffers 4 8k` is 32 KiB of head, and
+//! `max_headers` is 1000 fields — so the pass above happens on every request.
+//! An explicit `0` means "no bound", which is this project's spelling for off
+//! everywhere else; the reference refuses every field at `max_headers 0`
+//! instead, a difference recorded in the engineering memory (#58).
 
 use std::borrow::Cow;
 
@@ -67,6 +74,35 @@ pub(crate) enum HeaderLimitBreach<'a> {
 /// ✂️ The longest field name a response body will repeat. Longer names are
 /// cut, so a client cannot make the 431 body as large as its own request.
 const MAX_NAMED_FIELD: usize = 64;
+
+/// 📏 The head budget when the site names none: the reference's
+/// `large_client_header_buffers` default of four 8 KiB buffers.
+pub(crate) const DEFAULT_MAX_HEADER_BYTES: usize = 4 * 8 * 1024;
+
+/// 🔢 The field ceiling when the site names none: the reference's
+/// `max_headers` default.
+pub(crate) const DEFAULT_MAX_HEADER_COUNT: usize = 1000;
+
+/// 📏 The byte budget this check enforces.
+///
+/// `Some(0)` is the explicit "no bound"; `None` is the site saying nothing,
+/// which now means the reference's default rather than no limit at all.
+fn byte_budget(limits: &ResourceLimitsConfig) -> Option<usize> {
+    match limits.max_header_bytes {
+        Some(0) => None,
+        Some(value) => Some(value),
+        None => Some(DEFAULT_MAX_HEADER_BYTES),
+    }
+}
+
+/// 🔢 The field ceiling this check enforces, with the same three states.
+fn field_ceiling(limits: &ResourceLimitsConfig) -> Option<usize> {
+    match limits.max_header_count {
+        Some(0) => None,
+        Some(value) => Some(value),
+        None => Some(DEFAULT_MAX_HEADER_COUNT),
+    }
+}
 
 impl HeaderLimitBreach<'_> {
     /// 🚦 The status this breach is answered with.
@@ -117,7 +153,7 @@ pub(crate) fn check<'a>(
     count: usize,
     fields: impl Iterator<Item = (&'a str, usize)>,
 ) -> Option<HeaderLimitBreach<'a>> {
-    let byte_limit = limits.max_header_bytes;
+    let byte_limit = byte_budget(limits);
     // 🚦 With a byte budget, the request line is read before the fields and
     // decides first.
     if let Some(limit) = byte_limit
@@ -125,7 +161,7 @@ pub(crate) fn check<'a>(
     {
         return Some(HeaderLimitBreach::RequestLineTooLarge);
     }
-    if limits.max_header_count.is_some_and(|limit| count > limit) {
+    if field_ceiling(limits).is_some_and(|limit| count > limit) {
         return Some(HeaderLimitBreach::TooMany);
     }
     // 🧾 Either limit stands alone: a site may set the count and nothing else,
@@ -157,8 +193,8 @@ pub(crate) fn check<'a>(
 const PROTOCOL_FIELD_OVERHEAD: usize = 32;
 
 /// 🔢 The most field lines a site may allow (`max_headers`, validated in the
-/// compiler). Used as the field count when a site sets none.
-const MAX_CONFIGURABLE_FIELDS: usize = 256;
+/// compiler). Used as the field count when a site switches the ceiling off.
+const MAX_CONFIGURABLE_FIELDS: usize = 4096;
 
 /// 🧮 The header-list size to hand the HTTP/2 and HTTP/3 libraries, given the
 /// listener's `max_header_bytes`.
@@ -179,15 +215,14 @@ const MAX_CONFIGURABLE_FIELDS: usize = 256;
 ///
 /// 📌 Computed once per listener at startup, never per request.
 pub fn protocol_header_list_limit(limits: &ResourceLimitsConfig) -> Option<usize> {
-    let fields = limits
-        .max_header_count
+    let fields = field_ceiling(limits)
         .unwrap_or(MAX_CONFIGURABLE_FIELDS)
         .min(MAX_CONFIGURABLE_FIELDS)
         // 📇 The pseudo-headers are fields to the protocol library even though
         // they are not field lines to us: `:method`, `:scheme`, `:authority`,
         // `:path`, so the section it measures is four overheads larger.
         .saturating_add(PSEUDO_HEADERS);
-    limits.max_header_bytes.map(|limit| {
+    byte_budget(limits).map(|limit| {
         limit
             .saturating_mul(2)
             .saturating_add(fields.saturating_mul(PROTOCOL_FIELD_OVERHEAD))
@@ -244,12 +279,29 @@ mod tests {
             protocol_header_list_limit(&limits(Some(10), Some(1024))),
             Some(2048 + 14 * 32)
         );
-        // 📌 No field count configured: the compiler's ceiling of 256 fields.
+        // 📌 No field count configured: the reference's default of 1000.
         assert_eq!(
             protocol_header_list_limit(&limits(None, Some(1024))),
-            Some(2048 + 260 * 32)
+            Some(2048 + 1004 * 32)
         );
-        assert_eq!(protocol_header_list_limit(&limits(Some(10), None)), None);
+        // 📏 No byte budget configured: the reference's 32 KiB applies.
+        assert_eq!(
+            protocol_header_list_limit(&limits(Some(10), None)),
+            Some(2 * 32 * 1024 + 14 * 32)
+        );
+        // 🔌 An explicit zero switches both bounds off.
+        assert_eq!(protocol_header_list_limit(&limits(Some(0), Some(0))), None);
+    }
+
+    /// 📏 The reference's defaults apply until the site says otherwise.
+    #[test]
+    fn the_reference_defaults_apply_until_the_site_says_otherwise() {
+        assert_eq!(byte_budget(&limits(None, None)), Some(32 * 1024));
+        assert_eq!(field_ceiling(&limits(None, None)), Some(1000));
+        assert_eq!(byte_budget(&limits(Some(0), Some(0))), None);
+        assert_eq!(field_ceiling(&limits(Some(0), Some(0))), None);
+        assert_eq!(byte_budget(&limits(Some(7), Some(4096))), Some(4096));
+        assert_eq!(field_ceiling(&limits(Some(7), Some(4096))), Some(7));
     }
 
     #[test]
