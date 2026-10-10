@@ -154,6 +154,16 @@ clients get `503`, HTTP/2 and HTTP/3 connections are closed. Writing
 `.limits(maxConnections: N)` sets the number explicitly; `0` stays refused,
 on TCP listeners as well (#58).
 
+### 🔁 A keepalive connection is retired after its request budget
+
+`.limits(keepaliveRequests: N)` sets how many requests one downstream
+keepalive connection serves before it is closed; the default is the
+reference's `keepalive_requests`, 1000. `0` is refused, because the
+listener-wide value is the strictest configured one and an "off" zero would
+void every other site's number. The bound applies to HTTP/1 connections
+today; the HTTP/2 and HTTP/3 sessions do not carry the counter, and the
+engineering memory tracks that gap (#58).
+
 ## [0.2.2]
 
 ### 🛡️ Underscore-named request fields can be allowlisted

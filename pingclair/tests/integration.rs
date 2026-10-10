@@ -117,6 +117,9 @@ mod retry_attempts;
 #[path = "integration/send_timeout.rs"]
 mod send_timeout;
 
+#[path = "integration/keepalive_requests.rs"]
+mod keepalive_requests;
+
 // 🔪 Responses that fail after they started live beside this file too.
 #[path = "integration/started_response.rs"]
 mod started_response;

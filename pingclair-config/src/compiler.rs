@@ -528,6 +528,9 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
             max_header_count: server.limits.max_header_count,
             max_header_bytes: server.limits.max_header_bytes,
             max_connections: server.limits.max_connections,
+            // 🔁 Native-only as well: the compatibility dialect keeps its
+            // frozen surface (docs/guardrails/config.md).
+            keepalive_requests: None,
             upload_bytes_per_sec: server.limits.upload_bytes_per_sec,
             download_bytes_per_sec: server.limits.download_bytes_per_sec,
             long_connections: pingclair_core::config::LongConnectionLimits {
@@ -1308,6 +1311,14 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
         if limits.max_connections == Some(0) {
             return Err(CompileError::InvalidServer {
                 message: "max_connections must be greater than zero".to_string(),
+            });
+        }
+        // 🔁 Zero is refused for the same reason as `max_connections`: the
+        // listener-wide value is the smallest bound configured, so a zero
+        // read as "unlimited" would silently void every other site's number.
+        if limits.keepalive_requests == Some(0) {
+            return Err(CompileError::InvalidServer {
+                message: "keepalive_requests must be greater than zero".to_string(),
             });
         }
         if limits.upload_bytes_per_sec == Some(0) || limits.download_bytes_per_sec == Some(0) {

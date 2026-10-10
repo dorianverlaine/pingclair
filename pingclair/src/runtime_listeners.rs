@@ -44,6 +44,7 @@ struct CapturedListenerLimits {
     max_header_count: Option<usize>,
     max_header_bytes: Option<usize>,
     max_connections: Option<usize>,
+    keepalive_requests: Option<u32>,
 }
 
 impl From<&ResourceLimitsConfig> for CapturedListenerLimits {
@@ -55,6 +56,7 @@ impl From<&ResourceLimitsConfig> for CapturedListenerLimits {
             max_header_count: limits.max_header_count,
             max_header_bytes: limits.max_header_bytes,
             max_connections: limits.max_connections,
+            keepalive_requests: limits.keepalive_requests,
         }
     }
 }

@@ -49,6 +49,7 @@ b.example, www.b.example {
         "max_header_count": null,
         "max_header_bytes": null,
         "max_connections": null,
+        "keepalive_requests": null,
         "upload_bytes_per_sec": null,
         "download_bytes_per_sec": null,
         "long_connections": {
@@ -123,6 +124,7 @@ b.example, www.b.example {
         "max_header_count": null,
         "max_header_bytes": null,
         "max_connections": null,
+        "keepalive_requests": null,
         "upload_bytes_per_sec": null,
         "download_bytes_per_sec": null,
         "long_connections": {

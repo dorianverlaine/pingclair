@@ -615,6 +615,22 @@ fn send_timeout_is_spellable_and_zero_disables_it() {
 }
 
 #[test]
+fn keepalive_requests_is_spellable_and_zero_is_refused() {
+    let site =
+        r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback { Respond(body: "hi") } } }"#;
+    let bounded = crate::compile(&format!("{site}.limits(keepaliveRequests: 250)")).unwrap();
+    assert_eq!(bounded.servers[0].limits.keepalive_requests, Some(250));
+
+    // 🔁 The listener-wide value is the smallest bound configured, so a zero
+    // read as "unlimited" cannot be one of them.
+    assert!(crate::compile(&format!("{site}.limits(keepaliveRequests: 0)")).is_err());
+    // 🚫 The counter the transport carries is a u32, and the label needs a
+    // number, not a duration.
+    assert!(crate::compile(&format!("{site}.limits(keepaliveRequests: 4294967296)")).is_err());
+    assert!(crate::compile(&format!("{site}.limits(keepaliveRequests: .seconds(2))")).is_err());
+}
+
+#[test]
 fn limits_lower_to_the_resource_bounds() {
     let native = crate::compile(
         r#"

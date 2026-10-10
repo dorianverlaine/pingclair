@@ -36,6 +36,7 @@ mod header_limits;
 pub mod header_timeout;
 pub mod health_check;
 mod http_policy;
+pub mod keepalive_requests;
 pub mod listener_generation;
 pub mod load_balancer;
 pub mod metrics;

@@ -574,6 +574,7 @@ pub(crate) const HTTP_LIMITS_LABELS: &[&str] = &[
     "maxHeaders",
     "maxHeaderBytes",
     "maxConnections",
+    "keepaliveRequests",
     "uploadBytesPerSecond",
     "downloadBytesPerSecond",
     "longConnections",
@@ -613,6 +614,9 @@ fn apply_http_limits(call: &Call, limits: &mut ResourceLimitsConfig) -> Result<(
     if call.get("maxConnections").is_some() {
         limits.max_connections = Some(http_count(call, "maxConnections")?);
     }
+    if call.get("keepaliveRequests").is_some() {
+        limits.keepalive_requests = Some(http_u32(call, "keepaliveRequests")?);
+    }
     if call.get("uploadBytesPerSecond").is_some() {
         limits.upload_bytes_per_sec = Some(call.measure("uploadBytesPerSecond", true)?);
     }
@@ -624,6 +628,12 @@ fn apply_http_limits(call: &Call, limits: &mut ResourceLimitsConfig) -> Result<(
 
 fn http_count(call: &Call, key: &str) -> Result<usize, Error> {
     usize::try_from(call.integer(key)?)
+        .map_err(|_| call.at.error(format!("{key} exceeds the platform range")))
+}
+
+/// 🔁 A count the transport carries in its own narrower integer.
+fn http_u32(call: &Call, key: &str) -> Result<u32, Error> {
+    u32::try_from(call.integer(key)?)
         .map_err(|_| call.at.error(format!("{key} exceeds the platform range")))
 }
 

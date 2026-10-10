@@ -75,6 +75,8 @@ impl BootstrapRuntime {
                 self.configuration.threads,
             );
             listener_limits.max_connections = Some(ceiling);
+            options.keepalive_request_limit =
+                pingclair_proxy::keepalive_requests::resolve(&listener_limits);
             let app = ResourceGuardedProxy::new(
                 pingora_proxy::HttpProxy::new(proxy.clone(), self.configuration.clone()),
                 listener_limits,

@@ -841,6 +841,15 @@ pub struct ResourceLimitsConfig {
     /// reference's `worker_connections` — resolved when a listener's service
     /// starts; `Some(0)` is refused, exactly as TCP listeners refuse it.
     pub max_connections: Option<usize>,
+    /// 🔁 Requests one downstream keepalive connection serves before it is
+    /// retired, the reference's `keepalive_requests`.
+    ///
+    /// `None` uses the runtime default (1000); `Some(0)` is refused, because
+    /// the listener-wide value is the strictest configured one and an "off"
+    /// zero would win every merge. Enforced on HTTP/1 today; the HTTP/2 and
+    /// HTTP/3 sessions do not carry the counter while the engineering memory
+    /// tracks the gap (#58).
+    pub keepalive_requests: Option<u32>,
     /// 📥 Maximum downstream request-body throughput in bytes per second.
     pub upload_bytes_per_sec: Option<u64>,
     /// 📤 Maximum downstream response-body throughput in bytes per second.

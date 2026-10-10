@@ -103,6 +103,10 @@ pub(super) fn register(
                 server.configuration.threads,
             );
             listener_limits.max_connections = Some(ceiling);
+            // 🔁 How many requests one keepalive connection serves before it
+            // is retired; see `keepalive_requests` for the reference's number.
+            server_options.keepalive_request_limit =
+                pingclair_proxy::keepalive_requests::resolve(&listener_limits);
             // 🧱 Captured before the guard consumes the limits, so the public
             // PROXY ingress can carry the same ceiling as the private hop.
             let ingress_max_connections = listener_limits.max_connections;

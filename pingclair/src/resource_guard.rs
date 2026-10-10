@@ -209,9 +209,16 @@ impl ResourceGuardedProxy {
                 return None;
             }
             let mut session = ServerSession::new_http1(stream);
-            if let Some(persistent) = persistent.take() {
-                persistent.apply_to_session(&mut session);
-            }
+            let fresh_connection = match persistent.take() {
+                Some(persistent) => {
+                    // 🔁 Carries the decremented reuse budget; the limit below
+                    // is for the fresh session only, or every reuse would
+                    // restore it and the bound would never arrive.
+                    persistent.apply_to_session(&mut session);
+                    false
+                }
+                None => true,
+            };
             // 📌 Pingora carries a prefix of its own only when pipelining is
             // enabled, which this server never does, so this is the only one.
             session.set_pipelined_prefix(head);
@@ -223,9 +230,11 @@ impl ResourceGuardedProxy {
             // ⏱️ Pingora's keepalive timer overrides its header-read timer.
             // ⏱️ Keepalive therefore begins only after routing accepts the header.
             session.set_keepalive(None);
-            session.set_keepalive_reuses_remaining(
-                options.and_then(|options| options.keepalive_request_limit),
-            );
+            if fresh_connection {
+                session.set_keepalive_reuses_remaining(
+                    options.and_then(|options| options.keepalive_request_limit),
+                );
+            }
 
             let reused = self.proxy.process_new_http(session, shutdown).await?;
             (stream, persistent) = reused.consume();

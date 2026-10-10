@@ -488,6 +488,7 @@ fn merged_listener_limits<'a>(
         merge_listener_limit(&mut limits.max_header_count, candidate.max_header_count);
         merge_listener_limit(&mut limits.max_header_bytes, candidate.max_header_bytes);
         merge_listener_limit(&mut limits.max_connections, candidate.max_connections);
+        merge_listener_limit(&mut limits.keepalive_requests, candidate.keepalive_requests);
         merge_listener_limit(&mut limits.idle_timeout_ms, candidate.idle_timeout_ms);
         merge_listener_limit(
             &mut limits.long_connections.idle_timeout_ms,
