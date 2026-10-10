@@ -219,6 +219,42 @@ async fn test_431_names_the_single_field_that_is_too_large() {
     );
 }
 
+/// 🚫 A request line over the head budget is `414`, not `431`.
+///
+/// `max_header_bytes` bounds the whole head. The request line is read before
+/// any field, and asking a client to shrink a field it never sent would be a
+/// lie — nginx answers `414` for a request line its buffer cannot hold
+/// (`large_client_header_buffers`), and RFC 9112 §3 points at the same status
+/// for a request-target longer than the server will parse. Before this the
+/// line was counted by nothing (#326), so a 256 KiB URI was admitted with
+/// `200` while the option reported nothing.
+#[tokio::test]
+async fn test_414_when_the_request_line_alone_exceeds_the_head_budget() {
+    let mut server = TestServer::new_pingclairfile(&header_limited_site(""));
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    // 📏 The 1 KiB budget is already spent by the request line alone…
+    let long = client
+        .get(server.url(0, &format!("/{}", "u".repeat(2000))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(long.status(), 414);
+    assert_eq!(
+        long.text().await.unwrap(),
+        "414 URI Too Long: the request line alone exceeds the header size limit"
+    );
+    // …while a target that leaves room for the fields is admitted.
+    let short = client
+        .get(server.url(0, &format!("/{}", "u".repeat(200))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(short.status(), 200);
+    assert_eq!(short.text().await.unwrap(), "admitted");
+}
+
 /// 🔎 Over HTTP/2 the 431 names the field too, and only that stream fails.
 ///
 /// Before the fix `max_header_bytes` was also the listener's

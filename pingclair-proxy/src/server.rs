@@ -1856,6 +1856,7 @@ pub(crate) fn error_reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         413 => "Request Entity Too Large",
+        414 => "URI Too Long",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
@@ -6719,8 +6720,28 @@ impl ProxyHttp for PingclairProxy {
         let Some(state) = generation.routes().get(host.as_ref()) else {
             return Ok(());
         };
+        // 🧾 The head budget covers the whole head, not only the field lines.
+        // The request line is measured here: an origin-form URI contributes its
+        // path and query, an absolute-form one its scheme and authority too —
+        // which is how HTTP/2 carries the authority instead of a `Host` field.
+        // Every piece is a `&str`, so nothing is allocated for the count.
+        let uri = &request.uri;
+        let head = request.method.as_str().len()
+            + 1
+            + uri.scheme().map_or(0, |scheme| scheme.as_str().len() + 3)
+            + uri.authority().map_or(0, |authority| authority.as_str().len())
+            + uri.path_and_query().map_or(0, |target| target.as_str().len())
+            + 1
+            // 📏 The version token's own width: `HTTP/1.1` is eight bytes,
+            // `HTTP/2` three. `http::Version` has no string form, and this is
+            // an accounting estimate, not a faithful re-rendering.
+            + match request.version {
+                http::Version::HTTP_2 | http::Version::HTTP_3 => 3,
+                _ => 8,
+            };
         let breach = crate::header_limits::check(
             &state.config.limits,
+            head,
             request.headers.len(),
             request
                 .headers
@@ -6731,8 +6752,11 @@ impl ProxyHttp for PingclairProxy {
         // up again, and for the 431 below: without a state the error-page
         // lookup finds no site and the configured page is unreachable.
         let detail = breach.as_ref().and_then(|breach| breach.detail());
+        let status = breach
+            .as_ref()
+            .map(crate::header_limits::HeaderLimitBreach::status);
         ctx.state = Some(state);
-        if breach.is_some() {
+        if let Some(status) = status {
             // 🧾 The same record the H3 refusal writes, so an operator's
             // search finds every header-limit refusal and not only the TCP
             // ones (#308). Pingora's own early-filter line is an incidental
@@ -6741,12 +6765,12 @@ impl ProxyHttp for PingclairProxy {
                 http::Version::HTTP_2 => "h2",
                 _ => "h1",
             };
-            crate::header_limits::log_refusal(transport, detail.as_deref());
+            crate::header_limits::log_refusal(transport, status, detail.as_deref());
             ctx.error_detail = detail;
             ctx.refused_before_routing = true;
             session.as_mut().set_keepalive(None);
             return pingora_core::Error::e_explain(
-                pingora_core::ErrorType::HTTPStatus(431),
+                pingora_core::ErrorType::HTTPStatus(status),
                 "request headers exceed configured limits",
             );
         }

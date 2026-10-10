@@ -3982,8 +3982,15 @@ async fn handle_request_inner(
         // an oversized section reaches this check and is refused on this
         // stream alone, instead of quiche closing the connection with
         // H3_EXCESSIVE_LOAD and failing every other request on it.
+        // 🧾 Pseudo-headers are head bytes the field iterator never sees:
+        // `:method`, `:path` and `:authority` count toward the budget the same
+        // way the HTTP/1 request line does, with the version token the line
+        // would have carried. Without them a 256 KiB `:path` was admitted with
+        // `200` exactly as its HTTP/1 twin was (#326).
+        let head = req.method.len() + 1 + req.path.len() + 1 + "HTTP/3".len() + req.authority.len();
         if let Some(breach) = crate::header_limits::check(
             &state.config.limits,
+            head,
             req.headers.len(),
             req.headers
                 .iter()
@@ -3996,11 +4003,11 @@ async fn handle_request_inner(
             // 🧾 The same record the H1/H2 refusal writes: this path builds
             // the 431 itself, and before the record existed a QUIC refusal
             // left nothing in the log at all (#308).
-            crate::header_limits::log_refusal("h3", breach.detail().as_deref());
+            crate::header_limits::log_refusal("h3", breach.status(), breach.detail().as_deref());
             send_error_response(
                 resp_tx,
                 stream_id,
-                431,
+                breach.status(),
                 breach.detail().as_deref(),
                 Some(&state),
                 response_policy,

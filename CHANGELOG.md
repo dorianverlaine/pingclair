@@ -84,6 +84,18 @@ HTTP header and negotiated-TLS logging options are rejected for raw TCP.
 Logger changes apply to new connections. Unchanged loggers survive route reloads
 without creating additional writer threads.
 
+### 🚫 The request line counts toward the header budget
+
+`limits { max_header_bytes }` now bounds the whole request head: the request
+line on HTTP/1, or the pseudo-headers on HTTP/2 and HTTP/3, as well as the
+field lines. A request-target that exceeds the budget on its own is answered
+`414 URI Too Long` — the status nginx answers with when a request line does not
+fit its buffer, and the one RFC 9112 §3 points at for a target longer than the
+server will parse. A total that is mostly fields stays `431`, and one field
+larger than the budget still names that field. Before this the request line was
+counted by nothing: a 256 KiB URI was admitted with `200` while the option
+reported nothing (#326).
+
 ## [0.2.2]
 
 ### 🛡️ Underscore-named request fields can be allowlisted

@@ -4,13 +4,24 @@
 //! 🧾 The `max_headers` and `max_header_bytes` check, shared by both
 //! transports.
 //!
-//! Both limits are totals, so the check sums every field line. RFC 6585 §5
-//! separates two reasons for a 431: the fields together are too large, or one
-//! field alone is. In the second case the response should say which field, so
-//! the client knows what to shrink. The same pass that sums the sizes also
-//! remembers the largest single line; only when that one line exceeds the
-//! byte limit on its own is it named. A total that no single field accounts
-//! for names nothing, because any name chosen there would be a guess.
+//! Both limits are totals, so the check sums the whole head: the field lines
+//! **and** the bytes outside them — the HTTP/1 request line, or the HTTP/2 and
+//! HTTP/3 pseudo-headers (`:method`, `:target`, `:authority`, `:scheme`), which
+//! the field iterator never sees. Before the head was counted, a 256 KiB
+//! request-target was admitted with `200` while `max_header_bytes` reported
+//! nothing (#326); nginx bounds the line itself and answers `414`.
+//!
+//! RFC 6585 §5 separates two reasons for a 431: the fields together are too
+//! large, or one field alone is. In the second case the response should say
+//! which field, so the client knows what to shrink. The same pass that sums the
+//! sizes also remembers the largest single line; only when that one line
+//! exceeds the byte limit on its own is it named. A total that no single field
+//! accounts for names nothing, because any name chosen there would be a guess.
+//!
+//! 🚦 The head bytes decide the status on their own: over the budget before a
+//! single field is read is `414`, which is what the request-target deserves
+//! (RFC 9112 §3, and nginx's answer for a line its buffer cannot hold), while
+//! an over-budget total that is mostly fields stays `431`.
 //!
 //! 🏎️ One pass, no allocation: this runs on every request of a site that
 //! configured a limit. The field name is copied only when a 431 is sent.
@@ -27,9 +38,10 @@ use pingclair_core::config::ResourceLimitsConfig;
 /// every refusal except the QUIC ones (#308). This is the stable record: the
 /// transport is a field rather than a different message, and the text matches
 /// the sentence H1/H2 already carried, so an existing search keeps working.
-pub fn log_refusal(transport: &'static str, detail: Option<&str>) {
+pub fn log_refusal(transport: &'static str, status: u16, detail: Option<&str>) {
     tracing::warn!(
         transport,
+        status,
         detail = detail.unwrap_or_default(),
         "⛔ request headers exceed configured limits"
     );
@@ -38,6 +50,12 @@ pub fn log_refusal(transport: &'static str, detail: Option<&str>) {
 /// 🚫 Why a request's header section was refused.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum HeaderLimitBreach<'a> {
+    /// The bytes outside the field lines — the HTTP/1 request line, or the
+    /// HTTP/2 and HTTP/3 pseudo-headers — exceed `max_header_bytes` on their
+    /// own. Answering 431 here would tell a client to shrink a field it never
+    /// sent, so this case is `414`, the status nginx reserves for a
+    /// request-target it will not parse.
+    RequestLineTooLarge,
     /// More field lines than `max_headers` allows.
     TooMany,
     /// The fields together exceed `max_header_bytes`, and no single one does.
@@ -51,6 +69,14 @@ pub(crate) enum HeaderLimitBreach<'a> {
 const MAX_NAMED_FIELD: usize = 64;
 
 impl HeaderLimitBreach<'_> {
+    /// 🚦 The status this breach is answered with.
+    pub(crate) fn status(&self) -> u16 {
+        match self {
+            Self::RequestLineTooLarge => 414,
+            Self::TooMany | Self::TooLarge | Self::FieldTooLarge(_) => 431,
+        }
+    }
+
     /// 💬 A sentence naming the field at fault, for the 431 body, or `None`
     /// when no single field is.
     ///
@@ -59,6 +85,11 @@ impl HeaderLimitBreach<'_> {
     /// be a field name, and echoing it could put markup or control bytes into
     /// the response.
     pub(crate) fn detail(&self) -> Option<Cow<'static, str>> {
+        if matches!(self, Self::RequestLineTooLarge) {
+            return Some(Cow::Borrowed(
+                "the request line alone exceeds the header size limit",
+            ));
+        }
         let Self::FieldTooLarge(name) = self else {
             return None;
         };
@@ -75,19 +106,26 @@ impl HeaderLimitBreach<'_> {
 
 /// 🧾 Checks one request's field lines against the site's limits.
 ///
-/// `fields` yields each field line's name and value length; `count` is the
-/// number of lines, which both callers know without iterating.
+/// `head` is the size of the bytes that are not field lines (the HTTP/1 request
+/// line, or the pseudo-headers on HTTP/2 and HTTP/3); `fields` yields each field
+/// line's name and value length, and `count` is the number of lines, which both
+/// callers know without iterating. The order is the order a server reads them
+/// in: the request line first, then the fields.
 pub(crate) fn check<'a>(
     limits: &ResourceLimitsConfig,
+    head: usize,
     count: usize,
     fields: impl Iterator<Item = (&'a str, usize)>,
 ) -> Option<HeaderLimitBreach<'a>> {
+    let limit = limits.max_header_bytes?;
+    if head > limit {
+        return Some(HeaderLimitBreach::RequestLineTooLarge);
+    }
     if limits.max_header_count.is_some_and(|limit| count > limit) {
         return Some(HeaderLimitBreach::TooMany);
     }
-    let limit = limits.max_header_bytes?;
     let (total, largest) = fields.fold(
-        (0usize, None::<(&str, usize)>),
+        (head, None::<(&str, usize)>),
         |(total, largest), (name, value_len)| {
             let size = name.len().saturating_add(value_len);
             let largest = match largest {
@@ -137,13 +175,20 @@ pub fn protocol_header_list_limit(limits: &ResourceLimitsConfig) -> Option<usize
     let fields = limits
         .max_header_count
         .unwrap_or(MAX_CONFIGURABLE_FIELDS)
-        .min(MAX_CONFIGURABLE_FIELDS);
+        .min(MAX_CONFIGURABLE_FIELDS)
+        // 📇 The pseudo-headers are fields to the protocol library even though
+        // they are not field lines to us: `:method`, `:scheme`, `:authority`,
+        // `:path`, so the section it measures is four overheads larger.
+        .saturating_add(PSEUDO_HEADERS);
     limits.max_header_bytes.map(|limit| {
         limit
             .saturating_mul(2)
             .saturating_add(fields.saturating_mul(PROTOCOL_FIELD_OVERHEAD))
     })
 }
+
+/// 📇 The pseudo-headers HTTP/2 and HTTP/3 count (RFC 9113 §8.3, RFC 9114 §4.3).
+const PSEUDO_HEADERS: usize = 4;
 
 /// 🔤 RFC 9110 §5.6.2 `tchar`.
 fn is_tchar(byte: u8) -> bool {
@@ -166,7 +211,7 @@ mod tests {
         limits: &ResourceLimitsConfig,
         fields: &[(&'a str, usize)],
     ) -> Option<HeaderLimitBreach<'a>> {
-        check(limits, fields.len(), fields.iter().copied())
+        check(limits, 0, fields.len(), fields.iter().copied())
     }
 
     #[test]
@@ -186,17 +231,40 @@ mod tests {
 
     #[test]
     fn protocol_limit_leaves_room_for_the_check_to_answer() {
-        // 🎯 1024 bytes and 10 fields: twice the limit, plus 32 per field.
+        // 🎯 1024 bytes and 10 fields: twice the limit, plus 32 for each of the
+        // ten fields and the four pseudo-headers the library also counts.
         assert_eq!(
             protocol_header_list_limit(&limits(Some(10), Some(1024))),
-            Some(2048 + 320)
+            Some(2048 + 14 * 32)
         );
         // 📌 No field count configured: the compiler's ceiling of 256 fields.
         assert_eq!(
             protocol_header_list_limit(&limits(None, Some(1024))),
-            Some(2048 + 256 * 32)
+            Some(2048 + 260 * 32)
         );
         assert_eq!(protocol_header_list_limit(&limits(Some(10), None)), None);
+    }
+
+    #[test]
+    fn a_head_over_the_budget_alone_is_414_and_comes_first() {
+        let limits = limits(Some(1), Some(100));
+        // 🚦 The request line is read before the fields, so it decides first —
+        // even when the field count is also over.
+        assert_eq!(
+            check(&limits, 200, 5, [("a", 1), ("b", 1)].into_iter()),
+            Some(HeaderLimitBreach::RequestLineTooLarge)
+        );
+        assert_eq!(HeaderLimitBreach::RequestLineTooLarge.status(), 414);
+        assert_eq!(
+            HeaderLimitBreach::RequestLineTooLarge.detail().as_deref(),
+            Some("the request line alone exceeds the header size limit")
+        );
+        // 📌 Under the budget the head still counts toward the total.
+        assert_eq!(
+            check(&limits, 80, 1, [("a", 30)].into_iter()),
+            Some(HeaderLimitBreach::TooLarge)
+        );
+        assert_eq!(check(&limits, 60, 1, [("a", 30)].into_iter()), None);
     }
 
     #[test]
