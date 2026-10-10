@@ -93,7 +93,16 @@ pub(super) fn register(
             // refuses every `CONNECT` through the same local-hop answer as
             // HTTP/3 — it only moves the refusal to where it is logged.
             server_options.allow_connect_method_proxying = true;
-            let listener_limits = proxy_logic.listener_limits();
+            let mut listener_limits = proxy_logic.listener_limits();
+            // 🔌 The reference's connection ceiling applies whether or not the
+            // configuration wrote one down. Resolving it here, where the
+            // service's thread count is known, keeps the H1/H2 semaphore, the
+            // PROXY ingress and the H3 accept loop admitting the same number.
+            let ceiling = pingclair_proxy::connection_limit::resolve(
+                &listener_limits,
+                server.configuration.threads,
+            );
+            listener_limits.max_connections = Some(ceiling);
             // 🧱 Captured before the guard consumes the limits, so the public
             // PROXY ingress can carry the same ceiling as the private hop.
             let ingress_max_connections = listener_limits.max_connections;

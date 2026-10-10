@@ -836,6 +836,10 @@ pub struct ResourceLimitsConfig {
     /// 📏 Maximum decoded request-header bytes, including names and values.
     pub max_header_bytes: Option<usize>,
     /// 🔌 Maximum simultaneous downstream transport connections per listener.
+    ///
+    /// `None` uses the runtime default — 512 per worker thread, the
+    /// reference's `worker_connections` — resolved when a listener's service
+    /// starts; `Some(0)` is refused, exactly as TCP listeners refuse it.
     pub max_connections: Option<usize>,
     /// 📥 Maximum downstream request-body throughput in bytes per second.
     pub upload_bytes_per_sec: Option<u64>,

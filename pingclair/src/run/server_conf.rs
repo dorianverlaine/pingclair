@@ -30,13 +30,9 @@ pub(super) fn build(config: &pingclair_core::config::PingclairConfig) -> (Server
         // the knob per deployment.
         .unwrap_or_else(|| server_conf.upstream_keepalive_pool_size.max(512));
     // Pingora defaults to ONE thread per service — on a multi-core box that
-    // leaves the machine idle while nginx runs one worker per core. Scale
-    // with available parallelism instead (still overridable via config).
-    server_conf.threads = config.global.worker_threads.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-    });
+    // leaves the machine idle while the reference runs one worker per core.
+    // Scale with available parallelism instead (still overridable via config).
+    server_conf.threads = effective_worker_threads(&config.global);
     // 🚰 What happens to a request that is still running when SIGTERM arrives.
     //
     // Pingora's own default gives the runtime five seconds and then stops it,
@@ -113,4 +109,18 @@ pub(super) fn build(config: &pingclair_core::config::PingclairConfig) -> (Server
     }
 
     (server_conf, grace_period_secs)
+}
+
+/// 🧵 The threads each service runs with: the configured value, or the
+/// processors this machine offers.
+///
+/// Shared with the modules that size defaults from the thread count, so a
+/// `worker_threads` override moves the services and the connection ceiling
+/// together instead of half of them.
+pub(super) fn effective_worker_threads(global: &pingclair_core::config::GlobalConfig) -> usize {
+    global.worker_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    })
 }

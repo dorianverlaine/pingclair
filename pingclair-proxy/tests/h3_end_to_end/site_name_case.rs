@@ -45,7 +45,7 @@ async fn h3_exclusion_holds_for_a_mixed_case_sni() {
     certs.set_excluded_names(["opted-out.h3.test"]);
 
     let server =
-        QuicServer::new(address, Arc::new(proxy), certs, 8, Vec::new()).with_socket(socket);
+        QuicServer::new(address, Arc::new(proxy), certs, 8, 4, Vec::new()).with_socket(socket);
     tokio::spawn(async move {
         if let Err(e) = server.run().await {
             eprintln!("H3 server stopped: {e}");

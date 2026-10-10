@@ -49,8 +49,8 @@ async fn h3_requests_during_reloads_are_all_served() {
     let certs = Arc::new(CertTable::new());
     let (cert, key) = self_signed_pem(&["h3.pingclair.test"]);
     certs.upsert_pem("h3.pingclair.test", &cert, &key).unwrap();
-    let server =
-        QuicServer::new(address, Arc::new(proxy.clone()), certs, 8, Vec::new()).with_socket(socket);
+    let server = QuicServer::new(address, Arc::new(proxy.clone()), certs, 8, 4, Vec::new())
+        .with_socket(socket);
     tokio::spawn(async move {
         if let Err(error) = server.run().await {
             eprintln!("H3 server stopped: {error}");

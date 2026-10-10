@@ -1190,7 +1190,8 @@ struct H3App {
     /// only those record it — everywhere else this stays `None` and no
     /// allocation happens.
     tls_identity: Option<crate::tls_identity::DownstreamTlsIdentity>,
-    /// 🔢 Releases this connection's slot against `limits.max_connections`.
+    /// 🔢 Releases this connection's slot against the listener's connection
+    /// ceiling.
     _slot: ConnectionSlot,
     /// 🛑 The first request stream id this connection will no longer serve,
     /// once it has sent `GOAWAY` during a graceful stop.
@@ -1241,7 +1242,8 @@ impl Drop for H3App {
     }
 }
 
-/// 🔢 Holds one connection's admission against `limits.max_connections`.
+/// 🔢 Holds one connection's admission against the listener's connection
+/// ceiling.
 ///
 /// The count has to fall when the worker task ends, not when the accept loop
 /// moves on, so this rides along inside [`H3App`] and releases on drop.
@@ -1572,6 +1574,9 @@ pub struct QuicServer {
     certs: Arc<CertTable>,
     connector: Arc<pingora_core::connectors::http::Connector>,
     filter: PingclairConnectionFilter,
+    /// 🧵 Worker threads this service runs with; sizes the default downstream
+    /// connection ceiling when no site sets `limits(maxConnections:)`.
+    worker_threads: usize,
     /// 🔌 A socket bound ahead of time by [`bind_udp`]. Startup binds
     /// it synchronously, next to the TCP listeners, so a port that is already
     /// taken stops the process instead of leaving it advertising HTTP/3 it
@@ -1587,6 +1592,9 @@ impl QuicServer {
     /// - `certs`: SNI certificate table consulted by every new handshake.
     /// - `upstream_keepalive_pool_size`: Pingora upstream pool size, kept
     ///   consistent with the H1/H2 path.
+    /// - `worker_threads`: 🧵 The threads this service runs with, so the
+    ///   default connection ceiling means the same number here as on the
+    ///   H1/H2 listener when no site sets `limits(maxConnections:)`.
     /// - `blocked_networks`: 🛡️ L4 blocklist, parsed once at startup and
     ///   shared in meaning with the TCP listener's connection filter.
     pub fn new(
@@ -1594,6 +1602,7 @@ impl QuicServer {
         proxy: Arc<PingclairProxy>,
         certs: Arc<CertTable>,
         upstream_keepalive_pool_size: usize,
+        worker_threads: usize,
         blocked_networks: Vec<ipnet::IpNet>,
     ) -> Self {
         let options = pingora_core::connectors::ConnectorOptions::new(upstream_keepalive_pool_size);
@@ -1605,6 +1614,7 @@ impl QuicServer {
                 options,
             ))),
             filter: PingclairConnectionFilter::new(blocked_networks),
+            worker_threads,
             socket: None,
         }
     }
@@ -1746,10 +1756,9 @@ impl QuicServer {
             // ⏱️ Read once per connection, so a reload's limits apply to the
             // connections that open after it.
             let limits = self.proxy.listener_limits();
-            if let Some(limit) = limits.max_connections
-                && live_connections.load(Ordering::Acquire) >= limit
-            {
-                tracing::warn!("🚫 Rejecting an HTTP/3 connection at the configured limit");
+            let ceiling = crate::connection_limit::resolve(&limits, self.worker_threads);
+            if live_connections.load(Ordering::Acquire) >= ceiling {
+                tracing::warn!("🚫 Rejecting an HTTP/3 connection at the connection ceiling");
                 continue;
             }
             live_connections.fetch_add(1, Ordering::AcqRel);

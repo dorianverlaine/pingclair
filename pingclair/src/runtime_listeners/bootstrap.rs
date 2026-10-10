@@ -67,9 +67,17 @@ impl BootstrapRuntime {
             let mut options = pingora_core::apps::HttpServerOptions::default();
             options.h2c = true;
             options.allow_connect_method_proxying = true;
+            // 🔌 Same ceiling resolution as the ordinary listener path; the
+            // bootstrap service is a listener too.
+            let mut listener_limits = proxy.listener_limits();
+            let ceiling = pingclair_proxy::connection_limit::resolve(
+                &listener_limits,
+                self.configuration.threads,
+            );
+            listener_limits.max_connections = Some(ceiling);
             let app = ResourceGuardedProxy::new(
                 pingora_proxy::HttpProxy::new(proxy.clone(), self.configuration.clone()),
-                proxy.listener_limits(),
+                listener_limits,
                 options,
             );
             let mut service = Service::new("Pingclair bootstrap HTTP service".to_string(), app);

@@ -70,6 +70,10 @@ pub(super) fn start(
         .cloned()
         .collect();
     let h3_pool_size = config.global.upstream_keepalive_pool_size.unwrap_or(512);
+    // 🧵 The threads each service runs with; the H3 accept loop sizes its
+    // default connection ceiling from this, so an unconfigured listener
+    // admits the same number over QUIC as over H1/H2.
+    let worker_threads = super::server_conf::effective_worker_threads(&config.global);
 
     // 📜 One certificate table is retained by the runtime publisher so a
     // manual rotation reaches QUIC in the same transaction as TCP TLS.
@@ -113,6 +117,7 @@ pub(super) fn start(
                     proxy,
                     table_for_task.clone(),
                     h3_pool_size,
+                    worker_threads,
                     blocked_for_task.clone(),
                 )
                 .with_socket(socket);

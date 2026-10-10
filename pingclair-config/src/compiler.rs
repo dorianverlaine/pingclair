@@ -1302,6 +1302,9 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
                 message: "max_header_bytes must be off, zero, or between 1 and 1048575".to_string(),
             });
         }
+        // 🔢 Zero is refused here, not read as "off" the way header ceilings
+        // are: a TCP listener refuses it the same way, and the reference has
+        // no off switch for its connection ceiling either.
         if limits.max_connections == Some(0) {
             return Err(CompileError::InvalidServer {
                 message: "max_connections must be greater than zero".to_string(),

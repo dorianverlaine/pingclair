@@ -143,6 +143,17 @@ larger than the budget still names that field. Before this the request line was
 counted by nothing: a 256 KiB URI was admitted with `200` while the option
 reported nothing (#326).
 
+### 🔌 Unconfigured listeners get the reference's connection ceiling
+
+A listener whose sites set no `limits(maxConnections:)` now admits 512
+connections per worker thread — the reference's `worker_connections` default
+— instead of taking connections without a ceiling. The bound applies to
+HTTP/1 and HTTP/2 clients, HTTP/3 clients, and the PROXY-protocol ingress
+alike. Excess connections are refused before a request is read: HTTP/1
+clients get `503`, HTTP/2 and HTTP/3 connections are closed. Writing
+`.limits(maxConnections: N)` sets the number explicitly; `0` stays refused,
+on TCP listeners as well (#58).
+
 ## [0.2.2]
 
 ### 🛡️ Underscore-named request fields can be allowlisted

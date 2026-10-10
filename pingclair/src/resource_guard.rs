@@ -245,7 +245,9 @@ impl ServerApp for ResourceGuardedProxy {
             Some(connections) => match connections.try_acquire() {
                 Ok(permit) => Some(permit),
                 Err(_) => {
-                    tracing::warn!("🚫 Rejecting a downstream connection at the configured limit");
+                    tracing::warn!(
+                        "🚫 Rejecting a downstream connection at the connection ceiling"
+                    );
                     Self::reject_excess_connection(stream).await;
                     return None;
                 }

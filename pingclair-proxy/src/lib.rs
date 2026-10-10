@@ -23,6 +23,7 @@ mod cache_vary;
 pub mod client_auth;
 mod config_text;
 pub mod connection_filter;
+pub mod connection_limit;
 pub mod dns;
 pub mod drain;
 pub mod dynamic_upstream;

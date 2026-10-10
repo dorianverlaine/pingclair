@@ -205,7 +205,7 @@ async fn spawn_h3_listener_with_policy(
     }
 
     let server =
-        QuicServer::new(address, Arc::new(proxy), certs, 8, Vec::new()).with_socket(socket);
+        QuicServer::new(address, Arc::new(proxy), certs, 8, 4, Vec::new()).with_socket(socket);
     tokio::spawn(async move {
         if let Err(e) = server.run().await {
             eprintln!("H3 server stopped: {e}");
