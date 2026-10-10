@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 pub struct Dns {
     pub address: SocketAddr,
     pub queries: Arc<Mutex<Vec<(Name, RecordType)>>>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl Dns {
@@ -44,14 +44,28 @@ impl Dns {
         Self {
             address,
             queries,
-            task,
+            task: Some(task),
+        }
+    }
+
+    /// 🧹 Stops the UDP task and waits until it is really gone.
+    ///
+    /// `abort` only schedules the cancellation; the task stays alive until the
+    /// runtime polls it. A test that counts live tasks must not start while a
+    /// retired attempt is still on that books, so this waits for the join.
+    pub async fn shutdown(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
         }
     }
 }
 
 impl Drop for Dns {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -89,6 +103,14 @@ pub async fn tcp_query(stream: &mut TcpStream) -> Message {
 /// address, both transports) is unchanged, and five attempts make the race
 /// negligible. A failure that is not a lost port still panics at once, so a
 /// real defect is not hidden behind the retry.
+///
+/// 🔢 The retry also has to *finish* with the failed attempt: its UDP task is
+/// being cancelled, and `num_alive_tasks` keeps counting it until the runtime
+/// polls the cancellation through. Returning with that task still on the
+/// books made `raw_cancellation_joins_every_transport_task` fail by exactly
+/// one task (`left: 1, right: 2`, CI x86_64 shard 3, 2026-10-10) whenever the
+/// collision happened. Waiting for the join before retrying removes the
+/// coincidence: a baseline measured after this fixture is a settled one.
 pub async fn truncated_dns() -> (Dns, TcpListener) {
     for _ in 0..5 {
         let dns = Dns::new(|query| {
@@ -99,7 +121,10 @@ pub async fn truncated_dns() -> (Dns, TcpListener) {
         .await;
         match TcpListener::bind(dns.address).await {
             Ok(tcp) => return (dns, tcp),
-            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                dns.shutdown().await;
+                continue;
+            }
             Err(error) => panic!("TCP side of the DNS fixture: {error}"),
         }
     }
