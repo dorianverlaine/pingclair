@@ -233,7 +233,8 @@
 
 Protocol behaviour is tested in `pingclair/tests/integration/rfc_conformance/`,
 one requirement per test, and each test cites the clause that decides it. The
-authority order lives in `config.md` (RFC > nginx); what belongs here is
+authority order lives in `config.md` (the RFC first, then the recorded reference
+reading); what belongs here is
 the mechanic that makes it work:
 
 - **An ignored test is the outstanding list.** A requirement the build does not
@@ -244,11 +245,12 @@ the mechanic that makes it work:
   would both satisfy the RFC — refuse the configuration, or normalise the value —
   the test accepts either and rejects only the answer the clause forbids. Fixing
   the defect should not require rewriting the test that describes it.
-- **Parity checks live in `parity.rs` and say so.** A property wanted because
-  Caddy or nginx has it, with no RFC behind it, is still worth a test; it just
-  never pretends to be a standard. The doc comment names the server it was
-  measured against, because "we differ from Caddy here, deliberately" is a
-  decision somebody will otherwise re-litigate.
+- **Parity checks live in `parity.rs` and say so.** A property wanted because a
+  reference implementation has it, with no RFC behind it, is still worth a test;
+  it just never pretends to be a standard. The doc comment names the reference it
+  was measured against, and the reading itself lives in the memory repository,
+  because "we differ here, deliberately" is a decision somebody will otherwise
+  re-litigate.
 - **A conformance test is not a substitute for the integration suite.** It checks
   the wire, not the product: streaming budgets, lifecycle, reload and the rest
   stay where they already are.
@@ -277,7 +279,7 @@ after any H2/H3 change:
 Two things those numbers say that are easy to misread:
 
 - **Our own HTTP/3 + QPACK layer is the strong half.** Of the 18 h3spec failures,
-  13 are cases Caddy v2.11.7 (quic-go) passes — every one a QUIC transport rule
+  13 are cases the quic-go stack passes — every one a QUIC transport rule
   *below* our code — while 13 *other* cases are ones quic-go fails and we pass,
   all HTTP/3 and QPACK rules, which is the layer `quic.rs` owns. Reporting only
   "18 failures" would hide that split, so compare against a second implementation
@@ -370,7 +372,7 @@ rediscover them.
 
 - **Print `succeeded` on every row and void the row when it does not match.**
   `h2load -H "host: bench.local"` **cannot set the HTTP/1.1 Host** — Host comes
-  from the URL's authority. So nginx and Pingclair both received
+  from the URL's authority. So both the comparison target and Pingclair received
   `Host: 127.0.0.1`, neither matched a vhost, and **all 30,000 requests were
   4xx** — while the comparison target, which has no concept of virtual hosts,
   returned 200 and looked entirely normal. That table showed us "winning" by a
@@ -386,8 +388,9 @@ rediscover them.
   `-t2 -c50 -n100000`) were once compared against athlon's (`--cpus=1`,
   `-t1 -c25 -n30000`) and the difference read as a machine-generation effect —
   **that was a comparison of settings**. The same run missed another variable:
-  athlon has no AES-NI, so Pingclair negotiated ChaCha20-Poly1305 while nginx
-  negotiated AES-256-GCM, and **the two were not doing the same work at all**.
+  athlon has no AES-NI, so Pingclair negotiated ChaCha20-Poly1305 while the
+  comparison target negotiated AES-256-GCM, and **the two were not doing the
+  same work at all**.
 
   > 🎯 **The operable rule**: **the cipher is a variable too.** Before comparing
   > machines, confirm both negotiated the same cipher suite (`openssl s_client`
@@ -476,6 +479,6 @@ and **neither is a defect.**
   hide checks depend on, for 1–2 %, does not pay.
 
 ⚠️ That round did not advance the question it was meant to answer: no comparison
-target was set up locally (neither nginx nor a TLS-capable Rust static server),
-the load average was 3.3, and the client was emulated amd64. The open item is
-tracked as issue #35.
+target was set up locally (no TLS-capable static server either), the load
+average was 3.3, and the client was emulated amd64. The open item is tracked as
+issue #35.

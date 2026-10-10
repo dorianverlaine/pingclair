@@ -31,7 +31,8 @@
   plausible; neither had a single measurement taken under conditions where the
   patched component was a saturated resource. `pingora-core` cut cumulative
   allocation by 86% for +0.9% throughput (inside the noise) with completely
-  overlapping RSS ranges. The first load test was not even valid — nginx was
+  overlapping RSS ranges. The first load test was not even valid — the
+  comparison target was
   pinned at 200% of its quota while Pingclair still had headroom, so the backend
   was what got measured. **The rule now: record CPU for all three parties on every
   A/B round, and throw the round away when the proxy is not the saturated layer.**
@@ -99,9 +100,9 @@
   `panicked at`; that signal holds under both profiles.
 - **A listener-level switch must not be built as a global one.** PROXY protocol
   was once `global.proxy_protocol`, so turning it on made every listener demand
-  the header and broke the directly-connected one. nginx spells it
-  `listen 443 proxy_protocol;` and Caddy uses a per-server listener wrapper —
-  neither is global, because real deployments routinely have one port behind an L4
+  the header and broke the directly-connected one. The reference
+  implementations attach it to one listener rather than to the process — every
+  one of them, because real deployments routinely have one port behind an L4
   load balancer and another taking direct connections. Incidentally, `listen` used
   to **silently drop extra arguments**, so `listen :443 proxy_protocol` produced a
   listener that named the feature without requiring it — the same class as
@@ -470,9 +471,10 @@
   the first plan, and the second dialled under the first one's policy. ⚠️ **No test
   catches this naturally**, because using the wrong plan still "works".
 
-- 🧾 **The DSL cannot express this, and that itself is a gap.** Caddyfile's
-  `forward_auth` accepts only `uri` and `copy_headers`; every other subdirective is
-  an `UnknownDirective`. So the exposure here is JSON and Admin only.
+- 🧾 **The DSL cannot express this, and that itself is a gap.** The
+  compatibility dialect's `forward_auth` accepts only `uri` and `copy_headers`;
+  every other subdirective is an `UnknownDirective`. So the exposure here is
+  JSON and Admin only.
   🎯 It **fails closed** (rejects) rather than ignoring silently, which makes it a
   missing feature rather than a second defect — but "the internal auth service sits
   behind a private CA" is a thoroughly ordinary shape and should be supported.

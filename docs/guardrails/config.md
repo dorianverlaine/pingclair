@@ -102,36 +102,36 @@
   through the same `set_http_version` — so it is not possible for the two to
   disagree about whether a connection may be reused.
 
-## 📜 Authority when servers disagree (2026-10-06)
+## 📜 Authority when references disagree (2026-10-10)
 
-Pingclair's behaviour is decided by this project, and "another server does it"
-is not what settles an argument. The order is **RFC > nginx**:
+Pingclair's behaviour is decided by this project. This file and the reference
+readings behind it are the whole argument — no other server's behaviour is.
 
-1. **An RFC requirement wins outright, nginx included.** A response that breaks a
-   `MUST`/`SHOULD` is a defect here even when the reference implementation has
-   the same one — "the reference does it too" is a description of the world, not a
-   defence of the behaviour. Open examples from the 2026-10-06 audit: a `CONNECT`
-   that matches no site answered `200` with a reusable connection where
-   RFC 9110 §9.3.6 and §8.6 require a refusal that ends it (#283, since fixed); a proxied `204`
-   forwarded with `Content-Length` on HTTP/1.1 (§8.6, #270); a field named in the
-   upstream's `Connection` header passed on to the client (§7.6.1, #263); field
-   values padded with SP/HTAB emitted on HTTP/2 and HTTP/3 (§8.2.1, #256).
-2. **Otherwise nginx is the semantic reference** (2026-10-10, from the 0.3 line
-   on). When nginx's behaviour and ours differ and a configuration can reach the
-   difference, the default answer is nginx's; the issue records what nginx does
-   and where it was read from, the way every rejection note has to. The tree to
-   read is the local checkout of `nginx/nginx` (mainline,
-   `release-1.31.6-19-g2b5c2b605` at the time of writing) — for ACME and
-   OpenTelemetry the OSS tree has no module, so the reference is the project's
-   own companion module (`nginx/nginx-acme`, `nginxinc/nginx-otel`) and its
-   directive set. Where we deliberately differ, the divergence is written down
-   as deliberate, with the reason.
-3. **The Caddyfile frontend is a frozen migration layer.** It keeps accepting
-   the syntax it accepts today and lowers it into the same `PingclairConfig`, so
-   an existing file keeps running. It does not grow: **a new feature gets a
-   native spelling only**, and a Caddyfile that uses a directive this build does
-   not accept is refused rather than taught. Caddy is where a migrated file's
-   *spelling* comes from; it is not a reason for behaviour.
+1. **An RFC requirement wins outright, including over any reference.** A
+   response that breaks a `MUST`/`SHOULD` is a defect here even when another
+   implementation has the same one — "the reference does it too" is a
+   description of the world, not a defence of the behaviour. Open examples from
+   the 2026-10-06 audit: a `CONNECT` that matches no site answered `200` with a
+   reusable connection where RFC 9110 §9.3.6 and §8.6 require a refusal that
+   ends it (#283, since fixed); a proxied `204` forwarded with `Content-Length`
+   on HTTP/1.1 (§8.6, #270); a field named in the upstream's `Connection`
+   header passed on to the client (§7.6.1, #263); field values padded with
+   SP/HTAB emitted on HTTP/2 and HTTP/3 (§8.2.1, #256).
+2. **Otherwise the recorded reference reading decides the default.** The
+   engineering memory repository — a sibling checkout named in `AGENTS.md` —
+   records which implementation was read for each behaviour, what it does, and
+   why we follow it or diverge. A behaviour that a configuration can reach and
+   that differs from that reading is a finding until either the behaviour
+   changes or the divergence is written down as deliberate.
+3. **The compatibility frontend is a frozen migration layer.** It keeps
+   accepting the syntax it accepts today and lowers it into the same
+   `PingclairConfig`, so an existing file keeps running. It does not grow: **a
+   new feature gets a native spelling only**, and a file that uses a directive
+   this build does not accept is refused rather than taught.
+
+> 📌 The reference readings themselves — which implementation, which version,
+> which symbol, which measurement — live in the memory repository, not here.
+> The public documentation describes Pingclair on its own terms.
 
 > 🎯 **The operable rule**: a test that pins protocol behaviour cites the RFC
 > clause, never another server. `pingclair/tests/integration/rfc_conformance/`
@@ -257,7 +257,7 @@ check in the issue, not just in the author's head:
   was emitted as a token and scanning stopped). Same file, same "text glued to a
   placeholder belongs to the same word" rule, two directions implemented
   separately — so only one of them was alive. The cost: `redir {host}/moved 302`
-  (a legal Caddyfile) was rejected, while `try_files {path} {path}/ …`
+  (valid in the compatibility dialect) was rejected, while `try_files {path} {path}/ …`
   **silently** grew an extra `/` candidate that matches the site root on every
   request — which looks exactly like normal operation.
 

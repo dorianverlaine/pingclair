@@ -1,8 +1,12 @@
 # 🔌 Layer 4 implementation boundaries
 
 The 0.3 line on `main` routes raw TCP using complete TLS ClientHello metadata
-and peer addresses. TLS remains end to end. Issue #183 provides background;
-nginx source and tested behavior decide semantics when early issue prose differs.
+and peer addresses. TLS remains end to end. Issue #183 provides background.
+The reference readings behind these semantics — what was read, at which
+revision, and which divergences we keep on purpose — are recorded in the
+engineering memory repository (`features/layer4-tcp-routing.md` and
+`research/server-reference-readings-2026-10.md`); this file describes what the
+build does.
 
 ## 🧭 Ownership
 
@@ -18,26 +22,19 @@ nginx source and tested behavior decide semantics when early issue prose differs
   at load/reload, without periodic DNS refresh or health checking.
 - Extract shared runtime infrastructure only when a concrete consumer needs it.
 
-## 🔬 Reference evidence, 2026-10-07
+## 🔬 What the semantics rest on
 
-nginx revision `2b5c2b605b5df669da5dec6749dcc76c07d1315d` is the semantic
-reference. Caddy supplies block and named-matcher syntax only.
-
-- `ngx_stream_core_preread_phase` finalizes on timeout with `NGX_STREAM_OK`;
-  that status is not `NGX_OK`, which advances the phase. Timeout is not fallback.
-- `ngx_stream_ssl_preread_handler` declines non-TLS and some malformed inputs;
-  do not assume every parse failure means nginx closes the connection. Preserve
-  this distinction when defining and testing the classifier outcomes.
-- `ngx_parse_size` uses binary k/m units. Millisecond `ngx_parse_time` uses
-  seconds for bare integers, permits zero and rejects month/year units.
-- `proxy_timeout` bounds inactivity, not total connection lifetime. Relay EOF
-  handling must drain buffered bytes before finalization or half-close.
-
-Sources: [stream core](https://github.com/nginx/nginx/blob/2b5c2b605b5df669da5dec6749dcc76c07d1315d/src/stream/ngx_stream_core_module.c),
-[TLS preread](https://github.com/nginx/nginx/blob/2b5c2b605b5df669da5dec6749dcc76c07d1315d/src/stream/ngx_stream_ssl_preread_module.c),
-[numeric parsing](https://github.com/nginx/nginx/blob/2b5c2b605b5df669da5dec6749dcc76c07d1315d/src/core/ngx_parse.c),
-[proxy](https://nginx.org/en/docs/stream/ngx_stream_proxy_module.html),
-[Caddy syntax](https://github.com/mholt/caddy-l4/blob/master/layer4/caddyfile.go).
+- **A preread timeout is not a fallback trigger.** It finalizes the preread
+  phase with a status that does not advance it; only a complete classification
+  moves on. Configuration that expects the fallback route after a stalled
+  ClientHello is wrong.
+- **A parse failure is not one thing.** Some malformed inputs are declined by
+  the classifier without the connection being treated as hostile; keep the
+  distinction explicit when defining and testing the classifier outcomes.
+- **Buffer units are binary**, and a bare integer duration is seconds; zero is
+  legal and month/year units are not.
+- **An idle timeout bounds inactivity, not a session's total lifetime.** Relay
+  EOF handling drains buffered bytes before finalization or half-close.
 
 ## 🔌 Minimal TCP configuration
 
@@ -86,7 +83,7 @@ TCPListener(on: ":9443") {
 }
 ```
 
-The equivalent Caddy-style source is:
+The equivalent source in the compatibility dialect is:
 
 ```caddyfile
 {
@@ -131,7 +128,8 @@ one five-second deadline, at most eight CNAME hops and 64 unique addresses.
 Transient errors back off with bounded jitter. Truncated UDP replies use TCP.
 
 By default, only public destinations are allowed. A nonempty native
-`allowIP: ["10.0.0.0/8"]` or Caddy `allow_ip 10.0.0.0/8` explicitly permits
+`allowIP: ["10.0.0.0/8"]` or the compatibility dialect's `allow_ip 10.0.0.0/8`
+explicitly permits
 listed non-public ranges. Loopback and link-local access require CIDRs confined
 to those classes; a broad CIDR cannot grant them incidentally. Unspecified,
 multicast and known local HTTP, L4 or Admin destinations remain forbidden.
@@ -231,13 +229,12 @@ fields as escaped key/value pairs. Neither format records payloads or TLS names.
 Sampling and a full queue may drop records; the shared
 `pingclair_access_log_dropped_total` counts queue drops.
 
-Status follows [nginx stream](https://nginx.org/en/docs/stream/ngx_stream_core_module.html#variables),
-not HTTP responses on the TCP wire: `403` is a blocked peer, `400` is preread
-overflow, `502` is no selected/reachable upstream, and `500` is cancellation or
-an internal allocation failure. Normal completion, client EOF/I/O termination
-and idle/preread timeout use `200`; the explicit `outcome` distinguishes them.
-The meanings of session byte fields and durations follow
-[nginx stream logging](https://nginx.org/en/docs/stream/ngx_stream_log_module.html).
+Status describes the session, not an HTTP response on the TCP wire: `403` is a
+blocked peer, `400` is preread overflow, `502` is no selected/reachable
+upstream, and `500` is cancellation or an internal allocation failure. Normal
+completion, client EOF/I/O termination and idle/preread timeout use `200`; the
+explicit `outcome` distinguishes them. The reading that fixed these meanings is
+recorded in the memory repository.
 
 ## 🚦 Connection admission
 
@@ -272,7 +269,7 @@ remaining `proxy_connect_timeout` budget. A session tries at most four distinct
 addresses from its pool. Refused connections, network failures and timeouts may
 advance to the next address; local resource errors and unclassified failures stop
 immediately. A zero total budget refuses the dial without opening an upstream socket.
-These fixed alpha limits bound work; they are not nginx's unlimited retry defaults.
+These fixed alpha limits bound work; they are not unlimited retry defaults.
 Local descriptor, memory/buffer and unavailable-address failures also produce
 a process-wide warning at most once per 30 seconds. The warning uses a fixed
 reason and OS error number, without a destination-derived metric label.

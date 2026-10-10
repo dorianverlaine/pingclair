@@ -1,23 +1,22 @@
 # 🧩 Native configuration language
 
-The native language is a declarative configuration surface beside the
-Caddy-style Pingclairfile. It borrows Swift's argument labels and SwiftUI's
-component composition; it is not executable Swift, and nothing in it is
-evaluated at request time. Native files are selected by the `.pingclair`
-extension or, for `Pingclairfile`, `Caddyfile` and standard input, by content
-shape: a `let`, an `@` attribute, or a top-level `Component(`. A file that
-carries one language's extension and the other language's content is refused
-with the rename that fixes it, and malformed native input is never
-reinterpreted as a Caddyfile. There is no version header.
+The native language is a declarative configuration surface beside the legacy
+Pingclairfile. It borrows Swift's argument labels and SwiftUI's component
+composition; it is not executable Swift, and nothing in it is evaluated at
+request time. Native files are selected by the `.pingclair` extension or, for
+the extensionless entry points, by content shape: a `let`, an `@` attribute, or
+a top-level `Component(`. A file that carries one language's extension and the
+other language's content is refused with the rename that fixes it, and
+malformed native input is never reinterpreted as the legacy dialect. There is
+no version header.
 
-One concept has exactly one spelling. The names the Caddyfile uses belong to
-the compatibility frontend, which stays supported during migration; the native
+One concept has exactly one spelling. The legacy names belong to the
+compatibility frontend, which stays supported during migration; the native
 frontend refuses them instead of growing aliases. Both frontends produce the
 same `PingclairConfig` through one validation and publication path. That
-compatibility frontend is **frozen**: it keeps accepting the syntax it accepts
-today, and a new feature never adds a Caddyfile spelling for it — the native
-language is where new surface lands, and behaviour follows nginx rather than
-Caddy (`docs/guardrails/config.md`).
+compatibility frontend is **frozen** (`docs/guardrails/config.md`): it keeps
+accepting the syntax it accepts today, and a new feature gets a native spelling
+only.
 
 `pingclair describe` prints the catalogue the parser accepts — every component,
 modifier and attribute, each with an example and a refusal — and
