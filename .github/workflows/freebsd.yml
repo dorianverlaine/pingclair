@@ -47,7 +47,9 @@ jobs:
           mem: "8192"
           prepare: |
             set -e
-            pkg install -y cmake ninja perl5 gmake pkgconf git curl
+            # 🐚 bash is not in the FreeBSD base system, and the official Rust
+            # installer re-execs itself through `#!/usr/bin/env bash`.
+            pkg install -y bash cmake ninja perl5 gmake pkgconf git curl
           run: |
             set -e
 
