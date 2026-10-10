@@ -23,6 +23,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// containing literal braces — JSON, JavaScript, documentation — survives it.
 /// Replacing the unknown name with nothing is the one answer that silently
 /// changes content the operator wrote.
+///
+/// 📌 This is the **frozen Caddyfile dialect's** replacer rule, not a decision
+/// about new surface: the native language has no interpolation in literals
+/// (`Format` carries dynamic values), so nothing here constrains it.
 #[tokio::test]
 async fn test_unknown_placeholder_is_preserved() {
     let mut server = TestServer::new_pingclairfile(&site(r#"respond "open {brace} close""#));
@@ -47,9 +51,12 @@ async fn test_unknown_placeholder_is_preserved() {
 ///
 /// Caddy answers `206` with `Content-Encoding: gzip` and a `Content-Range` over
 /// the sidecar's length, so the representation a client negotiated is the one it
-/// ranges over. This is a parity choice rather than an RFC requirement — nginx's
-/// `gzip_static` serves the identity file for ranges — but it has to be a choice,
-/// which is what this test records.
+/// ranges over. The first version of this comment claimed nginx does the
+/// opposite; a measurement against 1.31.6 refuted it — `gzip_static on` answers
+/// `206`, `Content-Encoding: gzip`, `Content-Range: bytes 0-9/56` over a 56-byte
+/// sidecar — and the source says the same thing:
+/// `ngx_http_gzip_static_module.c:250` sets `r->allow_ranges = 1` on the sidecar
+/// it serves. Both references do what this test pins.
 #[tokio::test]
 async fn test_precompressed_range_uses_the_compressed_representation() {
     use std::io::Write;
@@ -151,6 +158,11 @@ async fn test_known_length_body_arrives_before_it_ends() {
 /// Caddy's fix for this (caddyserver/caddy#7845) passes along the response head
 /// it already formed; a stream reset with no status at all leaves the client —
 /// and the operator reading the access log — with nothing to act on.
+///
+/// ⏳ Re-base owed: measured against Caddy so far. nginx's h2 side of this —
+/// whether the status reaches the client before the stream is reset — has not
+/// been compared yet; the differential harness in `pingclair-tests` is where
+/// that measurement belongs.
 #[tokio::test]
 async fn test_truncated_upstream_answers_an_h2_client() {
     let upstream = ScriptedUpstream::start(
@@ -206,6 +218,10 @@ async fn test_truncated_upstream_answers_an_h2_client() {
 /// the client must notice into a clean end. Caddy relays the head it formed
 /// with chunked framing instead, so the missing terminating chunk stays
 /// visible.
+///
+/// 📌 nginx shares the rule that decides this: a proxied response whose length
+/// is unknown to it is framed chunked to an HTTP/1.1 client, so a break before
+/// the terminating chunk stays visible there too.
 #[tokio::test]
 async fn test_truncated_flushing_response_is_not_a_clean_h1_end() {
     let upstream = ScriptedUpstream::start(
@@ -304,6 +320,10 @@ async fn test_flushing_route_keeps_its_h1_connection() {
 /// repository's own fail-closed rule: an operator draining a backend for a
 /// cutover is entitled to have the configuration mean what it says, and a
 /// silently clamped weight is the one answer that satisfies neither reading.
+///
+/// 📌 nginx agrees, from the source: `ngx_http_upstream_round_robin.c:190–192`
+/// copies `weight` into `effective_weight`, so a zero-weight peer never wins a
+/// round — the same exclusion, reached by the same reading of the number.
 #[tokio::test]
 async fn test_zero_weight_upstream_receives_no_traffic() {
     let drained = ScriptedUpstream::start(
@@ -378,6 +398,10 @@ async fn test_header_block_keeps_every_set_cookie() {
 /// `Pingclair` over whatever arrived, which is why monitoring that identifies
 /// an origin, or a mixed fleet comparing nodes, saw something different
 /// (#159).
+///
+/// 📌 nginx does the same two things: its upstream header table copies `Server`
+/// into the response (`ngx_http_upstream.c:240–244`), and a locally generated
+/// response carries its own product string (measured: `Server: nginx/1.31.6`).
 #[tokio::test]
 async fn test_the_upstreams_server_header_survives_the_proxy() {
     let upstream = ScriptedUpstream::start(
@@ -575,6 +599,13 @@ async fn recording_origin() -> (
 /// client is told `200 OK`. `aws-chunked` uploads put a checksum there and
 /// announce it with `x-amz-trailer` rather than `Trailer:`, so the quiet path is
 /// the one real clients take.
+///
+/// 📌 nginx's model for when #257 is fixed: it reads request trailers and does
+/// not forward them by default — `proxy_pass_trailers on` is the opt-in
+/// (`ngx_http_proxy_module.c:385`, since 1.27.2) — and nginx/nginx#778 is the
+/// same silent-drop report this test pins. So the reference agrees that
+/// forwarding is opt-in; what it does not settle is what the *declared* case
+/// should answer, which is ours to decide.
 #[tokio::test]
 #[ignore = "pingclair#257 — the trailer is dropped and the request is answered 200"]
 async fn test_undeclared_request_trailer_is_not_silently_dropped() {
