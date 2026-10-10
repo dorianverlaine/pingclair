@@ -38,6 +38,17 @@ model already carried: addresses, CIDRs or `.privateRanges`, the same values
 read, on HTTP and L4 alike; the compatibility dialect keeps refusing to spell
 it (#325).
 
+### 💡 Early hints reach HTTP/3 clients
+
+An upstream `103 Early Hints` is relayed to an HTTP/3 client as its own header
+block in front of the answer, instead of being dropped (the hint used to be
+read and thrown away). `100 Continue` is the one informational response that is
+*not* forwarded: this proxy reads the request in full before the origin
+answers, and RFC 9110 §15.2.1 forbids passing along permission the client has
+already used. HTTP/2 still cannot carry a hint — Pingora's h2 session ignores
+informational responses by design — so hints reach HTTP/1.1 and HTTP/3 clients
+only (#207).
+
 ### 🔌 Layer 4 TCP routing for 0.3 alpha
 
 L4 listeners now enforce `max_connections` (default 1024, range 1–4096),

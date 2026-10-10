@@ -924,6 +924,10 @@ fn h3_request_header(req: &H3Request, method: http::Method) -> Result<RequestHea
 enum RespMsg {
     /// 📋 Carries response headers and whether they end the stream.
     Headers(Vec<quiche::h3::Header>, bool),
+    /// 💡 Carries an informational response (a `103` hint) to write before
+    /// the answer. It is not an answer: it has no body, it must not become the
+    /// status the access log and metrics see, and the exchange continues.
+    Informational(Vec<quiche::h3::Header>),
     /// 🌊 Carries one body chunk and whether it ends the stream.
     Body(Bytes, bool),
     /// 🧾 Carries response trailers that end the stream.
@@ -1102,6 +1106,13 @@ const BODY_QUEUE_CAP: usize = 128 * 1024;
 struct StreamState {
     /// 📤 Holds response headers until QUIC flow control accepts them.
     pending_headers: Option<(Vec<quiche::h3::Header>, bool)>,
+    /// 💡 Holds informational responses (a `103` hint) until QUIC accepts
+    /// them; bounded upstream by `MAX_INTERIM_RESPONSES`.
+    pending_informational: VecDeque<Vec<quiche::h3::Header>>,
+    /// 💡 Records that a hint already left this stream. quiche allows exactly
+    /// one `send_response` per stream, so the answer must use
+    /// `send_additional_headers` once this is set.
+    informational_sent: bool,
     headers_sent: bool,
     /// 🌊 Holds response chunks that quiche has not accepted yet.
     ///
@@ -2309,6 +2320,17 @@ impl H3App {
                     }
                     ss.pending_headers = Some((headers, fin));
                 }
+                RespMsg::Informational(headers) => {
+                    // 💡 Only in front of the answer: once the final header
+                    // block is queued or sent there is nothing left for a
+                    // hint to precede, and a `1xx` that arrives after the
+                    // answer is an upstream protocol error — dropping it is
+                    // the quiet half of that error, and all the client can
+                    // observe either way.
+                    if !ss.headers_sent && ss.pending_headers.is_none() {
+                        ss.pending_informational.push_back(headers);
+                    }
+                }
                 RespMsg::Body(_, _) | RespMsg::Trailers(_) if ss.no_content => {}
                 RespMsg::Body(bytes, fin) => {
                     // 🌊 An empty chunk at the queue head makes quiche return
@@ -2426,6 +2448,34 @@ impl H3App {
             return;
         }
 
+        // 💡 Hints leave before the answer. quiche permits exactly one
+        // `send_response` per stream, so the first hint takes it and every
+        // later header block — further hints, then the answer — is an
+        // "additional headers" send. A hint that QUIC has no room for stays
+        // queued for the next writable event; one that fails outright is
+        // dropped, because the answer still matters and a hint is an
+        // optimization.
+        while let Some(headers) = ss.pending_informational.front().cloned() {
+            let sent = if ss.informational_sent {
+                h3.send_additional_headers(conn, stream_id, &headers, false, false)
+            } else {
+                h3.send_response(conn, stream_id, &headers, false)
+            };
+            match sent {
+                Ok(()) => {
+                    ss.informational_sent = true;
+                    ss.pending_informational.pop_front();
+                }
+                Err(quiche::h3::Error::StreamBlocked) => break,
+                Err(error) => {
+                    tracing::debug!(
+                        "📤 H3 informational headers failed on stream {stream_id}: {error:?}"
+                    );
+                    ss.pending_informational.pop_front();
+                }
+            }
+        }
+
         if !ss.headers_sent {
             let Some((mut headers, mut fin)) = ss.pending_headers.take() else {
                 return;
@@ -2466,7 +2516,15 @@ impl H3App {
                     quiche::h3::WireErrorCode::NoError as u64,
                 );
             }
-            match h3.send_response(conn, stream_id, &headers, fin) {
+            // 💡 After a hint the answer is an "additional headers" send:
+            // quiche permits exactly one `send_response` per stream and the
+            // hint above already used it.
+            let sent = if ss.informational_sent {
+                h3.send_additional_headers(conn, stream_id, &headers, false, fin)
+            } else {
+                h3.send_response(conn, stream_id, &headers, fin)
+            };
+            match sent {
                 Ok(()) => {
                     ss.headers_sent = true;
                     if fin {
@@ -6274,8 +6332,12 @@ async fn reverse_proxy_upstream(
         // client sees, the circuit breaker's verdict, and the retry predicate —
         // must be fed the final status and nothing earlier.
         //
-        // 📌 Interim responses are dropped rather than relayed for now; the
-        // H3 client still gets the final response, only without the hint.
+        // 💡 Interim responses are relayed, not swallowed: the client is the
+        // one that benefits from a hint, and an informational response can
+        // never be mistaken for the answer because it is a separate header
+        // block with no body. The field list is built the way the answer's is
+        // — `:status` first, hop-by-hop fields dropped, and no
+        // `content-length` (RFC 9114 §4.1: a 1xx has no body).
         const MAX_INTERIM_RESPONSES: u32 = 32;
         let mut interim_responses = 0u32;
         let upstream_status = loop {
@@ -6307,7 +6369,40 @@ async fn reverse_proxy_upstream(
                 // request open forever. The ceiling is far above what any
                 // real origin sends in front of one response.
                 100..=199 if interim_responses < MAX_INTERIM_RESPONSES => {
+                    // 🚫 RFC 9110 §15.2.1: a proxy that received the request
+                    // in full must not forward `100 Continue` — the client is
+                    // not waiting for permission it has already used. It
+                    // still counts against the ceiling above.
+                    if status == 100 {
+                        interim_responses += 1;
+                        continue;
+                    }
                     interim_responses += 1;
+                    if let Some(response) = session.response_header() {
+                        let mut headers = vec![quiche::h3::Header::new(
+                            b":status",
+                            status.to_string().as_bytes(),
+                        )];
+                        for (name, value) in &response.headers {
+                            let lower = name.as_str();
+                            if matches!(
+                                lower,
+                                "connection"
+                                    | "proxy-connection"
+                                    | "keep-alive"
+                                    | "transfer-encoding"
+                                    | "te"
+                                    | "trailer"
+                                    | "upgrade"
+                                    | "content-length"
+                            ) {
+                                continue;
+                            }
+                            headers
+                                .push(quiche::h3::Header::new(lower.as_bytes(), value.as_bytes()));
+                        }
+                        send_informational(resp_tx, stream_id, headers).await;
+                    }
                 }
                 100..=199 => {
                     tracing::error!("🚫 H3 upstream sent too many interim responses");
@@ -7422,6 +7517,24 @@ async fn send_headers(
         .send(RespEvent {
             stream_id,
             msg: RespMsg::Headers(headers, fin),
+        })
+        .await;
+}
+
+/// 💡 Hands one informational response to the worker.
+///
+/// Deliberately does not call `observe_headers`: a hint is not the answer, so
+/// it must not become the status the access log and the metrics report.
+async fn send_informational(
+    resp_tx: &ResponseSink,
+    stream_id: u64,
+    headers: Vec<quiche::h3::Header>,
+) {
+    let _ = resp_tx
+        .tx
+        .send(RespEvent {
+            stream_id,
+            msg: RespMsg::Informational(headers),
         })
         .await;
 }
@@ -8587,7 +8700,10 @@ mod tests {
                             break;
                         }
                     }
-                    RespMsg::Trailers(_) | RespMsg::HandlerDone | RespMsg::Abort(_) => {}
+                    RespMsg::Informational(_)
+                    | RespMsg::Trailers(_)
+                    | RespMsg::HandlerDone
+                    | RespMsg::Abort(_) => {}
                 }
             }
             (status, body)

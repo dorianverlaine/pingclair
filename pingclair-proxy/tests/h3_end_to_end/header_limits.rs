@@ -117,6 +117,7 @@ async fn h3_concurrent_gets(
                 Ok((id, quiche::h3::Event::Headers { list, .. })) => {
                     let response = partial.entry(id).or_insert(H3Response {
                         status: 0,
+                        interim_statuses: Vec::new(),
                         headers: Vec::new(),
                         body: Vec::new(),
                     });

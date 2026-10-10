@@ -220,6 +220,8 @@ async fn spawn_h3_listener_with_policy(
 #[derive(Debug)]
 struct H3Response {
     status: u16,
+    /// 💡 Informational statuses seen before the answer, in order.
+    interim_statuses: Vec<u16>,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
@@ -531,6 +533,7 @@ async fn h3_attempt(
     let mut request_stream: Option<u64> = None;
     let mut body_sent = 0usize;
     let mut status = None;
+    let mut interim_statuses: Vec<u16> = Vec::new();
     let mut response_headers = Vec::new();
     let mut body = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -629,7 +632,14 @@ async fn h3_attempt(
                     Ok((_, quiche::h3::Event::Headers { list, .. })) => {
                         for header in &list {
                             if header.name() == b":status" {
-                                status = String::from_utf8_lossy(header.value()).parse().ok();
+                                let seen: Option<u16> =
+                                    String::from_utf8_lossy(header.value()).parse().ok();
+                                // 💡 A `1xx` is a hint, not the answer: it must
+                                // not overwrite the status the answer will set.
+                                match seen {
+                                    Some(code) if code < 200 => interim_statuses.push(code),
+                                    _ => status = seen,
+                                }
                             } else {
                                 response_headers.push((
                                     String::from_utf8_lossy(header.name()).into_owned(),
@@ -654,6 +664,7 @@ async fn h3_attempt(
                         flush!();
                         return Ok(H3Response {
                             status: status.ok_or("finished without a :status")?,
+                            interim_statuses,
                             headers: response_headers,
                             body,
                         });
@@ -2534,27 +2545,32 @@ async fn h3_drops_expect_before_forwarding() {
     );
 }
 
-/// 🔁 Interim responses in front of the final one are skipped, not relayed as
-/// the answer.
+/// 💡 An origin's `103` reaches an H3 client, and `100 Continue` does not.
 ///
-/// Reading only the first response head turned an origin's `103 Early Hints`
-/// into the whole reply: the client got a bodiless `:status: 103` and the
-/// `200` behind it was never read.
+/// Reading only the first response head turned the hint into the whole reply:
+/// the client got a bodiless `:status: 103` and the `200` behind it was never
+/// read. Skipping the hint entirely fixed that and lost the hint; it is now
+/// relayed as its own header block, and the answer follows it. A forwarded
+/// `100 Continue` is the one informational response that must not travel
+/// (RFC 9110 §15.2.1): this proxy read the request in full before the origin
+/// answered, so the client is not waiting for permission it already used.
 #[tokio::test]
-async fn h3_skips_interim_responses_before_the_final_one() {
-    let replies: [(&str, &'static [u8]); 2] = [
+async fn h3_relays_early_hints_without_forwarding_continue() {
+    let replies: [(&str, &'static [u8], &[u16]); 2] = [
         (
             "103 Early Hints",
             b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n\
               HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            &[103],
         ),
         (
             "100 Continue",
             b"HTTP/1.1 100 Continue\r\n\r\n\
               HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            &[],
         ),
     ];
-    for (interim, reply) in replies {
+    for (interim, reply, expected_interim) in replies {
         let (upstream, _, _) = spawn_scripted_upstream(reply).await;
         let server =
             spawn_h3_from_pingclairfile(&format!(":443 {{\n reverse_proxy http://{upstream}\n}}"))
@@ -2564,7 +2580,11 @@ async fn h3_skips_interim_responses_before_the_final_one() {
         assert_eq!(
             (response.status, response.body.as_slice()),
             (200, &b"ok"[..]),
-            "the final response must follow a {interim}"
+            "the answer must follow a {interim}"
+        );
+        assert_eq!(
+            response.interim_statuses, expected_interim,
+            "informational responses relayed in front of a {interim}"
         );
     }
 }
