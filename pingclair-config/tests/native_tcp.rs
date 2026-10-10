@@ -60,6 +60,18 @@ fn tcp_source_addresses_are_typed_matcher_values() {
             .is_err()
         );
     }
+    // 🚫 `from:` was the argument this replaced. One directive, one spelling:
+    // the old shape is refused rather than kept as an alias.
+    assert!(
+        pingclair_config::compile(
+            r#"TCPListener(on: "127.0.0.1:19443") {
+                Route(when: .tls(sni: ["a.test"]), from: ["127.0.0.0/8"]) {
+                    Proxy(to: "127.0.0.1:18443")
+                }
+            }"#
+        )
+        .is_err()
+    );
 }
 
 #[test]
