@@ -74,7 +74,7 @@ protocol, wildcard SNI or weighted balancing in this alpha.
 
 Native TCP routes select exactly one `to:` or `dynamic:` source:
 
-```swift
+```pingclair
 TCPListener(on: ":9443") {
     Route(when: .tls(sni: ["local.example.test"])) {
         Proxy(to: "127.0.0.1:8443")
