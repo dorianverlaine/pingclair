@@ -894,13 +894,21 @@ TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#
     Entry {
         name: "Secret",
         kind: Kind::Attribute,
-        summary: "Marks a value binding as a secret; using one is refused until a field can hold it.",
+        summary: "Marks a value binding as a secret; it may only flow into the DNS-01 provider \
+                  arguments, and diagnostics never echo it.",
         example: r#"@Secret
 let token = "placeholder"
-TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#,
+HTTPListener(on: ":8443") {
+    Site(host: "example.test") { Fallback { Respond(body: "ok") } }
+}
+.tls(.automatic(email: "admin@example.com", challenge: .dns(.cloudflare(token))))"#,
         refusal: r#"@Secret
-let backend = Proxy(to: "127.0.0.1:8080")
-TCPListener(on: "127.0.0.1:9443") { Fallback { Proxy(to: "127.0.0.1:8080") } }"#,
+let token = "placeholder"
+HTTPListener(on: ":8080") {
+    Site(host: "*") {
+        Fallback { Proxy(to: "127.0.0.1:9000", headersUp: [.set("X-Review", token)]) }
+    }
+}"#,
         labels: &[],
     },
 ];
