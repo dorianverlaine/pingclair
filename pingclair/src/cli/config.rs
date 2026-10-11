@@ -13,6 +13,18 @@ pub(crate) enum ConfigAdapter {
 
 /// 🧾 Explicit adapters override extensions; absent adapters preserve file inference.
 pub(crate) fn load(path: &str, adapter: Option<ConfigAdapter>) -> anyhow::Result<PingclairConfig> {
+    let compiled = load_compiled(path, adapter)?;
+    // 🧭 Lints never refuse and never change behavior: the surprise they name
+    // reaches the operator at start, at reload, and in `validate` alike, from
+    // the one place every load goes through.
+    for lint in pingclair_config::lints(&compiled) {
+        tracing::warn!("⚠️ {lint}");
+    }
+    Ok(compiled)
+}
+
+/// 📄 The load itself, before the lints are read off the result.
+fn load_compiled(path: &str, adapter: Option<ConfigAdapter>) -> anyhow::Result<PingclairConfig> {
     let file = std::path::Path::new(path);
     if path != "-" && file.is_dir() {
         if adapter.is_some() {

@@ -34,6 +34,7 @@ pub mod frontend;
 mod header_fields;
 mod layer4;
 mod layer4_dynamic;
+mod lint;
 mod retired_placeholders;
 mod shared_ports;
 mod syntax;
@@ -47,6 +48,7 @@ pub use caddyfile::parser::{
 };
 
 pub use compiler::{CompileError, compile_ast};
+pub use lint::lints;
 
 use pingclair_core::config::PingclairConfig;
 use std::path::Path;

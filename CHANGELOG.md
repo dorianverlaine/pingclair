@@ -77,6 +77,12 @@ Proxy `header_down` values resolve against the request. `header_down X "{host}"`
 used to put a literal `{host}` on the wire on every transport; the value is now
 the request's host, matching the `header` directive and Caddy's own behavior.
 
+`pingclair validate` (and every load, including a reload) now warns when a
+`Redirect` target is a literal string containing placeholder-shaped braces —
+`Redirect(to: "https://example.com{uri}")` would send `{uri}` exactly as
+written, and the warning points at `Format(…)`. A lint, not a refusal: literal
+braces stay legal text.
+
 Native `RequestHeader`, `ResponseHeader` and `Proxy` header set, append and
 default values retain literal braces through JSON export and reload. Legacy
 template strings remain templates. HTTP/3 now also forwards appended proxy

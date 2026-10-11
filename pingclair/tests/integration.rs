@@ -46,6 +46,9 @@ mod cli_args;
 #[path = "integration/cli_empty.rs"]
 mod cli_empty;
 
+#[path = "integration/cli_text_lint.rs"]
+mod cli_text_lint;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
