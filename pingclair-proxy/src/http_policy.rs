@@ -27,6 +27,11 @@ pub(crate) use cookies::CookieFold;
 mod strict_transport;
 pub(crate) use strict_transport::StrictTransport;
 
+/// 🚨 An explicit status wins; an omitted one keeps the active error or answers 200.
+pub(crate) fn respond_status(status: Option<u16>, error_status: Option<u16>) -> u16 {
+    status.or(error_status).unwrap_or(200)
+}
+
 /// 🧰 Request-scoped variables set by `vars` handlers and read by
 /// `{http.vars.*}` placeholders and the `vars` matcher.
 ///
@@ -261,7 +266,7 @@ pub fn evaluate_response_handlers(
                     response_headers.remove(name);
                 }
                 outcome.replacement = Some(InterceptedResponse {
-                    status: *status,
+                    status: respond_status(*status, None),
                     headers: response_headers,
                     body: body
                         .as_ref()
@@ -518,7 +523,7 @@ mod response_interception_tests {
                     require: None,
                 },
                 HandlerConfig::Respond {
-                    status: 403,
+                    status: Some(403),
                     body: Some(pingclair_core::config::ConfigText::Template(
                         "denied".to_string(),
                     )),

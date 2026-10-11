@@ -103,6 +103,42 @@ async fn h3_handle_errors_regex_rewrite_uses_the_error_routes_table() {
     );
 }
 
+/// 💬 An omitted `respond` status in `handle_errors` keeps the error status
+/// over HTTP/3 too, and an ordinary route's omission still answers 200.
+#[tokio::test]
+async fn h3_handle_errors_respond_without_a_status_keeps_the_error() {
+    let source = r#":443 {
+        handle_errors {
+            respond "page"
+        }
+        handle /boom {
+            error "exploded" 503
+        }
+        handle /fine {
+            respond "ok"
+        }
+    }"#;
+    let site = pingclair_config::compile(source).unwrap().servers[0].clone();
+    let server = spawn_h3_server_with(|address| ServerConfig {
+        listen: vec![address.to_string()],
+        ..site
+    })
+    .await;
+
+    let mut seen = Vec::new();
+    for path in ["/boom", "/fine"] {
+        let response = h3_get(server, path).await.unwrap();
+        seen.push((
+            response.status,
+            String::from_utf8_lossy(&response.body).into_owned(),
+        ));
+    }
+    assert_eq!(
+        seen,
+        vec![(503, "page".to_string()), (200, "ok".to_string())]
+    );
+}
+
 /// 🔥 A template that fails to render is raised on HTTP/3 too, so
 /// `handle_errors` answers it exactly as HTTP/1 and HTTP/2 do (#245).
 #[tokio::test]

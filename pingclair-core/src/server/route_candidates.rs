@@ -236,7 +236,7 @@ mod tests {
                 .map(|path| RouteConfig {
                     path: path.to_string(),
                     handler: HandlerConfig::Respond {
-                        status: 200,
+                        status: Some(200),
                         body: None,
                         headers: BTreeMap::new(),
                     },

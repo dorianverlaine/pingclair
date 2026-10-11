@@ -652,7 +652,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 routes: vec![RouteConfig {
                     path: "/*".to_string(),
                     handler: HandlerConfig::Respond {
-                        status: status.unwrap_or(200),
+                        status: Some(status.unwrap_or(200)),
                         body: body.map(pingclair_core::config::ConfigText::Template),
                         headers: headers.into_iter().collect(),
                     },

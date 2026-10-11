@@ -115,7 +115,7 @@ mod global_tests {
         let routes = server.routes.as_ref().unwrap();
         let handler = &routes.inner.arms[0].inner.handler;
         if let Handler::Respond(cfg) = handler {
-            assert_eq!(cfg.status, 403);
+            assert_eq!(cfg.status, Some(403));
         } else {
             panic!("Expected Respond handler");
         }
@@ -1978,7 +1978,10 @@ mod fail_closed_tests {
         ));
         assert!(matches!(
             handlers[1],
-            pingclair_core::config::HandlerConfig::Respond { status: 403, .. }
+            pingclair_core::config::HandlerConfig::Respond {
+                status: Some(403),
+                ..
+            }
         ));
         assert!(matches!(
             proxy.handle_response[1].handlers[0],

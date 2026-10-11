@@ -1298,8 +1298,12 @@ pub(super) fn adapt_basic_auth(d: Directive) -> Result<Handler, AdapterError> {
 ///   respond "body" 403
 ///   respond 404
 ///   respond "body"
+///
+/// 💬 An omitted status stays omitted: inside `handle_errors` the response
+/// then keeps the original error status, exactly as Caddy's own static
+/// response defaulted it before this frontend ever existed.
 pub(super) fn adapt_respond(d: Directive) -> Result<Handler, AdapterError> {
-    let mut status: u16 = 200;
+    let mut status: Option<u16> = None;
     let mut body: Option<Expr> = None;
 
     match d.args.len() {
@@ -1325,7 +1329,7 @@ pub(super) fn adapt_respond(d: Directive) -> Result<Handler, AdapterError> {
         1 => {
             let arg = &d.args[0];
             if let Ok(code) = arg.parse::<u16>() {
-                status = code;
+                status = Some(code);
             } else {
                 body = Some(Expr::String(arg.clone()));
             }
@@ -1334,9 +1338,9 @@ pub(super) fn adapt_respond(d: Directive) -> Result<Handler, AdapterError> {
             // respond "body" 403  OR  respond 403 "body"
             if let Ok(code) = d.args[1].parse::<u16>() {
                 body = Some(Expr::String(d.args[0].clone()));
-                status = code;
+                status = Some(code);
             } else if let Ok(code) = d.args[0].parse::<u16>() {
-                status = code;
+                status = Some(code);
                 body = Some(Expr::String(d.args[1].clone()));
             } else {
                 body = Some(Expr::String(d.args[0].clone()));
@@ -1348,7 +1352,7 @@ pub(super) fn adapt_respond(d: Directive) -> Result<Handler, AdapterError> {
             if let Some(last) = d.args.last()
                 && let Ok(code) = last.parse::<u16>()
             {
-                status = code;
+                status = Some(code);
             }
         }
     }

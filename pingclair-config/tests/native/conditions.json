@@ -20,7 +20,6 @@
           "path": "/api*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "path"
             },
@@ -40,7 +39,6 @@
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "host"
             },
@@ -58,7 +56,6 @@
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "method"
             },
@@ -78,7 +75,6 @@
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "header"
             },
@@ -98,7 +94,6 @@
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "bearer"
             },
@@ -117,7 +112,6 @@
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "query"
             },
@@ -135,7 +129,6 @@
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "h2"
             },
@@ -152,7 +145,6 @@
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "intranet"
             },
@@ -174,7 +166,6 @@
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "peer"
             },
@@ -191,7 +182,6 @@
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "tier"
             },
@@ -242,7 +232,6 @@
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "up"
             },
@@ -272,7 +261,6 @@
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "anything else"
             },

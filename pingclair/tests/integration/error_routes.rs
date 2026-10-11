@@ -402,6 +402,56 @@ async fn test_handle_errors_applies_a_header_written_after_respond() {
     );
 }
 
+/// 💬 An omitted `respond` status keeps the original error status, exactly
+/// like Caddy's own static response inside an error handler. An ordinary
+/// route's omitted status still answers 200 on both HTTP/1.1 and HTTP/2.
+#[tokio::test]
+async fn test_handle_errors_respond_without_a_status_keeps_the_error() {
+    let mut server = TestServer::new_pingclairfile(
+        r#"
+        {
+            admin off
+        }
+
+        http://__PINGCLAIR_TEST_LISTEN__ {
+            @readiness path __PINGCLAIR_TEST_READINESS_PATH__
+            respond @readiness "__PINGCLAIR_TEST_READINESS_TOKEN__"
+
+            handle_errors {
+                respond "page"
+            }
+
+            handle /boom {
+                error "exploded" 503
+            }
+
+            handle /fine {
+                respond "ok"
+            }
+        }
+        "#,
+    );
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let h2 = reqwest::Client::builder()
+        .no_proxy()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    for (protocol, client) in [("h1", no_proxy_client()), ("h2", h2)] {
+        let mut seen = Vec::new();
+        for path in ["/boom", "/fine"] {
+            let response = client.get(server.url(0, path)).send().await.unwrap();
+            seen.push((response.status().as_u16(), response.text().await.unwrap()));
+        }
+        assert_eq!(
+            seen,
+            vec![(503, "page".to_string()), (200, "ok".to_string())],
+            "{protocol}"
+        );
+    }
+}
+
 /// 🔤 A regex `rewrite` inside `handle_errors` resolves against the error
 /// route's own compiled patterns.
 ///

@@ -45,7 +45,6 @@ example.com {
               },
               {
                 "type": "respond",
-                "status": 200,
                 "body": "fallback",
                 "headers": {}
               }

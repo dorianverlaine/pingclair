@@ -139,7 +139,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         name: "Respond",
         kind: Kind::Component,
-        summary: "A fixed HTTP response: `Respond(body:, status:)`.",
+        summary: "A fixed HTTP response: `Respond(body:, status:)`. Omitted status keeps an active error, otherwise 200.",
         example: r#"HTTPListener(on: ":8080") {
     Site(host: "*") {
         Fallback { Respond(body: "hello", status: 200) }

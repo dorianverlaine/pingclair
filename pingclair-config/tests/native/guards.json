@@ -186,7 +186,6 @@
               },
               {
                 "type": "respond",
-                "status": 200,
                 "body": {
                   "literal": "intranet only"
                 },
@@ -214,7 +213,6 @@
               },
               {
                 "type": "respond",
-                "status": 200,
                 "body": {
                   "literal": "ok"
                 },

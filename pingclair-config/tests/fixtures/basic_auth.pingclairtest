@@ -43,7 +43,6 @@ private.example {
               },
               {
                 "type": "respond",
-                "status": 200,
                 "body": "private",
                 "headers": {}
               }
@@ -62,7 +61,6 @@ private.example {
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": "private",
             "headers": {}
           },

@@ -216,7 +216,7 @@ mod tests {
             routes: vec![RouteConfig {
                 path: "/*".to_string(),
                 handler: pingclair_core::config::HandlerConfig::Respond {
-                    status: 200,
+                    status: Some(200),
                     body: Some(pingclair_core::config::ConfigText::Template(
                         "cached".to_string(),
                     )),

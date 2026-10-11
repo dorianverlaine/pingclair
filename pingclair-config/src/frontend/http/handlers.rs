@@ -98,9 +98,11 @@ pub(super) fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
         "Respond" => {
             call.leaf(RESPOND_LABELS)?;
             let status = match call.get("status") {
-                Some(_) => u16::try_from(call.integer("status")?)
-                    .map_err(|_| call.at.error("status must fit in 0..=65535"))?,
-                None => 200,
+                Some(_) => Some(
+                    u16::try_from(call.integer("status")?)
+                        .map_err(|_| call.at.error("status must fit in 0..=65535"))?,
+                ),
+                None => None,
             };
             Ok(HandlerConfig::Respond {
                 status,
@@ -230,9 +232,11 @@ fn response_handler(call: &Call) -> Result<ResponseHandlerConfig, Error> {
             "Respond" => {
                 child.leaf(&["body", "status"])?;
                 let status = match child.get("status") {
-                    Some(_) => u16::try_from(child.integer("status")?)
-                        .map_err(|_| child.at.error("status must fit in 0..=65535"))?,
-                    None => 200,
+                    Some(_) => Some(
+                        u16::try_from(child.integer("status")?)
+                            .map_err(|_| child.at.error("status must fit in 0..=65535"))?,
+                    ),
+                    None => None,
                 };
                 handlers.push(HandlerConfig::Respond {
                     status,

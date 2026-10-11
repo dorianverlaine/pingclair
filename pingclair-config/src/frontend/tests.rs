@@ -1502,6 +1502,15 @@ fn error_surfaces_lower_like_their_caddyfile_twins() {
                 .to_string(),
         ),
         (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") {
+                ErrorRoute(for: [.status(503)]) { Respond(body: "page") }
+                Fallback { Respond(body: "ok") }
+            } }"#
+                .to_string(),
+            "http://:8080 {\n\thandle_errors 503 {\n\t\trespond \"page\"\n\t}\n\trespond \"ok\"\n}"
+                .to_string(),
+        ),
+        (
             // 🧵 A body that stops at middleware shapes the answer the runtime
             // already built, so no terminal is needed here.
             r#"HTTPListener(on: ":8080") { Site(host: "*") {
@@ -1529,6 +1538,38 @@ fn error_surfaces_lower_like_their_caddyfile_twins() {
         let legacy = crate::compile(&legacy_source).unwrap();
         assert_eq!(twin(native), twin(legacy), "{native_source}");
     }
+}
+
+/// 💬 An omitted `respond` status stays omitted in both frontends, so the
+/// runtime decides: an error route keeps the active error, an ordinary route
+/// answers 200. The Caddyfile follows Caddy, whose static response keeps an
+/// error handler's status code unless the handler overrides it.
+#[test]
+fn an_omitted_respond_status_stays_omitted_in_both_frontends() {
+    let native = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") {
+            ErrorRoute(for: [.anyError]) { Respond(body: "page") }
+            Fallback { Respond(body: "ok") }
+        } }"#,
+    )
+    .unwrap();
+    let legacy = crate::compile(
+        "http://:8080 {\n\thandle_errors {\n\t\trespond \"page\"\n\t}\n\trespond \"ok\"\n}",
+    )
+    .unwrap();
+    let statuses = |config: &pingclair_core::config::PingclairConfig| {
+        let server = &config.servers[0];
+        let status_of = |handler: &pingclair_core::config::HandlerConfig| match handler {
+            pingclair_core::config::HandlerConfig::Respond { status, .. } => *status,
+            other => panic!("expected Respond, got {other:?}"),
+        };
+        (
+            status_of(&server.error_routes[0].handlers[0].handler),
+            status_of(&server.routes[0].handler),
+        )
+    };
+    assert_eq!(statuses(&native), (None, None));
+    assert_eq!(statuses(&legacy), (None, None));
 }
 
 #[test]
@@ -1800,6 +1841,18 @@ fn intercept_lowers_like_its_caddyfile_twin() {
             } } }"#
                 .to_string(),
             "http://:8080 {\n\troute {\n\t\tintercept {\n\t\t\t@missing status 404\n\t\t\thandle_response @missing {\n\t\t\t\trespond \"soft 404\" 200\n\t\t\t}\n\t\t\treplace_status 503\n\t\t}\n\t\treverse_proxy 127.0.0.1:9000\n\t}\n}"
+                .to_string(),
+        ),
+        (
+            r#"HTTPListener(on: ":8080") { Site(host: "*") { Fallback {
+                Intercept {
+                    Response(when: .status(404)) { Respond(body: "soft 404") }
+                    Response { ReplaceStatus(status: 503) }
+                }
+                Proxy(to: "127.0.0.1:9000")
+            } } }"#
+                .to_string(),
+            "http://:8080 {\n\troute {\n\t\tintercept {\n\t\t\t@missing status 404\n\t\t\thandle_response @missing {\n\t\t\t\trespond \"soft 404\"\n\t\t\t}\n\t\t\treplace_status 503\n\t\t}\n\t\treverse_proxy 127.0.0.1:9000\n\t}\n}"
                 .to_string(),
         ),
         (

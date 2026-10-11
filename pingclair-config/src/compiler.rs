@@ -1675,14 +1675,21 @@ fn reject_unimplemented_handler(handler: &HandlerConfig, error_route: bool) -> C
         // coming, and it carries no content (RFC 9110 §15.2). `respond` sends
         // exactly one response and then ends the exchange, so a 1xx there
         // would leave the client waiting for a final answer that never comes.
-        HandlerConfig::Respond { status, .. } if (100..200).contains(status) => {
-            Err(CompileError::InvalidRoute {
-                message: format!(
-                    "`respond` cannot send {status}: a 1xx status is informational and \
+        HandlerConfig::Respond {
+            status: Some(status),
+            ..
+        } if (100..200).contains(status) => Err(CompileError::InvalidRoute {
+            message: format!(
+                "`respond` cannot send {status}: a 1xx status is informational and \
                      must be followed by a final response, which `respond` never sends"
-                ),
-            })
-        }
+            ),
+        }),
+        HandlerConfig::Respond {
+            status: Some(status),
+            ..
+        } if !(200..=599).contains(status) => Err(CompileError::InvalidRoute {
+            message: format!("`respond` status {status} must be a final HTTP status in 200..=599"),
+        }),
         HandlerConfig::Pipeline { handlers }
         | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
@@ -4215,7 +4222,7 @@ mod fail_closed_handler_tests {
 
     fn harmless() -> HandlerConfig {
         HandlerConfig::Respond {
-            status: 200,
+            status: Some(200),
             body: Some(pingclair_core::config::ConfigText::Template(
                 "ok".to_string(),
             )),
@@ -4351,7 +4358,7 @@ mod fail_closed_handler_tests {
     fn respond_with_an_informational_status_is_refused() {
         assert!(crate::compile(":80 {\n respond \"x\" 103\n}").is_err());
         let informational = HandlerConfig::Respond {
-            status: 100,
+            status: Some(100),
             body: None,
             headers: std::collections::BTreeMap::new(),
         };

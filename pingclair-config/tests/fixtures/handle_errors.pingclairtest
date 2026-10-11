@@ -54,7 +54,6 @@ private.example {
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": "ok",
             "headers": {}
           },
@@ -115,7 +114,6 @@ private.example {
           "handlers": [
             {
               "type": "respond",
-              "status": 200,
               "body": "404 or 410 error",
               "headers": {}
             }
@@ -149,7 +147,6 @@ private.example {
                   "handlers": [
                     {
                       "type": "respond",
-                      "status": 200,
                       "body": "default not found",
                       "headers": {}
                     }

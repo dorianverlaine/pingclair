@@ -30,7 +30,6 @@ b.example, www.b.example {
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": "a",
             "headers": {}
           },
@@ -105,7 +104,6 @@ b.example, www.b.example {
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": "b",
             "headers": {}
           },

@@ -24,7 +24,7 @@ async fn h3_exclusion_holds_for_a_mixed_case_sni() {
         routes: vec![RouteConfig {
             path: "/*".to_string(),
             handler: HandlerConfig::Respond {
-                status: 200,
+                status: Some(200),
                 body: Some(pingclair_core::config::ConfigText::Template(
                     "kept".to_string(),
                 )),

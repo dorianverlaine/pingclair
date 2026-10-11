@@ -22,6 +22,9 @@ use tokio_quiche::quiche::h3::NameValue;
 #[path = "h3_end_to_end/native_header_text.rs"]
 mod native_header_text;
 
+#[path = "h3_end_to_end/native_error_status.rs"]
+mod native_error_status;
+
 // 🔪 Responses that fail after they started. A sibling file rather than more
 // of this one, which is already a high-touch file.
 #[path = "h3_end_to_end/truncation.rs"]
@@ -689,7 +692,7 @@ async fn h3_attempt(
 #[tokio::test]
 async fn h3_serves_a_request_end_to_end() {
     let server = spawn_h3_server(HandlerConfig::Respond {
-        status: 200,
+        status: Some(200),
         body: Some(pingclair_core::config::ConfigText::Template(
             "hello over http/3".to_string(),
         )),
@@ -757,7 +760,7 @@ async fn h3_reuses_one_connection_for_several_requests() {
     // 🔁 A second request on the same connection proves stream state is torn
     // down per stream and not per connection.
     let server = spawn_h3_server(HandlerConfig::Respond {
-        status: 200,
+        status: Some(200),
         body: Some(pingclair_core::config::ConfigText::Template(
             "ok".to_string(),
         )),
@@ -780,7 +783,7 @@ async fn h3_streams_a_body_larger_than_one_packet() {
     // events, which is exactly what `process_writes` now drives.
     let payload = "x".repeat(512 * 1024);
     let server = spawn_h3_server(HandlerConfig::Respond {
-        status: 200,
+        status: Some(200),
         body: Some(pingclair_core::config::ConfigText::Template(
             payload.clone(),
         )),
@@ -1604,7 +1607,7 @@ async fn h3_rejects_a_settings_frame_on_a_request_stream() {
     // 📕 RFC 9114 §7.2.4: SETTINGS belongs on the control stream only. Meeting
     // one on a request stream must be H3_FRAME_UNEXPECTED.
     let server = spawn_h3_server(HandlerConfig::Respond {
-        status: 200,
+        status: Some(200),
         body: Some(pingclair_core::config::ConfigText::Template(
             "ok".to_string(),
         )),
@@ -1629,7 +1632,7 @@ async fn h3_rejects_a_data_frame_before_any_headers() {
     // 📕 RFC 9114 §4.1: a request begins with HEADERS. DATA arriving first has
     // no message to belong to.
     let server = spawn_h3_server(HandlerConfig::Respond {
-        status: 200,
+        status: Some(200),
         body: Some(pingclair_core::config::ConfigText::Template(
             "ok".to_string(),
         )),
@@ -1829,7 +1832,7 @@ async fn spawn_h3_mtls_listener(
             let route = |body: &str| RouteConfig {
                 path: "/*".to_string(),
                 handler: HandlerConfig::Respond {
-                    status: 200,
+                    status: Some(200),
                     body: Some(pingclair_core::config::ConfigText::Template(
                         body.to_string(),
                     )),
@@ -2038,7 +2041,7 @@ async fn h3_client_auth_ca_rotation_rejects_the_previous_authority() {
                 routes: vec![RouteConfig {
                     path: "/*".to_string(),
                     handler: HandlerConfig::Respond {
-                        status: 200,
+                        status: Some(200),
                         body: Some(pingclair_core::config::ConfigText::Template(
                             "secure-ok".to_string(),
                         )),
@@ -2296,7 +2299,7 @@ async fn h3_session_resumes(server: SocketAddr, sni: &str) -> bool {
 #[tokio::test]
 async fn h3_client_auth_turns_session_resumption_off() {
     let ordinary = spawn_h3_server(HandlerConfig::Respond {
-        status: 200,
+        status: Some(200),
         body: Some(pingclair_core::config::ConfigText::Template(
             "ok".to_string(),
         )),

@@ -26,6 +26,57 @@ fn abort_ends_the_native_route() {
 }
 
 #[test]
+fn omitted_and_explicit_response_statuses_survive_json_round_trip() {
+    let source = r#"HTTPListener(on: "127.0.0.1:18080") {
+        Site(host: "*") {
+            ErrorRoute(for: [.status(503)]) { Respond(body: "inherited") }
+            ErrorRoute(for: [.status(404)]) { Respond(body: "explicit", status: 200) }
+            Fallback { Respond(body: "ordinary") }
+        }
+    }"#;
+    let config = pingclair_config::compile(source).unwrap();
+    let document = serde_json::to_value(&config).unwrap();
+    let decoded: pingclair_core::config::PingclairConfig =
+        serde_json::from_value(document.clone()).unwrap();
+    pingclair_config::compiler::validate_config(&decoded).unwrap();
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), document);
+    let server = &decoded.servers[0];
+    let handlers = [
+        &server.error_routes[0].handlers[0].handler,
+        &server.error_routes[1].handlers[0].handler,
+        &server.routes[0].handler,
+    ];
+    let serialized: Vec<_> = handlers
+        .into_iter()
+        .map(|handler| serde_json::to_value(handler).unwrap())
+        .collect();
+    assert_eq!(
+        serialized,
+        vec![
+            serde_json::json!({"type":"respond", "body":{"literal":"inherited"}, "headers":{}}),
+            serde_json::json!({"type":"respond", "status":200, "body":{"literal":"explicit"}, "headers":{}}),
+            serde_json::json!({"type":"respond", "body":{"literal":"ordinary"}, "headers":{}}),
+        ]
+    );
+}
+
+#[test]
+fn invalid_final_response_statuses_are_refused_by_every_entry_point() {
+    for status in [0, 99, 100, 103, 199, 600, 65535] {
+        assert!(
+            pingclair_config::compile(&site(&format!("Respond(body: \"bad\", status: {status})")))
+                .is_err()
+        );
+        let mut config = pingclair_config::compile(&site("Respond(body: \"ok\")")).unwrap();
+        config.servers[0].routes[0].handler = serde_json::from_value(serde_json::json!({
+            "type":"respond", "status":status, "body":null
+        }))
+        .unwrap();
+        assert!(pingclair_config::compiler::validate_config(&config).is_err());
+    }
+}
+
+#[test]
 fn unimplemented_error_proxy_is_refused_by_shared_validation() {
     let source = r#"HTTPListener(on: "127.0.0.1:18080") {
         Site(host: "*") {

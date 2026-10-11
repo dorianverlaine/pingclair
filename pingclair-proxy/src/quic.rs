@@ -3467,7 +3467,10 @@ async fn plan_h3_handler_with_connector(
                     .into_owned()
             });
             Ok(H3Plan::Terminal(H3Terminal::Respond {
-                status: *status,
+                status: crate::http_policy::respond_status(
+                    *status,
+                    error_scope.map(|scope| scope.status),
+                ),
                 body,
                 headers: default_local_headers(headers.clone()),
             }))
@@ -9111,7 +9114,7 @@ mod tests {
                     method: None,
                 }),
                 HandlerElement::plain(HandlerConfig::Respond {
-                    status: 200,
+                    status: Some(200),
                     body: Some(pingclair_core::config::ConfigText::Template(
                         "ok".to_string(),
                     )),
@@ -9172,7 +9175,7 @@ mod tests {
             (
                 "respond",
                 HandlerConfig::Respond {
-                    status: 200,
+                    status: Some(200),
                     body: Some(pingclair_core::config::ConfigText::Template(
                         "hello".to_string(),
                     )),
@@ -9222,7 +9225,7 @@ mod tests {
 
         // 🎛️ The operator's own type is the answer when they write one.
         let handler = HandlerConfig::Respond {
-            status: 200,
+            status: Some(200),
             body: Some(pingclair_core::config::ConfigText::Template(
                 "{}".to_string(),
             )),
@@ -9271,7 +9274,7 @@ mod tests {
                     max_age: 600,
                 }),
                 HandlerElement::plain(HandlerConfig::Respond {
-                    status: 200,
+                    status: Some(200),
                     body: Some(pingclair_core::config::ConfigText::Template(
                         "must not run".to_string(),
                     )),
@@ -9321,7 +9324,7 @@ mod tests {
                     values: BTreeMap::from([("who".to_string(), "h3".to_string())]),
                 }),
                 HandlerElement::plain(HandlerConfig::Respond {
-                    status: 200,
+                    status: Some(200),
                     body: Some(pingclair_core::config::ConfigText::Template(
                         "{http.vars.who}".to_string(),
                     )),
@@ -9627,7 +9630,7 @@ mod tests {
             }),
             status_code: None,
             handlers: vec![HandlerConfig::Respond {
-                status: 201,
+                status: Some(201),
                 body: Some(pingclair_core::config::ConfigText::Template(
                     "wrapped-local".to_string(),
                 )),
@@ -9635,7 +9638,7 @@ mod tests {
             }],
         }];
         let state = proxy_state(HandlerConfig::Respond {
-            status: 418,
+            status: Some(418),
             body: Some(pingclair_core::config::ConfigText::Template(
                 "original".to_string(),
             )),
@@ -9685,7 +9688,7 @@ mod tests {
     #[tokio::test]
     async fn h3_respond_expands_placeholders_like_h1_h2() {
         let handler = HandlerConfig::Respond {
-            status: 200,
+            status: Some(200),
             body: Some(pingclair_core::config::ConfigText::Template(
                 "path={path} scheme={scheme} host={host} remote={client_ip}".to_string(),
             )),
@@ -9773,7 +9776,7 @@ mod tests {
                         patterns: vec!["/admin/*".to_string()],
                     },
                     HandlerConfig::Respond {
-                        status: 200,
+                        status: Some(200),
                         body: Some(pingclair_core::config::ConfigText::Template(
                             "SECRET".to_string(),
                         )),
@@ -9781,7 +9784,7 @@ mod tests {
                     },
                 ),
                 HandlerElement::plain(HandlerConfig::Respond {
-                    status: 200,
+                    status: Some(200),
                     body: Some(pingclair_core::config::ConfigText::Template(
                         "public".to_string(),
                     )),

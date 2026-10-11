@@ -62,7 +62,6 @@ example.com {
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": "public",
             "headers": {}
           },

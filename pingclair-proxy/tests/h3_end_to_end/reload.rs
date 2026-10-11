@@ -21,7 +21,7 @@ fn generation(address: SocketAddr, body: &str) -> Vec<ServerConfig> {
             routes: vec![RouteConfig {
                 path: "/*".to_string(),
                 handler: HandlerConfig::Respond {
-                    status: 200,
+                    status: Some(200),
                     body: Some(pingclair_core::config::ConfigText::Template(
                         body.to_string(),
                     )),

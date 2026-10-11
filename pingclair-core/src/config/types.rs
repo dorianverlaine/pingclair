@@ -1800,10 +1800,10 @@ pub enum HandlerConfig {
         set: Option<String>,
     },
 
-    /// Respond with static content
+    /// 💬 Responds with static content, preserving an active error when status is omitted.
     Respond {
-        #[serde(default = "default_status_code")]
-        status: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
         body: Option<ConfigText>,
         #[serde(default)]
         headers: BTreeMap<String, String>,
@@ -2101,10 +2101,6 @@ pub fn default_cors_headers() -> Vec<String> {
 /// ⏱️ How long a preflight may be cached when the configuration says nothing.
 pub fn default_cors_max_age() -> u64 {
     86400 // 24 hours
-}
-
-fn default_status_code() -> u16 {
-    200
 }
 
 /// 🚨 A bare `error` raises 500, exactly as upstream defaults it.
@@ -4268,7 +4264,7 @@ mod tests {
                 routes: vec![RouteConfig {
                     path: "/*".into(),
                     handler: HandlerConfig::Respond {
-                        status: 200,
+                        status: Some(200),
                         body: None,
                         headers: BTreeMap::new(),
                     },

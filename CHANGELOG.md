@@ -48,6 +48,15 @@ response. Error-route proxies are rejected by common validation, including
 JSON loads, instead of accepting a configuration that cannot contact its
 upstream (#303).
 
+`Respond` now preserves an omitted status through JSON export and reload. In
+an error route it keeps the original error status; elsewhere it defaults to
+200, and an explicit `status: 200` still overrides an error. The Caddyfile
+frontend follows: `handle_errors { respond "page" }` now answers with the
+original error status instead of 200, matching Caddy's own error handlers.
+Existing numeric JSON statuses remain explicit, and common validation rejects
+explicit statuses outside 200–599 because `Respond` sends a final HTTP
+response.
+
 Native `RequestHeader`, `ResponseHeader` and `Proxy` header set, append and
 default values retain literal braces through JSON export and reload. Legacy
 template strings remain templates. HTTP/3 now also forwards appended proxy

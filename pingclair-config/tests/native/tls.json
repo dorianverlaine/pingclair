@@ -110,7 +110,6 @@
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "issued by ACME"
             },
@@ -210,7 +209,6 @@
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "client verified"
             },
@@ -301,7 +299,6 @@
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "wildcard certificate"
             },

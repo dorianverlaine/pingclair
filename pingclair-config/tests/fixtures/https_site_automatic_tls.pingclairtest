@@ -28,7 +28,6 @@ https://example.com {
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": "OK",
             "headers": {}
           },

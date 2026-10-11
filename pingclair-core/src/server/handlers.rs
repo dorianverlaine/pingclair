@@ -122,11 +122,12 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             body,
             headers,
         } => {
+            let status = status.unwrap_or(200);
             let mut response = if let Some(body_content) = body {
                 // Clone the body content to get owned data
-                HandlerResponse::with_body(*status, Bytes::copy_from_slice(body_content.as_str().as_bytes()))
+                HandlerResponse::with_body(status, Bytes::copy_from_slice(body_content.as_str().as_bytes()))
             } else {
-                HandlerResponse::status(*status)
+                HandlerResponse::status(status)
             };
 
             for (name, value) in headers {
@@ -566,7 +567,7 @@ mod tests {
     #[test]
     fn test_respond_handler() {
         let config = HandlerConfig::Respond {
-            status: 200,
+            status: Some(200),
             body: Some(crate::config::ConfigText::Template(
                 "Hello, World!".to_string(),
             )),

@@ -1291,7 +1291,7 @@ mod tests {
         RouteConfig {
             path: path.to_string(),
             handler: HandlerConfig::Respond {
-                status: 200,
+                status: Some(200),
                 body: None,
                 headers: BTreeMap::new(),
             },
@@ -1494,7 +1494,7 @@ mod tests {
         let route = RouteConfig {
             path: "/*".to_string(),
             handler: HandlerConfig::Respond {
-                status: 200,
+                status: Some(200),
                 body: None,
                 headers: BTreeMap::new(),
             },
@@ -1543,7 +1543,7 @@ mod tests {
         let route_for = |pattern: &str| RouteConfig {
             path: "/*".to_string(),
             handler: HandlerConfig::Respond {
-                status: 200,
+                status: Some(200),
                 body: None,
                 headers: BTreeMap::new(),
             },
@@ -1664,7 +1664,7 @@ mod tests {
         let route = RouteConfig {
             path: "/*".to_string(),
             handler: HandlerConfig::Respond {
-                status: 200,
+                status: Some(200),
                 body: None,
                 headers: BTreeMap::new(),
             },
@@ -1712,7 +1712,7 @@ mod tests {
         let route = RouteConfig {
             path: "/*".to_string(),
             handler: HandlerConfig::Respond {
-                status: 200,
+                status: Some(200),
                 body: None,
                 headers: BTreeMap::new(),
             },
@@ -1758,7 +1758,7 @@ mod tests {
         let route = RouteConfig {
             path: "/*".to_string(),
             handler: HandlerConfig::Respond {
-                status: 200,
+                status: Some(200),
                 body: None,
                 headers: BTreeMap::new(),
             },
@@ -1805,7 +1805,7 @@ mod tests {
         let route = RouteConfig {
             path: "/*".to_string(),
             handler: HandlerConfig::Respond {
-                status: 200,
+                status: Some(200),
                 body: None,
                 headers: BTreeMap::new(),
             },

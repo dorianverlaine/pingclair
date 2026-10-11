@@ -45,7 +45,7 @@ fn original_uri_variables_are_precomputed_from_configuration() {
         routes: vec![pingclair_core::config::RouteConfig {
             path: "/*".to_string(),
             handler: HandlerConfig::Respond {
-                status: 200,
+                status: Some(200),
                 body: Some(pingclair_core::config::ConfigText::Template(
                     "ordinary response".to_string(),
                 )),

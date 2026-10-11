@@ -28,7 +28,7 @@ fn route(path: &str, matcher: Option<Matcher>) -> RouteConfig {
     RouteConfig {
         path: path.to_string(),
         handler: HandlerConfig::Respond {
-            status: 200,
+            status: Some(200),
             body: Some(pingclair_core::config::ConfigText::Template(
                 path.to_string(),
             )),

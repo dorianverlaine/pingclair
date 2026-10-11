@@ -4734,7 +4734,11 @@ impl PingclairProxy {
                 body,
                 headers,
             } => {
-                let mut response = ResponseHeader::build(*status, Some(3)).unwrap();
+                let status = crate::http_policy::respond_status(
+                    *status,
+                    ctx.error_scope.map(|scope| scope.status),
+                );
+                let mut response = ResponseHeader::build(status, Some(3)).unwrap();
                 for (k, v) in headers {
                     if let (Ok(name), Ok(value)) = (
                         http::header::HeaderName::from_bytes(k.as_bytes()),

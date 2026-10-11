@@ -1156,10 +1156,13 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
-/// Static response configuration
+/// 💬 Static response configuration.
+///
+/// `status` is `None` when the directive omits it, so the runtime keeps an
+/// active error's status instead of inventing one here.
 #[derive(Debug, Clone)]
 pub struct ResponseConfig {
-    pub status: u16,
+    pub status: Option<u16>,
     pub body: Option<Expr>,
     pub headers: BTreeMap<String, String>,
 }

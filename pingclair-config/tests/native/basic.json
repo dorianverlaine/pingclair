@@ -20,7 +20,6 @@
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": {
               "literal": "hello from Pingclair"
             },

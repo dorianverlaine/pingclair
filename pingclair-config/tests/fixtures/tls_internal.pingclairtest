@@ -27,7 +27,6 @@ internal.example {
           "path": "/*",
           "handler": {
             "type": "respond",
-            "status": 200,
             "body": "secure",
             "headers": {}
           },

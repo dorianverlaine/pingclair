@@ -106,7 +106,7 @@ fn proxy_state_exposes_the_same_compiled_access_gate_to_every_protocol() {
                         access,
                     )),
                     pingclair_core::config::HandlerElement::plain(HandlerConfig::Respond {
-                        status: 200,
+                        status: Some(200),
                         body: Some("ok".into()),
                         headers: BTreeMap::new(),
                     }),
