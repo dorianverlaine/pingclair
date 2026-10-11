@@ -391,6 +391,19 @@ impl Parser {
                     };
                     if self.take(':') {
                         (Some(name), self.value(depth + 1)?)
+                    } else if self.peek() == &Token::Mark('(') {
+                        // 💬 A component call in argument position is a value,
+                        // not a binding reference: `Respond(body: Format(…))`
+                        // spells a value constructor inline.
+                        (
+                            None,
+                            Value::Component(self.call_with_open(
+                                name,
+                                item.at,
+                                depth + 1,
+                                false,
+                            )?),
+                        )
                     } else {
                         (None, Value::Reference { name, at: item.at })
                     }
@@ -476,7 +489,17 @@ impl Parser {
             Token::Word(value) if value == "true" || value == "false" => {
                 Ok(Value::Bool(value == "true"))
             }
-            Token::Word(name) => Ok(Value::Reference { name, at: item.at }),
+            Token::Word(name) => {
+                if self.peek() == &Token::Mark('(') {
+                    return Ok(Value::Component(self.call_with_open(
+                        name,
+                        item.at,
+                        depth + 1,
+                        false,
+                    )?));
+                }
+                Ok(Value::Reference { name, at: item.at })
+            }
             _ => Err(item
                 .at
                 .error("expected a literal, array, typed value, or binding")),

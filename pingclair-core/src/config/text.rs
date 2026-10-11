@@ -5,13 +5,56 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 📝 Legacy strings are templates; native literals carry an explicit tag.
-/// This nonrecursive wire value never reinterprets literal braces as sources.
+/// 💬 One request fact a dynamic text value can read.
+///
+/// 📌 This is the typed spelling of the Caddy placeholders the legacy form
+/// still carries: a closed set, checked by the frontend at load time and
+/// resolved through the same lookups as `{client_ip}`, `{uri}` and friends, so
+/// the two spellings can never disagree about what a name means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextSource {
+    /// 🛡️ The client after trusted-proxy handling.
+    ClientIp,
+    /// 🔌 The socket peer, whatever any header claims.
+    RemoteHost,
+    RemotePort,
+    /// 🧭 What the client used, which a plaintext hop behind a TLS terminator
+    /// cannot be read off the headers.
+    Scheme,
+    Host,
+    Path,
+    Method,
+    /// 🧭 The current request target: path and query, never scheme or
+    /// authority. A rewrite changes it, because it is *this* request's target.
+    Uri,
+    /// 🚨 Only meaningful inside an error route; the shared validation refuses
+    /// it anywhere else.
+    ErrorStatus,
+    ErrorMessage,
+}
+
+/// 💬 One piece of a compiled dynamic text value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextSegment {
+    Literal(String),
+    Source(TextSource),
+}
+
+/// 📝 Legacy strings are templates; native literals carry an explicit tag;
+/// `Format(…)` and `from:` compile to a segment list at load time.
+///
+/// 🚫 This nonrecursive wire value never reinterprets literal braces as
+/// sources, and the segment form never re-parses text at request time: the
+/// frontend compiles the pattern once, and the transports only look up the
+/// sources it names.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ConfigText {
     Template(String),
     Literal { literal: String },
+    Segments { segments: Vec<TextSegment> },
 }
 
 impl ConfigText {
@@ -22,11 +65,19 @@ impl ConfigText {
         }
     }
 
-    /// 📝 Returns the characters without changing their interpretation.
-    pub fn as_str(&self) -> &str {
+    /// 💬 A compiled segment list that reads exactly one source.
+    pub fn from_source(source: TextSource) -> Self {
+        Self::Segments {
+            segments: vec![TextSegment::Source(source)],
+        }
+    }
+
+    /// 📝 The characters when they need no request-time data.
+    pub fn as_static_str(&self) -> Option<&str> {
         match self {
-            Self::Template(value) => value,
-            Self::Literal { literal } => literal,
+            Self::Template(value) => Some(value),
+            Self::Literal { literal } => Some(literal),
+            Self::Segments { .. } => None,
         }
     }
 
@@ -34,35 +85,39 @@ impl ConfigText {
     pub fn is_template(&self) -> bool {
         matches!(self, Self::Template(_))
     }
+
+    /// 🧭 Reports whether resolution can change the characters at all: a
+    /// legacy template that carries a placeholder, or a compiled segment list.
+    pub fn needs_resolution(&self) -> bool {
+        match self {
+            Self::Template(value) => value.contains('{'),
+            Self::Literal { .. } => false,
+            Self::Segments { .. } => true,
+        }
+    }
+
+    /// 💬 The compiled segments, when this value is the typed form.
+    pub fn segments(&self) -> Option<&[TextSegment]> {
+        match self {
+            Self::Segments { segments } => Some(segments),
+            _ => None,
+        }
+    }
 }
 
 /// 📝 Reading a text value yields its characters; the interpretation is what
 /// `is_template` answers, not what this does. Comparisons against `&str` are
 /// then the plain question "do the characters match", which is what a test
 /// asserting a body or a message means to ask.
-impl std::ops::Deref for ConfigText {
-    type Target = str;
-
-    fn deref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl AsRef<str> for ConfigText {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
 impl PartialEq<str> for ConfigText {
     fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
+        self.as_static_str() == Some(other)
     }
 }
 
 impl PartialEq<&str> for ConfigText {
     fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
+        self.as_static_str() == Some(*other)
     }
 }
 

@@ -139,7 +139,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         name: "Respond",
         kind: Kind::Component,
-        summary: "A fixed HTTP response: `Respond(body:, status:)`. Omitted status keeps an active error, otherwise 200.",
+        summary: "A fixed HTTP response: `Respond(body:, status:)`. `body:` takes a literal or `Format(…)`; omitted status keeps an active error, otherwise 200.",
         example: r#"HTTPListener(on: ":8080") {
     Site(host: "*") {
         Fallback { Respond(body: "hello", status: 200) }
@@ -203,11 +203,12 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         name: "Redirect",
         kind: Kind::Component,
-        summary: "A redirect: `Redirect(to:, status:)` with a typed status.",
+        summary: "A redirect: `Redirect(to:, status:)` with a typed status; `to:` takes a literal or `Format(…)`, so `{uri}` can keep the request target.",
         example: r#"HTTPListener(on: ":8080") {
     Site(host: "*") {
         Route(when: .path(prefix: "/old")) {
-            Redirect(to: "/new", status: .permanent)
+            Redirect(to: Format("https://example.com{uri}", uri: .uri),
+                     status: .permanentRedirect)
         }
     }
 }"#,
@@ -325,7 +326,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         name: "RequestHeader",
         kind: Kind::Component,
-        summary: "Sets request headers for later components: `.set`, `.append`, `.remove`, `.replace`.",
+        summary: "Sets request headers for later components: `.set`, `.append`, `.remove`, `.replace`. Values take a literal, `Format(…)`, or `from: .source`.",
         example: r#"HTTPListener(on: ":8080") {
     Site(host: "*") {
         Fallback {
@@ -347,7 +348,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         name: "ResponseHeader",
         kind: Kind::Component,
-        summary: "Rewrites the response on its way out: `.set`, `.append`, `.remove`, `.setIfAbsent`, `.replace`.",
+        summary: "Rewrites the response on its way out: `.set`, `.append`, `.remove`, `.setIfAbsent`, `.replace`. Values take a literal, `Format(…)`, or `from: .source`.",
         example: r#"HTTPListener(on: ":8080") {
     Site(host: "*") {
         Fallback {

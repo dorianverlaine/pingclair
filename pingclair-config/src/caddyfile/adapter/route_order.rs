@@ -293,7 +293,9 @@ mod tests {
     /// these fixtures label their routes; `proxy` when there is none.
     fn body(handler: &HandlerConfig) -> Option<&str> {
         match handler {
-            HandlerConfig::Respond { body, .. } => body.as_deref(),
+            HandlerConfig::Respond { body, .. } => {
+                body.as_ref().and_then(|text| text.as_static_str())
+            }
             HandlerConfig::Pipeline { handlers } => {
                 handlers.iter().find_map(|element| body(&element.handler))
             }

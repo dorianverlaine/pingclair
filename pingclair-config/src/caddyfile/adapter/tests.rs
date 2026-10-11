@@ -2053,14 +2053,14 @@ mod fail_closed_tests {
             config
                 .headers_up
                 .get("X-Forwarded-Method")
-                .map(|text| text.as_str()),
+                .and_then(|text| text.as_static_str()),
             Some("{http.request.method}")
         );
         assert_eq!(
             config
                 .headers_up
                 .get("X-Forwarded-Uri")
-                .map(|text| text.as_str()),
+                .and_then(|text| text.as_static_str()),
             Some("{http.request.uri}")
         );
         let subrequest = config
@@ -2306,7 +2306,7 @@ mod fail_closed_tests {
                 .unwrap_or_else(|| panic!("{source} must compile to a header handler"));
             if let Some((name, value)) = want_set {
                 assert_eq!(
-                    headers.0.get(name).map(|text| text.as_str()),
+                    headers.0.get(name).and_then(|text| text.as_static_str()),
                     Some(value),
                     "{source} must set {name}"
                 );
@@ -3129,7 +3129,9 @@ mod fail_closed_tests {
         let route = &config.servers[0].routes[0];
         let found = handlers_of(&route.handler).into_iter().any(|handler| {
             matches!(handler, HandlerConfig::RequestHeaders { set, .. }
-                if set.get("X-Trace").is_some_and(|text| text.is_empty()))
+                if set
+                    .get("X-Trace")
+                    .is_some_and(|text| text.as_static_str().unwrap_or_default().is_empty()))
         });
         assert!(found, "`request_header X-Trace` sets an empty value");
     }
@@ -4061,7 +4063,8 @@ mod header_match_tests {
             unreachable!()
         };
         assert_eq!(
-            set.get("X-Conditional").map(|text| text.as_str()),
+            set.get("X-Conditional")
+                .and_then(|text| text.as_static_str()),
             Some("yes")
         );
     }
@@ -4080,7 +4083,10 @@ mod header_match_tests {
         let HandlerConfig::Headers { set, .. } = &handler else {
             unreachable!()
         };
-        assert_eq!(set.get("X-After").map(|text| text.as_str()), Some("yes"));
+        assert_eq!(
+            set.get("X-After").and_then(|text| text.as_static_str()),
+            Some("yes")
+        );
     }
 
     #[test]
@@ -5145,14 +5151,20 @@ mod error_directive_tests {
     fn a_lone_word_is_the_message_with_status_500() {
         let (status, message) = error_of("example.com {\n\terror \"oops\"\n}");
         assert_eq!(status, 500);
-        assert_eq!(message.as_deref(), Some("oops"));
+        assert_eq!(
+            message.as_ref().and_then(|text| text.as_static_str()),
+            Some("oops")
+        );
     }
 
     #[test]
     fn message_and_status_are_two_arguments() {
         let (status, message) = error_of("example.com {\n\terror \"Unauthorized\" 403\n}");
         assert_eq!(status, 403);
-        assert_eq!(message.as_deref(), Some("Unauthorized"));
+        assert_eq!(
+            message.as_ref().and_then(|text| text.as_static_str()),
+            Some("Unauthorized")
+        );
     }
 
     #[test]
@@ -5160,14 +5172,20 @@ mod error_directive_tests {
         let (status, message) =
             error_of("example.com {\n\terror 404 {\n\t\tmessage \"not here\"\n\t}\n}");
         assert_eq!(status, 404);
-        assert_eq!(message.as_deref(), Some("not here"));
+        assert_eq!(
+            message.as_ref().and_then(|text| text.as_static_str()),
+            Some("not here")
+        );
     }
 
     #[test]
     fn a_two_digit_number_is_a_message_not_a_status() {
         let (status, message) = error_of("example.com {\n\terror 99\n}");
         assert_eq!(status, 500);
-        assert_eq!(message.as_deref(), Some("99"));
+        assert_eq!(
+            message.as_ref().and_then(|text| text.as_static_str()),
+            Some("99")
+        );
     }
 
     #[test]
@@ -5479,7 +5497,7 @@ mod matcher_inside_route_body_tests {
             panic!("expected respond");
         };
         assert_eq!(
-            body.as_deref(),
+            body.as_ref().and_then(|text| text.as_static_str()),
             Some("SECRET"),
             "the token must not become the body"
         );
@@ -5824,7 +5842,10 @@ mod php_fastcgi_tests {
         // the load balancer below has only one peer to choose between.
         assert_eq!(config.upstreams, ["localhost:9000", "localhost:9001"]);
         assert_eq!(
-            config.headers_up.get("X-Method").map(|text| text.as_str()),
+            config
+                .headers_up
+                .get("X-Method")
+                .and_then(|text| text.as_static_str()),
             Some("{http.request.method}")
         );
         assert_eq!(config.load_balance.strategy, "round_robin");

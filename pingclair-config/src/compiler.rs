@@ -1064,6 +1064,9 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
     }
     // 🚫 `{remote_ip}` is refused wherever it appears (see that module).
     crate::retired_placeholders::refuse_retired_placeholders(config)?;
+    // 💬 Compiled text segments: error sources only inside error routes, and
+    // no segments in the stages that resolve without a request.
+    crate::typed_text::validate(config)?;
     // 🛡️ Both lists are refused here rather than at listener setup, so
     // `pingclair validate`, the Admin `/load` endpoint and a reload all reject
     // a bad entry. `blocked_ips` used to be checked by nobody: the listener

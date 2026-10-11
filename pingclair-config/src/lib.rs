@@ -37,6 +37,7 @@ mod layer4_dynamic;
 mod retired_placeholders;
 mod shared_ports;
 mod syntax;
+mod typed_text;
 mod underscore_headers;
 mod upstream_weights;
 
@@ -2543,10 +2544,13 @@ mod tests {
                     }
                     HandlerConfig::Headers { set, remove, .. } => {
                         if let Some(value) = set.get("Cache-Control") {
-                            *cache_control = Some(value.as_str().to_owned());
+                            *cache_control =
+                                Some(value.as_static_str().unwrap_or_default().to_owned());
                         }
-                        *has_security_header |=
-                            set.get("X-Frame-Options").map(|text| text.as_str()) == Some("DENY");
+                        *has_security_header |= set
+                            .get("X-Frame-Options")
+                            .and_then(|text| text.as_static_str())
+                            == Some("DENY");
                         *removes_server |= remove.iter().any(|name| name == "Server");
                     }
                     HandlerConfig::ReverseProxy(_) => *has_proxy = true,

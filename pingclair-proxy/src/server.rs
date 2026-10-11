@@ -3706,16 +3706,19 @@ impl PingclairProxy {
         ctx.response_status = header.status;
         // 🧩 FastCGI never enters `upstream_peer`, so proxy-owned response
         // fields must join the local policy before the response decision runs.
-        ctx.response_headers.merge_proxy_response_ops(
-            &config.headers_down,
-            &config.headers_down_add,
-            &config.headers_down_remove,
-            &config.headers_down_default,
+        // ⚡ The verified client address is only stringified when some
+        // `header_down` value actually needs it.
+        let verified_client_ip = proxy_down_needs_resolution(config)
+            .then(|| ctx.verified_client_ip.map(|ip| ip.to_string()))
+            .flatten();
+        merge_proxy_down(
+            &mut ctx.response_headers,
+            config,
+            session.req_header(),
+            ctx.request_scheme,
+            verified_client_ip.as_deref(),
+            &ctx.request_vars,
         );
-        if !config.headers_down_replace.is_empty() {
-            ctx.response_headers
-                .merge_proxy_replacements(&config.headers_down_replace);
-        }
         ctx.streaming_response = wants_immediate_flush(config.flush_interval);
 
         // 🧭 `handle_response`/`intercept` evaluate before the client sees
@@ -4245,7 +4248,7 @@ impl PingclairProxy {
             || set
                 .values()
                 .chain(add.values().flatten())
-                .any(|value| value.is_template() && value.contains('{'));
+                .any(|value| value.needs_resolution());
         let verified_client_ip = needs_resolution
             .then(|| ctx.verified_client_ip.map(|ip| ip.to_string()))
             .flatten();
@@ -4261,7 +4264,7 @@ impl PingclairProxy {
                     .flat_map(|(name, values)| values.iter().map(move |value| (name, value, true))),
             )
         {
-            let value = if template.is_template() && template.contains('{') {
+            let value = if template.needs_resolution() {
                 resolve_caddy_placeholders(
                     template,
                     source,
@@ -4271,7 +4274,7 @@ impl PingclairProxy {
                 )
                 .into_owned()
             } else {
-                template.as_str().to_owned()
+                template.as_static_str().unwrap_or_default().to_owned()
             };
             resolved.push((name.clone(), value, is_add));
         }
@@ -4514,7 +4517,7 @@ impl PingclairProxy {
             return Ok(());
         };
         let body_bytes = {
-            let verified_client_ip = if message.is_template() && message.as_str().contains('{') {
+            let verified_client_ip = if message.needs_resolution() {
                 ctx.verified_client_ip.map(|ip| ip.to_string())
             } else {
                 None
@@ -4556,8 +4559,24 @@ impl PingclairProxy {
         // inside `handle_errors` renders the status that was raised rather than
         // an empty string. The response's own status is independent of it:
         // Caddy's `respond` still answers with the code it was written with.
+        // 💬 The message resolves once here, so `{err.message}` and the body
+        // below can never disagree about what it said.
+        let resolved_message = message.as_ref().map(|text| {
+            let verified_client_ip = text
+                .needs_resolution()
+                .then(|| ctx.verified_client_ip.map(|ip| ip.to_string()))
+                .flatten();
+            resolve_caddy_placeholders(
+                text,
+                session.req_header(),
+                verified_client_ip.as_deref(),
+                ctx.request_scheme,
+                &ctx.request_vars,
+            )
+            .into_owned()
+        });
         ctx.request_vars
-            .set_error(status, message.as_ref().map(|text| text.as_str()));
+            .set_error(status, resolved_message.as_deref());
         // 📎 Cloned so `state` does not borrow `ctx`: the error routes below
         // need `&mut ctx` for the same handler machinery that matched them.
         let Some(state) = ctx.state.clone() else {
@@ -4768,12 +4787,11 @@ impl PingclairProxy {
                 let body_bytes = {
                     let empty = pingclair_core::config::ConfigText::literal("");
                     let raw_body = body.as_ref().unwrap_or(&empty);
-                    let verified_client_ip =
-                        if raw_body.is_template() && raw_body.as_str().contains('{') {
-                            ctx.verified_client_ip.map(|ip| ip.to_string())
-                        } else {
-                            None
-                        };
+                    let verified_client_ip = if raw_body.needs_resolution() {
+                        ctx.verified_client_ip.map(|ip| ip.to_string())
+                    } else {
+                        None
+                    };
                     let resolved = resolve_caddy_placeholders(
                         raw_body,
                         session.req_header(),
@@ -4846,7 +4864,7 @@ impl PingclairProxy {
             HandlerConfig::Redirect { to, code } => {
                 // 🧭 A redirect target is a template, so `redir https://{host}{uri}`
                 // can send a client to the same resource over another scheme.
-                let verified_client_ip = if to.is_template() && to.as_str().contains('{') {
+                let verified_client_ip = if to.needs_resolution() {
                     ctx.verified_client_ip.map(|ip| ip.to_string())
                 } else {
                     None
@@ -5410,7 +5428,7 @@ impl PingclairProxy {
                         .values()
                         .chain(add.values().flatten())
                         .chain(default_set.values())
-                        .any(|value| value.is_template() && value.contains('{'));
+                        .any(|value| value.needs_resolution());
                 let verified_client_ip = needs_resolution
                     .then(|| ctx.verified_client_ip.map(|ip| ip.to_string()))
                     .flatten();
@@ -6127,8 +6145,23 @@ pub(crate) fn resolve_caddy_placeholders<'a, T: crate::config_text::TextInput + 
     scheme: &'static str,
     vars: &crate::http_policy::RequestVars,
 ) -> std::borrow::Cow<'a, str> {
-    let template = input.text();
-    if !input.is_template() || !template.contains('{') {
+    // 💬 A compiled segment list is the typed spelling of the same lookups, so
+    // it resolves through them and the two spellings can never disagree about
+    // what a name means.
+    if let Some(segments) = input.segments() {
+        let mut resolved = String::new();
+        for segment in segments {
+            match segment {
+                pingclair_core::config::TextSegment::Literal(text) => resolved.push_str(text),
+                pingclair_core::config::TextSegment::Source(source) => resolved.push_str(
+                    &resolve_text_source(*source, req, verified_client_ip, scheme, vars),
+                ),
+            }
+        }
+        return std::borrow::Cow::Owned(resolved);
+    }
+    let template = input.static_text().unwrap_or_default();
+    if !input.needs_resolution() {
         // ⚡ OPTIMIZATION: Fast path — no placeholders, return as-is.
         return std::borrow::Cow::Borrowed(template);
     }
@@ -6158,6 +6191,81 @@ pub(crate) fn resolve_caddy_placeholders<'a, T: crate::config_text::TextInput + 
     }
 
     std::borrow::Cow::Owned(result)
+}
+
+/// 💬 One typed source, resolved through the placeholder lookups.
+///
+/// 📌 The mapping is the whole point of reusing `resolve_single_placeholder`:
+/// `.uri` must mean exactly what `{uri}` means (path and query, with the
+/// authority left out so HTTP/2 and HTTP/1.1 agree), `.host` must strip the
+/// port the same way, and an error source must read the same request-scoped
+/// keys the error machinery writes.
+fn resolve_text_source(
+    source: pingclair_core::config::TextSource,
+    req: &RequestHeader,
+    verified_client_ip: Option<&str>,
+    scheme: &'static str,
+    vars: &crate::http_policy::RequestVars,
+) -> String {
+    use pingclair_core::config::TextSource;
+    let name = match source {
+        TextSource::ClientIp => "client_ip",
+        TextSource::RemoteHost => "remote_host",
+        TextSource::RemotePort => "remote_port",
+        TextSource::Scheme => "scheme",
+        TextSource::Host => "host",
+        TextSource::Path => "path",
+        TextSource::Method => "method",
+        TextSource::Uri => "uri",
+        TextSource::ErrorStatus => "err.status_code",
+        TextSource::ErrorMessage => "err.message",
+    };
+    resolve_single_placeholder(name, req, verified_client_ip, scheme, vars)
+}
+
+/// 🗄️ Merges one proxy's `header_down` operations against this request.
+///
+/// 💬 `header_down` is a response-phase value, and response-phase text
+/// resolves against the request that produced the response — the rule a
+/// route-level `ResponseHeader` already follows. Until the typed text work
+/// these values were stored ready-made and written verbatim, so
+/// `header_down X-Test "{host}"` put a literal `{host}` on the wire; both
+/// spellings now resolve through the same lookups as everything else.
+pub(crate) fn proxy_down_needs_resolution(
+    proxy: &pingclair_core::config::ReverseProxyConfig,
+) -> bool {
+    proxy
+        .headers_down
+        .values()
+        .chain(proxy.headers_down_add.values().flatten())
+        .chain(proxy.headers_down_default.values())
+        .any(|value| value.needs_resolution())
+}
+
+pub(crate) fn merge_proxy_down(
+    policy: &mut crate::http_policy::ResponseHeaderPolicy,
+    proxy: &pingclair_core::config::ReverseProxyConfig,
+    req: &RequestHeader,
+    scheme: &'static str,
+    verified_client_ip: Option<&str>,
+    vars: &crate::http_policy::RequestVars,
+) {
+    let text = crate::http_policy::ResponseTextResolution {
+        req,
+        verified_client_ip,
+        scheme,
+        vars,
+    };
+    policy.merge_proxy_response_ops(
+        &proxy.headers_down,
+        &proxy.headers_down_add,
+        &proxy.headers_down_remove,
+        &proxy.headers_down_default,
+        &text,
+    );
+    if !proxy.headers_down_replace.is_empty() {
+        policy.merge_proxy_replacements(&proxy.headers_down_replace);
+    }
 }
 
 /// 🧭 Resolves rewrite operands against one request, borrowing from the
@@ -7745,16 +7853,17 @@ impl ProxyHttp for PingclairProxy {
             // 🧭 After `handle_config`, so a `header` directive around the proxy
             // has already claimed its fields and keeps winning a shared `set`.
             if let Some(proxy_config) = self.get_proxy_config(&state, index) {
-                ctx.response_headers.merge_proxy_response_ops(
-                    &proxy_config.headers_down,
-                    &proxy_config.headers_down_add,
-                    &proxy_config.headers_down_remove,
-                    &proxy_config.headers_down_default,
+                let verified_client_ip = proxy_down_needs_resolution(proxy_config)
+                    .then(|| ctx.verified_client_ip.map(|ip| ip.to_string()))
+                    .flatten();
+                merge_proxy_down(
+                    &mut ctx.response_headers,
+                    proxy_config,
+                    session.req_header(),
+                    ctx.request_scheme,
+                    verified_client_ip.as_deref(),
+                    &ctx.request_vars,
                 );
-                if !proxy_config.headers_down_replace.is_empty() {
-                    ctx.response_headers
-                        .merge_proxy_replacements(&proxy_config.headers_down_replace);
-                }
             }
         }
 

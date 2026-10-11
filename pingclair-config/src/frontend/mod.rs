@@ -6,6 +6,7 @@
 pub(crate) mod http;
 pub(crate) mod log;
 pub(crate) mod tcp;
+pub(crate) mod text;
 
 use http::http_listener;
 use tcp::listener;

@@ -49,6 +49,10 @@ Inside an error route, `Respond(body:)` keeps the original error status; an
 explicit `status:` overrides it, and a Caddyfile `handle_errors` block follows
 the same rule. Outside an error route, omission means 200. JSON export and
 reload preserve the distinction between omitted and explicit status.
+Text values stay literal unless written as dynamic values:
+`Redirect(to: Format("https://example.com{uri}", uri: .uri))` keeps the
+request target, and `.set("X-Real-IP", from: .clientIP)` feeds a header from a
+typed request source. Error sources exist only inside error routes.
 Native request and response header values are literal text, including braces;
 that interpretation survives JSON export and reload on HTTP/1.1, HTTP/2 and HTTP/3.
 TCP uses `.limits(maxConnections:)`, matching HTTP, and typed source-IP

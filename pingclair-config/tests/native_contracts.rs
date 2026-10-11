@@ -117,6 +117,69 @@ fn native_header_text_stays_literal_after_json_round_trip() {
     assert_eq!(serde_json::to_value(decoded).unwrap(), document);
 }
 
+/// 💬 `Format(…)` and `from:` round-trip through JSON, and the shared
+/// validation enforces the rules a frontend alone cannot see — a JSON
+/// document walks straight past the native parser.
+#[test]
+fn typed_text_survives_json_round_trip_and_keeps_its_context_rules() {
+    let source = r#"HTTPListener(on: "127.0.0.1:18080") {
+        Site(host: "*") {
+            Route(when: .path(exact: "/go")) {
+                Redirect(to: Format("https://example.com{uri}", uri: .uri),
+                         status: .permanentRedirect)
+            }
+            Route(when: .path(exact: "/boom")) { Fail(status: 503) }
+            ErrorRoute(for: [.serverError]) {
+                Respond(body: Format("status {code}", code: .errorStatus))
+            }
+            Fallback {
+                RequestHeader(.set("X-Real-IP", from: .clientIP))
+                Respond(body: "ok")
+            }
+        }
+    }"#;
+    let compiled = pingclair_config::compile(source).unwrap();
+    let document = serde_json::to_value(&compiled).unwrap();
+    let decoded: pingclair_core::config::PingclairConfig =
+        serde_json::from_value(document.clone()).unwrap();
+    pingclair_config::compiler::validate_config(&decoded).unwrap();
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), document);
+    let serialized = serde_json::to_string(&document).unwrap();
+    assert!(serialized.contains(r#""source":"uri""#), "{serialized}");
+    assert!(
+        serialized.contains(r#""source":"error_status""#),
+        "{serialized}"
+    );
+
+    // 🚫 An error source outside an error route cannot resolve, from JSON too.
+    let mut invalid = decoded.clone();
+    invalid.servers[0].routes[2].handler = serde_json::from_value(serde_json::json!({
+        "type": "respond",
+        "body": { "segments": [{ "source": "error_status" }] }
+    }))
+    .unwrap();
+    let error = pingclair_config::compiler::validate_config(&invalid)
+        .expect_err("an error source outside an error route cannot resolve");
+    assert!(error.to_string().contains("ErrorRoute"), "{error}");
+
+    // 🚫 And a response subroute is evaluated without a request, so a segment
+    // list cannot ride into one.
+    let mut subroute = decoded.clone();
+    subroute.servers[0].routes[2].handler = serde_json::from_value(serde_json::json!({
+        "type": "intercept",
+        "handlers": [{
+            "handlers": [{
+                "type": "respond",
+                "body": { "segments": [{ "source": "uri" }] }
+            }]
+        }]
+    }))
+    .unwrap();
+    let error = pingclair_config::compiler::validate_config(&subroute)
+        .expect_err("a response subroute cannot resolve dynamic text");
+    assert!(error.to_string().contains("response subroute"), "{error}");
+}
+
 #[test]
 fn extracting_a_positional_value_into_a_binding_preserves_the_document() {
     let inline = site(r#"ResponseHeader(.set("X-Test", "hello")) Respond(body: "ok")"#);

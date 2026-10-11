@@ -25,5 +25,5 @@ pub use layer4_dynamic::{Layer4Dns, Layer4Dynamic, Layer4IpVersions};
 pub use loader::ConfigLoader;
 pub use secret::SecretString;
 pub use shared_ports::{FoldedListener, SharedPortConflict, SharedPortFold, covering_wildcard};
-pub use text::ConfigText;
+pub use text::{ConfigText, TextSegment, TextSource};
 pub use types::*;

@@ -3185,7 +3185,7 @@ async fn plan_h3_handler_with_connector(
                     }),
                 )
             {
-                let value = if template.is_template() && template.contains('{') {
+                let value = if template.needs_resolution() {
                     resolve_caddy_placeholders(
                         template,
                         request_header,
@@ -3195,7 +3195,7 @@ async fn plan_h3_handler_with_connector(
                     )
                     .into_owned()
                 } else {
-                    template.as_str().to_owned()
+                    template.as_static_str().unwrap_or_default().to_owned()
                 };
                 let failed = if is_add {
                     request_header.append_header(name.clone(), value).is_err()
@@ -3461,8 +3461,7 @@ async fn plan_h3_handler_with_connector(
             // resolved it, so a site served `path={path}` over HTTP/3 and
             // the value over HTTP/1 and HTTP/2.
             let body = body.as_ref().map(|raw| {
-                let verified =
-                    (raw.is_template() && raw.as_str().contains('{')).then_some(verified_client_ip);
+                let verified = raw.needs_resolution().then_some(verified_client_ip);
                 resolve_caddy_placeholders(raw, request_header, verified, "https", request_vars)
                     .into_owned()
             });
@@ -3484,7 +3483,18 @@ async fn plan_h3_handler_with_connector(
             // transport and not the other is exactly the parity gap this crate
             // keeps having to close.
             if error_scope.is_none() {
-                request_vars.set_error(*status, message.as_ref().map(|text| text.as_str()));
+                let resolved = message.as_ref().map(|text| {
+                    let verified = text.needs_resolution().then_some(verified_client_ip);
+                    resolve_caddy_placeholders(
+                        text,
+                        request_header,
+                        verified,
+                        "https",
+                        request_vars,
+                    )
+                    .into_owned()
+                });
+                request_vars.set_error(*status, resolved.as_deref());
             }
             let default_message = pingclair_core::config::ConfigText::literal(
                 http::StatusCode::from_u16(*status)
@@ -3493,8 +3503,7 @@ async fn plan_h3_handler_with_connector(
                     .unwrap_or(""),
             );
             let raw = message.as_ref().unwrap_or(&default_message);
-            let verified =
-                (raw.is_template() && raw.as_str().contains('{')).then_some(verified_client_ip);
+            let verified = raw.needs_resolution().then_some(verified_client_ip);
             let body = Some(
                 resolve_caddy_placeholders(raw, request_header, verified, "https", request_vars)
                     .into_owned(),
@@ -5570,15 +5579,14 @@ async fn fastcgi_upstream(
         headers.remove(name.as_ref());
     }
     let mut effective_response_policy = response_policy.clone();
-    effective_response_policy.merge_proxy_response_ops(
-        &proxy_config.headers_down,
-        &proxy_config.headers_down_add,
-        &proxy_config.headers_down_remove,
-        &proxy_config.headers_down_default,
+    crate::server::merge_proxy_down(
+        &mut effective_response_policy,
+        proxy_config,
+        request_header,
+        "https",
+        Some(verified_client_ip),
+        request_vars,
     );
-    if !proxy_config.headers_down_replace.is_empty() {
-        effective_response_policy.merge_proxy_replacements(&proxy_config.headers_down_replace);
-    }
     let handlers = (!proxy_config.handle_response.is_empty())
         .then_some(proxy_config.handle_response.as_slice())
         .or(standalone_response_handlers)
@@ -6763,15 +6771,14 @@ async fn reverse_proxy_upstream(
     // 🧩 Proxy-owned replacements fill gaps without overriding outer middleware.
     let mut effective_policy = response_policy.clone();
     if let Some(cfg) = &proxy_config {
-        effective_policy.merge_proxy_response_ops(
-            &cfg.headers_down,
-            &cfg.headers_down_add,
-            &cfg.headers_down_remove,
-            &cfg.headers_down_default,
+        crate::server::merge_proxy_down(
+            &mut effective_policy,
+            cfg,
+            client_header,
+            "https",
+            Some(verified_client_ip),
+            request_vars,
         );
-        if !cfg.headers_down_replace.is_empty() {
-            effective_policy.merge_proxy_replacements(&cfg.headers_down_replace);
-        }
     }
     // 🔀 Only the proxied path gets a `Via`: the other H3 responses are
     // produced by this server, so there is no hop to record. Appended after

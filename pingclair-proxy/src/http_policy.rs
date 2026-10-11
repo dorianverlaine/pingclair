@@ -8,8 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http::{HeaderMap, Method};
-use pingclair_core::config::{HandlerConfig, ResponseHandlerConfig, ResponseMatcher};
+use pingclair_core::config::{ConfigText, HandlerConfig, ResponseHandlerConfig, ResponseMatcher};
 use pingora_core::Result as PingoraResult;
+use pingora_http::RequestHeader;
 use pingora_http::ResponseHeader;
 use regex::Regex;
 
@@ -164,6 +165,10 @@ pub struct ResponseFileServer {
 ///
 /// The decision is made from the response header alone — status and headers —
 /// never from the body, which is the property that keeps this streaming-safe.
+///
+/// 💬 This stage has no request to resolve typed text against, so shared
+/// validation refuses a compiled segment list anywhere inside an `Intercept`
+/// entry; the reads below go through `as_static_str` on that invariant.
 pub fn evaluate_response_handlers(
     handlers: &[ResponseHandlerConfig],
     status: u16,
@@ -218,18 +223,20 @@ pub fn evaluate_response_handlers(
                 require: _,
             } => {
                 for (name, value) in set {
-                    outcome
-                        .header_set
-                        .push((name.clone(), value.as_str().to_owned()));
+                    outcome.header_set.push((
+                        name.clone(),
+                        value.as_static_str().unwrap_or_default().to_owned(),
+                    ));
                 }
                 // 📋 The subroute surface collects name/value edits and its
                 // consumers build a map from them, so a repeated `+Name` keeps
                 // the meaning it had before multi-value adds (#276).
                 for (name, values) in add {
                     for value in values {
-                        outcome
-                            .header_set
-                            .push((name.clone(), value.as_str().to_owned()));
+                        outcome.header_set.push((
+                            name.clone(),
+                            value.as_static_str().unwrap_or_default().to_owned(),
+                        ));
                     }
                 }
                 outcome.header_remove.extend(remove.iter().cloned());
@@ -270,14 +277,14 @@ pub fn evaluate_response_handlers(
                     headers: response_headers,
                     body: body
                         .as_ref()
-                        .map(|text| text.as_str().as_bytes().to_vec())
+                        .map(|text| text.as_static_str().unwrap_or_default().as_bytes().to_vec())
                         .unwrap_or_default(),
                 });
             }
             HandlerConfig::Error { status, message } => {
                 let body = message
                     .as_ref()
-                    .map(|text| text.as_str().to_owned())
+                    .map(|text| text.as_static_str().unwrap_or_default().to_owned())
                     .unwrap_or_else(|| {
                         http::StatusCode::from_u16(*status)
                             .ok()
@@ -875,6 +882,37 @@ struct SetHeader {
     header_value: Option<http::HeaderValue>,
 }
 
+/// 💬 The request facts a response-side header text resolves against.
+///
+/// `header_down` is a response-phase value: Caddy resolves its placeholders
+/// against the request that produced the response, and so does this. Before
+/// the typed text work these values were stored ready-made and written
+/// verbatim — `header_down X-Test "{host}"` sent a literal `{host}` — which
+/// this fixes for the template and the typed spelling at once.
+pub(crate) struct ResponseTextResolution<'r> {
+    pub req: &'r RequestHeader,
+    pub verified_client_ip: Option<&'r str>,
+    pub scheme: &'static str,
+    pub vars: &'r RequestVars,
+}
+
+impl ResponseTextResolution<'_> {
+    /// 💬 One configured value, resolved against this request.
+    ///
+    /// 🏎️ The resolver's fast path hands a literal back without copying — the
+    /// `to_owned` here is the one allocation the caller's storage needs anyway.
+    pub(crate) fn resolve(&self, value: &ConfigText) -> String {
+        crate::server::resolve_caddy_placeholders(
+            value,
+            self.req,
+            self.verified_client_ip,
+            self.scheme,
+            self.vars,
+        )
+        .into_owned()
+    }
+}
+
 /// 🧭 Stores transport-neutral downstream header mutations in execution order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ResponseHeaderPolicy {
@@ -1039,16 +1077,20 @@ impl ResponseHeaderPolicy {
     }
 
     /// 🧩 Adds proxy-owned replacements without overriding outer middleware.
-    pub(crate) fn merge_proxy_set<T: AsRef<str>>(&mut self, headers: &BTreeMap<String, T>) {
+    pub(crate) fn merge_proxy_set(
+        &mut self,
+        headers: &BTreeMap<String, ConfigText>,
+        text: &ResponseTextResolution<'_>,
+    ) {
         for (name, value) in headers {
-            let value = value.as_ref();
+            let value = text.resolve(value);
             let name = name.to_ascii_lowercase();
             // 🧩 `or_insert_with` is the whole rule: an entry the outer
             // middleware already decided is never overwritten here.
             self.set.entry(name).or_insert_with_key(|name| SetHeader {
                 name_bytes: Bytes::copy_from_slice(name.as_bytes()),
-                header_value: http::HeaderValue::from_str(value).ok(),
-                value: value.to_owned(),
+                header_value: http::HeaderValue::from_str(&value).ok(),
+                value,
             });
         }
     }
@@ -1066,30 +1108,31 @@ impl ResponseHeaderPolicy {
     /// difference is deliberate and is the one place a `header_down` can lose:
     /// `set` is the only operation that can name a header an outer `header`
     /// directive already decided, and within one policy the outer decision wins.
-    pub(crate) fn merge_proxy_response_ops<T: AsRef<str>>(
+    pub(crate) fn merge_proxy_response_ops(
         &mut self,
-        set: &BTreeMap<String, T>,
-        add: &BTreeMap<String, Vec<T>>,
+        set: &BTreeMap<String, ConfigText>,
+        add: &BTreeMap<String, Vec<ConfigText>>,
         remove: &[String],
-        default_set: &BTreeMap<String, T>,
+        default_set: &BTreeMap<String, ConfigText>,
+        text: &ResponseTextResolution<'_>,
     ) {
         if set.is_empty() && add.is_empty() && remove.is_empty() && default_set.is_empty() {
             return;
         }
-        self.merge_proxy_set(set);
+        self.merge_proxy_set(set, text);
         // 📋 Every value of every `+Name` line, in order: two `+Set-Cookie`
         // lines are two cookies, and RFC 6265 §3 forbids folding them into one
         // field line (#276).
         for (name, values) in add {
             for value in values {
-                self.add(name.clone(), value.as_ref().to_owned());
+                self.add(name.clone(), text.resolve(value));
             }
         }
         for name in remove {
             self.remove(name.clone());
         }
         for (name, value) in default_set {
-            self.set_if_absent(name.clone(), value.as_ref().to_owned());
+            self.set_if_absent(name.clone(), text.resolve(value));
         }
     }
 
@@ -2966,13 +3009,26 @@ mod tests {
         let mut policy = ResponseHeaderPolicy::default();
         policy.set("x-owner", "outer-middleware");
 
-        let proxy_headers: BTreeMap<String, String> = [
-            ("X-Owner".to_string(), "proxy-config".to_string()),
-            ("x-only-proxy".to_string(), "proxy-config".to_string()),
+        let proxy_headers: BTreeMap<String, ConfigText> = [
+            ("X-Owner".to_string(), ConfigText::literal("proxy-config")),
+            (
+                "x-only-proxy".to_string(),
+                ConfigText::literal("proxy-config"),
+            ),
         ]
         .into_iter()
         .collect();
-        policy.merge_proxy_set(&proxy_headers);
+        let request = RequestHeader::build("GET", b"/", None).unwrap();
+        let vars = RequestVars::default();
+        policy.merge_proxy_set(
+            &proxy_headers,
+            &ResponseTextResolution {
+                req: &request,
+                verified_client_ip: None,
+                scheme: "http",
+                vars: &vars,
+            },
+        );
 
         let response = applied(&policy, None);
         assert_eq!(

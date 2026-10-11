@@ -18,7 +18,7 @@
 //! such a byte at request time is a separate question for the transports.
 
 use crate::compiler::{CompileError, CompileResult};
-use pingclair_core::config::{HandlerConfig, HeaderReplacement};
+use pingclair_core::config::{ConfigText, HandlerConfig, HeaderReplacement, TextSegment};
 use std::collections::BTreeMap;
 
 /// 🚫 Walks a handler tree and refuses any header field it would emit that
@@ -80,7 +80,7 @@ pub(crate) fn validate_header_fields(handler: &HandlerConfig) -> CompileResult<(
                 &proxy.headers_down,
                 &proxy.headers_down_default,
             ] {
-                fields.values().try_for_each(|value| check_value(value))?;
+                fields.values().try_for_each(check_value)?;
             }
             // 📋 `header_down +Name` values are multi-valued now, so every one
             // of them is checked, not just the last (#276).
@@ -88,9 +88,9 @@ pub(crate) fn validate_header_fields(handler: &HandlerConfig) -> CompileResult<(
                 .headers_down_add
                 .values()
                 .flatten()
-                .try_for_each(|value| check_value(value))?;
+                .try_for_each(check_value)?;
             for replacement in &proxy.headers_down_replace {
-                check_value(&replacement.replace)?;
+                check_static_value(&replacement.replace)?;
             }
             proxy
                 .handle_response
@@ -117,7 +117,7 @@ fn check_fields(
 fn check_replacements(replacements: &[HeaderReplacement]) -> CompileResult<()> {
     for replacement in replacements {
         check_name(&replacement.field)?;
-        check_value(&replacement.replace)?;
+        check_static_value(&replacement.replace)?;
     }
     Ok(())
 }
@@ -131,7 +131,20 @@ fn check_name(name: &str) -> CompileResult<()> {
     Ok(())
 }
 
-fn check_value(value: &str) -> CompileResult<()> {
+fn check_value(value: &ConfigText) -> CompileResult<()> {
+    match value.segments() {
+        // 💬 Only the literal halves are known at load time. A source resolves
+        // to request data, and a value that turns out to be unrepresentable
+        // then is dropped by the transports, as the module doc says.
+        Some(segments) => segments.iter().try_for_each(|segment| match segment {
+            TextSegment::Literal(text) => check_static_value(text),
+            TextSegment::Source(_) => Ok(()),
+        }),
+        None => check_static_value(value.as_static_str().unwrap_or_default()),
+    }
+}
+
+fn check_static_value(value: &str) -> CompileResult<()> {
     if value.contains(['\r', '\n', '\0']) {
         return Err(CompileError::InvalidRoute {
             message: format!(

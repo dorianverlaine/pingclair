@@ -25,6 +25,9 @@ mod native_header_text;
 #[path = "h3_end_to_end/native_error_status.rs"]
 mod native_error_status;
 
+#[path = "h3_end_to_end/native_typed_text.rs"]
+mod native_typed_text;
+
 // 🔪 Responses that fail after they started. A sibling file rather than more
 // of this one, which is already a high-touch file.
 #[path = "h3_end_to_end/truncation.rs"]

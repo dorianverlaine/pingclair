@@ -104,11 +104,13 @@ pub(super) fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
                 ),
                 None => None,
             };
+            let Some(body_value) = call.get("body") else {
+                return Err(call.at.error("Respond requires body:"));
+            };
+            let body = crate::frontend::text::config_text(body_value, "body", call.at)?;
             Ok(HandlerConfig::Respond {
                 status,
-                body: Some(pingclair_core::config::ConfigText::literal(
-                    call.string("body")?,
-                )),
+                body: Some(body),
                 headers: std::collections::BTreeMap::new(),
             })
         }
@@ -1002,17 +1004,29 @@ fn header_ops_from(
 
 /// 🏷️ Reads the two unlabeled operands of `.set`/`.append`/`.setIfAbsent`.
 fn header_pair(action: &Call) -> Result<(String, pingclair_core::config::ConfigText), Error> {
-    let [(None, Value::String(field)), (None, Value::String(value))] = action.args.as_slice()
-    else {
+    let [(None, Value::String(field)), rest @ ..] = action.args.as_slice() else {
         return Err(action.at.error(format!(
-            ".{} takes a quoted field name and a quoted value",
+            ".{} takes a quoted field name and a value",
             action.name
         )));
     };
-    Ok((
-        field.clone(),
-        pingclair_core::config::ConfigText::literal(value),
-    ))
+    let value = match rest {
+        [(None, value)] => crate::frontend::text::config_text(value, "the value", action.at)?,
+        // 💬 One dynamic value is written `from: <source>`; a literal is a
+        // string and a mix of text and sources is `Format(…)`.
+        [(Some(label), value)] if label == "from" => {
+            pingclair_core::config::ConfigText::from_source(crate::frontend::text::source_value(
+                value, "from:", action.at,
+            )?)
+        }
+        _ => {
+            return Err(action.at.error(format!(
+                ".{} takes a quoted field name and a literal, Format(…), or from: <source>",
+                action.name
+            )));
+        }
+    };
+    Ok((field.clone(), value))
 }
 
 /// 🚫 Refuses a second map-backed action for one field.
@@ -2666,7 +2680,10 @@ pub(crate) const REDIRECT_LABELS: &[&str] = &["to", "status"];
 /// ➡️ `.Redirect(to:, status:)`: the redirect statuses the RFC names.
 fn redirect(call: &Call) -> Result<HandlerConfig, Error> {
     call.leaf(REDIRECT_LABELS)?;
-    let to = call.string("to")?;
+    let Some(to_value) = call.get("to") else {
+        return Err(call.at.error("Redirect requires to:"));
+    };
+    let to = crate::frontend::text::config_text(to_value, "to", call.at)?;
     let code = match call.get("status") {
         None => 302,
         Some(Value::Typed(value)) => {
@@ -2692,10 +2709,7 @@ fn redirect(call: &Call) -> Result<HandlerConfig, Error> {
                 .error("status takes a redirect status such as .permanent"));
         }
     };
-    Ok(HandlerConfig::Redirect {
-        to: pingclair_core::config::ConfigText::literal(to),
-        code,
-    })
+    Ok(HandlerConfig::Redirect { to, code })
 }
 
 /// 🏷️ The argument labels `fail` accepts, named once for the parser and `describe`.

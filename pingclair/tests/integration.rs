@@ -16640,6 +16640,9 @@ mod native_header_text;
 #[path = "integration/native_error_status.rs"]
 mod native_error_status;
 
+#[path = "integration/native_typed_text.rs"]
+mod native_typed_text;
+
 // 🔌 An IP-literal site and a hostname site on one port share one socket.
 #[path = "integration/shared_port_sites.rs"]
 mod shared_port_sites;

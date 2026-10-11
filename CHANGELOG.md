@@ -62,6 +62,21 @@ delivered in the first moments after startup is ignored instead of killing the
 process through its default action. This closes a startup window that could
 terminate the server with no log line (#299).
 
+Native text values can be dynamic: `Format("…{name}…", name: .source)` combines
+literal text with request facts, and `from: .source` names one for a header
+value. The sources are `.clientIP`, `.remoteHost`, `.remotePort`, `.scheme`,
+`.host`, `.path`, `.method` and `.uri` — the request target, path and query,
+after rewrites — plus `.errorStatus` / `.errorMessage`, which exist only
+inside an error route. `Redirect(to: Format("https://example.com{uri}",
+uri: .uri))` now keeps the request target instead of emitting `{uri}`
+verbatim (#330). Common validation refuses unknown names, unused or duplicated
+parameters, unbalanced braces and error sources outside an error route,
+including from JSON.
+
+Proxy `header_down` values resolve against the request. `header_down X "{host}"`
+used to put a literal `{host}` on the wire on every transport; the value is now
+the request's host, matching the `header` directive and Caddy's own behavior.
+
 Native `RequestHeader`, `ResponseHeader` and `Proxy` header set, append and
 default values retain literal braces through JSON export and reload. Legacy
 template strings remain templates. HTTP/3 now also forwards appended proxy

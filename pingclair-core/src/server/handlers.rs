@@ -5,7 +5,9 @@
 //!
 //! Provides handlers for respond, redirect, and headers operations.
 
-use crate::config::{BasicAuthAlgorithm, BasicAuthCredential, HandlerConfig, HandlerElement};
+use crate::config::{
+    BasicAuthAlgorithm, BasicAuthCredential, ConfigText, HandlerConfig, HandlerElement,
+};
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use base64::Engine as _;
 use bcrypt::HashParts;
@@ -57,6 +59,20 @@ fn append_header(headers: &mut http::HeaderMap, name: &str, value: &str) {
     ) {
         headers.append(name, value);
     }
+}
+
+/// 💬 Static text for this request-less executor.
+///
+/// 🚫 A compiled segment list reads request facts, and this function has no
+/// request — the transports resolve dynamic text before it would reach here.
+/// Refusing beats resolving to something invented.
+fn static_text(text: &ConfigText) -> Result<&str, HandlerError> {
+    text.as_static_str().ok_or_else(|| {
+        HandlerError::Config(
+            "a dynamic text value needs the request-time resolver, which this executor has"
+                .to_string(),
+        )
+    })
 }
 
 /// Handler error
@@ -125,7 +141,10 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             let status = status.unwrap_or(200);
             let mut response = if let Some(body_content) = body {
                 // Clone the body content to get owned data
-                HandlerResponse::with_body(status, Bytes::copy_from_slice(body_content.as_str().as_bytes()))
+                HandlerResponse::with_body(
+                    status,
+                    Bytes::copy_from_slice(static_text(body_content)?.as_bytes()),
+                )
             } else {
                 HandlerResponse::status(status)
             };
@@ -140,16 +159,22 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
         // operator gave no message, the status's canonical text is the body,
         // matching what Caddy's default error handler writes.
         HandlerConfig::Error { status, message } => {
-            let body = message.as_ref().map(|text| text.as_str().to_owned()).unwrap_or_else(|| {
-                http::StatusCode::from_u16(*status)
-                    .ok()
-                    .and_then(|code| code.canonical_reason().map(str::to_string))
-                    .unwrap_or_default()
-            });
+            let body = message
+                .as_ref()
+                .map(|text| static_text(text).map(str::to_owned))
+                .transpose()?
+                .unwrap_or_else(|| {
+                    http::StatusCode::from_u16(*status)
+                        .ok()
+                        .and_then(|code| code.canonical_reason().map(str::to_string))
+                        .unwrap_or_default()
+                });
             Ok(HandlerResponse::with_body(*status, Bytes::from(body)))
         }
 
-        HandlerConfig::Redirect { to, code } => Ok(HandlerResponse::redirect(to.as_str(), *code)),
+        HandlerConfig::Redirect { to, code } => {
+            Ok(HandlerResponse::redirect(static_text(to)?, *code))
+        }
 
         // 🧭 Templates render in the proxy pipeline where file access and
         // response writing live; the pure core handler has nothing to do.
@@ -186,20 +211,20 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             // Return a passthrough response
             let mut response = HandlerResponse::status(200);
             for (k, v) in set {
-                append_header(&mut response.headers, k, v);
+                append_header(&mut response.headers, k, static_text(v)?);
             }
             for (k, values) in add {
                 for v in values {
                     // 📋 Appended, not replaced: a name added twice is two
                     // field lines, which is what `+Set-Cookie` means (#276).
-                    append_header(&mut response.headers, k, v);
+                    append_header(&mut response.headers, k, static_text(v)?);
                 }
             }
             // ❓ Nothing was there before this response existed, so a default
             // always applies.
             for (k, v) in default_set {
                 if !response.headers.contains_key(k) {
-                    append_header(&mut response.headers, k, v);
+                    append_header(&mut response.headers, k, static_text(v)?);
                 }
             }
             Ok(response)

@@ -1572,6 +1572,103 @@ fn an_omitted_respond_status_stays_omitted_in_both_frontends() {
     assert_eq!(statuses(&legacy), (None, None));
 }
 
+/// 💬 `Format(…)` and `from:` compile into segment lists at load time: the
+/// pattern is parsed once, literal braces survive as `{{`/`}}`, and the wire
+/// form names only the closed set of sources.
+#[test]
+fn typed_text_values_compile_into_segments() {
+    let config = crate::compile(
+        r#"HTTPListener(on: ":8080") { Site(host: "*") {
+            Route(when: .path(exact: "/go")) {
+                Redirect(to: Format("https://example.com{uri}", uri: .uri),
+                         status: .permanentRedirect)
+            }
+            Fallback {
+                RequestHeader(.set("X-Real-IP", from: .clientIP))
+                Respond(body: Format("{{escaped}} {m}", m: .method))
+            }
+        } }"#,
+    )
+    .unwrap();
+    let json = serde_json::to_value(&config).unwrap();
+    let routes = &json["servers"][0]["routes"];
+    assert_eq!(
+        routes[0]["handler"]["to"],
+        serde_json::json!({
+            "segments": [
+                { "literal": "https://example.com" },
+                { "source": "uri" },
+            ]
+        })
+    );
+    assert_eq!(
+        routes[1]["handler"]["handlers"][0]["set"]["X-Real-IP"],
+        serde_json::json!({ "segments": [{ "source": "client_ip" }] })
+    );
+    assert_eq!(
+        routes[1]["handler"]["handlers"][1]["body"],
+        serde_json::json!({
+            "segments": [
+                { "literal": "{escaped} " },
+                { "source": "method" },
+            ]
+        })
+    );
+}
+
+/// 🚫 Every way a text value can be wrong is refused at load, by name.
+#[test]
+fn typed_text_values_fail_closed() {
+    let site = |body: &str| {
+        format!("HTTPListener(on: \":8080\") {{ Site(host: \"*\") {{ Fallback {{ {body} }} }} }}")
+    };
+    for (body, expected) in [
+        (
+            "Respond(body: Format(\"x\", x: .nope))",
+            "unknown text source `.nope`",
+        ),
+        (
+            "Respond(body: Format(\"{x}\", x: .uri, y: .host))",
+            "Format parameter `y` never appears in the pattern",
+        ),
+        (
+            "Respond(body: Format(\"{missing}\", x: .uri))",
+            "Format pattern names `{missing}`, which has no parameter",
+        ),
+        ("Respond(body: Format(\"x{x\", x: .uri))", "unclosed `{`"),
+        ("Respond(body: Format(\"x}x\", x: .uri))", "unmatched `}`"),
+        (
+            "Respond(body: Format(\"{x}\", x: .uri, x: .host))",
+            "duplicate argument label",
+        ),
+        (
+            "Respond(body: Format(\"plain\"))",
+            "drop the Format wrapper",
+        ),
+        (
+            "Respond(body: Formt(\"x\"))",
+            "unknown text constructor `Formt",
+        ),
+        (
+            "Respond(body: Format(\"{x}\", .uri))",
+            "Format parameters need labels",
+        ),
+        (
+            "RequestHeader(.set(\"X\", from: \"literal\")) Respond(body: \"ok\")",
+            "from: takes a text source",
+        ),
+        (
+            "Respond(body: Format(\"{code}\", code: .errorStatus))",
+            "only available inside an ErrorRoute",
+        ),
+        ("Respond(body: 5)", "requires a quoted string"),
+    ] {
+        let source = site(body);
+        let error = crate::compile(&source).unwrap_err().to_string();
+        assert!(error.contains(expected), "{body}: {error}");
+    }
+}
+
 #[test]
 fn error_surfaces_that_cannot_mean_anything_fail_closed() {
     let site = |body: &str| {
