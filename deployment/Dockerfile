@@ -6,9 +6,10 @@
 # clang/cmake/BoringSSL's dependencies, and the workspace path; the apt list
 # that used to live here is defined once, there.
 #
-# 📌 `:v1` is a tag this repository controls and moves deliberately (the digest
-# of record is recorded in .github/workflows/builder-image.yml); the base image
-# is pinned the same way CI pins `ubuntu-24.04`.
+# 📌 `:v1` is a tag this repository controls and moves deliberately: the
+# `Builder image` workflow republishes it before any container job starts and
+# prints the per-architecture digests of record into its run summary; the base
+# image is pinned the same way CI pins `ubuntu-24.04`.
 FROM ghcr.io/dorianverlaine/pingclair-builder:v1 AS builder
 
 COPY . .
