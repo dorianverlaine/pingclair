@@ -86,10 +86,10 @@ __pycache__/
 # Stray test output
 **/test_output.txt
 
-# ⚡ The Foundations compatibility crate ships with the repository; anything
-# else under vendor/ is local scratch space.
+# 📦 Only explicitly maintained dependency bridges ship with the repository.
 vendor/*
 !vendor/foundations-compat/
+!vendor/pingora-proxy/
 
 # 🔬 Verification-day working material: the scripts a Day runs against a clean
 # Linux box, the configurations they drive, and the evidence they produce.

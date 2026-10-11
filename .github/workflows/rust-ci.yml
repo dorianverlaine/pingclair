@@ -146,7 +146,7 @@ jobs:
           just lint
           just bench-smoke
 
-      - name: Run tests with the known-flaky retry policy
+      - name: Run tests
         # 🎯 Naming the host target explicitly is what lets this job reuse the
         # test-profile artifacts the nextest archive job builds: cargo's default
         # layout for a host build is `…/ci-test`, the archive's is

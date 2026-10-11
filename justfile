@@ -43,6 +43,10 @@ conformance:
 shear:
     cargo +{{ rust }} shear --deny-warnings
 
+# 🛡️ Audit the resolved graph and the registry origin of the vendored backport.
+audit:
+    python3 scripts/audit-dependencies.py
+
 # 🏗️ Check repository invariants that CI enforces mechanically.
 repo-lint:
     python3 scripts/repo_lint/repo_lint.py

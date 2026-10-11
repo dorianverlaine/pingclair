@@ -156,36 +156,15 @@
   property (no two adjacent alike, each got half), not a sequence you observed
   once.
 
-- 🎲 **`test_websocket_upgrade_tunnels_bytes_in_both_directions` is a known
-  upstream (Pingora) flake.** `scripts/run-ci-tests.sh` (called by the `rust-ci`
-  fast gate) re-runs the whole nextest round up to three times, but **only** when
-  that test is the sole failure; any other failure, or three failures in a row,
-  still goes red. **Do not change test code to chase this flake** — its occasional
-  failure is not evidence of a regression, and a retry is enough to remove the
-  noise.
-
-  > 📌 **The citation** (added 2026-08-10; before that this rule had a conclusion
-  > and no source, and this repository's own rule is that a conclusion-only
-  > rejection note becomes a door nobody dares push):
-  > reported upstream as
-  > [cloudflare/pingora#946](https://github.com/cloudflare/pingora/issues/946),
-  > "HTTP/1 upgrade torn down when the upstream's 101 is read before the
-  > request's empty body" (opened 2026-07-30, still open), with the fix in
-  > [#947](https://github.com/cloudflare/pingora/pull/947), "Keep an upgraded
-  > tunnel open when the request body ends after 101" (opened 2026-08-04,
-  > **not yet merged**). The symptom is an `UnexpectedEof` while waiting for the
-  > tunnel marker.
-  >
-  > **This rule expires with #947**: once it merges and reaches the pingora
-  > version we pin, the flake should disappear, and the retry must come out so
-  > the test goes back to being one that is simply expected to pass. Keeping a
-  > retry after the flake is fixed means keeping a test that can never go red.
-  >
-  > **Re-admission (2026-09-10):** upstream #946 is still open and #947 is still
-  > unmerged. A fresh comparison of Pingora 0.9.0 and `main` still finds no
-  > `request_body_end_handled` state in `pingora-proxy/src/proxy_h1.rs`, so the
-  > retry remains a bounded, evidence-backed exception rather than a permanent
-  > green button.
+- 🔌 **WebSocket upgrades must pass without retries.** Pingora 0.9.0 is
+  vendored with the state-machine fix backported from
+  [cloudflare/pingora#947](https://github.com/cloudflare/pingora/pull/947).
+  `websocket_handshake_ordering.rs` delays the original empty-body task to
+  reproduce the failing ordering; the real-binary bidirectional tunnel test
+  remains enabled. The old dated retry exemption was removed on 2026-10-11.
+  See [`vendor/pingora-proxy/PATCHES.md`](../../vendor/pingora-proxy/PATCHES.md)
+  for provenance, audit coverage and removal criteria. This does not fix the
+  separate tunnel half-close defect (#274).
 - 🔒 **`security-audit.yml` (`cargo audit`) runs on the merge gate and on a
   nightly schedule**, not once before a release. RustSec publishes on its own
   schedule, not this project's, and a dependency that merged clean and was

@@ -14,6 +14,15 @@ fact.
 
 ## [Unreleased]
 
+### 🔌 WebSocket handshakes survive either event ordering
+
+Backport the fix from Pingora PR #947 onto the published `pingora-proxy 0.9.0`
+crate. An upstream's immediate `101` no longer lets the original request's
+empty-body task close the new tunnel. The regression runs under the normal
+CI gate, and the expired retry exemption is removed. Other Pingora crates
+remain on their existing registry versions; tunnel half-close (#274) remains
+outstanding.
+
 ### 🧩 Native configuration language for 0.3 alpha
 
 Native declarations sit at the top level; the frontend is selected by the

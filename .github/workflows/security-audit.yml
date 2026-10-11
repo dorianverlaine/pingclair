@@ -36,6 +36,6 @@ jobs:
         run: command -v cargo-audit || cargo install cargo-audit --locked --version 0.22.2
 
       - name: Audit dependencies
-        run: cargo audit
+        run: python3 scripts/audit-dependencies.py
 
       - uses: ./.github/actions/check-clean-worktree

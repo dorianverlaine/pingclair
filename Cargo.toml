@@ -15,6 +15,7 @@ members = [
 ]
 exclude = [
     "vendor/foundations-compat",
+    "vendor/pingora-proxy",
 ]
 
 [workspace.package]
@@ -175,9 +176,10 @@ arc-swap = "1"
 #     A/B +0.9 % throughput with RSS ranges fully overlapping, and the
 #     published c7i-flex table still 55 % behind nginx on H1 proxy.
 #
-# The standing rule this leaves behind: a fork needs a number from a run
+# ⚡ An optimization fork needs a number from a run
 # where the thing it patches is the saturated resource, or it does not go
-# in. Vendoring also removes `source`/`checksum` from the lockfile entry,
+# in. A correctness backport needs a failing reproducer and a bounded patch.
+# 🛡️ Vendoring also removes `source`/`checksum` from the lockfile entry,
 # which makes the crate invisible to `cargo audit` — verified directly.
 [patch.crates-io]
 # 🧷 Cloudflare's BoringSSL 5 support is not released in `tokio-quiche 0.19.1`
@@ -197,6 +199,12 @@ tokio-quiche = { git = "https://github.com/cjpatton/quiche.git", rev = "82152d23
 # though it only consumes the settings, logging, metrics, and testing APIs.
 # Remove the shim when that upstream release exposes the safe graph directly.
 foundations = { path = "vendor/foundations-compat" }
+
+# 🔌 Pingora 0.9.0 plus the correctness backport of cloudflare/pingora#947.
+# The upstream PR predates 0.9; only its HTTP/1 state-machine fix is applied
+# to the published 0.9.0 source. Provenance and removal criteria live beside it.
+# `just audit` restores the registry coordinate in a temporary audit lockfile.
+pingora-proxy = { path = "vendor/pingora-proxy" }
 
 [profile.release]
 lto = "fat"

@@ -1,0 +1,29 @@
+--- a/src/proxy_h1.rs
++++ b/src/proxy_h1.rs
+@@ -263,0 +264,6 @@
++        // The end of the *request body* is not the end of an upgraded tunnel. Exactly one
++        // end-of-body task belongs to the original request, but whether it is handled before
++        // or after the 101 is read is decided by task scheduling, so it has to be accounted
++        // for in both branches below. Without this the tunnel is torn down as soon as it is
++        // established whenever the upstream response wins the race.
++        let mut request_body_end_handled = false;
+@@ -276,0 +283,4 @@
++                                    // If the request body already ended, that end belonged to the
++                                    // request and has now been accounted for; the branch below
++                                    // must not consume a second one.
++                                    request_body_end_handled = request_done;
+@@ -326,0 +337,3 @@
++                    // A closed pipe is the downstream half going away, which ends the tunnel
++                    // no matter what the original request body did.
++                    let downstream_pipe_closed = body.is_none();
+@@ -332 +345,9 @@
+-                                response_done = true;
++                                if !request_body_end_handled && !downstream_pipe_closed {
++                                    // The 101 was read while the end of the request body was
++                                    // still in the pipe. That end says the request finished,
++                                    // not that the tunnel did, so keep reading from downstream.
++                                    request_body_end_handled = true;
++                                    request_done = false;
++                                } else {
++                                    response_done = true;
++                                }
