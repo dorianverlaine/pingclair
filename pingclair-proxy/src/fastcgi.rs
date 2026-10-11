@@ -191,8 +191,8 @@ pub(crate) struct EnvironmentInput<'a> {
 /// directive would compile and mean nothing on this transport alone.
 pub(crate) fn prepare_request_header(
     request: &RequestHeader,
-    headers_up: &BTreeMap<String, String>,
-    headers_up_add: &BTreeMap<String, Vec<String>>,
+    headers_up: &BTreeMap<String, pingclair_core::config::ConfigText>,
+    headers_up_add: &BTreeMap<String, Vec<pingclair_core::config::ConfigText>>,
     headers_up_remove: &[String],
     verified_client_ip: Option<&str>,
     scheme: &'static str,
@@ -730,7 +730,7 @@ mod tests {
         request.insert_header("host", "example.test").unwrap();
         let headers_up = BTreeMap::from([(
             "X-Request-Method".to_string(),
-            "{http.request.method}".to_string(),
+            "{http.request.method}".into(),
         )]);
         let variables = RequestVars::default();
         let prepared = prepare_request_header(

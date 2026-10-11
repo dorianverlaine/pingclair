@@ -49,6 +49,24 @@ fn unimplemented_error_proxy_is_refused_by_shared_validation() {
 }
 
 #[test]
+fn native_header_text_stays_literal_after_json_round_trip() {
+    let source = site(
+        r#"RequestHeader(.set("X-Request", "{host}"), .append("X-Request", "{path}"))
+        ResponseHeader(.setIfAbsent("X-Default", "{host}"))
+        Proxy(to: "127.0.0.1:9000", headersUp: [.set("X-Up", "{host}")],
+              headersDown: [.append("X-Down", "{path}")])"#,
+    );
+    let compiled = pingclair_config::compile(&source).unwrap();
+    let document = serde_json::to_value(&compiled).unwrap();
+    let serialized = serde_json::to_string(&document).unwrap();
+    assert!(serialized.contains(r#""literal":"{host}""#));
+    assert!(serialized.contains(r#""literal":"{path}""#));
+    let decoded: pingclair_core::config::PingclairConfig =
+        serde_json::from_value(document.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), document);
+}
+
+#[test]
 fn extracting_a_positional_value_into_a_binding_preserves_the_document() {
     let inline = site(r#"ResponseHeader(.set("X-Test", "hello")) Respond(body: "ok")"#);
     let bound = format!(

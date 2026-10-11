@@ -16634,6 +16634,9 @@ mod error_routes;
 #[path = "integration/native_terminals.rs"]
 mod native_terminals;
 
+#[path = "integration/native_header_text.rs"]
+mod native_header_text;
+
 // 🔌 An IP-literal site and a hostname site on one port share one socket.
 #[path = "integration/shared_port_sites.rs"]
 mod shared_port_sites;

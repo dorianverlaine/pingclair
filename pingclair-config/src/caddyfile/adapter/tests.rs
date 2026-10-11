@@ -1137,16 +1137,16 @@ mod fail_closed_tests {
         };
         assert_eq!(
             proxy.headers_down.get("X-Set"),
-            Some(&"set-by-caddy".to_string())
+            Some(&"set-by-caddy".into())
         );
         assert_eq!(
             proxy.headers_down_add.get("X-Add"),
-            Some(&vec!["added".to_string()])
+            Some(&vec!["added".into()])
         );
         assert_eq!(proxy.headers_down_remove, vec!["X-Remove".to_string()]);
         assert_eq!(
             proxy.headers_down_default.get("X-Default"),
-            Some(&"only-if-absent".to_string())
+            Some(&"only-if-absent".into())
         );
         assert_eq!(proxy.headers_down_replace.len(), 1);
         assert_eq!(proxy.headers_down_replace[0].field, "X-Replace");
@@ -2050,11 +2050,14 @@ mod fail_closed_tests {
             config
                 .headers_up
                 .get("X-Forwarded-Method")
-                .map(String::as_str),
+                .map(|text| text.as_str()),
             Some("{http.request.method}")
         );
         assert_eq!(
-            config.headers_up.get("X-Forwarded-Uri").map(String::as_str),
+            config
+                .headers_up
+                .get("X-Forwarded-Uri")
+                .map(|text| text.as_str()),
             Some("{http.request.uri}")
         );
         let subrequest = config
@@ -2300,7 +2303,7 @@ mod fail_closed_tests {
                 .unwrap_or_else(|| panic!("{source} must compile to a header handler"));
             if let Some((name, value)) = want_set {
                 assert_eq!(
-                    headers.0.get(name).map(String::as_str),
+                    headers.0.get(name).map(|text| text.as_str()),
                     Some(value),
                     "{source} must set {name}"
                 );
@@ -3123,7 +3126,7 @@ mod fail_closed_tests {
         let route = &config.servers[0].routes[0];
         let found = handlers_of(&route.handler).into_iter().any(|handler| {
             matches!(handler, HandlerConfig::RequestHeaders { set, .. }
-                if set.get("X-Trace").is_some_and(String::is_empty))
+                if set.get("X-Trace").is_some_and(|text| text.is_empty()))
         });
         assert!(found, "`request_header X-Trace` sets an empty value");
     }
@@ -4054,7 +4057,10 @@ mod header_match_tests {
         let HandlerConfig::Headers { set, .. } = &handler else {
             unreachable!()
         };
-        assert_eq!(set.get("X-Conditional").map(String::as_str), Some("yes"));
+        assert_eq!(
+            set.get("X-Conditional").map(|text| text.as_str()),
+            Some("yes")
+        );
     }
 
     #[test]
@@ -4071,7 +4077,7 @@ mod header_match_tests {
         let HandlerConfig::Headers { set, .. } = &handler else {
             unreachable!()
         };
-        assert_eq!(set.get("X-After").map(String::as_str), Some("yes"));
+        assert_eq!(set.get("X-After").map(|text| text.as_str()), Some("yes"));
     }
 
     #[test]
@@ -5815,7 +5821,7 @@ mod php_fastcgi_tests {
         // the load balancer below has only one peer to choose between.
         assert_eq!(config.upstreams, ["localhost:9000", "localhost:9001"]);
         assert_eq!(
-            config.headers_up.get("X-Method").map(String::as_str),
+            config.headers_up.get("X-Method").map(|text| text.as_str()),
             Some("{http.request.method}")
         );
         assert_eq!(config.load_balance.strategy, "round_robin");

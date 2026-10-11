@@ -31,6 +31,11 @@ response. Error-route proxies are rejected by common validation, including
 JSON loads, instead of accepting a configuration that cannot contact its
 upstream (#303).
 
+Native `RequestHeader`, `ResponseHeader` and `Proxy` header set, append and
+default values retain literal braces through JSON export and reload. Legacy
+template strings remain templates. HTTP/3 now also forwards appended proxy
+upstream headers instead of dropping them.
+
 TCP limits now use `.limits(maxConnections:)`, the same label as HTTP.
 Source-IP routes use `when: .from([...])`; `.all` combines TLS and source IP,
 and `.any` selects alternative matcher sets. The alpha spellings `connections:`

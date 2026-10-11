@@ -170,7 +170,9 @@
             {
               "type": "headers",
               "set": {
-                "X-Error-Page": "pingclair"
+                "X-Error-Page": {
+                  "literal": "pingclair"
+                }
               },
               "remove": []
             },

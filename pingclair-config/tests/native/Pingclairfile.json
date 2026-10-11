@@ -24,7 +24,9 @@
               {
                 "type": "headers",
                 "set": {
-                  "Cache-Control": "public, max-age=3600"
+                  "Cache-Control": {
+                    "literal": "public, max-age=3600"
+                  }
                 },
                 "remove": []
               },

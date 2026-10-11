@@ -24,7 +24,9 @@
               {
                 "type": "request_headers",
                 "set": {
-                  "X-Request-Start": "pingclair"
+                  "X-Request-Start": {
+                    "literal": "pingclair"
+                  }
                 },
                 "remove": [
                   "Cookie"
@@ -65,11 +67,15 @@
                 "max_fails": 3,
                 "fail_duration_ms": 30000,
                 "headers_up": {
-                  "Host": "app.internal"
+                  "Host": {
+                    "literal": "app.internal"
+                  }
                 },
                 "headers_down": {},
                 "headers_down_default": {
-                  "X-Served-By": "pingclair"
+                  "X-Served-By": {
+                    "literal": "pingclair"
+                  }
                 },
                 "headers_up_remove": [
                   "Cookie"

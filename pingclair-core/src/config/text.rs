@@ -48,6 +48,12 @@ impl std::ops::Deref for ConfigText {
     }
 }
 
+impl AsRef<str> for ConfigText {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 impl PartialEq<str> for ConfigText {
     fn eq(&self, other: &str) -> bool {
         self.as_str() == other

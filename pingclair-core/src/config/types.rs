@@ -332,25 +332,32 @@ pub enum PreferredChains {
 /// neither branch, so a malformed value reports "data did not match any
 /// variant" and the operator has to guess which of two spellings they got
 /// wrong. Startup errors are read exactly once, by someone in a hurry.
-fn deserialize_probe_headers<'de, D>(
+fn deserialize_probe_headers<'de, D, T>(
     deserializer: D,
-) -> Result<BTreeMap<String, Vec<String>>, D::Error>
+) -> Result<BTreeMap<String, Vec<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + From<String>,
 {
     use serde::de::{MapAccess, Visitor};
 
-    struct Values;
+    struct Values<T>(std::marker::PhantomData<T>);
 
-    impl<'de> Visitor<'de> for Values {
-        type Value = Vec<String>;
+    impl<'de, T: Deserialize<'de> + From<String>> Visitor<'de> for Values<T> {
+        type Value = Vec<T>;
 
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("a header value, or a list of header values")
         }
 
         fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-            Ok(vec![value.to_string()])
+            Ok(vec![value.to_string().into()])
+        }
+
+        // 📝 A tagged literal is one value, just as a legacy string is.
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                .map(|value| vec![value])
         }
 
         fn visit_seq<A: serde::de::SeqAccess<'de>>(
@@ -358,17 +365,17 @@ where
             mut seq: A,
         ) -> Result<Self::Value, A::Error> {
             let mut values = Vec::with_capacity(seq.size_hint().unwrap_or(1));
-            while let Some(value) = seq.next_element::<String>()? {
+            while let Some(value) = seq.next_element::<T>()? {
                 values.push(value);
             }
             Ok(values)
         }
     }
 
-    struct Headers;
+    struct Headers<T>(std::marker::PhantomData<T>);
 
-    impl<'de> Visitor<'de> for Headers {
-        type Value = BTreeMap<String, Vec<String>>;
+    impl<'de, T: Deserialize<'de> + From<String>> Visitor<'de> for Headers<T> {
+        type Value = BTreeMap<String, Vec<T>>;
 
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("a map of header names to values")
@@ -377,7 +384,7 @@ where
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
             let mut headers = BTreeMap::new();
             while let Some(name) = map.next_key::<String>()? {
-                let values = map.next_value_seed(ValuesSeed)?;
+                let values = map.next_value_seed(ValuesSeed::<T>(std::marker::PhantomData))?;
                 // 🔁 Extend rather than replace: a JSON object should not have
                 // a duplicate key, but if one arrives, dropping the earlier
                 // values is the exact bug this field exists to fix.
@@ -387,20 +394,20 @@ where
         }
     }
 
-    struct ValuesSeed;
+    struct ValuesSeed<T>(std::marker::PhantomData<T>);
 
-    impl<'de> serde::de::DeserializeSeed<'de> for ValuesSeed {
-        type Value = Vec<String>;
+    impl<'de, T: Deserialize<'de> + From<String>> serde::de::DeserializeSeed<'de> for ValuesSeed<T> {
+        type Value = Vec<T>;
 
         fn deserialize<D2: serde::Deserializer<'de>>(
             self,
             deserializer: D2,
         ) -> Result<Self::Value, D2::Error> {
-            deserializer.deserialize_any(Values)
+            deserializer.deserialize_any(Values::<T>(std::marker::PhantomData))
         }
     }
 
-    deserializer.deserialize_map(Headers)
+    deserializer.deserialize_map(Headers::<T>(std::marker::PhantomData))
 }
 
 /// 📊 How much detail the collected metrics carry.
@@ -1751,7 +1758,7 @@ pub enum HandlerConfig {
     /// told about something that already happened.
     RequestHeaders {
         #[serde(default)]
-        set: BTreeMap<String, String>,
+        set: BTreeMap<String, ConfigText>,
         /// 📋 Multi-valued, like the response side: two `+Name` lines are two
         /// field lines (#276). A single string still loads.
         #[serde(
@@ -1759,7 +1766,7 @@ pub enum HandlerConfig {
             deserialize_with = "deserialize_probe_headers",
             skip_serializing_if = "BTreeMap::is_empty"
         )]
-        add: BTreeMap<String, Vec<String>>,
+        add: BTreeMap<String, Vec<ConfigText>>,
         #[serde(default)]
         remove: Vec<String>,
         /// 🔁 Regex search-and-replace over a header's existing values, in
@@ -1815,7 +1822,7 @@ pub enum HandlerConfig {
     /// Headers modification, on the **response**.
     Headers {
         #[serde(default)]
-        set: BTreeMap<String, String>,
+        set: BTreeMap<String, ConfigText>,
         /// 📋 Multi-valued: two `+Set-Cookie` lines in one block are two
         /// cookies, and RFC 6265 §3 forbids folding them into one field line
         /// (#276). A single string still loads, so JSON written before
@@ -1825,7 +1832,7 @@ pub enum HandlerConfig {
             deserialize_with = "deserialize_probe_headers",
             skip_serializing_if = "BTreeMap::is_empty"
         )]
-        add: BTreeMap<String, Vec<String>>,
+        add: BTreeMap<String, Vec<ConfigText>>,
         #[serde(default)]
         remove: Vec<String>,
         /// 🔁 Regex search-and-replace over values the response already
@@ -1839,7 +1846,7 @@ pub enum HandlerConfig {
         /// Response-only, because "is it already there" needs a message to
         /// look at. The request-side equivalent is a matcher.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        default_set: BTreeMap<String, String>,
+        default_set: BTreeMap<String, ConfigText>,
         /// 🧭 `match { … }` inside the block: the gate the whole block's
         /// operations are behind, evaluated against the finished response.
         ///
@@ -2037,11 +2044,11 @@ impl ForwardAuthConfig {
         let mut headers_up = BTreeMap::new();
         headers_up.insert(
             "X-Forwarded-Method".to_string(),
-            "{http.request.method}".to_string(),
+            ConfigText::from("{http.request.method}"),
         );
         headers_up.insert(
             "X-Forwarded-Uri".to_string(),
-            "{http.request.uri}".to_string(),
+            ConfigText::from("{http.request.uri}"),
         );
         ReverseProxyConfig {
             upstreams: vec![self.upstream.clone()],
@@ -2296,11 +2303,11 @@ pub struct ReverseProxyConfig {
 
     /// Headers to add to upstream request
     #[serde(default)]
-    pub headers_up: BTreeMap<String, String>,
+    pub headers_up: BTreeMap<String, ConfigText>,
 
     /// Headers to add to downstream response
     #[serde(default)]
-    pub headers_down: BTreeMap<String, String>,
+    pub headers_down: BTreeMap<String, ConfigText>,
 
     /// 🗄️ Response headers to append rather than replace, from `header_down
     /// +Name`.
@@ -2319,7 +2326,7 @@ pub struct ReverseProxyConfig {
         deserialize_with = "deserialize_probe_headers",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
-    pub headers_down_add: BTreeMap<String, Vec<String>>,
+    pub headers_down_add: BTreeMap<String, Vec<ConfigText>>,
 
     /// 🚫 Response header names to remove, from `header_down -Name`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2328,7 +2335,7 @@ pub struct ReverseProxyConfig {
     /// ❓ Response headers written only when the response does not already
     /// carry them, from `header_down ?Name Value`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub headers_down_default: BTreeMap<String, String>,
+    pub headers_down_default: BTreeMap<String, ConfigText>,
 
     /// 🔁 Search-and-replace over a response header's existing value, from
     /// `header_down Name Search Replace`.
@@ -2351,7 +2358,7 @@ pub struct ReverseProxyConfig {
         deserialize_with = "deserialize_probe_headers",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
-    pub headers_up_add: BTreeMap<String, Vec<String>>,
+    pub headers_up_add: BTreeMap<String, Vec<ConfigText>>,
 
     /// 🔁 Search-and-replace over an upstream request header's existing value,
     /// from `header_up >Name Search Replace`.

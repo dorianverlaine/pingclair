@@ -623,7 +623,7 @@ mod tests {
     #[test]
     fn test_headers_handler() {
         let mut headers = BTreeMap::new();
-        headers.insert("X-Custom".to_string(), "value".to_string());
+        headers.insert("X-Custom".to_string(), "value".into());
 
         let config = HandlerConfig::Headers {
             set: headers,

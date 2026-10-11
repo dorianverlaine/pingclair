@@ -3245,8 +3245,23 @@ fn compile_handler(
             // the same shapes (#311). There is no request-side `?N` field: the
             // reference refuses that modifier on requests and the parser
             // refuses it first.
-            config.headers_up = proxy.header_up.set.clone();
-            config.headers_up_add = proxy.header_up.add.clone();
+            config.headers_up = proxy
+                .header_up
+                .set
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone().into()))
+                .collect();
+            config.headers_up_add = proxy
+                .header_up
+                .add
+                .iter()
+                .map(|(name, values)| {
+                    (
+                        name.clone(),
+                        values.iter().cloned().map(Into::into).collect(),
+                    )
+                })
+                .collect();
             config.headers_up_remove = proxy.header_up.remove.clone();
             config.headers_up_replace = proxy.header_up.replace.clone();
 
@@ -3256,10 +3271,30 @@ fn compile_handler(
             // block existed, all of them were written empty, so a Pingclairfile
             // could not say what a JSON configuration could; the fields being
             // present is what made that read as an implemented feature.
-            config.headers_down = proxy.header_down.set.clone();
-            config.headers_down_add = proxy.header_down.add.clone();
+            config.headers_down = proxy
+                .header_down
+                .set
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone().into()))
+                .collect();
+            config.headers_down_add = proxy
+                .header_down
+                .add
+                .iter()
+                .map(|(name, values)| {
+                    (
+                        name.clone(),
+                        values.iter().cloned().map(Into::into).collect(),
+                    )
+                })
+                .collect();
             config.headers_down_remove = proxy.header_down.remove.clone();
-            config.headers_down_default = proxy.header_down.default_set.clone();
+            config.headers_down_default = proxy
+                .header_down
+                .default_set
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone().into()))
+                .collect();
             config.headers_down_replace = proxy.header_down.replace.clone();
 
             // Transport
@@ -3332,11 +3367,28 @@ fn compile_handler(
                 })?;
             }
             Ok(HandlerConfig::Headers {
-                set: headers.set.clone(),
-                add: headers.add.clone(),
+                set: headers
+                    .set
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone().into()))
+                    .collect(),
+                add: headers
+                    .add
+                    .iter()
+                    .map(|(name, values)| {
+                        (
+                            name.clone(),
+                            values.iter().cloned().map(Into::into).collect(),
+                        )
+                    })
+                    .collect(),
                 remove: headers.remove.clone(),
                 replace: headers.replace.clone(),
-                default_set: headers.default_set.clone(),
+                default_set: headers
+                    .default_set
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone().into()))
+                    .collect(),
                 require: headers.require.clone(),
             })
         }
@@ -3362,8 +3414,21 @@ fn compile_handler(
                 })?;
             }
             Ok(HandlerConfig::RequestHeaders {
-                set: headers.set.clone(),
-                add: headers.add.clone(),
+                set: headers
+                    .set
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone().into()))
+                    .collect(),
+                add: headers
+                    .add
+                    .iter()
+                    .map(|(name, values)| {
+                        (
+                            name.clone(),
+                            values.iter().cloned().map(Into::into).collect(),
+                        )
+                    })
+                    .collect(),
                 remove: headers.remove.clone(),
                 replace: headers.replace.clone(),
             })

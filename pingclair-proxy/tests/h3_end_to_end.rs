@@ -19,6 +19,9 @@ use pingclair_proxy::server::PingclairProxy;
 use tokio_quiche::quiche;
 use tokio_quiche::quiche::h3::NameValue;
 
+#[path = "h3_end_to_end/native_header_text.rs"]
+mod native_header_text;
+
 // 🔪 Responses that fail after they started. A sibling file rather than more
 // of this one, which is already a high-touch file.
 #[path = "h3_end_to_end/truncation.rs"]

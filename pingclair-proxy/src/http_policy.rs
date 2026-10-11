@@ -213,14 +213,18 @@ pub fn evaluate_response_handlers(
                 require: _,
             } => {
                 for (name, value) in set {
-                    outcome.header_set.push((name.clone(), value.clone()));
+                    outcome
+                        .header_set
+                        .push((name.clone(), value.as_str().to_owned()));
                 }
                 // 📋 The subroute surface collects name/value edits and its
                 // consumers build a map from them, so a repeated `+Name` keeps
                 // the meaning it had before multi-value adds (#276).
                 for (name, values) in add {
                     for value in values {
-                        outcome.header_set.push((name.clone(), value.clone()));
+                        outcome
+                            .header_set
+                            .push((name.clone(), value.as_str().to_owned()));
                     }
                 }
                 outcome.header_remove.extend(remove.iter().cloned());
@@ -506,7 +510,7 @@ mod response_interception_tests {
                     exclude: vec![],
                 },
                 HandlerConfig::Headers {
-                    set: BTreeMap::from([("X-Reason".to_string(), "auth".to_string())]),
+                    set: BTreeMap::from([("X-Reason".to_string(), "auth".into())]),
                     add: BTreeMap::new(),
                     remove: vec![],
                     replace: Vec::new(),
@@ -1030,15 +1034,16 @@ impl ResponseHeaderPolicy {
     }
 
     /// 🧩 Adds proxy-owned replacements without overriding outer middleware.
-    pub(crate) fn merge_proxy_set(&mut self, headers: &BTreeMap<String, String>) {
+    pub(crate) fn merge_proxy_set<T: AsRef<str>>(&mut self, headers: &BTreeMap<String, T>) {
         for (name, value) in headers {
+            let value = value.as_ref();
             let name = name.to_ascii_lowercase();
             // 🧩 `or_insert_with` is the whole rule: an entry the outer
             // middleware already decided is never overwritten here.
             self.set.entry(name).or_insert_with_key(|name| SetHeader {
                 name_bytes: Bytes::copy_from_slice(name.as_bytes()),
                 header_value: http::HeaderValue::from_str(value).ok(),
-                value: value.clone(),
+                value: value.to_owned(),
             });
         }
     }
@@ -1056,12 +1061,12 @@ impl ResponseHeaderPolicy {
     /// difference is deliberate and is the one place a `header_down` can lose:
     /// `set` is the only operation that can name a header an outer `header`
     /// directive already decided, and within one policy the outer decision wins.
-    pub(crate) fn merge_proxy_response_ops(
+    pub(crate) fn merge_proxy_response_ops<T: AsRef<str>>(
         &mut self,
-        set: &BTreeMap<String, String>,
-        add: &BTreeMap<String, Vec<String>>,
+        set: &BTreeMap<String, T>,
+        add: &BTreeMap<String, Vec<T>>,
         remove: &[String],
-        default_set: &BTreeMap<String, String>,
+        default_set: &BTreeMap<String, T>,
     ) {
         if set.is_empty() && add.is_empty() && remove.is_empty() && default_set.is_empty() {
             return;
@@ -1072,14 +1077,14 @@ impl ResponseHeaderPolicy {
         // field line (#276).
         for (name, values) in add {
             for value in values {
-                self.add(name.clone(), value.clone());
+                self.add(name.clone(), value.as_ref().to_owned());
             }
         }
         for name in remove {
             self.remove(name.clone());
         }
         for (name, value) in default_set {
-            self.set_if_absent(name.clone(), value.clone());
+            self.set_if_absent(name.clone(), value.as_ref().to_owned());
         }
     }
 

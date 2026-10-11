@@ -865,11 +865,11 @@ fn skip_log(call: &Call) -> Result<HandlerConfig, Error> {
 /// 🏷️ The header operations one component carries, in writing order.
 #[derive(Default)]
 struct HeaderOps {
-    set: std::collections::BTreeMap<String, String>,
-    add: std::collections::BTreeMap<String, Vec<String>>,
+    set: std::collections::BTreeMap<String, pingclair_core::config::ConfigText>,
+    add: std::collections::BTreeMap<String, Vec<pingclair_core::config::ConfigText>>,
     remove: Vec<String>,
     replace: Vec<HeaderReplacement>,
-    set_if_absent: std::collections::BTreeMap<String, String>,
+    set_if_absent: std::collections::BTreeMap<String, pingclair_core::config::ConfigText>,
 }
 
 /// 🏷️ `RequestHeader(...)`: rewrites the request later handlers read.
@@ -997,7 +997,7 @@ fn header_ops_from(
 }
 
 /// 🏷️ Reads the two unlabeled operands of `.set`/`.append`/`.setIfAbsent`.
-fn header_pair(action: &Call) -> Result<(String, String), Error> {
+fn header_pair(action: &Call) -> Result<(String, pingclair_core::config::ConfigText), Error> {
     let [(None, Value::String(field)), (None, Value::String(value))] = action.args.as_slice()
     else {
         return Err(action.at.error(format!(
@@ -1005,7 +1005,10 @@ fn header_pair(action: &Call) -> Result<(String, String), Error> {
             action.name
         )));
     };
-    Ok((field.clone(), value.clone()))
+    Ok((
+        field.clone(),
+        pingclair_core::config::ConfigText::literal(value),
+    ))
 }
 
 /// 🚫 Refuses a second map-backed action for one field.

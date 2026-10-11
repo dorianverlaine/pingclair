@@ -2543,10 +2543,10 @@ mod tests {
                     }
                     HandlerConfig::Headers { set, remove, .. } => {
                         if let Some(value) = set.get("Cache-Control") {
-                            *cache_control = Some(value.clone());
+                            *cache_control = Some(value.as_str().to_owned());
                         }
                         *has_security_header |=
-                            set.get("X-Frame-Options").map(String::as_str) == Some("DENY");
+                            set.get("X-Frame-Options").map(|text| text.as_str()) == Some("DENY");
                         *removes_server |= remove.iter().any(|name| name == "Server");
                     }
                     HandlerConfig::ReverseProxy(_) => *has_proxy = true,

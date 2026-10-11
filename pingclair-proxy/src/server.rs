@@ -160,9 +160,9 @@ pub struct RequestContext {
     /// Selected upstream (kept for connection tracking)
     pub upstream: Option<Upstream>,
     /// Extra headers to add upstream
-    pub headers_upstream: BTreeMap<String, String>,
+    pub headers_upstream: BTreeMap<String, pingclair_core::config::ConfigText>,
     /// 📋 Upstream request headers to append, from `header_up +Name Value`.
-    pub headers_upstream_add: BTreeMap<String, Vec<String>>,
+    pub headers_upstream_add: BTreeMap<String, Vec<pingclair_core::config::ConfigText>>,
     /// 🚫 Header names to take off the upstream request, from `header_up -Name`.
     pub headers_upstream_remove: Vec<String>,
     /// 🔁 Rewrites over an upstream request header's existing value, from
@@ -4234,15 +4234,21 @@ impl PingclairProxy {
         source: &pingora_http::RequestHeader,
         ctx: &RequestContext,
         route_index: usize,
-        set: &std::collections::BTreeMap<String, String>,
-        add: &std::collections::BTreeMap<String, Vec<String>>,
+        set: &std::collections::BTreeMap<String, pingclair_core::config::ConfigText>,
+        add: &std::collections::BTreeMap<String, Vec<pingclair_core::config::ConfigText>>,
         remove: &[String],
         replace: &[pingclair_core::config::HeaderReplacement],
     ) -> PingoraResult<()> {
-        // 🧭 Values are templates, the same as they are on the response side.
-        // Resolved against the request as it stands now, so a later
+        // 🧭 Legacy templates resolve against the request as it stands now, so a later
         // `request_header` sees what an earlier one wrote.
-        let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+        let needs_resolution = !replace.is_empty()
+            || set
+                .values()
+                .chain(add.values().flatten())
+                .any(|value| value.is_template() && value.contains('{'));
+        let verified_client_ip = needs_resolution
+            .then(|| ctx.verified_client_ip.map(|ip| ip.to_string()))
+            .flatten();
         let scheme = ctx.request_scheme;
         let mut resolved: Vec<(String, String, bool)> = Vec::new();
         for (name, template, is_add) in set
@@ -4255,7 +4261,7 @@ impl PingclairProxy {
                     .flat_map(|(name, values)| values.iter().map(move |value| (name, value, true))),
             )
         {
-            let value = if template.contains('{') {
+            let value = if template.is_template() && template.contains('{') {
                 resolve_caddy_placeholders(
                     template,
                     source,
@@ -4265,7 +4271,7 @@ impl PingclairProxy {
                 )
                 .into_owned()
             } else {
-                template.clone()
+                template.as_str().to_owned()
             };
             resolved.push((name.clone(), value, is_add));
         }
@@ -5395,7 +5401,15 @@ impl PingclairProxy {
                 let mut block = ResponseHeaderPolicy::default();
                 // 🔁 Patterns come from the per-route table compiled when the
                 // configuration was published, so this is a lookup.
-                let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+                let needs_resolution = !replace.is_empty()
+                    || set
+                        .values()
+                        .chain(add.values().flatten())
+                        .chain(default_set.values())
+                        .any(|value| value.is_template() && value.contains('{'));
+                let verified_client_ip = needs_resolution
+                    .then(|| ctx.verified_client_ip.map(|ip| ip.to_string()))
+                    .flatten();
                 for entry in replace {
                     let resolved = ctx.state.as_ref().and_then(|state| {
                         compiled_header_replacement(
@@ -5413,66 +5427,30 @@ impl PingclairProxy {
                         block.replace(entry.field.clone(), pattern, replacement);
                     }
                 }
-                // 🏷️ `header X-Trace {host}` is ordinary syntax, and the value used
-                // to reach the client verbatim — Day 26 measured `x-probe: {host}`
-                // where the hostname belonged.
-                //
-                // Resolved here, as the value enters the request, rather than at
-                // write time: this is the one place that has both the configured
-                // template and the request, so the policy downstream stays a plain
-                // list of literal values and every response path benefits without
-                // being touched.
-                let needs_resolution = set.values().any(|value| value.contains('{'))
-                    || add.values().flatten().any(|value| value.contains('{'));
-                let resolve = |value: &String, session: &Session, ctx: &RequestContext| {
-                    if value.contains('{') {
-                        resolve_caddy_placeholders(
-                            value,
-                            session.req_header(),
-                            ctx.verified_client_ip.map(|ip| ip.to_string()).as_deref(),
-                            ctx.request_scheme,
-                            &ctx.request_vars,
-                        )
-                        .into_owned()
-                    } else {
-                        value.clone()
-                    }
+                // 📝 Only legacy templates expand; native values keep their braces.
+                let resolve = |value: &pingclair_core::config::ConfigText| {
+                    resolve_caddy_placeholders(
+                        value,
+                        session.req_header(),
+                        verified_client_ip.as_deref(),
+                        ctx.request_scheme,
+                        &ctx.request_vars,
+                    )
+                    .into_owned()
                 };
-                if needs_resolution {
-                    // 🔒 Collected first so `ctx` is not borrowed while it is being
-                    // written to.
-                    let resolved_set: Vec<(String, String)> = set
-                        .iter()
-                        .map(|(k, v)| (k.clone(), resolve(v, session, ctx)))
-                        .collect();
-                    let resolved_add: Vec<(String, String)> = add
-                        .iter()
-                        .flat_map(|(k, values)| {
-                            values.iter().map(|v| (k.clone(), resolve(v, session, ctx)))
-                        })
-                        .collect();
-                    for (k, v) in resolved_set {
-                        block.set(k, v);
-                    }
-                    for (k, v) in resolved_add {
-                        block.add(k, v);
-                    }
-                } else {
-                    for (k, v) in set {
-                        block.set(k, v.clone());
-                    }
-                    // 📋 Every value of every `+Name` line, in order (#276).
-                    for (k, values) in add {
-                        for v in values {
-                            block.add(k, v.clone());
-                        }
+                for (name, value) in set {
+                    block.set(name, resolve(value));
+                }
+                for (name, values) in add {
+                    for value in values {
+                        block.add(name, resolve(value));
                     }
                 }
                 for name in remove {
                     block.remove(name);
                 }
                 for (name, value) in default_set {
-                    block.set_if_absent(name, value.clone());
+                    block.set_if_absent(name, resolve(value));
                 }
                 ctx.response_headers.merge_block(require.clone(), block);
                 Ok(false)

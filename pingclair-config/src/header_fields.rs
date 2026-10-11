@@ -103,7 +103,9 @@ pub(crate) fn validate_header_fields(handler: &HandlerConfig) -> CompileResult<(
 }
 
 /// 🏷️ Checks one map of field names to values.
-fn check_fields(fields: &BTreeMap<String, String>) -> CompileResult<()> {
+fn check_fields(
+    fields: &BTreeMap<String, pingclair_core::config::ConfigText>,
+) -> CompileResult<()> {
     for (name, value) in fields {
         check_name(name)?;
         check_value(value)?;
@@ -147,7 +149,7 @@ mod tests {
 
     fn headers(name: &str, value: &str) -> HandlerConfig {
         HandlerConfig::Headers {
-            set: BTreeMap::from([(name.to_string(), value.to_string())]),
+            set: BTreeMap::from([(name.to_string(), value.into())]),
             add: BTreeMap::new(),
             remove: Vec::new(),
             replace: Vec::new(),

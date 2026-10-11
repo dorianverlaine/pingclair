@@ -3134,17 +3134,28 @@ async fn plan_h3_handler_with_connector(
                     ),
                 }
             }
+            // 📝 Use the same literal/template gate as the H1/H2 response path.
+            let resolve = |value: &pingclair_core::config::ConfigText| {
+                resolve_caddy_placeholders(
+                    value,
+                    request_header,
+                    Some(verified_client_ip),
+                    "https",
+                    request_vars,
+                )
+                .into_owned()
+            };
             for (name, value) in set {
-                block.set(name, value.clone());
+                block.set(name, resolve(value));
             }
             // 📋 Every value of every `+Name` line, in order (#276).
             for (name, values) in add {
                 for value in values {
-                    block.add(name, value.clone());
+                    block.add(name, resolve(value));
                 }
             }
             for (name, value) in default_set {
-                block.set_if_absent(name, value.clone());
+                block.set_if_absent(name, resolve(value));
             }
             for name in remove {
                 block.remove(name);
@@ -3167,7 +3178,7 @@ async fn plan_h3_handler_with_connector(
                     }),
                 )
             {
-                let value = if template.contains('{') {
+                let value = if template.is_template() && template.contains('{') {
                     resolve_caddy_placeholders(
                         template,
                         request_header,
@@ -3177,7 +3188,7 @@ async fn plan_h3_handler_with_connector(
                     )
                     .into_owned()
                 } else {
-                    template.clone()
+                    template.as_str().to_owned()
                 };
                 let failed = if is_add {
                     request_header.append_header(name.clone(), value).is_err()
@@ -6136,7 +6147,15 @@ async fn reverse_proxy_upstream(
 
         // 🧩 Resolves configured upstream header placeholders for each selected peer.
         if let Some(config) = &proxy_config {
-            for (key, template) in &config.headers_up {
+            for (key, template, append) in
+                config
+                    .headers_up
+                    .iter()
+                    .map(|(key, value)| (key, value, false))
+                    .chain(config.headers_up_add.iter().flat_map(|(key, values)| {
+                        values.iter().map(move |value| (key, value, true))
+                    }))
+            {
                 let resolved = resolve_caddy_placeholders(
                     template,
                     client_header,
@@ -6144,7 +6163,11 @@ async fn reverse_proxy_upstream(
                     "https",
                     request_vars,
                 );
-                up_req.insert_header(key.clone(), resolved.as_ref()).ok();
+                if append {
+                    up_req.append_header(key.clone(), resolved.as_ref()).ok();
+                } else {
+                    up_req.insert_header(key.clone(), resolved.as_ref()).ok();
+                }
             }
             // 🚫 Deletions run after the sets and before the automatic headers
             // below, the order Caddy's `HeaderOps` applies them in, so
@@ -6163,6 +6186,7 @@ async fn reverse_proxy_upstream(
                     config
                         .headers_up
                         .keys()
+                        .chain(config.headers_up_add.keys())
                         .any(|key| key.eq_ignore_ascii_case(name))
                         || config
                             .headers_up_remove
@@ -9329,7 +9353,7 @@ mod tests {
         let handler = HandlerConfig::Pipeline {
             handlers: vec![
                 HandlerElement::plain(HandlerConfig::Headers {
-                    set: BTreeMap::from([("x-policy".to_string(), "active".to_string())]),
+                    set: BTreeMap::from([("x-policy".to_string(), "active".into())]),
                     add: BTreeMap::new(),
                     remove: Vec::new(),
                     replace: Vec::new(),

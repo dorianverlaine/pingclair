@@ -45,6 +45,8 @@ Swift-inspired labels and SwiftUI-inspired TCP components in 0.3 alpha.
 Native HTTP routes also accept `Abort()` to close an exchange without sending
 an HTTP response. Error routes reject proxies until their upstream lifecycle
 is supported; use `Respond` or `ServeFiles` to render an error locally.
+Native request and response header values are literal text, including braces;
+that interpretation survives JSON export and reload on HTTP/1.1, HTTP/2 and HTTP/3.
 TCP uses `.limits(maxConnections:)`, matching HTTP, and typed source-IP
 conditions such as `Route(when: .from(["10.0.0.0/8"]))`.
 See the [L4 boundaries](docs/guardrails/layer4.md) for syntax and current limits.

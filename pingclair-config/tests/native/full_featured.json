@@ -30,7 +30,9 @@
               {
                 "type": "request_headers",
                 "set": {
-                  "X-Forwarded-By": "pingclair"
+                  "X-Forwarded-By": {
+                    "literal": "pingclair"
+                  }
                 },
                 "remove": [
                   "Cookie"
@@ -49,7 +51,9 @@
                 "set": {},
                 "remove": [],
                 "default_set": {
-                  "X-Served-By": "pingclair"
+                  "X-Served-By": {
+                    "literal": "pingclair"
+                  }
                 }
               },
               {

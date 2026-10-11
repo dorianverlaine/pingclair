@@ -1939,8 +1939,16 @@ fn adapt_response_handler(
                 ));
             }
             Ok(pingclair_core::config::HandlerConfig::Headers {
-                set: config.set,
-                add: config.add,
+                set: config
+                    .set
+                    .into_iter()
+                    .map(|(name, value)| (name, value.into()))
+                    .collect(),
+                add: config
+                    .add
+                    .into_iter()
+                    .map(|(name, values)| (name, values.into_iter().map(Into::into).collect()))
+                    .collect(),
                 remove: config.remove,
                 // 🔁 The response-subroute form takes set/add/remove only.
                 replace: Vec::new(),
