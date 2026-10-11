@@ -1331,7 +1331,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
             validate_proxy_protection_handler(&route.handler)?;
             validate_basic_auth_credentials(&route.handler)?;
             validate_subrequest_handler(&route.handler)?;
-            reject_unimplemented_handler(&route.handler)?;
+            reject_unimplemented_handler(&route.handler, false)?;
             if let Some(matcher) = &route.matcher {
                 validate_matcher(matcher)?;
             }
@@ -1344,7 +1344,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
             for element in &error_route.handlers {
                 validate_basic_auth_credentials(&element.handler)?;
                 validate_subrequest_handler(&element.handler)?;
-                reject_unimplemented_handler(&element.handler)?;
+                reject_unimplemented_handler(&element.handler, true)?;
                 if let Some(matcher) = &element.matcher {
                     validate_matcher(matcher)?;
                 }
@@ -1654,8 +1654,16 @@ fn pingclair_proxy_address_is_invalid(address: &str) -> bool {
 /// Living here rather than in the DSL adapter is deliberate: the Admin API
 /// deserializes straight into core types, so an adapter-only check is a
 /// bypass — see the note on `validate_config` being the single validation path.
-fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
+fn reject_unimplemented_handler(handler: &HandlerConfig, error_route: bool) -> CompileResult<()> {
     match handler {
+        // 🚫 Every frontend needs this check: error routes have no upstream
+        // slot yet, so accepting a proxy would run another route's policy.
+        HandlerConfig::ReverseProxy(_) if error_route => Err(CompileError::InvalidRoute {
+            message:
+                "an error route cannot proxy yet: its upstream exchange has no execution slot; \
+                      proxy in a site route and render its errors with Respond or ServeFiles"
+                    .to_string(),
+        }),
         HandlerConfig::Plugin { name, .. } => Err(CompileError::InvalidRoute {
             message: format!(
                 "handler `plugin` is not implemented, so the route named `{name}` would \
@@ -1679,22 +1687,30 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
         | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             for element in handlers {
-                reject_unimplemented_handler(&element.handler)?;
+                reject_unimplemented_handler(&element.handler, error_route)?;
             }
             Ok(())
         }
         HandlerConfig::HandleErrors { errors } => {
             for handlers in errors.values() {
                 for handler in handlers {
-                    reject_unimplemented_handler(handler)?;
+                    reject_unimplemented_handler(handler, true)?;
                 }
             }
             Ok(())
         }
         HandlerConfig::TryFiles { fallback, .. } => match fallback {
-            Some(fallback) => reject_unimplemented_handler(fallback),
+            Some(fallback) => reject_unimplemented_handler(fallback, error_route),
             None => Ok(()),
         },
+        HandlerConfig::Intercept { handlers } => {
+            for entry in handlers {
+                for handler in &entry.handlers {
+                    reject_unimplemented_handler(handler, error_route)?;
+                }
+            }
+            Ok(())
+        }
         // 🧭 Named exhaustively rather than with a wildcard: a new handler
         // variant must force a decision here about whether it is executable,
         // instead of defaulting to "allowed" and shipping as a silent no-op.
@@ -1702,7 +1718,6 @@ fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
         | HandlerConfig::ReverseProxy(_)
         | HandlerConfig::CopyResponse { .. }
         | HandlerConfig::CopyResponseHeaders { .. }
-        | HandlerConfig::Intercept { .. }
         | HandlerConfig::ForwardAuth(_)
         | HandlerConfig::Redirect { .. }
         | HandlerConfig::Rewrite { .. }

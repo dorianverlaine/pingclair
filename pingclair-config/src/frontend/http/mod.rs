@@ -726,7 +726,8 @@ fn route_elements(
 }
 
 /// 🅿️ The components that answer a request, named once for every refusal.
-const TERMINALS: &str = "Respond, ServeFiles, Proxy, Redirect, Fail, ServeMetrics or ACMEServer";
+const TERMINALS: &str =
+    "Respond, ServeFiles, Proxy, Redirect, Fail, Abort, ServeMetrics or ACMEServer";
 
 /// 🅿️ What a component does to the control flow, read from its own options.
 ///
@@ -754,7 +755,7 @@ fn answers(call: &Call) -> Answers {
         "ServeFiles" if matches!(call.get("passThru"), Some(Value::Bool(true))) => Answers::Maybe,
         // 🐘 Answers for the extensions it split off, stands down otherwise.
         "PHPFastCGI" => Answers::Maybe,
-        "Respond" | "ServeFiles" | "Proxy" | "Redirect" | "Fail" | "ServeMetrics"
+        "Respond" | "ServeFiles" | "Proxy" | "Redirect" | "Fail" | "Abort" | "ServeMetrics"
         | "ACMEServer" => Answers::Always,
         _ => Answers::Never,
     }

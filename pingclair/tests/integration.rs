@@ -16631,6 +16631,9 @@ mod retry_duration;
 #[path = "integration/error_routes.rs"]
 mod error_routes;
 
+#[path = "integration/native_terminals.rs"]
+mod native_terminals;
+
 // 🔌 An IP-literal site and a hostname site on one port share one socket.
 #[path = "integration/shared_port_sites.rs"]
 mod shared_port_sites;

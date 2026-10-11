@@ -10,6 +10,45 @@ fn site(body: &str) -> String {
 }
 
 #[test]
+fn abort_ends_the_native_route() {
+    let config =
+        pingclair_config::compile(&site("Abort()")).expect("Abort is a terminal operation");
+    assert!(matches!(
+        config.servers[0].routes[0].handler,
+        pingclair_core::config::HandlerConfig::Abort
+    ));
+    for body in [
+        "Abort() Respond(body: \"unreachable\")",
+        "Abort(status: 444)",
+    ] {
+        assert!(pingclair_config::compile(&site(body)).is_err());
+    }
+}
+
+#[test]
+fn unimplemented_error_proxy_is_refused_by_shared_validation() {
+    let source = r#"HTTPListener(on: "127.0.0.1:18080") {
+        Site(host: "*") {
+            ErrorRoute(for: [.serverError]) { Proxy(to: "127.0.0.1:9000") }
+            Fallback { Fail(status: 503) }
+        }
+    }"#;
+    let adapted = pingclair_config::adapt(source).unwrap();
+    let json = serde_json::to_string(&adapted).unwrap();
+    let decoded = serde_json::from_str(&json).unwrap();
+    for config in [&adapted, &decoded] {
+        let error = pingclair_config::compiler::validate_config(config)
+            .expect_err("an error proxy cannot execute until it has its own upstream slot");
+        assert!(
+            error
+                .to_string()
+                .contains("an error route cannot proxy yet")
+        );
+    }
+    assert!(pingclair_config::compile(source).is_err());
+}
+
+#[test]
 fn extracting_a_positional_value_into_a_binding_preserves_the_document() {
     let inline = site(r#"ResponseHeader(.set("X-Test", "hello")) Respond(body: "ok")"#);
     let bound = format!(

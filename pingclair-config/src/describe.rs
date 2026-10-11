@@ -59,6 +59,18 @@ pub const ENTRIES: &[Entry] = &[
         labels: crate::frontend::tcp::TCP_LISTENER_LABELS,
     },
     Entry {
+        name: "Abort",
+        kind: Kind::Component,
+        summary: "Ends the exchange without an HTTP response: `Abort()`.",
+        example: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") { Fallback { Abort() } }
+}"#,
+        refusal: r#"HTTPListener(on: ":8080") {
+    Site(host: "*") { Fallback { Abort() Respond(body: "unreachable") } }
+}"#,
+        labels: &[],
+    },
+    Entry {
         name: "Route",
         kind: Kind::Component,
         summary: "A conditional route: L4 takes a typed `when:` condition plus one `Proxy`; HTTP takes a typed `when:` condition.",

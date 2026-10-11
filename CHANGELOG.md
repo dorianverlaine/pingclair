@@ -26,6 +26,11 @@ expansion. Existing Caddy-style files remain supported during migration. Admin
 accepts `text/pingclair`; `fmt` formats native files with comments preserved,
 and `describe` prints the component table.
 
+Native `Abort()` now ends a route and closes the exchange without an HTTP
+response. Error-route proxies are rejected by common validation, including
+JSON loads, instead of accepting a configuration that cannot contact its
+upstream (#303).
+
 TCP limits now use `.limits(maxConnections:)`, the same label as HTTP.
 Source-IP routes use `when: .from([...])`; `.all` combines TLS and source IP,
 and `.any` selects alternative matcher sets. The alpha spellings `connections:`

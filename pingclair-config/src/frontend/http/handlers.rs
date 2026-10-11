@@ -114,6 +114,10 @@ pub(super) fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
         "Proxy" => proxy(call),
         "Redirect" => redirect(call),
         "Fail" => fail(call),
+        "Abort" => {
+            call.leaf(&[])?;
+            Ok(HandlerConfig::Abort)
+        }
         "ServeMetrics" => serve_metrics(call),
         "RequestHeader" => request_headers(call),
         "ResponseHeader" => response_headers(call),
@@ -133,7 +137,7 @@ pub(super) fn http_handler(call: &Call) -> Result<HandlerConfig, Error> {
         "ACMEServer" => acme_server(call),
         _ => Err(call.at.error(
             "unknown HTTP component; expected a terminal (Respond, ServeFiles, Proxy, Redirect, \
-             Fail, ServeMetrics, ACMEServer) or middleware (RequestHeader, ResponseHeader, \
+             Fail, Abort, ServeMetrics, ACMEServer) or middleware (RequestHeader, ResponseHeader, \
              Rewrite, BasicAuth, RateLimit, AccessControl, CORS, SetVariable, LimitRequestBody, \
              SkipLog, Templates, ForwardAuth, TryFiles, Intercept, PHPFastCGI)",
         )),
