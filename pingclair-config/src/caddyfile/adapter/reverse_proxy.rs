@@ -2037,6 +2037,7 @@ fn adapt_response_handler(
                 pass_thru: false,
                 canonical_uris: true,
                 etag_file_extensions: Vec::new(),
+                negotiate: Vec::new(),
             })
         }
         other => Err(AdapterError::UnsupportedFeature(

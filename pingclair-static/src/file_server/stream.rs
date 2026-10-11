@@ -73,6 +73,9 @@ pub struct StreamingFile {
     /// usually the uncompressed variant of a compressible resource, which is
     /// exactly the case that used to reach a shared cache with no `Vary`.
     pub vary_accept_encoding: bool,
+    /// 🧭 See [`ServedFile::vary_accept`]: true when this stream is the answer
+    /// to a negotiated page.
+    pub vary_accept: bool,
     /// Bytes read so far
     bytes_read: u64,
 }
@@ -322,6 +325,7 @@ impl FileServer {
             content_range: window.content_range,
             content_encoding: window.content_encoding,
             vary_accept_encoding: server.config.varies_by_accept_encoding(),
+            vary_accept: false,
             bytes_read: 0,
         })
     }
@@ -665,7 +669,8 @@ mod bounded_memory_tests {
             ServedResponse::Redirect(_)
             | ServedResponse::NotModified(_)
             | ServedResponse::PreconditionFailed
-            | ServedResponse::MethodNotAllowed => 0,
+            | ServedResponse::MethodNotAllowed
+            | ServedResponse::NotAcceptable => 0,
         }
     }
 

@@ -1122,7 +1122,10 @@ pub(crate) const FILE_SERVER_LABELS: &[&str] = &[
 
 /// 📂 `.ServeFiles(root:, browse:, index:)`: the static file handler.
 fn serve_files(call: &Call) -> Result<HandlerConfig, Error> {
-    call.leaf(FILE_SERVER_LABELS)?;
+    call.labels(FILE_SERVER_LABELS)?;
+    if call.body.is_some() {
+        return Err(call.at.error("this declaration does not accept a block"));
+    }
     let root = call.string("root")?;
     let browse = if call.get("browse").is_some() {
         call.boolean("browse")?
@@ -1215,6 +1218,55 @@ fn serve_files(call: &Call) -> Result<HandlerConfig, Error> {
         true
     };
     let etag_file_extensions = call.strings("etagFileExtensions")?;
+    // 🧭 `.negotiate([…])`: representations this server may pick from the
+    // file tree itself. A modifier, not an argument — it is policy attached
+    // to the file server, the same shape `.protocols` has on a listener.
+    let mut negotiate = Vec::new();
+    for modifier in &call.modifiers {
+        match modifier.name.as_str() {
+            "negotiate" => {
+                let [(None, Value::Array(items))] = modifier.args.as_slice() else {
+                    return Err(modifier
+                        .at
+                        .error("negotiate takes one array such as [.markdown]"));
+                };
+                if modifier.body.is_some() {
+                    return Err(modifier.at.error("negotiate does not take a block"));
+                }
+                if items.is_empty() {
+                    return Err(modifier.at.error(
+                        "negotiate needs at least one representation; leave it out for none",
+                    ));
+                }
+                for item in items {
+                    let Value::Typed(value) = item else {
+                        return Err(modifier.at.error("negotiate takes .markdown values"));
+                    };
+                    if !value.args.is_empty() {
+                        return Err(value.at.error("a representation value takes no arguments"));
+                    }
+                    match value.name.as_str() {
+                        "markdown" => {
+                            if negotiate.contains(&pingclair_core::config::Negotiation::Markdown) {
+                                return Err(value.at.error("duplicate representation"));
+                            }
+                            negotiate.push(pingclair_core::config::Negotiation::Markdown);
+                        }
+                        other => {
+                            return Err(value.at.error(format!(
+                                "unknown representation '.{other}'; expected .markdown"
+                            )));
+                        }
+                    }
+                }
+            }
+            other => {
+                return Err(modifier.at.error(format!(
+                    "unknown file-server modifier '.{other}'; expected .negotiate([…])"
+                )));
+            }
+        }
+    }
     Ok(HandlerConfig::FileServer {
         root,
         index,
@@ -1236,6 +1288,7 @@ fn serve_files(call: &Call) -> Result<HandlerConfig, Error> {
         pass_thru,
         canonical_uris,
         etag_file_extensions,
+        negotiate,
     })
 }
 

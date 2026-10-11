@@ -242,6 +242,7 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
             pass_thru: _,
             canonical_uris: _,
             etag_file_extensions: _,
+            negotiate: _,
         } => {
             // File server would need async file reading
             // Return placeholder for now

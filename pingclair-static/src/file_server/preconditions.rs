@@ -150,6 +150,7 @@ impl FileServer {
                 etag: etag.clone(),
                 last_modified: meta.last_modified.clone(),
                 vary_accept_encoding: self.config.varies_by_accept_encoding(),
+                vary_accept: false,
             })),
             Precondition::Failed => Some(ServedResponse::PreconditionFailed),
         })

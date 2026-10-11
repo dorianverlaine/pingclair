@@ -28,6 +28,9 @@ mod native_error_status;
 #[path = "h3_end_to_end/native_typed_text.rs"]
 mod native_typed_text;
 
+#[path = "h3_end_to_end/markdown_negotiation.rs"]
+mod markdown_negotiation;
+
 // 🔪 Responses that fail after they started. A sibling file rather than more
 // of this one, which is already a high-touch file.
 #[path = "h3_end_to_end/truncation.rs"]

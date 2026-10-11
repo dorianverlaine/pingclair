@@ -929,6 +929,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 pass_thru: false,
                 canonical_uris: true,
                 etag_file_extensions: Vec::new(),
+                negotiate: Vec::new(),
             };
             let handler = if templates {
                 HandlerConfig::Pipeline {

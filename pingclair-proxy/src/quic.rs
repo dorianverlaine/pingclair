@@ -4637,6 +4637,9 @@ async fn handle_request_inner(
                             if not_modified.vary_accept_encoding {
                                 crate::response_encoding::vary_map_on_accept_encoding(&mut hdrs);
                             }
+                            if not_modified.vary_accept {
+                                crate::response_encoding::vary_map_on_accept(&mut hdrs);
+                            }
                             send_h3_local_response(
                                 resp_tx,
                                 stream_id,
@@ -4672,6 +4675,42 @@ async fn handle_request_inner(
                                 405,
                                 hdrs,
                                 H3LocalBody::Bytes(Bytes::new()),
+                                response_policy,
+                                request_id,
+                                request_deadline,
+                                &mut download_pacer,
+                            )
+                            .await
+                        }
+                        // 🚫 Same answer as the file server decided: the page
+                        // exists, and no representation of it matches `Accept`.
+                        Ok(Some(ServedResponse::NotAcceptable)) => {
+                            let mut hdrs = http::HeaderMap::new();
+                            hdrs.insert(
+                                "content-type",
+                                http::HeaderValue::from_static("text/plain; charset=utf-8"),
+                            );
+                            hdrs.insert(
+                                "content-length",
+                                http::HeaderValue::from(
+                                    pingclair_static::NOT_ACCEPTABLE_BODY.len() as u64,
+                                ),
+                            );
+                            crate::response_encoding::vary_map_on_accept(&mut hdrs);
+                            send_h3_local_response(
+                                resp_tx,
+                                stream_id,
+                                &state,
+                                &header,
+                                &effective_uri,
+                                &verified_client_ip_text,
+                                &request_vars,
+                                response_handlers.as_deref(),
+                                406,
+                                hdrs,
+                                H3LocalBody::Bytes(Bytes::from_static(
+                                    pingclair_static::NOT_ACCEPTABLE_BODY.as_bytes(),
+                                )),
                                 response_policy,
                                 request_id,
                                 request_deadline,
@@ -4744,6 +4783,9 @@ async fn handle_request_inner(
                             if stream.vary_accept_encoding {
                                 crate::response_encoding::vary_map_on_accept_encoding(&mut hdrs);
                             }
+                            if stream.vary_accept {
+                                crate::response_encoding::vary_map_on_accept(&mut hdrs);
+                            }
                             if let Some(lm) = &stream.last_modified {
                                 hdrs.insert("last-modified", lm.clone());
                             }
@@ -4794,6 +4836,9 @@ async fn handle_request_inner(
                             // 🧊 Same flag, same rule as the streamed branch above.
                             if file.vary_accept_encoding {
                                 crate::response_encoding::vary_map_on_accept_encoding(&mut hdrs);
+                            }
+                            if file.vary_accept {
+                                crate::response_encoding::vary_map_on_accept(&mut hdrs);
                             }
                             send_h3_local_response(
                                 resp_tx,
@@ -8688,6 +8733,7 @@ mod tests {
                     pass_thru: false,
                     canonical_uris: true,
                     etag_file_extensions: Vec::new(),
+                    negotiate: Vec::new(),
                 },
             ],
         }];

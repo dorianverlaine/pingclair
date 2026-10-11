@@ -45,6 +45,9 @@ mod canonical;
 mod canonical_tests;
 mod encode;
 mod listing;
+mod negotiate;
+#[cfg(test)]
+mod negotiate_tests;
 mod preconditions;
 mod serve;
 mod stream;
@@ -96,6 +99,9 @@ pub struct FileServerConfig {
     pub canonical_uris: bool,
     /// 🏷️ Extensions of sidecar files holding a precomputed ETag.
     pub etag_file_extensions: Vec<String>,
+    /// 🧭 Representations this server may negotiate for a page from the file
+    /// tree itself, in preference order. Empty means never negotiate.
+    pub negotiate: Vec<pingclair_core::config::Negotiation>,
 }
 
 /// 🗜️ One sidecar encoding, with the suffix and token resolved at load time so
@@ -233,6 +239,7 @@ impl FileServerConfig {
         status: Option<u16>,
         canonical_uris: bool,
         etag_file_extensions: &[String],
+        negotiate: &[pingclair_core::config::Negotiation],
     ) -> Self {
         let root = root.into();
         Self {
@@ -263,7 +270,14 @@ impl FileServerConfig {
             status,
             canonical_uris,
             etag_file_extensions: etag_file_extensions.to_vec(),
+            negotiate: negotiate.to_vec(),
         }
+    }
+
+    /// 📝 Whether the Markdown representation may be negotiated for a page.
+    pub(crate) fn negotiates_markdown(&self) -> bool {
+        self.negotiate
+            .contains(&pingclair_core::config::Negotiation::Markdown)
     }
 }
 
@@ -293,6 +307,7 @@ impl Default for FileServerConfig {
             status: None,
             canonical_uris: true,
             etag_file_extensions: Vec::new(),
+            negotiate: Vec::new(),
         }
     }
 }
@@ -359,6 +374,11 @@ pub struct ServedFile {
     /// on both variants for exactly this reason; Day 26 measured that we set it
     /// on neither of the uncompressed ones.
     pub vary_accept_encoding: bool,
+    /// 🧭 Whether this resource varies by `Accept`: true on every answer for
+    /// a page the server negotiates — the HTML, the Markdown, and the 406 —
+    /// because the answer for one path depends on the header, and which
+    /// representations exist can change on deploy.
+    pub vary_accept: bool,
 }
 
 /// Result of [`FileServer::serve_auto`]: either a fully buffered body
@@ -382,7 +402,41 @@ pub enum ServedResponse {
     /// 🚫 `405 Method Not Allowed`: the file exists, and the method is
     /// neither `GET` nor `HEAD`. The caller sends `Allow: GET, HEAD`.
     MethodNotAllowed,
+    /// 🚫 `406 Not Acceptable`: the path is a page, the client refused the
+    /// HTML, and no negotiated representation exists to stand in. The caller
+    /// answers with [`NOT_ACCEPTABLE_BODY`] and `Vary: Accept`.
+    NotAcceptable,
 }
+
+impl ServedResponse {
+    /// 🧭 Marks the answer as varying by `Accept`. Called once, on the single
+    /// response a negotiated page produces — which is why the flag can be set
+    /// here rather than threaded into every constructor inside the server.
+    pub(crate) fn with_vary_accept(self, vary: bool) -> Self {
+        if !vary {
+            return self;
+        }
+        match self {
+            Self::Buffered(mut file) => {
+                file.vary_accept = true;
+                Self::Buffered(file)
+            }
+            Self::Stream(mut stream) => {
+                stream.vary_accept = true;
+                Self::Stream(stream)
+            }
+            Self::NotModified(mut not_modified) => {
+                not_modified.vary_accept = true;
+                Self::NotModified(not_modified)
+            }
+            other => other,
+        }
+    }
+}
+
+/// 🚫 The body a `406` carries: the page exists, and no representation of it
+/// matches the request's `Accept`.
+pub const NOT_ACCEPTABLE_BODY: &str = "not acceptable: no representation matches Accept\n";
 
 /// 🧊 The header fields a `304` carries (RFC 9110 §15.4.5): the ones a `200`
 /// would have sent that let a cache refresh the copy it holds. No
@@ -396,6 +450,8 @@ pub struct NotModified {
     /// 🧊 Same meaning as [`ServedFile::vary_accept_encoding`]; a cache keys
     /// the refreshed entry on it.
     pub vary_accept_encoding: bool,
+    /// 🧭 Same meaning as [`ServedFile::vary_accept`].
+    pub vary_accept: bool,
 }
 
 impl FileServer {
@@ -560,6 +616,7 @@ mod subdirective_tests {
             Some(503),
             false,
             &["etag".to_string()],
+            &[],
         );
 
         // 📄 An empty index list falls back to the default document.

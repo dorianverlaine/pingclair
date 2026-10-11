@@ -5026,6 +5026,9 @@ impl PingclairProxy {
                             if not_modified.vary_accept_encoding {
                                 header.insert_header("Vary", "Accept-Encoding").unwrap();
                             }
+                            if not_modified.vary_accept {
+                                crate::response_encoding::vary_on_accept(&mut header)?;
+                            }
                             self.write_local_response(
                                 session,
                                 ctx,
@@ -5061,6 +5064,33 @@ impl PingclairProxy {
                                 ctx,
                                 header,
                                 LocalResponseBody::Empty,
+                                false,
+                            )
+                            .await?;
+                            return Ok(true);
+                        }
+                        // 🚫 Same answer as the file server decided: the page
+                        // exists, and no representation of it matches `Accept`.
+                        Ok(Some(pingclair_static::ServedResponse::NotAcceptable)) => {
+                            let mut header =
+                                Self::build_downstream_header(session, 406, Some(3)).unwrap();
+                            header
+                                .insert_header("Content-Type", "text/plain; charset=utf-8")
+                                .unwrap();
+                            header
+                                .insert_header(
+                                    "Content-Length",
+                                    pingclair_static::NOT_ACCEPTABLE_BODY.len().to_string(),
+                                )
+                                .unwrap();
+                            crate::response_encoding::vary_on_accept(&mut header)?;
+                            self.write_local_response(
+                                session,
+                                ctx,
+                                header,
+                                LocalResponseBody::Bytes(Bytes::from_static(
+                                    pingclair_static::NOT_ACCEPTABLE_BODY.as_bytes(),
+                                )),
                                 false,
                             )
                             .await?;
@@ -5122,6 +5152,9 @@ impl PingclairProxy {
                             if stream.vary_accept_encoding {
                                 header.insert_header("Vary", "Accept-Encoding").unwrap();
                             }
+                            if stream.vary_accept {
+                                crate::response_encoding::vary_on_accept(&mut header)?;
+                            }
                             header.insert_header("Accept-Ranges", "bytes").unwrap();
                             self.write_local_response(
                                 session,
@@ -5169,6 +5202,9 @@ impl PingclairProxy {
                             // a cache hand that copy to a client expecting gzip.
                             if file.vary_accept_encoding {
                                 header.insert_header("Vary", "Accept-Encoding").unwrap();
+                            }
+                            if file.vary_accept {
+                                crate::response_encoding::vary_on_accept(&mut header)?;
                             }
                             header.insert_header("Accept-Ranges", "bytes").unwrap();
                             self.write_local_response(
@@ -10303,6 +10339,7 @@ pub(crate) fn build_file_server(
         pass_thru: _,
         canonical_uris,
         etag_file_extensions,
+        negotiate,
     }) = find_file_server_config(handler)
     else {
         return None;
@@ -10319,6 +10356,7 @@ pub(crate) fn build_file_server(
             *status,
             *canonical_uris,
             etag_file_extensions,
+            negotiate,
         )
         .with_site_encode(site),
     )))

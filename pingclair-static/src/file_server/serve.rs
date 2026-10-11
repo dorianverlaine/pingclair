@@ -27,6 +27,7 @@ use http::HeaderValue;
 #[cfg(test)]
 use super::FileServerConfig;
 use super::cache::FileKey;
+use super::negotiate;
 use super::preconditions::FileRequest;
 use super::validators;
 use super::{FileServer, ServedFile, ServedResponse};
@@ -169,7 +170,6 @@ impl FileServer {
         let (original_path, query) = original_uri
             .split_once('?')
             .map_or((original_uri, None), |(path, query)| (path, Some(query)));
-        let range = request.range();
         // Lexical docroot check (rejects `..` traversal; no syscalls)
         let mut file_path = match self.resolve_path(path) {
             Some(p) => p,
@@ -188,7 +188,7 @@ impl FileServer {
 
         // Check if metadata exists (synchronous by design — see
         // serve_streaming for why tokio::fs is avoided on this hot path)
-        let metadata = match std::fs::metadata(&file_path) {
+        let mut metadata = match std::fs::metadata(&file_path) {
             Ok(m) => m,
             Err(_) => return Ok(None),
         };
@@ -231,6 +231,59 @@ impl FileServer {
             }
         }
 
+        // 🧭 Representation negotiation, before any index is resolved: a page
+        // request whose client prefers Markdown reads the sibling file
+        // instead, and a page request that refuses the HTML, with no sibling
+        // to stand in, is answered 406 rather than with a representation it
+        // said no to. Assets, explicit `.md` URLs and non-retrieval methods
+        // never enter this path. Every answer for a negotiated page varies by
+        // `Accept`, which `vary_accept` records for the one response the tail
+        // returns.
+        let mut vary_accept = false;
+        if self.config.negotiates_markdown() && request.is_retrieval() {
+            let page_shaped =
+                metadata.is_dir() || (metadata.is_file() && has_html_extension(&file_path));
+            if page_shaped {
+                vary_accept = true;
+                let preference = negotiate::PagePreference::from_headers(request.headers);
+                let twin = preference
+                    .prefers_markdown()
+                    .then(|| self.markdown_twin(&file_path, metadata.is_dir()))
+                    .flatten()
+                    .and_then(|twin| std::fs::metadata(&twin).ok().map(|m| (twin, m)));
+                match twin {
+                    Some((markdown_path, markdown_metadata)) => {
+                        file_path = markdown_path;
+                        metadata = markdown_metadata;
+                    }
+                    None if preference.refuses_html() => {
+                        return Ok(Some(ServedResponse::NotAcceptable));
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        let response = self
+            .serve_resolved(path, request, accept_encoding, file_path, metadata)
+            .await?;
+        Ok(response.map(|response| response.with_vary_accept(vary_accept)))
+    }
+
+    /// 📄 Everything after the path is resolved and its representation
+    /// chosen: index resolution, the method gate, preconditions, Range, and
+    /// the body decision. Split out only so the negotiation above has one
+    /// response to mark — the pipeline itself is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_resolved(
+        &self,
+        path: &str,
+        request: FileRequest<'_>,
+        accept_encoding: Option<&str>,
+        mut file_path: PathBuf,
+        metadata: std::fs::Metadata,
+    ) -> Result<Option<ServedResponse>> {
+        let range = request.range();
         // 📁 Resolve an index only for directories. A regular file keeps the
         // metadata already fetched above, avoiding a duplicate `statx` on the
         // dominant static-file path.
@@ -302,6 +355,7 @@ impl FileServer {
                         etag: None,
                         content_encoding: encoding,
                         vary_accept_encoding: self.config.varies_by_accept_encoding(),
+                        vary_accept: false,
                     })));
                 } else {
                     return Ok(None);
@@ -438,6 +492,7 @@ impl FileServer {
                         etag: None,
                         content_encoding: None,
                         vary_accept_encoding: self.config.varies_by_accept_encoding(),
+                        vary_accept: false,
                     })));
                 }
                 RangeDecision::Ignored => {}
@@ -521,6 +576,7 @@ impl FileServer {
                 etag: Some(sidecar_etag.clone()),
                 content_encoding: Some(encoding.to_string()),
                 vary_accept_encoding: self.config.varies_by_accept_encoding(),
+                vary_accept: false,
             })));
         }
 
@@ -573,6 +629,7 @@ impl FileServer {
                     etag: Some(meta.etags.for_coding(Some(enc)).clone()),
                     content_encoding: Some(enc.to_string()),
                     vary_accept_encoding: self.config.varies_by_accept_encoding(),
+                    vary_accept: false,
                 })));
             }
         }
@@ -652,6 +709,7 @@ impl FileServer {
                     etag: Some(meta.etags.for_coding(Some(enc)).clone()),
                     content_encoding: Some(enc.to_string()),
                     vary_accept_encoding: self.config.varies_by_accept_encoding(),
+                    vary_accept: false,
                 })));
             }
             Some((key, lock, guard))
@@ -690,7 +748,37 @@ impl FileServer {
             etag: Some(meta.etags.for_coding(content_encoding.as_deref()).clone()),
             content_encoding,
             vary_accept_encoding: self.config.varies_by_accept_encoding(),
+            vary_accept: false,
         })))
+    }
+
+    /// 📝 The Markdown sibling of a page, when one exists on disk: `X.md` or
+    /// `X/index.md` for a directory, `X.md` for an `X.html` file.
+    ///
+    /// 🙈 Hidden paths are hidden here too, so a `.md` the operator removed
+    /// from view cannot come back through negotiation, and the candidate has
+    /// to be a regular file — a directory named `index.md` is not a page.
+    fn markdown_twin(&self, file_path: &std::path::Path, is_dir: bool) -> Option<PathBuf> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if is_dir {
+            candidates.push(file_path.join("index.md"));
+            // 📌 Appended, not `with_extension`: a directory named `v1.2`
+            // must look for `v1.2.md`, not `v1.md`.
+            let mut sibling = file_path.as_os_str().to_owned();
+            sibling.push(".md");
+            candidates.push(PathBuf::from(sibling));
+        } else if has_html_extension(file_path) {
+            candidates.push(file_path.with_extension("md"));
+        }
+        for candidate in candidates {
+            if self.config.hide.hides(&candidate) {
+                continue;
+            }
+            if std::fs::metadata(&candidate).is_ok_and(|metadata| metadata.is_file()) {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     /// Serve a file request, always buffered.
@@ -723,7 +811,8 @@ impl FileServer {
                 ServedResponse::Redirect(_)
                 | ServedResponse::NotModified(_)
                 | ServedResponse::PreconditionFailed
-                | ServedResponse::MethodNotAllowed,
+                | ServedResponse::MethodNotAllowed
+                | ServedResponse::NotAcceptable,
             ) => Ok(None),
             Some(ServedResponse::Stream(mut stream)) => {
                 let mut content = Vec::with_capacity(stream.body_len as usize);
@@ -741,6 +830,7 @@ impl FileServer {
                     etag: stream.etag,
                     content_encoding: None,
                     vary_accept_encoding: self.config.varies_by_accept_encoding(),
+                    vary_accept: false,
                 }))
             }
             None => Ok(None),
@@ -1953,6 +2043,12 @@ fn segment_os_str(segment: &[u8]) -> Option<&std::ffi::OsStr> {
 #[cfg(not(unix))]
 fn segment_os_str(segment: &[u8]) -> Option<&std::ffi::OsStr> {
     std::str::from_utf8(segment).ok().map(std::ffi::OsStr::new)
+}
+
+/// 📄 Whether a path names an HTML page — the second shape negotiation speaks
+/// for, beside a directory URL.
+fn has_html_extension(path: &std::path::Path) -> bool {
+    path.extension().and_then(std::ffi::OsStr::to_str) == Some("html")
 }
 
 /// 🔁 The last path element, the way `path.Base` means it.

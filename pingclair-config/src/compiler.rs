@@ -3486,6 +3486,7 @@ fn compile_handler(
             pass_thru: fs.pass_thru,
             canonical_uris: fs.canonical_uris,
             etag_file_extensions: fs.etag_file_extensions.clone(),
+            negotiate: Vec::new(),
         }),
 
         Handler::Templates => Ok(HandlerConfig::Templates {
@@ -4276,6 +4277,7 @@ mod fail_closed_handler_tests {
             pass_thru: false,
             canonical_uris: true,
             etag_file_extensions: Vec::new(),
+            negotiate: Vec::new(),
         };
 
         for bad in [
@@ -4333,6 +4335,7 @@ mod fail_closed_handler_tests {
             pass_thru: false,
             canonical_uris: true,
             etag_file_extensions: Vec::new(),
+            negotiate: Vec::new(),
         };
         let json = |hide: &str| validate_config(&config_with(file_server(hide))).is_ok();
         let dsl = |hide: &str| {

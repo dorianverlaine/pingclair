@@ -572,6 +572,18 @@ pub enum Encoding {
     Zstd,
 }
 
+/// 🧭 A representation a file server can negotiate for a page.
+///
+/// 📌 Closed on purpose: the first version speaks only Markdown, and a variant
+/// arrives when a second representation has a real consumer — the same rule
+/// the typed sources follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Negotiation {
+    /// 📝 The sibling `X.md` (or `X/index.md`) served as `text/markdown`.
+    Markdown,
+}
+
 impl Encoding {
     /// The `Content-Encoding` / `Accept-Encoding` token for this coding.
     pub fn token(self) -> &'static str {
@@ -1625,6 +1637,14 @@ pub enum HandlerConfig {
         /// in order before one is derived from size and mtime.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         etag_file_extensions: Vec<String>,
+
+        /// 🧭 Representations this file server may negotiate from the file
+        /// tree itself for a *page* request (a directory URL or `*.html`):
+        /// when the client's `Accept` prefers one, the sibling file is served
+        /// instead of the HTML. Empty means never negotiate, which is the
+        /// shape every existing configuration has.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        negotiate: Vec<Negotiation>,
     },
 
     /// 🏛️ A site that acts as an ACME server for other clients.

@@ -170,7 +170,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         name: "ServeFiles",
         kind: Kind::Component,
-        summary: "Static files: `ServeFiles(root:, index:, browse:, hide:, precompressed:, status:, passThru:, …)`.",
+        summary: "Static files: `ServeFiles(root:, index:, browse:, hide:, precompressed:, status:, passThru:, …)`. `.negotiate([.markdown])` serves the sibling `X.md`/`X/index.md` when the client's `Accept` prefers it.",
         example: r#"HTTPListener(on: ":8080") {
     Site(host: "*") {
         Fallback { ServeFiles(root: "./public", browse: false) }

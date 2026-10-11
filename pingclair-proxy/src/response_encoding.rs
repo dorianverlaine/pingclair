@@ -126,6 +126,31 @@ pub(crate) fn vary_covers_accept_encoding(headers: &http::HeaderMap) -> bool {
         .any(|token| token == "*" || token.eq_ignore_ascii_case("accept-encoding"))
 }
 
+/// 🧭 The file server's negotiation flag, the `Accept` twin of
+/// [`vary_on_accept_encoding`]: every answer for a negotiated page says so, so
+/// a shared cache never hands one representation to a client that asked for
+/// the other.
+pub(crate) fn vary_on_accept(header: &mut ResponseHeader) -> pingora_core::Result<()> {
+    if vary_covers_accept(&header.headers) {
+        return Ok(());
+    }
+    header.append_header("Vary", "Accept")?;
+    Ok(())
+}
+
+/// 🧭 The same rule for a bare header map, which is what the HTTP/3 path
+/// assembles its local responses in before they become an H3 header list.
+pub(crate) fn vary_map_on_accept(headers: &mut http::HeaderMap) {
+    if !vary_covers_accept(headers) {
+        headers.append(http::header::VARY, http::HeaderValue::from_static("Accept"));
+    }
+}
+
+/// 🔎 Whether `Vary` already names `Accept`, or is `*`.
+pub(crate) fn vary_covers_accept(headers: &http::HeaderMap) -> bool {
+    field_tokens(headers, "vary").any(|token| token == "*" || token.eq_ignore_ascii_case("accept"))
+}
+
 /// 📐 Whether this response carries a complete representation that the
 /// proxy may re-encode for the client.
 ///

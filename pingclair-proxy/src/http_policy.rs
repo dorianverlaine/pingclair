@@ -349,6 +349,7 @@ pub fn evaluate_response_handlers(
                 pass_thru: _,
                 canonical_uris: _,
                 etag_file_extensions: _,
+                negotiate: _,
             } => {
                 outcome.file_server = Some(ResponseFileServer {
                     root: root.clone(),

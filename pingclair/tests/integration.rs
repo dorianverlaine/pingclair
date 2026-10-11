@@ -49,6 +49,9 @@ mod cli_empty;
 #[path = "integration/cli_text_lint.rs"]
 mod cli_text_lint;
 
+#[path = "integration/markdown_negotiation.rs"]
+mod markdown_negotiation;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;

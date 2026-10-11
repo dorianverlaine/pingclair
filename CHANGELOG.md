@@ -83,6 +83,15 @@ the request's host, matching the `header` directive and Caddy's own behavior.
 written, and the warning points at `Format(…)`. A lint, not a refusal: literal
 braces stay legal text.
 
+`ServeFiles(…).negotiate([.markdown])` lets the static file server answer a
+page request with its Markdown sibling: a directory URL reads `X/index.md` or
+`X.md`, an `X.html` URL reads `X.md`, and only when the client's `Accept`
+prefers `text/markdown` by RFC 9110's rules (`q=0` refuses; equal quality or
+no `Accept` keeps HTML). The sibling is read from the deployed tree — no
+build- or deploy-time copies — and every answer for a negotiated page carries
+`Vary: Accept`; a page whose HTML is refused with no sibling to stand in
+answers 406 instead of silently falling back.
+
 Native `RequestHeader`, `ResponseHeader` and `Proxy` header set, append and
 default values retain literal braces through JSON export and reload. Legacy
 template strings remain templates. HTTP/3 now also forwards appended proxy

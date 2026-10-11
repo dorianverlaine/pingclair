@@ -13,6 +13,6 @@ mod file_server;
 mod mime;
 
 pub use file_server::{
-    CacheBudgets, FileRequest, FileServer, FileServerConfig, HidePolicy, NotModified,
-    PrecompressedFormat, ServedResponse, StreamingFile, configure_cache_budgets,
+    CacheBudgets, FileRequest, FileServer, FileServerConfig, HidePolicy, NOT_ACCEPTABLE_BODY,
+    NotModified, PrecompressedFormat, ServedResponse, StreamingFile, configure_cache_budgets,
 };
