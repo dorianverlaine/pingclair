@@ -28,13 +28,13 @@ Pingclair 官方網站：[https://pingclair.com](https://pingclair.com)
 
 以下為 `pingclair.com` 正式環境使用的 `Pingclairfile`。
 
-網站由部署於巴黎 FreeBSD 伺服器上的 Pingclair 提供服務。`pingclair.pingclair.com` 保留作為預發布環境網域，`www.pingclair.com` 則永久重新導向至主網域。
+網站由部署於 FreeBSD 伺服器上的 Pingclair 提供服務。`pingclair.pingclair.com` 保留作為預發布環境網域，`www.pingclair.com` 則永久重新導向至主網域。
 
 設定中的英文註解保留原文，以便與實際部署檔案進行對照。
 
 ```swift
-// 🏝️ pingclair.com — the docs site, served by Pingclair from the
-// FreeBSD node, with pingclair.pingclair.com kept as the staging alias and
+// 🏝️ pingclair.com — the docs site, served by Pingclair from a FreeBSD
+// node, with pingclair.pingclair.com kept as the staging alias and
 // www redirected to the apex.
 
 AutomaticTLS(mode: .automatic, httpPort: 80, httpsPort: 443)
@@ -52,9 +52,15 @@ Admin(listen: "127.0.0.1:2019")
 let installerHost = "releases.pingclair.com:443"
 
 // 🤖 The agent endpoints still served by the documentation Worker; the
-// Paris node proxies them so `pingclair.com/mcp` and `/a2a` keep the URL
+// docs node proxies them so `pingclair.com/mcp` and `/a2a` keep the URL
 // contract the Worker era established.
 let cfWorker = "cf.pingclair.com:443"
+
+// 🔗 The discovery links the documentation Worker published through the build
+// output's `_headers` file; the native file server does not read that file, so
+// the same value is stated once here and reused by every route that serves
+// files. The escape keeps the real quotes in the value.
+let agentLink = "</.well-known/api-catalog>; rel=\"api-catalog\", </llms.txt>; rel=\"describedby\", </sitemap.xml>; rel=\"sitemap\""
 
 HTTPListener(on: ":443") {
     Site(host: "pingclair.com") {
@@ -86,6 +92,32 @@ HTTPListener(on: ":443") {
             Proxy(to: cfWorker, headersUp: [.set("Host", "cf.pingclair.com")])
             .upstreamTLS(.enabled(serverName: "cf.pingclair.com"))
         }
+        // 🗂️ Rules the Cloudflare side applied at the edge — the `_headers`
+        // file does not exist for the native file server — stated natively:
+        // immutable cache for build assets, a short cache for the search
+        // index, plain text for direct Markdown fetches, cross-origin
+        // discovery catalogs, and the API catalog's RFC 9727 media type
+        // (which the Worker set itself).
+        Route(when: .path(prefix: "/_astro")) {
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Cache-Control", "public, max-age=31536000, immutable"))
+            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
+        }
+        Route(when: .path(prefix: "/pagefind")) {
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Cache-Control", "public, max-age=3600"))
+            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
+        }
+        Route(when: .path(glob: "*.md")) {
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Content-Type", "text/plain; charset=utf-8"))
+            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
+        }
+        Route(when: .path(exact: "/.well-known/api-catalog")) {
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Access-Control-Allow-Origin", "*"), .set("Content-Type", "application/linkset+json"))
+            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
+        }
+        Route(when: .path(prefix: "/.well-known")) {
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Access-Control-Allow-Origin", "*"))
+            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
+        }
         // 📄 Agents that ask for markdown get the twin on the same URL: the
         // directory's `index.md`, or the sibling `<name>.md`; a miss carries
         // on to the normal file server unchanged. The `index.md` copies are
@@ -96,9 +128,9 @@ HTTPListener(on: ":443") {
         }
         Fallback {
             // 🔗 `public/_headers` states these on the Cloudflare deployment;
-            // the native file server does not read that file, so the Paris
-            // node states the same rules here.
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", "</.well-known/api-catalog>; rel=\"api-catalog\", </llms.txt>; rel=\"describedby\", </sitemap.xml>; rel=\"sitemap\""))
+            // the native file server does not read that file, so the same
+            // rules are stated here.
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink))
             ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
         }
     }
@@ -134,6 +166,27 @@ HTTPListener(on: ":443") {
             Proxy(to: cfWorker, headersUp: [.set("Host", "cf.pingclair.com")])
             .upstreamTLS(.enabled(serverName: "cf.pingclair.com"))
         }
+        // 🗂️ The same edge rules as the apex site.
+        Route(when: .path(prefix: "/_astro")) {
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Cache-Control", "public, max-age=31536000, immutable"))
+            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
+        }
+        Route(when: .path(prefix: "/pagefind")) {
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Cache-Control", "public, max-age=3600"))
+            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
+        }
+        Route(when: .path(glob: "*.md")) {
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Content-Type", "text/plain; charset=utf-8"))
+            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
+        }
+        Route(when: .path(exact: "/.well-known/api-catalog")) {
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Access-Control-Allow-Origin", "*"), .set("Content-Type", "application/linkset+json"))
+            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
+        }
+        Route(when: .path(prefix: "/.well-known")) {
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Access-Control-Allow-Origin", "*"))
+            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
+        }
         // 📄 The same markdown negotiation as the apex site.
         Route(when: .header(name: "Accept", contains: "text/markdown")) {
             TryFiles(candidates: [.requestPath(appending: "index.md"), .requestPath(appending: ".md")], root: "/usr/local/www/pingclair.pingclair.com")
@@ -141,7 +194,7 @@ HTTPListener(on: ":443") {
         }
         Fallback {
             // 🔗 The same header set as the apex site.
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", "</.well-known/api-catalog>; rel=\"api-catalog\", </llms.txt>; rel=\"describedby\", </sitemap.xml>; rel=\"sitemap\""))
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink))
             ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
         }
     }
