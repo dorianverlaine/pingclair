@@ -40,6 +40,10 @@ Pingclair 官方网站：[https://pingclair.com](https://pingclair.com)
 AutomaticTLS(mode: .automatic, httpPort: 80, httpsPort: 443)
 Storage(root: "/var/db/pingclair")
 
+// 🔁 The Admin API on loopback, so `pingclair reload` can hot-reload this
+// file instead of a restart dropping connections.
+Admin(listen: "127.0.0.1:2019")
+
 // 🧊 The one-line install address: `https://pingclair.com/install.sh`.
 //
 // The script lives in the server repository and is published to the release
@@ -90,7 +94,13 @@ HTTPListener(on: ":443") {
             TryFiles(candidates: [.requestPath(appending: "index.md"), .requestPath(appending: ".md")], root: "/usr/local/www/pingclair.pingclair.com")
             ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
         }
-        Fallback { ServeFiles(root: "/usr/local/www/pingclair.pingclair.com") }
+        Fallback {
+            // 🔗 `public/_headers` states these on the Cloudflare deployment;
+            // the native file server does not read that file, so the Paris
+            // node states the same rules here.
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", "</.well-known/api-catalog>; rel=\"api-catalog\", </llms.txt>; rel=\"describedby\", </sitemap.xml>; rel=\"sitemap\""))
+            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
+        }
     }
     // 🧾 Starlight ships a 404 page; unknown paths answer with it, the same
     // as the Cloudflare deployment's `not_found_handling`.
@@ -129,7 +139,11 @@ HTTPListener(on: ":443") {
             TryFiles(candidates: [.requestPath(appending: "index.md"), .requestPath(appending: ".md")], root: "/usr/local/www/pingclair.pingclair.com")
             ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
         }
-        Fallback { ServeFiles(root: "/usr/local/www/pingclair.pingclair.com") }
+        Fallback {
+            // 🔗 The same header set as the apex site.
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", "</.well-known/api-catalog>; rel=\"api-catalog\", </llms.txt>; rel=\"describedby\", </sitemap.xml>; rel=\"sitemap\""))
+            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
+        }
     }
     .errorPage(for: [.status(404)], file: "/usr/local/www/pingclair.pingclair.com/404.html")
     .encode(.zstd, .gzip)
@@ -153,11 +167,14 @@ HTTPListener(on: ":443") {
 ```swift
 AutomaticTLS(mode: .automatic, httpPort: 80, httpsPort: 443)
 Storage(root: "/var/db/pingclair")
+Admin(listen: "127.0.0.1:2019")
 ```
 
 `AutomaticTLS` 启用自动证书管理，配置 HTTP 和 HTTPS 端口，以支持证书签发与续期流程。
 
 `Storage` 指定持久化数据目录，用于保存 TLS 证书、ACME 账户密钥及相关状态信息。
+
+`Admin` 在本机回环地址上开放管理 API；这让配置变更可以热重载应用，而不必重启服务。
 
 此外，配置使用 `let` 声明两个上游地址：
 

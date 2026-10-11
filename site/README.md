@@ -40,6 +40,10 @@ The original English comments are preserved to facilitate comparison with the de
 AutomaticTLS(mode: .automatic, httpPort: 80, httpsPort: 443)
 Storage(root: "/var/db/pingclair")
 
+// 🔁 The Admin API on loopback, so `pingclair reload` can hot-reload this
+// file instead of a restart dropping connections.
+Admin(listen: "127.0.0.1:2019")
+
 // 🧊 The one-line install address: `https://pingclair.com/install.sh`.
 //
 // The script lives in the server repository and is published to the release
@@ -90,7 +94,13 @@ HTTPListener(on: ":443") {
             TryFiles(candidates: [.requestPath(appending: "index.md"), .requestPath(appending: ".md")], root: "/usr/local/www/pingclair.pingclair.com")
             ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
         }
-        Fallback { ServeFiles(root: "/usr/local/www/pingclair.pingclair.com") }
+        Fallback {
+            // 🔗 `public/_headers` states these on the Cloudflare deployment;
+            // the native file server does not read that file, so the Paris
+            // node states the same rules here.
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", "</.well-known/api-catalog>; rel=\"api-catalog\", </llms.txt>; rel=\"describedby\", </sitemap.xml>; rel=\"sitemap\""))
+            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
+        }
     }
     // 🧾 Starlight ships a 404 page; unknown paths answer with it, the same
     // as the Cloudflare deployment's `not_found_handling`.
@@ -129,7 +139,11 @@ HTTPListener(on: ":443") {
             TryFiles(candidates: [.requestPath(appending: "index.md"), .requestPath(appending: ".md")], root: "/usr/local/www/pingclair.pingclair.com")
             ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
         }
-        Fallback { ServeFiles(root: "/usr/local/www/pingclair.pingclair.com") }
+        Fallback {
+            // 🔗 The same header set as the apex site.
+            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", "</.well-known/api-catalog>; rel=\"api-catalog\", </llms.txt>; rel=\"describedby\", </sitemap.xml>; rel=\"sitemap\""))
+            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
+        }
     }
     .errorPage(for: [.status(404)], file: "/usr/local/www/pingclair.pingclair.com/404.html")
     .encode(.zstd, .gzip)
@@ -153,11 +167,14 @@ HTTPListener(on: ":443") {
 ```swift
 AutomaticTLS(mode: .automatic, httpPort: 80, httpsPort: 443)
 Storage(root: "/var/db/pingclair")
+Admin(listen: "127.0.0.1:2019")
 ```
 
 `AutomaticTLS` enables automatic certificate management and configures the HTTP and HTTPS ports used to support certificate issuance and renewal.
 
 `Storage` specifies the persistent data directory for TLS certificates, ACME account keys, and related state information.
+
+`Admin` publishes the administration API on the loopback address; that is what makes a hot reload possible, so configuration edits do not require a restart.
 
 The configuration also uses `let` declarations to define two upstream addresses:
 
