@@ -57,6 +57,11 @@ Existing numeric JSON statuses remain explicit, and common validation rejects
 explicit statuses outside 200–599 because `Respond` sends a final HTTP
 response.
 
+Signal handlers are claimed before the readiness announcement, so a SIGHUP
+delivered in the first moments after startup is ignored instead of killing the
+process through its default action. This closes a startup window that could
+terminate the server with no log line (#299).
+
 Native `RequestHeader`, `ResponseHeader` and `Proxy` header set, append and
 default values retain literal braces through JSON export and reload. Legacy
 template strings remain templates. HTTP/3 now also forwards appended proxy

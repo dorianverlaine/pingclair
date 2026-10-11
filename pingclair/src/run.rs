@@ -388,15 +388,37 @@ pub(crate) fn run_server_with_adapter(
         },
     )?;
 
+    // 🛑🔔 Claim every signal handler before the readiness announcement below.
+    //
+    // 🙈 Claiming a stream is what registers the process-wide handler: the
+    // default terminate action (SIGHUP above all) is gone the moment the claim
+    // returns. Spawning the listener tasks alone orders nothing — a task may
+    // first run after READY — and a SIGHUP delivered in that window kills the
+    // process with no log line at all (#299). The tasks below only consume
+    // what was claimed here.
+    #[cfg(unix)]
+    let (reload_signals, stop_signals) = bg_handle.block_on(async {
+        (
+            reload::ReloadSignals::claim(),
+            crate::shutdown::StopSignals::claim(),
+        )
+    });
+
     // 🔔 SIGUSR1 reloads the configuration file; see `reload`.
     #[cfg(unix)]
-    {
-        bg_handle.spawn(reload::listen_for_reload(
-            config_path.clone(),
-            adapter,
-            config_publisher.clone(),
-            api_changed.clone(),
-        ));
+    match reload_signals {
+        Ok(signals) => {
+            bg_handle.spawn(reload::listen_for_reload(
+                signals,
+                config_path.clone(),
+                adapter,
+                config_publisher.clone(),
+                api_changed.clone(),
+            ));
+        }
+        Err(error) => {
+            tracing::error!("❌ Failed to claim the reload signals: {error}");
+        }
     }
 
     // 🔄 ========================================
@@ -426,6 +448,7 @@ pub(crate) fn run_server_with_adapter(
     // flushes the logs, and exits.
     #[cfg(unix)]
     bg_handle.spawn(crate::shutdown::listen_for_stop(
+        stop_signals,
         admin_shutdown.clone(),
         stop_requested,
     ));

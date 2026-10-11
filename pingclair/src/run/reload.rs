@@ -14,37 +14,51 @@ use crate::systemd::notify_systemd_status;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+/// 🔔 The reload signals, claimed before readiness.
+///
+/// Claiming a stream is what registers the process-wide handler: the default
+/// terminate-on-SIGHUP action is gone the moment [`ReloadSignals::claim`]
+/// returns. The caller claims it *before* announcing readiness, because
+/// spawning this listener alone orders nothing — the task may first run after
+/// READY — and a SIGHUP delivered in that window kills the process with no
+/// log line at all (#299).
+pub(super) struct ReloadSignals {
+    /// SIGHUP: claimed only so the default action retires; never read.
+    hup: tokio::signal::unix::Signal,
+    usr1: tokio::signal::unix::Signal,
+}
+
+impl ReloadSignals {
+    /// Claims both streams; must run inside the background runtime's context.
+    pub(super) fn claim() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            hup: signal(SignalKind::hangup())?,
+            usr1: signal(SignalKind::user_defined1())?,
+        })
+    }
+}
+
 /// 🔔 Waits for SIGUSR1 forever and reloads `config_path` on each one.
 ///
 /// 🚫 Once the Admin API has changed the configuration, `api_changed` is set
 /// and a signal is ignored with a warning: the file on disk no longer
 /// describes what is running, so reloading it would silently undo the API.
 pub(super) async fn listen_for_reload(
+    signals: ReloadSignals,
     config_path: String,
     adapter: Option<crate::cli::config::ConfigAdapter>,
     publisher_for_reload: Arc<dyn pingclair_proxy::server::ConfigPublisher>,
     api_changed_for_reload: Arc<AtomicBool>,
 ) {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    // 🚦 SIGUSR1 is Caddy's reload signal; SIGHUP is deliberately
-    // ignored, matching Caddy's signal table.
-    // 🙈 Claiming the stream registers the handler, so the default
-    // terminate-on-SIGHUP action never fires; the signal is dropped.
-    let mut _hup_ignored = match signal(SignalKind::hangup()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("❌ Failed to create SIGHUP listener: {}", e);
-            return;
-        }
-    };
-    let mut usr1_stream = match signal(SignalKind::user_defined1()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("❌ Failed to create SIGUSR1 listener: {}", e);
-            return;
-        }
-    };
+    // 🚦 SIGUSR1 is Caddy's reload signal; SIGHUP is deliberately ignored,
+    // matching Caddy's signal table. Both streams were claimed before the
+    // readiness announcement, so the handler is already installed; holding
+    // the HUP stream without polling it is the "ignored" part.
+    let ReloadSignals {
+        hup: _hup_ignored,
+        usr1: mut usr1_stream,
+    } = signals;
 
     tracing::info!(
         "📡 Reload listener active (SIGUSR1, Config: {})",

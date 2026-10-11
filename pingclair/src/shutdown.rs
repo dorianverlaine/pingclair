@@ -63,14 +63,49 @@ use crate::systemd::notify_systemd_stopping;
 /// redesign rather than another number here.
 const FLUSH_BUDGET: Duration = Duration::from_secs(1);
 
+/// 🛑 The stop signals, claimed before readiness.
+///
+/// Claiming a stream registers the process-wide handler, so none of SIGINT,
+/// SIGTERM or SIGQUIT can still hit its default action once the service has
+/// announced itself.
+#[cfg(unix)]
+pub(crate) struct StopSignals {
+    term: Option<tokio::signal::unix::Signal>,
+    quit: Option<tokio::signal::unix::Signal>,
+    int: Option<tokio::signal::unix::Signal>,
+}
+
+#[cfg(unix)]
+impl StopSignals {
+    /// Claims every stop signal; must run inside the background runtime's
+    /// context.
+    ///
+    /// 🚧 A stream that cannot be claimed is reported and skipped, not fatal:
+    /// the other ways to stop still work.
+    pub(crate) fn claim() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+        let claim = |kind: SignalKind, name: &str| match signal(kind) {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                tracing::error!("❌ Failed to create {name} listener: {error}");
+                None
+            }
+        };
+        Self {
+            term: claim(SignalKind::terminate(), "SIGTERM"),
+            quit: claim(SignalKind::quit(), "SIGQUIT"),
+            int: claim(SignalKind::interrupt(), "SIGINT"),
+        }
+    }
+}
+
 /// 🛑 Listens for every way to ask this process to stop, from startup on.
 ///
-/// The signal handlers are installed here, on the background runtime, before
-/// Pingora starts its services, because Pingora only asks [`SignalWatch`]
-/// once its services are running. A SIGTERM that arrived in between would
-/// otherwise hit the default action and kill the process without draining its
-/// logs. Here it is recorded, and the graceful stop begins as soon as Pingora
-/// looks.
+/// The signals arrive pre-claimed ([`StopSignals::claim`]) because Pingora
+/// only asks [`SignalWatch`] once its services are running, and a SIGTERM
+/// that arrived before the handlers were registered would hit the default
+/// action and kill the process without draining its logs. Claimed, it is
+/// recorded, and the graceful stop begins as soon as Pingora looks.
 ///
 /// Pingora's own watcher would treat SIGQUIT as "hand the sockets to a new
 /// process" and SIGINT as "stop without waiting". Neither matches Caddy's
@@ -78,35 +113,32 @@ const FLUSH_BUDGET: Duration = Duration::from_secs(1);
 /// API's `POST /stop` all become one graceful stop.
 #[cfg(unix)]
 pub(crate) async fn listen_for_stop(
+    signals: StopSignals,
     admin: std::sync::Arc<tokio::sync::Notify>,
     requested: watch::Sender<bool>,
 ) {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let (sigterm, sigquit) = (signal(SignalKind::terminate()), signal(SignalKind::quit()));
-    // 🚧 A listener that could not be installed is reported and skipped, not
-    // fatal: the other ways to stop still work.
-    if let Err(e) = &sigterm {
-        tracing::error!("❌ Failed to create SIGTERM listener: {}", e);
-    }
-    if let Err(e) = &sigquit {
-        tracing::error!("❌ Failed to create SIGQUIT listener: {}", e);
-    }
+    let StopSignals { term, quit, int } = signals;
     let term = async {
-        match sigterm {
-            Ok(mut stream) => stream.recv().await,
-            Err(_) => std::future::pending().await,
+        match term {
+            Some(mut stream) => stream.recv().await,
+            None => std::future::pending().await,
         }
     };
     let quit = async {
-        match sigquit {
-            Ok(mut stream) => stream.recv().await,
-            Err(_) => std::future::pending().await,
+        match quit {
+            Some(mut stream) => stream.recv().await,
+            None => std::future::pending().await,
+        }
+    };
+    let interrupt = async {
+        match int {
+            Some(mut stream) => stream.recv().await,
+            None => std::future::pending().await,
         }
     };
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
+        _ = interrupt => {
             tracing::info!("🛑 Received SIGINT, shutting down");
         }
         _ = term => {

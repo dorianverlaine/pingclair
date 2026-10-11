@@ -316,7 +316,10 @@ async fn cli_stdin_startup_survives_reload_signals() {
         )
         .unwrap();
     let mut ready = false;
-    for _ in 0..200 {
+    // 🔍 A fine poll keeps the readiness observation close to the instant the
+    // announcement is written; a coarse one would give a not-yet-ordered
+    // startup time to catch up and hide the ordering this test exists to pin.
+    for _ in 0..2000 {
         assert!(child.0.try_wait().unwrap().is_none());
         let mut message = [0; 512];
         if let Ok(length) = notify.recv(&mut message)
@@ -325,9 +328,29 @@ async fn cli_stdin_startup_survives_reload_signals() {
             ready = true;
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     assert!(ready);
+    // 🛡️ Readiness must not precede the handlers. Claiming them is what
+    // retires the default terminate actions, so the kernel's caught-signal
+    // mask already names SIGINT (2), SIGQUIT (3), SIGHUP (1), SIGUSR1 (10)
+    // and SIGTERM (15) the moment READY=1 is observable (#299).
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", child.0.id()))
+            .expect("the child's status");
+        let caught = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigCgt:"))
+            .expect("SigCgt in the child's status");
+        let mask = u64::from_str_radix(caught.trim(), 16).expect("a hex mask");
+        let wanted = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 9) | (1 << 14);
+        assert_eq!(
+            mask & wanted,
+            wanted,
+            "signal handlers must be claimed before READY=1:\n{status}"
+        );
+    }
     let client = super::no_proxy_client();
     for signal in ["-HUP", "-USR1"] {
         assert!(
