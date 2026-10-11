@@ -2,9 +2,11 @@
 
 This independent test module runs the real Pingclair binary through quic-go
 v0.63.0. It adds controlled stream and lifecycle tests alongside the maintained
-curl/ngtcp2/nghttp3 scripts. `just h3` keeps its existing behavior.
+curl/ngtcp2/nghttp3 scripts. `just h3` runs both client matrices against the
+same freshly built release binary.
 
-Install Go, then run `just h3-go` to build the release binary and test it.
+Install Go, then run `just h3` for the complete gate, or `just h3-go` to build
+the release binary and run only the Go matrix.
 `just h3-go-test /absolute/path/to/pingclair` tests an existing binary;
 `just h3-go-check` checks formatting and runs vet. The recipes pin Go 1.27.1,
 use read-only dependencies, and enable the race detector for live tests.
@@ -29,7 +31,7 @@ dialing bypasses system proxies. Bodies and diagnostic reads are bounded;
 full log assertions scan line by line so bursts cannot hide early failures.
 Cleanup signals only the fixture's child process and waits for it to exit.
 
-Eight-second operation deadlines detect hangs; they are not performance
+Twenty-second operation deadlines detect hangs; they are not performance
 thresholds. These tests do not replace TLS authentication, default-SNI,
 large-upload, or curl interoperability coverage. The pinned quic-go API
 reports GOAWAY as `connection in graceful shutdown`; it does not expose the

@@ -14,6 +14,14 @@ fact.
 
 ## [Unreleased]
 
+### 🌊 HTTP/3 streaming keeps its response wakeup
+
+Response events dequeued after a write pass now schedule the next pass instead
+of waiting for another inbound packet or handler event. This prevents an SSE
+chunk from remaining queued on an otherwise quiet connection (#331), while
+QUIC flow-control blocking still waits without spinning. `just h3` now runs
+both the curl and Go client matrices, matching the Linux CI gate.
+
 ### 🔌 WebSocket handshakes survive either event ordering
 
 Backport the fix from Pingora PR #947 onto the published `pingora-proxy 0.9.0`

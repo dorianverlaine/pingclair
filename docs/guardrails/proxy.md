@@ -108,6 +108,10 @@ follow from it.
 - H3 request and response bodies must keep their **bounded channels, QUIC flow
   control, and streaming**. Never switch to full buffering for the sake of
   middleware parity.
+- 🌊 Applying a response event after a write pass must schedule another pass.
+  The event has already left the channel, so waiting on that channel alone can
+  strand an SSE chunk until another packet arrives. Consume the wake once;
+  blocked QUIC flow control must still wait for transport progress.
 - **0-RTT early data is disabled by default**: a reverse proxy supports
   non-idempotent methods and there is no replay protection yet. **Do not re-enable
   it** before route/method policy, replay semantics, and negative tests are done.

@@ -58,3 +58,6 @@ just ci
 ```
 
 Use `just lint` or `just test` when only one half is needed.
+For H3 or TLS changes, also run `just h3`. It builds one release binary and
+runs the curl interoperability and Go behavioral matrices; `h3.yml` invokes
+the same recipe after installing both clients.

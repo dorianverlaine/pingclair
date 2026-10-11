@@ -77,7 +77,7 @@ bench-smoke:
 l4-resources *args:
     python3 scripts/test-l4-dns-resources.py "$@"
 
-# 🛰️ Run the full HTTP/3 functional matrix against a fresh release binary.
+# 🛰️ Run both HTTP/3 client matrices against a fresh release binary.
 h3:
     cargo +{{ rust }} build --release --locked
     PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-22-septembre-2026-local.sh
@@ -87,6 +87,7 @@ h3:
     # 🧯 The local-failure matrix runs the real binary with a lowered descriptor
     # limit, which is why it cannot live in the in-process H3 test suite.
     PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-local-resource-failure-local.sh
+    just h3-go-test
 
 # 🛰️ Add a pinned Go client to the maintained curl interoperability matrix.
 h3-go:

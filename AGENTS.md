@@ -37,7 +37,7 @@ just shear            # unused-dependency check
 just repo-lint        # mechanical repository invariants
 just docs-lint        # codespell + markdownlint
 just bench / bench-smoke
-just h3               # the three HTTP/3 verification scripts
+just h3               # the curl and Go HTTP/3 client matrices
 just disk / cache-report
 just install          # install the pinned local tooling
 ```
@@ -388,9 +388,11 @@ H3 or TLS dependency changes, run:
 just h3
 ```
 
-which covers the three maintained scripts
+which covers the maintained curl scripts
 (`test-h3-22-septembre-2026-local.sh`, `test-h3-cancellation-local.sh`,
-`test-h3-client-auth-local.sh`). CI runs the Linux H3 gate post-merge on
+`test-h3-client-auth-local.sh`), default-SNI and resource-failure checks,
+and the Go HTTP/3 behavioral matrix (Go 1.27.1). CI runs the same Linux H3 gate
+post-merge on
 `ubuntu-24.04`; a manual Linux box can use `rust:1.99-bookworm` with `cmake`
 and `clang`/`libclang-dev` for BoringSSL/bindgen. The H3 client must be a
 curl built on ngtcp2/nghttp3 (Homebrew curl provides one; the macOS system

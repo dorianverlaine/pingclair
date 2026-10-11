@@ -95,7 +95,7 @@ for i in $(seq 1 6); do "$BIN" > /tmp/full_$i.log 2>&1 & done; wait
 ### H3 verification
 
 macOS unit tests do not validate linking or QUIC behavior. After any change to
-H3 or the TLS dependency tree, run `just h3` (the three maintained scripts)
+H3 or the TLS dependency tree, run `just h3` (the curl and Go client matrices)
 and the Linux half:
 
 ```bash

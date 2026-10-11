@@ -1181,6 +1181,8 @@ struct H3App {
     /// a handler whose stream is over [`BODY_QUEUE_CAP`] blocks on send
     /// instead of letting the worker buffer the whole body out of order.
     deferred: Option<RespEvent>,
+    /// 🌊 Events applied since the last flush still need a write pass.
+    response_write_pending: bool,
     body_notify: Arc<Notify>,
     /// 🪪 The server name this connection's handshake asked for.
     ///
@@ -1322,7 +1324,7 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
         // 🧲 Applies deferred or channel-head events first: a previous
         // iteration may have parked one while its stream was over the body
         // cap, and capacity may have opened since.
-        if self.apply_available_events() {
+        if std::mem::take(&mut self.response_write_pending) || self.apply_available_events() {
             return Ok(());
         }
         // 🛑 A parked event means the channel head cannot be applied yet.
@@ -1435,6 +1437,9 @@ impl tokio_quiche::ApplicationOverQuic for H3App {
 
         // 🧮 Applies deferred events whose streams may have room again.
         self.apply_available_events();
+        // 🌊 This pass attempts every queued write. Events applied after
+        // flushing set the flag again so the worker cannot sleep over them.
+        self.response_write_pending = false;
 
         let dirty: Vec<u64> = self
             .streams
@@ -1775,6 +1780,7 @@ impl QuicServer {
                 resp_tx,
                 resp_rx,
                 deferred: None,
+                response_write_pending: false,
                 body_notify: Arc::new(Notify::new()),
                 _slot: ConnectionSlot(Arc::clone(&live_connections)),
                 goaway_from: None,
@@ -2316,6 +2322,7 @@ impl H3App {
             if ss.dead || ss.handler_cancelled {
                 return;
             }
+            self.response_write_pending = true;
             match ev.msg {
                 RespMsg::Headers(headers, fin) => {
                     // 🔪 A second header block means someone tried to answer
@@ -7693,6 +7700,10 @@ async fn send_error_response(
 }
 
 // MARK: - Tests
+
+#[cfg(test)]
+#[path = "quic/response_wakeup_tests.rs"]
+mod response_wakeup_tests;
 
 #[cfg(test)]
 mod tests {
