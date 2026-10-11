@@ -13,15 +13,30 @@ permissions:
   contents: read
 
 jobs:
+  # 🧊 The builder image publishes — or proves current — the Linux build
+  # environment before the container jobs pull `:v1`, so a toolchain bump
+  # cannot race its own consumers (#300).
+  builder:
+    name: Builder image
+    # 🔐 The called workflow's build and manifest jobs push to GHCR, and the
+    # caller's permissions are their ceiling. Nothing publishes on a pull
+    # request — the gate keeps `:v1` where it is — so the grant is inert there.
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/builder-image.yml
+
   # Reusable children are kept alphabetized; the `required` job is the single
   # status the main-branch ruleset should require.
   rust-ci:
     name: Rust CI
+    needs: builder
     uses: ./.github/workflows/rust-ci.yml
     secrets: inherit
 
   docker:
     name: Docker
+    needs: builder
     uses: ./.github/workflows/docker.yml
     secrets: inherit
 

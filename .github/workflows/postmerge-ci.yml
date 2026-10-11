@@ -12,8 +12,20 @@ permissions:
   contents: read
 
 jobs:
+  # 🧊 The same ordering rule as blocking CI: the environment is published, or
+  # proven current, before the container jobs pull `:v1` (#300).
+  builder:
+    name: Builder image
+    # 🔐 The called workflow's build and manifest jobs push to GHCR, and the
+    # caller's permissions are their ceiling.
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/builder-image.yml
+
   rust-ci-full:
     name: Rust CI full
+    needs: builder
     uses: ./.github/workflows/rust-ci-full.yml
     secrets: inherit
 

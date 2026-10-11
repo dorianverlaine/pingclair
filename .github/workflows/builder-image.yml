@@ -7,21 +7,67 @@ name: Builder image
 # `deployment/Dockerfile` refer to, so a rebuild moves every builder at once —
 # which is the point: the cache is only shared by machines that agree on the
 # environment, and this file is where the environment is decided.
+#
+# 🏁 The publish has to finish before any container job starts, which is why
+# `blocking-ci.yml` and `postmerge-ci.yml` call this workflow first and their
+# container jobs `needs:` it. The gate compares the
+# `org.pingclair.builder-fingerprint` label on `:v1` with the fingerprint of
+# the environment sources (`.github/scripts/builder_fingerprint.py`): an
+# unchanged environment costs one small registry read, and a changed one is
+# published before its first consumer (#300).
 on:
-  push:
-    branches: [main]
-    paths:
-      - deployment/Builder.Dockerfile
-      - deployment/apt-retry.sh
-      - .github/workflows/builder-image.yml
+  workflow_call:
   workflow_dispatch:
+    inputs:
+      force:
+        description: Publish even when the fingerprint already matches
+        type: boolean
+        default: false
+
+concurrency:
+  # 🚦 One publisher at a time: a concurrent caller waits, then the gate
+  # re-reads `:v1` and skips the build the first caller just did.
+  group: builder-image
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
+  gate:
+    name: Decide
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Decide whether the environment has to be republished
+        id: decide
+        run: |
+          set -euo pipefail
+          publish=false
+          # 🚫 Only a push to main publishes on its own. A pull request's jobs
+          # keep the published `:v1`, so an unmerged branch cannot move the tag
+          # that every builder consumes.
+          if [[ "${{ github.event_name }}" != "pull_request" \
+                && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            if [[ "${{ inputs.force }}" == "true" ]]; then
+              echo "🧊 forced republish" >&2
+              publish=true
+            elif [[ "$(python3 .github/scripts/builder_fingerprint.py needs-build)" == "true" ]]; then
+              publish=true
+            fi
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build (${{ matrix.platform.name }})
+    needs: gate
+    if: needs.gate.outputs.publish == 'true'
     runs-on: ${{ matrix.platform.runner }}
     timeout-minutes: 60
     permissions:
@@ -46,6 +92,10 @@ jobs:
         id: version
         run: echo "tag=v1-$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
+      - name: Fingerprint the environment
+        id: fingerprint
+        run: echo "value=$(python3 .github/scripts/builder_fingerprint.py compute)" >> "$GITHUB_OUTPUT"
+
       # 🚫 `docker build` on the runner whose architecture this is, never a
       # cross-platform build: an emulated image would hand the fabric a
       # toolchain no real machine of that architecture ever ran.
@@ -53,6 +103,7 @@ jobs:
         run: |
           set -euo pipefail
           docker build \
+            --label "org.pingclair.builder-fingerprint=${{ steps.fingerprint.outputs.value }}" \
             -f deployment/Builder.Dockerfile \
             -t "ghcr.io/dorianverlaine/pingclair-builder:${{ steps.version.outputs.tag }}-${{ matrix.platform.tag }}" \
             .
@@ -85,7 +136,7 @@ jobs:
           digest="$(docker inspect --format='{{index .RepoDigests 0}}' "$image")"
           # 📌 The digest of record for this architecture, printed so the
           # workflow log is the audit trail for what `:v1` pointed at.
-          echo "pushed ${digest}" >> "$GITHUB_STEP_SUMMARY"
+          echo "pushed ${digest} (${{ steps.fingerprint.outputs.value }})" >> "$GITHUB_STEP_SUMMARY"
 
   manifest:
     name: Publish :v1

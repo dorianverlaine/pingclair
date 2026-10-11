@@ -19,6 +19,7 @@ workflow, so a red result never masks another.
 | --- | --- | --- |
 | `blocking-ci.yml` | PR, push `main` | Merge-gate parent; owns the `CI required` status |
 | `postmerge-ci.yml` | push `main` | Full-gate parent; owns postmerge results |
+| `builder-image.yml` | workflow_call, dispatch | Publishes `:v1`, the frozen Linux build environment, or proves it current; called first by both CI parents |
 | `rust-ci.yml` | workflow_call, dispatch | Path-aware fast gate; runs `just ci` on Rust changes |
 | `rust-ci-full.yml` | workflow_call, dispatch, `**full-ci**` | Full orchestration: release Clippy, nextest shards |
 | `rust-ci-full-nextest-platform.yml` | workflow_call | Nextest archive + 4 shards + JUnit for one platform |
@@ -48,6 +49,15 @@ workflow, so a red result never masks another.
 5. Grant elevated `permissions` only to jobs that need them; everything else
    stays at `contents: read`.
 6. Matrices use `fail-fast: false` so every leg's failure stays visible.
+7. Container jobs consume `ghcr.io/dorianverlaine/pingclair-builder:v1` only
+   after `builder-image.yml` has run: both CI parents call it first and their
+   container jobs `needs:` it. Never add a container job without that edge, or
+   a toolchain bump races the environment it needs (#300). The gate reads the
+   image's `org.pingclair.builder-fingerprint` label, so an unchanged
+   environment costs seconds and concurrent callers serialize on the
+   workflow's own concurrency group. `release.yml` consumes `:v1` at tag
+   time; the tag is cut after the merge's CI is green, which is what keeps
+   that image current.
 
 ## The local gate
 

@@ -94,12 +94,11 @@ jobs:
       - uses: ./.github/actions/setup-ci
 
       - name: Make sure the pinned toolchain has rustfmt and clippy
-        # 🧰 The `:v1` builder image moves, and the workflow that pushes a new
-        # one starts at the same time as this job: on the run that bumps the
-        # toolchain, this container may still hold the previous image, and
-        # rustup's auto-install brings rustc without the components `just lint`
-        # needs. Asking for them is idempotent and costs nothing when the image
-        # is already current.
+        # 🧰 The builder gate publishes `:v1` before this job starts, so the
+        # container here is this commit's environment. Asking anyway is
+        # idempotent and costs nothing; it covers a tree whose toolchain moved
+        # without moving the image, where rustup's auto-install brings rustc
+        # without the components `just lint` needs.
         run: |
           set -euo pipefail
           rustup component add rustfmt clippy --toolchain "$(just --evaluate rust)"
