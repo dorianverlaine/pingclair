@@ -269,6 +269,19 @@ void every other site's number. The bound applies to HTTP/1 connections
 today; the HTTP/2 and HTTP/3 sessions do not carry the counter, and the
 engineering memory tracks that gap (#58).
 
+## [0.2.3]
+
+### 🔀 Each proxy in a `route` block reaches its own upstream
+
+A route kept one upstream pool and one proxy policy, taken from the first
+`reverse_proxy` in it, so a `route` block of several proxying `handle` blocks
+sent every proxied request to the first block's upstream, with that block's
+headers and TLS name. A `route` of mutually exclusive `handle` blocks, and a
+`handle` nested in a `handle`, now compile to one route per block, in order;
+when no block matches, the request carries on to the routes after them, as
+upstream's `route` does. A route that would still hold two proxies is refused
+at load, from a Pingclairfile, a JSON file or the Admin API alike.
+
 ## [0.2.2]
 
 ### 🛡️ Underscore-named request fields can be allowlisted
@@ -5189,7 +5202,8 @@ where nginx is still ahead.
   ever produced a measurement from a run where the component it patched was
   the saturated resource.
 
-[Unreleased]: https://github.com/dorianverlaine/pingclair/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/dorianverlaine/pingclair/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/dorianverlaine/pingclair/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/dorianverlaine/pingclair/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/dorianverlaine/pingclair/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/dorianverlaine/pingclair/compare/v0.1.7...v0.2.0
