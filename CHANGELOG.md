@@ -25,6 +25,8 @@ when no block matches, the request carries on to the routes after them, as
 upstream's `route` does. A route that would still hold two proxies is refused
 at load, from a Pingclairfile, a JSON file or the Admin API alike.
 
+## [0.2.2]
+
 ### 🛡️ Underscore-named request fields can be allowlisted
 
 A request field containing an underscore was dropped before routing on every
