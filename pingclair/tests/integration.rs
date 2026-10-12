@@ -16676,6 +16676,10 @@ mod site_bind;
 #[path = "integration/default_bind_json.rs"]
 mod default_bind_json;
 
+// 🔒 Plaintext on the HTTPS port is refused on every entry point.
+#[path = "integration/https_port_plaintext.rs"]
+mod https_port_plaintext;
+
 // 🎯 An explicit site's name outranks a wildcard's `client_auth` (#259).
 #[path = "integration/client_auth_precedence.rs"]
 mod client_auth_precedence;

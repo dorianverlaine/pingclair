@@ -14,6 +14,24 @@ fact.
 
 ## [Unreleased]
 
+### 🔒 The HTTPS port never serves plaintext
+
+A configuration that would serve plaintext HTTP on port 443, or on the port
+`https_port` names, is now refused at load, by `validate`, `run`, a reload and
+the Admin `/load` endpoint alike. Before, four spellings loaded and served
+cleartext there: a Pingclairfile `http://example.com:443`, `tls off` on the
+HTTPS port, a native `HTTPListener(on: ":443")` without `.tls`, and a JSON
+`plaintext_listen` entry. The same refusal covers the plaintext Admin API on
+the HTTPS port and an `http_port` set to it. The check and the runtime now share
+one rule for whether a socket speaks TLS, so they cannot disagree.
+
+📦 **Upgrade:** Remove `http://` or `tls off` from a site on the HTTPS port so it
+serves TLS, or move plaintext to another port. Move an Admin API listening on
+the HTTPS port elsewhere. Three of these were accepted by the upstream
+Caddyfile and are now refused here on purpose: the Admin API on the HTTPS port,
+`http_port 443`, and an `http://` site on 443 while `https_port` names another
+port.
+
 ### 🌊 HTTP/3 streaming keeps its response wakeup
 
 Response events dequeued after a write pass now schedule the next pass instead

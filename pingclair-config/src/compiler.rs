@@ -1252,6 +1252,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
     validate_proxy_protocol_listeners(&bound)?;
     validate_listener_options(&bound)?;
     validate_plaintext_listeners(&bound)?;
+    crate::https_port::refuse_plaintext_on_https_port(&bound)?;
     crate::shared_ports::validate_shared_ports(&bound)?;
     validate_cache_ceiling_agrees(config)?;
     validate_log_channels_exist(config)?;
@@ -2787,23 +2788,13 @@ pub(crate) fn validate_plaintext_listeners(config: &PingclairConfig) -> CompileR
 
         for address in &server.listen {
             let normalized = normalize_config_listen(address);
-            let plaintext = server
-                .plaintext_listen
-                .iter()
-                .any(|declared| normalize_config_listen(declared) == normalized);
-            let requires_tls = if plaintext {
-                false
-            } else {
-                let port = normalized
-                    .rsplit_once(':')
-                    .and_then(|(_, port)| port.parse::<u16>().ok());
-                if port == Some(config.global.http_port) {
-                    false
-                } else {
-                    server.tls.is_some()
-                        || port.is_some_and(|port| port == config.global.https_port || port == 8443)
-                }
-            };
+            // 🔐 The runtime's own rule, so this check and the acceptor the
+            // runtime installs can never disagree about a socket.
+            let requires_tls = server.requires_tls_on(
+                &normalized,
+                config.global.http_port,
+                config.global.https_port,
+            );
 
             if let Some(existing) = policies.insert(normalized.clone(), requires_tls)
                 && existing != requires_tls

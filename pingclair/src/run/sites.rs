@@ -10,7 +10,7 @@
 //! addresses that must speak TLS. Nothing is bound here; that is the next
 //! phase, and it needs this whole picture first.
 
-use crate::listen::{automatic_http_companions, server_requires_tls};
+use crate::listen::automatic_http_companions;
 use pingclair_proxy::client_auth::PublishedListenerPolicy;
 use pingclair_proxy::server::PingclairProxy;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -83,7 +83,7 @@ pub(super) fn group_by_address(
             });
 
         for addr in listen_addrs {
-            if server_requires_tls(server_config, &addr, http_port, https_port) {
+            if server_config.requires_tls_on(&addr, http_port, https_port) {
                 tls_listeners.insert(addr.clone());
             }
             let listener_policy = listener_security_by_address

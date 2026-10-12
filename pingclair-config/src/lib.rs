@@ -32,6 +32,7 @@ pub mod describe;
 pub mod format;
 pub mod frontend;
 mod header_fields;
+mod https_port;
 mod layer4;
 mod layer4_dynamic;
 mod lint;
@@ -1332,6 +1333,9 @@ mod tests {
         assert_eq!(tls.key.as_deref(), Some("/etc/ssl/key.pem"));
     }
 
+    /// 📴 `tls off` still records the socket as plaintext in the adapted
+    /// document; on the HTTPS port, validation then refuses it (see
+    /// `https_port`), so this reads the adapter alone.
     #[test]
     fn test_compile_tls_off_disables_https_scheme_default() {
         let source = r#"
@@ -1341,7 +1345,7 @@ mod tests {
             }
         "#;
 
-        let config = compile(source).unwrap();
+        let config = adapt(source).unwrap();
         assert!(
             config.servers[0].tls.is_none(),
             "tls off must clear the https-scheme default"

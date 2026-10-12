@@ -12,7 +12,7 @@ async fn h3_typed_text_resolves_redirects_headers_and_error_bodies() {
     )
     .await;
     let source = format!(
-        r#"HTTPListener(on: ":443") {{
+        r#"HTTPListener(on: ":8080") {{
         Site(host: "*") {{
             Route(when: .path(exact: "/go")) {{
                 Redirect(to: Format("https://pingclair.com{{uri}}", uri: .uri),

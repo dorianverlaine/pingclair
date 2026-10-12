@@ -73,6 +73,15 @@
   through let any client name itself. It counts only when
   `client_ip_headers` lists it.
 - Misconfiguration always **fails closed**, never gets ignored silently.
+- 🔒 **The HTTPS port never serves plaintext.** Port 443, and the port
+  `https_port` names, are refused as plaintext listeners on every path — an
+  `http://` address, `tls off`, a native listener without `.tls`, a JSON
+  `plaintext_listen`, the Admin API, or an `http_port` set to them. Before
+  2026-10-12 all of these loaded and served cleartext where clients and
+  operators expect TLS. Whether a socket speaks TLS is decided by
+  `ServerConfig::requires_tls_on` alone, which both validation and the runtime
+  call; a second copy of that rule is how a validator passes a socket the
+  runtime then opens differently.
 - Sensitive fields (`Authorization`, `Cookie`, API keys) are **masked by default**
   in logs, metrics, Admin dumps, and panic messages.
 - Downgrade switches such as `insecure_skip_verify` must be **conspicuous and off

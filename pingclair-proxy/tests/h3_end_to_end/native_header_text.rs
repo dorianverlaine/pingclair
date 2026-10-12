@@ -9,7 +9,7 @@ async fn h3_native_header_literals_reach_both_sides_of_the_exchange() {
     )
     .await;
     let source = format!(
-        r#"HTTPListener(on: ":443") {{
+        r#"HTTPListener(on: ":8080") {{
         Site(host: "*") {{ Fallback {{
             RequestHeader(.set("X-Request", "{{host}}"), .append("X-Request", "{{path}}"))
             ResponseHeader(.set("X-Response", "{{host}}"), .append("X-Response", "{{path}}"),

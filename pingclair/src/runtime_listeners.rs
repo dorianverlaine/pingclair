@@ -21,9 +21,7 @@ mod bootstrap;
 #[cfg(unix)]
 pub(crate) use bootstrap::BootstrapRuntime;
 
-use crate::listen::{
-    bind_and_fold_listeners, normalize_listen_addr, server_requires_tls, servers_by_bind_address,
-};
+use crate::listen::{bind_and_fold_listeners, normalize_listen_addr, servers_by_bind_address};
 use parking_lot::{Mutex, RwLock};
 use pingclair_api::{AdminPolicy, PreparedAdminPolicy};
 use pingclair_core::config::{DnsChallengeConfig, PingclairConfig, ResourceLimitsConfig};
@@ -99,7 +97,7 @@ impl PreparedListenerPolicy {
     ) -> Result<Self, ConfigApplyError> {
         let tls_answers: HashSet<bool> = servers
             .iter()
-            .map(|server| server_requires_tls(server, address, http_port, https_port))
+            .map(|server| server.requires_tls_on(address, http_port, https_port))
             .collect();
         if tls_answers.len() > 1 {
             return Err(ConfigApplyError::invalid(format!(

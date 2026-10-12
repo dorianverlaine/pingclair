@@ -163,40 +163,6 @@ pub(crate) fn can_bind_automatic_http_port(http_port: u16) -> bool {
     std::net::TcpListener::bind(("0.0.0.0", http_port)).is_ok()
 }
 
-/// 🔐 Treats explicit TLS configuration as authoritative, except on the
-/// plaintext HTTP port.
-///
-/// Everything except the HTTP port keeps the previous rule: an explicit `tls`
-/// block enables TLS anywhere, and the HTTPS port (plus 8443, the legacy
-/// convention) implies it even without one.
-pub(crate) fn server_requires_tls(
-    config: &pingclair_core::config::ServerConfig,
-    addr: &str,
-    http_port: u16,
-    https_port: u16,
-) -> bool {
-    let normalized = normalize_listen_addr(addr);
-    if config
-        .plaintext_listen
-        .iter()
-        .any(|declared| normalize_listen_addr(declared) == normalized)
-    {
-        return false;
-    }
-
-    let port = addr
-        .rsplit_once(':')
-        .and_then(|(_, port)| port.parse::<u16>().ok());
-
-    // 🛡️ The plaintext HTTP port must never become a TLS listener: ACME's
-    // HTTP-01 probe arrives in the clear and would fail a TLS handshake.
-    if port == Some(http_port) {
-        return false;
-    }
-
-    config.tls.is_some() || port.is_some_and(|port| port == https_port || port == 8443)
-}
-
 /// 🌐 Collects names whose conventional HTTP listener is explicitly configured.
 ///
 /// Those names must stay routed to their plaintext site instead of being
@@ -388,70 +354,6 @@ mod tests {
             normalize_listen_addr(":8443")
                 .parse::<std::net::SocketAddr>()
                 .is_ok()
-        );
-    }
-
-    #[test]
-    fn explicit_tls_enables_nonstandard_https_listener() {
-        let config = pingclair_core::config::ServerConfig {
-            listen: vec!["127.0.0.1:21209".to_string()],
-            tls: Some(Default::default()),
-            ..Default::default()
-        };
-        assert!(server_requires_tls(&config, "127.0.0.1:21209", 80, 443));
-
-        let plain = pingclair_core::config::ServerConfig::default();
-        assert!(!server_requires_tls(&plain, "127.0.0.1:21209", 80, 443));
-        assert!(server_requires_tls(&plain, "[::]:443", 80, 443));
-        assert!(server_requires_tls(&plain, "[::]:8443", 80, 443));
-    }
-
-    /// 📴 Explicit plaintext policy wins over every port and TLS heuristic.
-    #[test]
-    fn explicit_http_and_tls_off_listeners_stay_plaintext() {
-        let explicit_http = pingclair_core::config::ServerConfig {
-            listen: vec!["127.0.0.1:21209".to_string()],
-            plaintext_listen: vec!["127.0.0.1:21209".to_string()],
-            tls: Some(Default::default()),
-            ..Default::default()
-        };
-        assert!(!server_requires_tls(
-            &explicit_http,
-            "127.0.0.1:21209",
-            80,
-            21209
-        ));
-
-        let tls_off = pingclair_core::config::ServerConfig {
-            listen: vec!["[::]:443".to_string()],
-            plaintext_listen: vec![":443".to_string()],
-            ..Default::default()
-        };
-        assert!(!server_requires_tls(&tls_off, "[::]:443", 80, 443));
-    }
-
-    /// 🚫 A `tls` block must not drag port 80 into TLS along with it.
-    ///
-    /// `example.com { listen :80  listen :443  tls auto }` is the config anyone
-    /// writes first, and it used to make port 80 a TLS listener. Let's Encrypt
-    /// then sent its plaintext HTTP-01 probe into a TLS handshake, the listener
-    /// logged `[HTTP_REQUEST]`, and the order failed — automatic HTTPS could
-    /// never obtain the certificate it was trying to install.
-    #[test]
-    fn port_80_stays_plaintext_even_with_an_explicit_tls_block() {
-        let config = pingclair_core::config::ServerConfig {
-            listen: vec!["[::]:80".to_string(), "[::]:443".to_string()],
-            tls: Some(Default::default()),
-            ..Default::default()
-        };
-
-        assert!(
-            !server_requires_tls(&config, "[::]:80", 80, 443),
-            "ACME HTTP-01 validation is plaintext on port 80 and must reach the proxy"
-        );
-        assert!(
-            server_requires_tls(&config, "[::]:443", 80, 443),
-            "the TLS block must still apply to the HTTPS listener"
         );
     }
 
