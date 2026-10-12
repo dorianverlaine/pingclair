@@ -80,8 +80,7 @@
 	# 📌 Each `reverse_proxy` sits in its own top-level `handle`: a build of
 	# Pingclair before the fix for proxies nested in one `route` sent every
 	# request of that route to its first proxy. Mutually exclusive `handle`
-	# blocks are ordered by path specificity, with the header-matched Markdown
-	# block after every path and the catch-all last.
+	# blocks are ordered by path specificity, with the catch-all last.
 	handle /install.sh {
 		import installer
 	}
@@ -127,19 +126,17 @@
 		file_server
 	}
 
-	# 📄 Agents that ask for Markdown get the twin on the same URL: the
-	# directory's `index.md`, or the sibling `<name>.md`; a miss carries on
-	# to the normal file server unchanged. The `index.md` copies are made
-	# at deploy time.
-	@markdown header Accept *text/markdown*
-	handle @markdown {
-		try_files {path}index.md {path}.md
-		file_server
-	}
-
+	# 📄 A client that prefers Markdown gets the page's twin on the same URL:
+	# `start/install.md` for `/start/install/`, or the directory's
+	# `index.md`. The preference is read from `Accept` quality values, so
+	# `text/markdown;q=0` is a refusal, a browser's `*/*` keeps the HTML, and
+	# an agent's `text/markdown, text/html` gets the Markdown it named. Every
+	# page response carries `Vary: Accept` for caches.
 	handle {
 		import edge_headers
-		file_server
+		file_server {
+			negotiate markdown
+		}
 	}
 
 	# 🧾 Starlight ships a 404 page; unknown paths answer with it, the same as

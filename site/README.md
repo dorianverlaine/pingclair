@@ -87,23 +87,20 @@ handle /install.sh {
     import installer
 }
 …
-@markdown header Accept *text/markdown*
-handle @markdown {
-    …
-}
 handle {
     import edge_headers
-    file_server
+    file_server {
+        negotiate markdown
+    }
 }
 ```
 
 `handle` blocks are mutually exclusive: the first one that matches answers the
 request. They are ordered by how specific their path is, so the exact paths and
 prefixes — the installer, the agent endpoints, the build assets, the search
-index, Markdown files and the `/.well-known` documents — come first; the block
-that matches on the `Accept` header comes after every path, and the block with
-no matcher comes last. None of the paths overlap, so that order is the order
-the site needs.
+index, Markdown files and the `/.well-known` documents — come first, and the
+block with no matcher comes last. None of the paths overlap, so that order is
+the order the site needs.
 
 ### 5. Proxying the installer, with a cache
 
@@ -157,22 +154,30 @@ catalog.
 ### 7. Markdown for AI agents
 
 ```caddyfile
-@markdown header Accept *text/markdown*
-handle @markdown {
-    try_files {path}index.md {path}.md
-    file_server
+handle {
+    import edge_headers
+    file_server {
+        negotiate markdown
+    }
 }
 ```
 
-A client whose `Accept` header contains `text/markdown` gets the page's
-Markdown twin on the same URL: the directory's `index.md`, or the sibling
-`<name>.md`. When neither exists, the request continues with its original path,
-so assets and pages without a twin are still served. Browsers keep getting
-HTML. The `index.md` copies are generated at deploy time.
+A client that prefers Markdown gets the page's Markdown twin on the same URL.
+For `/start/install/` that is the build's own `start/install.md`, or the
+directory's `index.md` where there is one, as for the home page; nothing is
+copied at deploy time. Pages without a twin, and assets, are served as before.
 
-This is a header test, not full HTTP content negotiation. Pingclair also offers
-`file_server { negotiate markdown }`, which follows RFC 9110's quality values
-and sets `Vary: Accept`; the site may move to it.
+The preference is read from the `Accept` quality values (RFC 9110):
+
+| `Accept` | Answer |
+| --- | --- |
+| `text/markdown` | Markdown |
+| `text/markdown, text/html` (what coding agents send) | Markdown: the client named it |
+| a browser's `text/html,…,*/*;q=0.8` | HTML |
+| `text/markdown;q=0, */*` | HTML: Markdown was refused |
+
+Every page response carries `Vary: Accept`, so a cache keeps the two versions
+apart.
 
 For background, see Cloudflare's [Agent Readiness](https://blog.cloudflare.com/agent-readiness/).
 

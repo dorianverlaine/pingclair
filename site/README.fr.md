@@ -88,13 +88,11 @@ handle /install.sh {
     import installer
 }
 …
-@markdown header Accept *text/markdown*
-handle @markdown {
-    …
-}
 handle {
     import edge_headers
-    file_server
+    file_server {
+        negotiate markdown
+    }
 }
 ```
 
@@ -102,9 +100,9 @@ Les blocs `handle` s'excluent mutuellement : le premier qui correspond répond �
 la requête. Ils sont classés selon la précision de leur chemin : les chemins
 exacts et les préfixes — script d'installation, points d'accès pour agents,
 ressources de build, index de recherche, fichiers Markdown et documents
-`/.well-known` — passent en premier ; le bloc qui teste l'en-tête `Accept` vient
-après tous les chemins, et le bloc sans condition en dernier. Aucun chemin ne se
-recoupe, si bien que cet ordre est celui dont le site a besoin.
+`/.well-known` — passent en premier, et le bloc sans condition en dernier.
+Aucun chemin ne se recoupe, si bien que cet ordre est celui dont le site a
+besoin.
 
 ### 5. Proxy du script d'installation, avec cache
 
@@ -159,23 +157,32 @@ pour le catalogue d'API.
 ### 7. Du Markdown pour les agents IA
 
 ```caddyfile
-@markdown header Accept *text/markdown*
-handle @markdown {
-    try_files {path}index.md {path}.md
-    file_server
+handle {
+    import edge_headers
+    file_server {
+        negotiate markdown
+    }
 }
 ```
 
-Un client dont l'en-tête `Accept` contient `text/markdown` reçoit la version
-Markdown de la page à la même URL : le `index.md` du répertoire, ou le fichier
-voisin `<nom>.md`. Si aucun n'existe, la requête continue avec son chemin
-d'origine, de sorte que les ressources et les pages sans version Markdown restent
-servies. Les navigateurs continuent de recevoir du HTML. Les copies `index.md`
-sont générées au déploiement.
+Un client qui préfère le Markdown reçoit la version Markdown de la page à la
+même URL. Pour `/start/install/`, c'est le `start/install.md` produit par le
+build, ou le `index.md` du répertoire quand il existe, comme pour la page
+d'accueil ; rien n'est copié au déploiement. Les pages sans version Markdown et
+les ressources sont servies comme avant.
 
-Il s'agit d'un test d'en-tête, pas d'une négociation de contenu HTTP complète.
-Pingclair propose aussi `file_server { negotiate markdown }`, qui suit les valeurs
-de qualité de la RFC 9110 et pose `Vary: Accept` ; le site pourrait l'adopter.
+La préférence se lit dans les valeurs de qualité de l'en-tête `Accept`
+(RFC 9110) :
+
+| `Accept` | Réponse |
+| --- | --- |
+| `text/markdown` | Markdown |
+| `text/markdown, text/html` (ce qu'envoient les agents de code) | Markdown : le client l'a nommé |
+| celui d'un navigateur, `text/html,…,*/*;q=0.8` | HTML |
+| `text/markdown;q=0, */*` | HTML : le Markdown est refusé |
+
+Chaque réponse de page porte `Vary: Accept`, si bien qu'un cache garde les deux
+versions séparées.
 
 Pour le contexte, voir l'article de Cloudflare [Agent Readiness](https://blog.cloudflare.com/agent-readiness/).
 

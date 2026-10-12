@@ -84,20 +84,17 @@ handle /install.sh {
     import installer
 }
 …
-@markdown header Accept *text/markdown*
-handle @markdown {
-    …
-}
 handle {
     import edge_headers
-    file_server
+    file_server {
+        negotiate markdown
+    }
 }
 ```
 
 `handle` 块彼此互斥：第一个匹配的负责响应。它们按路径的明确程度排序，因此精确路径与
 前缀（安装脚本、代理端点、构建产物、搜索索引、Markdown 文件与 `/.well-known` 文档）排在
-前面；按 `Accept` header 判断的块排在所有路径之后，没有条件的块排在最后。这些路径彼此
-没有重叠，所以这个顺序正是网站所需的顺序。
+前面，没有条件的块排在最后。这些路径彼此没有重叠，所以这个顺序正是网站所需的顺序。
 
 ### 5. 代理安装脚本并缓存
 
@@ -146,21 +143,28 @@ handle /_astro/* {
 ### 7. 面向 AI 代理的 Markdown
 
 ```caddyfile
-@markdown header Accept *text/markdown*
-handle @markdown {
-    try_files {path}index.md {path}.md
-    file_server
+handle {
+    import edge_headers
+    file_server {
+        negotiate markdown
+    }
 }
 ```
 
-`Accept` header 中包含 `text/markdown` 的客户端，会在同一个 URL 上获得页面的 Markdown
-版本：目录中的 `index.md`，或同名的 `<name>.md`。两者都不存在时，请求会以原始路径继续
-处理，因此静态资源和没有 Markdown 版本的页面依然可以访问；浏览器得到的仍是 HTML。
-`index.md` 副本在部署时生成。
+偏好 Markdown 的客户端，会在同一个 URL 上获得页面的 Markdown 版本。以 `/start/install/`
+为例，响应的是构建生成的 `start/install.md`；目录中有 `index.md` 时（例如首页）则使用
+它。部署时不再复制任何文件。没有 Markdown 版本的页面和静态资源照常提供。
 
-这是基于 header 的判断，而非完整的 HTTP 内容协商。Pingclair 另外提供
-`file_server { negotiate markdown }`，它按照 RFC 9110 的质量值判断并设置
-`Vary: Accept`，网站之后可能改用它。
+偏好按 `Accept` 的质量值判断（RFC 9110）：
+
+| `Accept` | 响应 |
+| --- | --- |
+| `text/markdown` | Markdown |
+| `text/markdown, text/html`（编程代理发送的） | Markdown：客户端明确写出了它 |
+| 浏览器的 `text/html,…,*/*;q=0.8` | HTML |
+| `text/markdown;q=0, */*` | HTML：Markdown 被拒绝 |
+
+每个页面响应都带 `Vary: Accept`，缓存会把两种版本分开存放。
 
 背景说明可参考 Cloudflare 的 [Agent Readiness](https://blog.cloudflare.com/agent-readiness/)。
 
