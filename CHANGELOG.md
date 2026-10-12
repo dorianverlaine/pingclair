@@ -146,8 +146,10 @@ them.
 `file_server { negotiate markdown }` lets the static file server answer a
 page request with its Markdown sibling: a directory URL reads `X/index.md` or
 `X.md`, an `X.html` URL reads `X.md`, and only when the client's `Accept`
-prefers `text/markdown` by RFC 9110's rules (`q=0` refuses; equal quality or
-no `Accept` keeps HTML). The sibling is read from the deployed tree — no
+prefers `text/markdown` by RFC 9110's rules (`q=0` refuses; no `Accept`, or
+a tie reached through wildcards such as a browser's `*/*`, keeps HTML; a tie
+where the client named `text/markdown` itself, as coding agents do with
+`text/markdown, text/html`, serves the Markdown). The sibling is read from the deployed tree — no
 build- or deploy-time copies — and every answer for a negotiated page carries
 `Vary: Accept`; a page whose HTML is refused with no sibling to stand in
 answers 406 instead of silently falling back.

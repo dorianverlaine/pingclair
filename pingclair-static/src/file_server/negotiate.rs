@@ -10,6 +10,12 @@
 //! malformed is ignored, and a type no range matches has quality 0 — which is
 //! what makes `text/markdown;q=0, */*;q=1` forbid Markdown while a browser's
 //! `*/*;q=0.8` leaves both representations equal and HTML the default.
+//!
+//! 🤖 A tie is broken by who named Markdown. A browser never writes
+//! `text/markdown`, so its tie comes from a wildcard and keeps the HTML. An
+//! agent that sends `text/markdown, text/html` named Markdown first-hand and
+//! asked for it; coding agents send exactly that header, and answering it
+//! with HTML would hand them the page they were trying to avoid.
 
 use http::HeaderValue;
 
@@ -21,6 +27,9 @@ pub(crate) type Quality = u16;
 pub(crate) struct PagePreference {
     /// 📝 The quality of `text/markdown`; `None` when no `Accept` was sent.
     pub(crate) markdown: Option<Quality>,
+    /// 🤖 Whether that quality came from a `text/markdown` range written out
+    /// by name rather than from `text/*` or `*/*`.
+    pub(crate) markdown_named: bool,
     /// 🌐 The quality of `text/html`; `None` when no `Accept` was sent.
     pub(crate) html: Option<Quality>,
 }
@@ -36,17 +45,22 @@ impl PagePreference {
             // said nothing usable, so it is treated like a missing header.
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        let markdown = quality(accept, "text", "markdown");
         Self {
-            markdown: quality(accept, "text", "markdown"),
-            html: quality(accept, "text", "html"),
+            markdown: markdown.map(|range| range.quality),
+            markdown_named: markdown.is_some_and(|range| range.named),
+            html: quality(accept, "text", "html").map(|range| range.quality),
         }
     }
 
-    /// 📝 Markdown is served when the client prefers it *strictly*: no
-    /// `Accept` at all, or equal quality, keeps the HTML — a tie is a browser
-    /// that mentioned neither type by name, and its `*/*` fallback says so.
+    /// 📝 Markdown is served when the client ranks it above HTML, or level
+    /// with HTML after naming `text/markdown` itself. No `Accept` at all, or
+    /// a tie reached through wildcards, keeps the HTML.
     pub(crate) fn prefers_markdown(&self) -> bool {
-        matches!((self.markdown, self.html), (Some(md), Some(html)) if md > html)
+        match (self.markdown, self.html) {
+            (Some(md), Some(html)) => md > html || (self.markdown_named && md > 0 && md == html),
+            _ => false,
+        }
     }
 
     /// 🚫 Whether the client refused the HTML representation outright.
@@ -55,12 +69,21 @@ impl PagePreference {
     }
 }
 
-/// 📏 The quality this header assigns to `type/subtype`, in thousandths.
+/// 📏 What one `Accept` header says about one media type.
+#[derive(Clone, Copy)]
+struct RangeQuality {
+    /// 🔢 The quality, in thousandths.
+    quality: Quality,
+    /// 🎯 Whether the deciding range named the type exactly.
+    named: bool,
+}
+
+/// 📏 The quality this header assigns to `type/subtype`.
 ///
 /// `None` means the request carried no `Accept` header — every representation
-/// is then acceptable, and the default applies. A value of 0 means the
+/// is then acceptable, and the default applies. A quality of 0 means the
 /// representation was refused, either by `q=0` or by matching no range.
-fn quality(accept: Option<&str>, type_: &str, subtype: &str) -> Option<Quality> {
+fn quality(accept: Option<&str>, type_: &str, subtype: &str) -> Option<RangeQuality> {
     let accept = accept?;
     let mut best: Option<(u8, Quality)> = None;
     for member in accept.split(',') {
@@ -94,7 +117,16 @@ fn quality(accept: Option<&str>, type_: &str, subtype: &str) -> Option<Quality> 
             best = Some((specificity, member_quality));
         }
     }
-    Some(best.map_or(0, |(_, quality)| quality))
+    Some(best.map_or(
+        RangeQuality {
+            quality: 0,
+            named: false,
+        },
+        |(specificity, quality)| RangeQuality {
+            quality,
+            named: specificity == 1,
+        },
+    ))
 }
 
 /// 🔢 The `q` parameter of one member, or 1 when it carries none.
@@ -158,6 +190,7 @@ mod tests {
             preference,
             PagePreference {
                 markdown: None,
+                markdown_named: false,
                 html: None
             }
         );
@@ -172,7 +205,25 @@ mod tests {
         assert_eq!(preference.html, Some(1000));
         // 📌 `*/*;q=0.8` matches text/markdown too — equal is not preferred.
         assert_eq!(preference.markdown, Some(800));
+        assert!(!preference.markdown_named);
         assert!(!preference.prefers_markdown());
+    }
+
+    /// 🤖 The header coding agents send: both named, both at q=1.
+    #[test]
+    fn a_named_markdown_tie_serves_markdown() {
+        for accept in [
+            "text/markdown, text/html",
+            "text/html, text/markdown",
+            "text/markdown, text/html, */*",
+            "text/markdown;q=0.8, text/html;q=0.8",
+        ] {
+            assert!(preference(accept).prefers_markdown(), "{accept}");
+        }
+        // 📌 A tie through `text/*` alone is still a wildcard tie.
+        assert!(!preference("text/*, text/html").prefers_markdown());
+        // 🚫 A named refusal stays a refusal even when HTML is refused too.
+        assert!(!preference("text/markdown;q=0, text/html;q=0").prefers_markdown());
     }
 
     #[test]
@@ -210,6 +261,7 @@ mod tests {
             preference,
             PagePreference {
                 markdown: None,
+                markdown_named: false,
                 html: None
             }
         );

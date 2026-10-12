@@ -88,6 +88,16 @@ async fn markdown_negotiation_serves_the_twin_and_keeps_browsers_on_html() {
             "{protocol}"
         );
 
+        // 🤖 The header coding agents send names both types at q=1; naming
+        // Markdown breaks the tie toward it.
+        let response = client
+            .get(server.url(0, "/"))
+            .header("Accept", "text/markdown, text/html")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.text().await.unwrap(), "# home", "{protocol}");
+
         // 📄 An `.html` URL reads its own twin.
         let response = client
             .get(server.url(0, "/page.html"))
