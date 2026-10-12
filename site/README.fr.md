@@ -84,27 +84,27 @@ répond aux défis ACME.
 ### 4. Ordre des routes
 
 ```caddyfile
-route {
-    handle /install.sh {
-        import installer
-    }
+handle /install.sh {
+    import installer
+}
+…
+@markdown header Accept *text/markdown*
+handle @markdown {
     …
-    handle {
-        import edge_headers
-        file_server
-    }
+}
+handle {
+    import edge_headers
+    file_server
 }
 ```
 
-Dans `route`, les blocs s'exécutent dans l'ordre où ils sont écrits, et le
-premier `handle` qui correspond répond à la requête. Le site suit cet ordre :
-
-1. le script d'installation, `/install.sh` et `/install` ;
-2. les points d'accès pour agents, `/mcp` et `/a2a` ;
-3. les règles de bordure pour les ressources de build, l'index de recherche,
-   les fichiers Markdown et les documents de découverte `/.well-known` ;
-4. le Markdown pour les clients qui le demandent ;
-5. tout le reste, servi depuis le disque.
+Les blocs `handle` s'excluent mutuellement : le premier qui correspond répond à
+la requête. Ils sont classés selon la précision de leur chemin : les chemins
+exacts et les préfixes — script d'installation, points d'accès pour agents,
+ressources de build, index de recherche, fichiers Markdown et documents
+`/.well-known` — passent en premier ; le bloc qui teste l'en-tête `Accept` vient
+après tous les chemins, et le bloc sans condition en dernier. Aucun chemin ne se
+recoupe, si bien que cet ordre est celui dont le site a besoin.
 
 ### 5. Proxy du script d'installation, avec cache
 

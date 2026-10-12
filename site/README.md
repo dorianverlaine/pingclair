@@ -83,27 +83,27 @@ challenges.
 ### 4. Route order
 
 ```caddyfile
-route {
-    handle /install.sh {
-        import installer
-    }
+handle /install.sh {
+    import installer
+}
+…
+@markdown header Accept *text/markdown*
+handle @markdown {
     …
-    handle {
-        import edge_headers
-        file_server
-    }
+}
+handle {
+    import edge_headers
+    file_server
 }
 ```
 
-Inside `route`, blocks run in the order they are written, and the first
-`handle` that matches answers the request. The site uses that order:
-
-1. the installer, `/install.sh` and `/install`;
-2. the agent endpoints, `/mcp` and `/a2a`;
-3. the edge rules for build assets, the search index, Markdown files and the
-   `/.well-known` discovery documents;
-4. Markdown for clients that ask for it;
-5. everything else, served from disk.
+`handle` blocks are mutually exclusive: the first one that matches answers the
+request. They are ordered by how specific their path is, so the exact paths and
+prefixes — the installer, the agent endpoints, the build assets, the search
+index, Markdown files and the `/.well-known` documents — come first; the block
+that matches on the `Accept` header comes after every path, and the block with
+no matcher comes last. None of the paths overlap, so that order is the order
+the site needs.
 
 ### 5. Proxying the installer, with a cache
 

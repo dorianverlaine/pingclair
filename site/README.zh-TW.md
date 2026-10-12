@@ -80,25 +80,24 @@ www.pingclair.com {
 ### 4. 路由順序
 
 ```caddyfile
-route {
-    handle /install.sh {
-        import installer
-    }
+handle /install.sh {
+    import installer
+}
+…
+@markdown header Accept *text/markdown*
+handle @markdown {
     …
-    handle {
-        import edge_headers
-        file_server
-    }
+}
+handle {
+    import edge_headers
+    file_server
 }
 ```
 
-在 `route` 裡，區塊依書寫順序執行，第一個符合的 `handle` 負責回應。網站的順序是：
-
-1. 安裝腳本：`/install.sh` 與 `/install`；
-2. 代理端點：`/mcp` 與 `/a2a`；
-3. 建置產物、搜尋索引、Markdown 檔案與 `/.well-known` 探索文件的邊緣規則；
-4. 提供 Markdown 給要求它的用戶端；
-5. 其他一律從磁碟提供。
+`handle` 區塊彼此互斥：第一個符合的負責回應。它們依路徑的明確程度排序，所以精確路徑
+與前綴（安裝腳本、代理端點、建置產物、搜尋索引、Markdown 檔案與 `/.well-known` 文件）
+排在前面；依 `Accept` header 判斷的區塊排在所有路徑之後，沒有條件的區塊排最後。這些
+路徑彼此沒有重疊，所以這個順序正是網站需要的順序。
 
 ### 5. 代理安裝腳本並快取
 

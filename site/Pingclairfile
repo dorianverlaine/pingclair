@@ -77,68 +77,69 @@
 
 	import access_log
 
-	# 📌 A `route` keeps these in the order written: the first block that
-	# matches answers.
-	route {
-		handle /install.sh {
-			import installer
-		}
-		handle /install {
-			import installer
-		}
-		handle /mcp {
-			import worker
-		}
-		handle /a2a {
-			import worker
-		}
+	# 📌 Each `reverse_proxy` sits in its own top-level `handle`: a build of
+	# Pingclair before the fix for proxies nested in one `route` sent every
+	# request of that route to its first proxy. Mutually exclusive `handle`
+	# blocks are ordered by path specificity, with the header-matched Markdown
+	# block after every path and the catch-all last.
+	handle /install.sh {
+		import installer
+	}
+	handle /install {
+		import installer
+	}
+	handle /mcp {
+		import worker
+	}
+	handle /a2a {
+		import worker
+	}
 
-		# 🗂️ Rules the Cloudflare side applied at the edge: immutable cache
-		# for build assets, a short cache for the search index, plain text for
-		# direct Markdown fetches, cross-origin discovery catalogs, and the API
-		# catalog's RFC 9727 media type.
-		handle /_astro/* {
-			import edge_headers
-			header Cache-Control "public, max-age=31536000, immutable"
-			file_server
-		}
-		handle /pagefind/* {
-			import edge_headers
-			header Cache-Control "public, max-age=3600"
-			file_server
-		}
-		@markdown_file path *.md
-		handle @markdown_file {
-			import edge_headers
-			header Content-Type "text/plain; charset=utf-8"
-			file_server
-		}
-		handle /.well-known/api-catalog {
-			import edge_headers
-			header Access-Control-Allow-Origin *
-			header Content-Type application/linkset+json
-			file_server
-		}
-		handle /.well-known/* {
-			import edge_headers
-			header Access-Control-Allow-Origin *
-			file_server
-		}
+	# 🗂️ Rules the Cloudflare side applied at the edge: immutable cache
+	# for build assets, a short cache for the search index, plain text for
+	# direct Markdown fetches, cross-origin discovery catalogs, and the API
+	# catalog's RFC 9727 media type.
+	handle /_astro/* {
+		import edge_headers
+		header Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+	handle /pagefind/* {
+		import edge_headers
+		header Cache-Control "public, max-age=3600"
+		file_server
+	}
+	@markdown_file path *.md
+	handle @markdown_file {
+		import edge_headers
+		header Content-Type "text/plain; charset=utf-8"
+		file_server
+	}
+	handle /.well-known/api-catalog {
+		import edge_headers
+		header Access-Control-Allow-Origin *
+		header Content-Type application/linkset+json
+		file_server
+	}
+	handle /.well-known/* {
+		import edge_headers
+		header Access-Control-Allow-Origin *
+		file_server
+	}
 
-		# 📄 Agents that ask for Markdown get the twin on the same URL: the
-		# directory's `index.md`, or the sibling `<name>.md`; a miss carries on
-		# to the normal file server unchanged. The `index.md` copies are made
-		# at deploy time.
-		@markdown header Accept *text/markdown*
-		handle @markdown {
-			try_files {path}index.md {path}.md
-			file_server
-		}
+	# 📄 Agents that ask for Markdown get the twin on the same URL: the
+	# directory's `index.md`, or the sibling `<name>.md`; a miss carries on
+	# to the normal file server unchanged. The `index.md` copies are made
+	# at deploy time.
+	@markdown header Accept *text/markdown*
+	handle @markdown {
+		try_files {path}index.md {path}.md
+		file_server
+	}
 
-		handle {
-			import edge_headers
-			file_server
-		}
+	handle {
+		import edge_headers
+		file_server
 	}
 
 	# 🧾 Starlight ships a 404 page; unknown paths answer with it, the same as
