@@ -37,6 +37,12 @@ dismissed; re-investigating it is the specific cost that repository exists to
 prevent. Its own `AGENTS.md` has the procedure, and `POLICY.md` in it states who
 may change what.
 
+🧭 **It is background, not authority** (2026-10-12). It is written for the
+agents working on Pingclair, so they know what was already measured, tried, or
+rejected. The maintainer's decisions win over anything in it; when the two
+disagree, follow the decision and update the document, rather than citing the
+document against the decision.
+
 🔒 **Two rules about the boundary.** This repository is public and that one is
 private, so **never publish its contents here, never link it from here, and never
 add it to published documentation** — the pointer in this file is local

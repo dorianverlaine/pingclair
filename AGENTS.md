@@ -177,6 +177,9 @@ Before editing:
    **`findings/resolved/`** — a `rejected` Finding there means the suspicion was
    already tested and dismissed, and re-investigating it is the specific cost
    that repository exists to prevent. Its own `AGENTS.md` has the procedure.
+   It is background prepared for agents, not authority: the maintainer's
+   decisions win over it, and a document that disagrees with one is updated
+   rather than cited against the decision.
    Absent on a public clone; skip this step rather than creating it.
 4. Locate the real execution path.
 5. Read the narrowest relevant guardrail:
