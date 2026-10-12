@@ -75,10 +75,12 @@
 - Misconfiguration always **fails closed**, never gets ignored silently.
 - 🔒 **The HTTPS port never serves plaintext.** Port 443, and the port
   `https_port` names, are refused as plaintext listeners on every path — an
-  `http://` address, `tls off`, a native listener without `.tls`, a JSON
-  `plaintext_listen`, the Admin API, or an `http_port` set to them. Before
-  2026-10-12 all of these loaded and served cleartext where clients and
-  operators expect TLS. Whether a socket speaks TLS is decided by
+  `http://` address, a native listener without `.tls`, a JSON
+  `plaintext_listen`, the Admin API, or an `http_port` set to them; `tls off`
+  is not accepted at all. Before 2026-10-12 all of these loaded and served
+  cleartext where clients and operators expect TLS. The one exception is the
+  upstream Caddyfile's: under `auto_https off`, a nameless site with no `tls`
+  serves plaintext wherever it listens. Whether a socket speaks TLS is decided by
   `ServerConfig::requires_tls_on` alone, which both validation and the runtime
   call; a second copy of that rule is how a validator passes a socket the
   runtime then opens differently.

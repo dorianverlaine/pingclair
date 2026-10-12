@@ -94,6 +94,44 @@ pub(super) fn reject_impossible_address(addr: &str) -> Result<(), AdapterError> 
     Ok(())
 }
 
+/// 🚫 Refuses a scheme that contradicts its port, the way the reference does.
+///
+/// `http://example.com:443` asks for plaintext on the port every client opens
+/// with a TLS handshake, and `https://example.com:80` asks for TLS on the port
+/// ACME's HTTP-01 probe reaches in the clear. Neither can be honoured, and the
+/// second used to load and quietly serve plaintext, because the HTTP port is
+/// never a TLS listener. The ports are the configured `http_port` and
+/// `https_port`, so `https_port 8443` moves the rule with it.
+pub(super) fn reject_scheme_port_conflict(
+    addr: &str,
+    global: &GlobalBlock,
+) -> Result<(), AdapterError> {
+    let Some(parsed) = parse_server_address(addr, global) else {
+        return Ok(());
+    };
+    if !addr.contains("://") {
+        return Ok(());
+    }
+    let http_port = global.http_port.unwrap_or(80);
+    let https_port = global.https_port.unwrap_or(443);
+    let conflict = match (parsed.listen.scheme, parsed.listen.port) {
+        (Scheme::Http, Some(port)) => port == https_port,
+        (Scheme::Https, Some(port)) => port == http_port,
+        _ => false,
+    };
+    if conflict {
+        return Err(AdapterError::InvalidArgument(
+            "site address".into(),
+            format!(
+                "`{addr}`: scheme and port violate convention. `http://` cannot name the \
+                 HTTPS port ({https_port}) and `https://` cannot name the HTTP port \
+                 ({http_port})"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// 🚫 Whether an address string uses Caddy syntax that Pingclair cannot
 /// honor yet: a network prefix (`tcp/`, `unix/`), a Unix socket path
 /// (`unix//...`), or a port range (`:8080-8085`).
@@ -279,6 +317,32 @@ pub(super) fn is_ip_literal(host: &str) -> bool {
 #[cfg(test)]
 mod address_semantics_tests {
     use crate::compile;
+
+    /// 🚫 A scheme that contradicts its port is refused in both directions,
+    /// and the configured ports move the rule with them.
+    #[test]
+    fn a_scheme_that_contradicts_its_port_is_refused() {
+        for source in [
+            "http://example.test:443 {\n respond \"x\"\n}",
+            "https://example.test:80 {\n respond \"x\"\n}",
+            "{\n http_port 8080\n https_port 8443\n}\nhttp://example.test:8443 {\n respond \"x\"\n}",
+            "{\n http_port 8080\n https_port 8443\n}\nhttps://example.test:8080 {\n respond \"x\"\n}",
+        ] {
+            let error = compile(source).expect_err(source).to_string();
+            assert!(
+                error.contains("scheme and port violate convention"),
+                "{error}"
+            );
+        }
+        // 👍 The matching pairs, and either scheme on an unrelated port, load.
+        for source in [
+            "http://example.test:80 {\n respond \"x\"\n}",
+            "https://example.test:443 {\n tls internal\n respond \"x\"\n}",
+            "http://example.test:8080 {\n respond \"x\"\n}",
+        ] {
+            compile(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+        }
+    }
 
     #[test]
     fn scheme_only_addresses_use_global_ports_and_keep_explicit_ports() {

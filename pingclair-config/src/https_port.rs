@@ -22,11 +22,17 @@
 //! acceptor — so "refused here" and "would have been plaintext there" are the
 //! same set.
 //!
+//! 📴 One exception, matching the reference: under `auto_https off` the
+//! operator has turned automatic HTTPS off on purpose, and a site with no TLS
+//! policy serves plaintext wherever it listens. The plaintext Admin API and an
+//! `http_port` on the HTTPS port stay refused even then.
+//!
 //! 📌 Load path only. Nothing here runs per request.
 
 use crate::compiler::{CompileError, CompileResult};
 use pingclair_core::config::{
-    CONVENTIONAL_HTTPS_PORT, PingclairConfig, ServerConfig, listen_port, normalize_listen_addr,
+    AutoHttpsMode, CONVENTIONAL_HTTPS_PORT, PingclairConfig, ServerConfig, listen_port,
+    normalize_listen_addr,
 };
 
 /// 🔒 Refuses every plaintext socket on the HTTPS port.
@@ -47,6 +53,14 @@ pub(crate) fn refuse_plaintext_on_https_port(config: &PingclairConfig) -> Compil
         });
     }
 
+    // 📴 `auto_https off` is the operator turning automatic HTTPS off on
+    // purpose, and a site with no TLS policy then serves plaintext wherever it
+    // listens, the HTTPS port included — the reference behaves the same way.
+    // Every other route to plaintext there is still refused below.
+    if config.global.auto_https == AutoHttpsMode::Off {
+        return refuse_admin_on_https_port(config, is_https_port);
+    }
+
     for server in &config.servers {
         for address in server.listen_addresses(http_port, https_port) {
             let Some(port) = listen_port(&address) else {
@@ -61,8 +75,15 @@ pub(crate) fn refuse_plaintext_on_https_port(config: &PingclairConfig) -> Compil
         }
     }
 
-    // 🛠️ The Admin API speaks plaintext HTTP only, so the HTTPS port is not a
-    // place it can listen either.
+    refuse_admin_on_https_port(config, is_https_port)
+}
+
+/// 🛠️ The Admin API speaks plaintext HTTP only, so the HTTPS port is not a
+/// place it can listen either, whatever `auto_https` says.
+fn refuse_admin_on_https_port(
+    config: &PingclairConfig,
+    is_https_port: impl Fn(u16) -> bool,
+) -> CompileResult<()> {
     if let Some(admin) = &config.admin
         && admin.enabled
         && listen_port(&normalize_listen_addr(&admin.listen)).is_some_and(is_https_port)
@@ -92,8 +113,8 @@ fn plaintext_refusal(server: &ServerConfig, address: &str) -> String {
         .iter()
         .any(|declared| normalize_listen_addr(declared) == address);
     let reason = if declared {
-        "the configuration declares that socket plaintext (an `http://` address, `tls off`, \
-         or a native listener without `.tls`)"
+        "the configuration declares that socket plaintext (an `http://` address, a JSON \
+         `plaintext_listen` entry, or a native listener without `.tls`)"
     } else {
         "it has no TLS"
     };
@@ -112,23 +133,23 @@ mod tests {
             .to_string()
     }
 
-    /// 🔒 An explicit `http://` address on 443 is refused, naming the cause.
+    /// 🔒 A JSON document reaches this check without any adapter, so it is
+    /// the path that proves the rule: `plaintext_listen` on 443 is refused.
     #[test]
-    fn an_http_address_on_the_https_port_is_refused() {
-        let message = refusal("http://example.test:443 {\n    respond \"x\"\n}\n");
+    fn a_json_plaintext_listener_on_the_https_port_is_refused() {
+        let mut config = pingclair_core::config::PingclairConfig::default();
+        config.servers.push(pingclair_core::config::ServerConfig {
+            name: Some("example.test".to_string()),
+            listen: vec![":443".to_string()],
+            plaintext_listen: vec![":443".to_string()],
+            ..Default::default()
+        });
+        let message = crate::compiler::validate_config(&config)
+            .expect_err("plaintext on the HTTPS port must be refused")
+            .to_string();
         assert!(message.contains("`[::]:443`, the HTTPS port"), "{message}");
         assert!(
             message.contains("declares that socket plaintext"),
-            "{message}"
-        );
-    }
-
-    /// 📴 `tls off` cannot turn the HTTPS port into a plaintext listener.
-    #[test]
-    fn tls_off_on_the_https_port_is_refused() {
-        let message = refusal("example.test:443 {\n    tls off\n    respond \"x\"\n}\n");
-        assert!(
-            message.contains("example.test would serve plaintext"),
             "{message}"
         );
     }
@@ -143,19 +164,14 @@ mod tests {
         assert!(message.contains("the HTTPS port"), "{message}");
     }
 
-    /// 🔢 A configured `https_port` is protected, and so is 443 beside it.
+    /// 🔢 With `https_port 8443`, 443 is still protected. The address check
+    /// in the Pingclairfile adapter only knows the configured HTTPS port, so
+    /// this is the rule that catches plaintext on 443 beside it.
     #[test]
-    fn a_custom_https_port_and_443_are_both_protected() {
-        let custom = refusal(
-            "{\n    https_port 8443\n}\nhttp://example.test:8443 {\n    respond \"x\"\n}\n",
-        );
-        assert!(custom.contains("`[::]:8443`, the HTTPS port"), "{custom}");
-        let conventional =
+    fn port_443_is_protected_beside_a_custom_https_port() {
+        let message =
             refusal("{\n    https_port 8443\n}\nhttp://example.test:443 {\n    respond \"x\"\n}\n");
-        assert!(
-            conventional.contains("`[::]:443`, the HTTPS port"),
-            "{conventional}"
-        );
+        assert!(message.contains("`[::]:443`, the HTTPS port"), "{message}");
     }
 
     /// 🧭 An HTTP port on the HTTPS port would host every plaintext site and
@@ -164,6 +180,24 @@ mod tests {
     fn an_http_port_on_the_https_port_is_refused() {
         let message = refusal("{\n    http_port 443\n}\nexample.test {\n    respond \"x\"\n}\n");
         assert!(message.contains("`http_port 443`"), "{message}");
+    }
+
+    /// 📴 `auto_https off` with a nameless `:443` and no `tls` serves
+    /// plaintext, as the reference does; a named site there keeps TLS.
+    #[test]
+    fn auto_https_off_lets_a_nameless_https_port_site_serve_plaintext() {
+        let config = crate::compile("{\n    auto_https off\n}\n:443 {\n    respond \"x\"\n}\n")
+            .expect("auto_https off makes a nameless :443 plaintext");
+        let server = &config.servers[0];
+        assert_eq!(
+            (server.tls.is_none(), server.plaintext_listen.as_slice()),
+            (true, ["[::]:443".to_string()].as_slice())
+        );
+
+        let named =
+            crate::compile("{\n    auto_https off\n}\nexample.test:443 {\n    respond \"x\"\n}\n")
+                .expect("a named site keeps its TLS policy");
+        assert!(named.servers[0].requires_tls_on("[::]:443", 80, 443));
     }
 
     /// 🛠️ The plaintext Admin API cannot take the HTTPS port.

@@ -173,6 +173,29 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
                 None => server_config.tls = Some(automatic),
             }
         }
+        // 📴 With `auto_https off`, a site that names no host, writes no `tls`
+        // and uses no `https://` address gets no TLS policy, so its listeners
+        // serve plaintext even on the HTTPS port — the reference's reading of
+        // `auto_https off` plus `:443 { … }`. Recorded as explicit plaintext,
+        // because the runtime would otherwise infer TLS from the port alone.
+        if config.global.auto_https == CoreAutoHttpsMode::Off
+            && block.tls.is_none()
+            && block
+                .listens
+                .iter()
+                .all(|listen| listen.scheme != Scheme::Https)
+            && !block
+                .names
+                .iter()
+                .any(|name| !name.is_empty() && name != "_")
+        {
+            server_config.tls = None;
+            for address in &server_config.listen {
+                if !server_config.plaintext_listen.contains(address) {
+                    server_config.plaintext_listen.push(address.clone());
+                }
+            }
+        }
         config.servers.push(server_config);
     }
 
@@ -577,56 +600,45 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
 
     // 🔐 The explicit directive merges with the HTTPS scheme without losing either source.
     if let Some(tls) = &server.tls {
-        if tls.off {
-            config.tls = None;
-            // 📴 `tls off` applies to every listener in this site, including
-            // conventional HTTPS ports that the runtime would otherwise infer.
-            for address in &config.listen {
-                if !config.plaintext_listen.contains(address) {
-                    config.plaintext_listen.push(address.clone());
-                }
-            }
-        } else {
-            let mut merged = config.tls.take().unwrap_or_default();
-            merged.auto = merged.auto || tls.auto;
-            merged.internal = merged.internal || tls.internal;
-            if tls.cert.is_some() {
-                merged.cert = tls.cert.clone();
-            }
-            if tls.key.is_some() {
-                merged.key = tls.key.clone();
-            }
-            if tls.acme_email.is_some() {
-                merged.acme_email = tls.acme_email.clone();
-            }
-            if let Some(http3) = tls.http3 {
-                merged.http3 = http3;
-            }
-            if tls.default_sni.is_some() {
-                merged.default_sni = tls.default_sni.clone();
-            }
-            // 🔄 A site's renewal window is its own policy, so it is carried
-            // rather than merged with the global one — the two decide different
-            // names, and the runtime picks between them by name.
-            if tls.renewal_window_ratio.is_some() {
-                merged.renewal_window_ratio = tls.renewal_window_ratio;
-            }
-            if tls.dns_challenge.is_some() {
-                merged.dns_challenge = tls.dns_challenge.clone();
-            }
-            if tls.client_auth.is_some() {
-                merged.client_auth = tls.client_auth.clone();
-            }
-            // 📧 An ACME email with no certificate management of its own is
-            // an instruction to *keep* automatic issuance with that account,
-            // not to stop it — `tls you@example.com` and
-            // `tls { acme_email you@example.com }` both mean "issue
-            // automatically as this account".
-            if merged.acme_email.is_some() && merged.cert.is_none() && !merged.internal {
-                merged.auto = true;
-            }
-            config.tls = Some(merged);
+        let mut merged = config.tls.take().unwrap_or_default();
+        merged.auto = merged.auto || tls.auto;
+        merged.internal = merged.internal || tls.internal;
+        if tls.cert.is_some() {
+            merged.cert = tls.cert.clone();
         }
+        if tls.key.is_some() {
+            merged.key = tls.key.clone();
+        }
+        if tls.acme_email.is_some() {
+            merged.acme_email = tls.acme_email.clone();
+        }
+        if let Some(http3) = tls.http3 {
+            merged.http3 = http3;
+        }
+        if tls.default_sni.is_some() {
+            merged.default_sni = tls.default_sni.clone();
+        }
+        // 🔄 A site's renewal window is its own policy, so it is carried
+        // rather than merged with the global one — the two decide different
+        // names, and the runtime picks between them by name.
+        if tls.renewal_window_ratio.is_some() {
+            merged.renewal_window_ratio = tls.renewal_window_ratio;
+        }
+        if tls.dns_challenge.is_some() {
+            merged.dns_challenge = tls.dns_challenge.clone();
+        }
+        if tls.client_auth.is_some() {
+            merged.client_auth = tls.client_auth.clone();
+        }
+        // 📧 An ACME email with no certificate management of its own is
+        // an instruction to *keep* automatic issuance with that account,
+        // not to stop it — `tls you@example.com` and
+        // `tls { acme_email you@example.com }` both mean "issue
+        // automatically as this account".
+        if merged.acme_email.is_some() && merged.cert.is_none() && !merged.internal {
+            merged.auto = true;
+        }
+        config.tls = Some(merged);
     }
 
     // 📍 The `bind` directive names the interface, not a listener. Keeping it

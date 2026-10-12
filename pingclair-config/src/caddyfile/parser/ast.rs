@@ -346,9 +346,6 @@ pub struct LongConnectionLimits {
 /// 🔐 Represents downstream TLS configuration from a server directive.
 #[derive(Debug, Clone, Default)]
 pub struct TlsDirective {
-    /// 📴 Explicitly disables TLS through `tls off`.
-    pub off: bool,
-
     /// 🌐 Enables automatic public certificate management through `tls auto`.
     pub auto: bool,
 
@@ -389,8 +386,7 @@ pub struct ListenAddr {
     pub host: String,
     pub port: Option<u16>,
     /// 📴 Forces this exact listener to remain plaintext because the site
-    /// address explicitly used `http://`. The compiler applies `tls off` to
-    /// every listener after this address-level policy is collected.
+    /// address explicitly used `http://`.
     pub force_plaintext: bool,
     /// 🧭 Requires a PROXY protocol header on this listener, as nginx spells
     /// `listen 443 proxy_protocol`. It is per-listener because a deployment

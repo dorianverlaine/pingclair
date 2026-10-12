@@ -4,7 +4,7 @@
 use super::AdapterError;
 use super::addresses::{
     is_local_https_default, looks_like_unsupported_address, parse_server_address,
-    reject_impossible_address,
+    reject_impossible_address, reject_scheme_port_conflict,
 };
 use super::directives::{
     adapt_handle_path, adapt_handler, adapt_header_directive, adapt_resource_limits,
@@ -72,6 +72,7 @@ pub(super) fn adapt_server(
         // 🚫 Refuse an address that cannot mean anything before deriving a
         // listener from it.
         reject_impossible_address(name)?;
+        reject_scheme_port_conflict(name, global)?;
         // 🌐 Catch-all schemes inherit the same global ports as named sites.
         // Their missing hostname must not prevent the listener from binding.
         if matches!(name.as_str(), "http://" | "https://") {

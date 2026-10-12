@@ -718,7 +718,6 @@ mod global_tests {
         assert_eq!(tls.cert.as_deref(), Some("/etc/ssl/cert.pem"));
         assert_eq!(tls.key.as_deref(), Some("/etc/ssl/key.pem"));
         assert!(!tls.auto);
-        assert!(!tls.off);
     }
 
     #[test]
@@ -788,19 +787,21 @@ mod global_tests {
         }
     }
 
+    /// 🚫 `tls off` is refused, as the reference refuses it; plaintext is
+    /// spelled with an `http://` address.
     #[test]
-    fn test_tls_off() {
+    fn test_tls_off_is_refused() {
         let source = r#"
-            example.com {
-                listen :443
+            example.com:8080 {
                 tls off
             }
         "#;
         let directives = parse(source).unwrap();
-        let ast = adapt(directives).unwrap();
-
-        let tls = ast.servers[0].inner.tls.as_ref().expect("tls directive");
-        assert!(tls.off);
+        let error = adapt(directives).expect_err("tls off is not a tls argument");
+        assert!(
+            error.to_string().contains("`off` is not a tls argument"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2764,7 +2765,7 @@ mod fail_closed_tests {
         // about the empty form rather than about `tls` itself.
         for accepted in [
             "example.com {\n    tls internal\n    respond \"hi\"\n}",
-            "example.com {\n    tls off\n    respond \"hi\"\n}",
+            "example.com {\n    tls admin@example.com\n    respond \"hi\"\n}",
         ] {
             crate::compile(accepted)
                 .unwrap_or_else(|error| panic!("`{accepted}` must load: {error}"));

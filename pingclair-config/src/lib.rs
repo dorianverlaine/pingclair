@@ -1333,30 +1333,6 @@ mod tests {
         assert_eq!(tls.key.as_deref(), Some("/etc/ssl/key.pem"));
     }
 
-    /// 📴 `tls off` still records the socket as plaintext in the adapted
-    /// document; on the HTTPS port, validation then refuses it (see
-    /// `https_port`), so this reads the adapter alone.
-    #[test]
-    fn test_compile_tls_off_disables_https_scheme_default() {
-        let source = r#"
-            https://example.com {
-                tls off
-                respond "OK"
-            }
-        "#;
-
-        let config = adapt(source).unwrap();
-        assert!(
-            config.servers[0].tls.is_none(),
-            "tls off must clear the https-scheme default"
-        );
-        assert_eq!(
-            config.servers[0].plaintext_listen,
-            ["[::]:443"],
-            "tls off must remain authoritative when the runtime sees port 443"
-        );
-    }
-
     /// 🌐 Mixed schemes share handlers but retain independent host and TLS policy.
     #[test]
     fn mixed_http_and_https_site_addresses_compile_to_independent_servers() {
@@ -1618,15 +1594,6 @@ mod tests {
             "https://localhost must use the internal CA, not ACME"
         );
         assert!(!tls.auto);
-    }
-
-    #[test]
-    fn test_tls_off_on_a_bare_hostname_stays_off() {
-        let config = compile("example.com {\n    tls off\n    respond \"OK\"\n}").unwrap();
-        assert!(
-            config.servers[0].tls.is_none(),
-            "`tls off` must not be re-enabled by the automatic HTTPS default"
-        );
     }
 
     #[test]

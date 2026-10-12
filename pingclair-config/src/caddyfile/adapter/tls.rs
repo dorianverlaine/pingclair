@@ -245,7 +245,18 @@ pub(super) fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, Adapter
     // its own is refused rather than silently dropped when a block follows.
     match d.args.as_slice() {
         [] => {}
-        [arg] if arg == "off" => tls.off = true,
+        // 🚫 Refused, as the reference refuses it: `tls` takes `internal`, an
+        // email address, or a block, and plaintext is spelled with an
+        // `http://` site address. Accepting `off` let a site turn the HTTPS
+        // port into a plaintext listener.
+        [arg] if arg == "off" => {
+            return Err(AdapterError::InvalidArgument(
+                "tls".into(),
+                "`off` is not a tls argument; serve plaintext with an `http://` site \
+                 address on a port other than the HTTPS port"
+                    .into(),
+            ));
+        }
         [arg] if arg == "auto" => tls.auto = true,
         [arg] if arg == "internal" => tls.internal = true,
         [arg] if arg.contains('@') => tls.acme_email = Some(arg.clone()),
@@ -372,16 +383,6 @@ pub(super) fn adapt_tls_directive(d: &Directive) -> Result<TlsDirective, Adapter
                 _ => return Err(AdapterError::UnknownDirective(format!("tls: {}", sub.name))),
             }
         }
-    }
-
-    // 🚫 `tls off` with a block contradicts itself — one half says there is
-    // no TLS and the other configures it — so the combination is refused
-    // rather than letting one half win silently.
-    if tls.off && d.block.is_some() {
-        return Err(AdapterError::InvalidArgument(
-            "tls".into(),
-            "off cannot be combined with a block".into(),
-        ));
     }
 
     // 🔗 A certificate without its matching private key is unusable.
