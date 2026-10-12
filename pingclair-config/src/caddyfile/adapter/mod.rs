@@ -68,6 +68,8 @@ mod block_matcher_tests;
 #[cfg(test)]
 mod error_routes_tests;
 #[cfg(test)]
+mod extension_tests;
+#[cfg(test)]
 mod forward_auth_tls_tests;
 #[cfg(test)]
 mod handle_groups_tests;

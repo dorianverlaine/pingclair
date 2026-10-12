@@ -1,22 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-//! 🧭 `ServeFiles(…).negotiate([.markdown])` end to end over H1 and H2.
+//! 🧭 `file_server { negotiate markdown }` end to end over H1 and H2.
 
 use super::{TestServer, no_proxy_client};
 
 fn site(root: &std::path::Path) -> String {
     format!(
-        r#"HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
-        Site(host: "*") {{
-            Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
-                Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
-            }}
-            Fallback {{
-                ServeFiles(root: "{}").negotiate([.markdown])
-            }}
+        r#":__PINGCLAIR_TEST_PORT__ {{
+    root * {}
+    handle __PINGCLAIR_TEST_READINESS_PATH__ {{
+        respond "__PINGCLAIR_TEST_READINESS_TOKEN__"
+    }}
+    handle {{
+        file_server {{
+            negotiate markdown
         }}
-    }}"#,
+    }}
+}}"#,
         root.display()
     )
 }
@@ -35,7 +36,7 @@ fn tree() -> tempfile::TempDir {
 #[tokio::test]
 async fn markdown_negotiation_serves_the_twin_and_keeps_browsers_on_html() {
     let root = tree();
-    let mut server = TestServer::new_native(&site(root.path()));
+    let mut server = TestServer::new_pingclairfile(&site(root.path()));
     assert!(server.wait_until_ready().await, "server failed to start");
 
     let h2 = reqwest::Client::builder()
@@ -132,7 +133,7 @@ async fn markdown_negotiation_serves_the_twin_and_keeps_browsers_on_html() {
 #[tokio::test]
 async fn a_range_reads_the_markdown_it_negotiated() {
     let root = tree();
-    let mut server = TestServer::new_native(&site(root.path()));
+    let mut server = TestServer::new_pingclairfile(&site(root.path()));
     assert!(server.wait_until_ready().await, "server failed to start");
     let response = no_proxy_client()
         .get(server.url(0, "/"))

@@ -80,6 +80,8 @@ pub struct GlobalBlock {
     pub persist_config_off: bool,
     /// 🛡️ Proxy IP or CIDR ranges allowed to supply client identity headers.
     pub trusted_proxies: Vec<String>,
+    /// 🚫 Peers refused before anything is read (`deny`), on every listener.
+    pub blocked_ips: Vec<String>,
     /// 🛡️ Headers a trusted proxy may name the client in (`client_ip_headers`).
     pub client_ip_headers: Vec<String>,
     /// 🛡️ Underscore-named request fields preserved on every listener by default.
@@ -331,6 +333,11 @@ pub struct ResourceLimitsConfig {
     pub max_header_count: Option<usize>,
     pub max_header_bytes: Option<usize>,
     pub max_connections: Option<usize>,
+    /// 📮 The longest pause between two writes to a client (`send_timeout`);
+    /// zero turns the bound off.
+    pub send_timeout_ms: Option<u64>,
+    /// 🔁 Requests one keepalive connection serves (`keepalive_requests`).
+    pub keepalive_requests: Option<u32>,
     pub upload_bytes_per_sec: Option<u64>,
     pub download_bytes_per_sec: Option<u64>,
     pub long_connections: LongConnectionLimits,
@@ -1251,6 +1258,8 @@ pub struct FileServerConfig {
     pub canonical_uris: bool,
     /// 🏷️ Extensions of sidecar files holding a precomputed ETag.
     pub etag_file_extensions: Vec<String>,
+    /// 🧭 Representations negotiated from a page's `Accept` (`negotiate`).
+    pub negotiate: Vec<pingclair_core::config::Negotiation>,
 }
 
 // ============================================================

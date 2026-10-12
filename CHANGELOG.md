@@ -14,6 +14,35 @@ fact.
 
 ## [Unreleased]
 
+### 🧩 Every capability has a Pingclairfile spelling again
+
+Four capabilities that only the native language could spell now have
+Pingclairfile directives. Each sits where the upstream Caddyfile keeps options
+of its kind, under nginx's name where nginx has the concept:
+
+```caddyfile
+{
+    deny 192.0.2.0/24 private_ranges
+}
+
+:8080 {
+    root * /srv/site
+    limits {
+        send_timeout 60s
+        keepalive_requests 1000
+    }
+    file_server {
+        negotiate markdown
+    }
+}
+```
+
+`deny` drops a peer before any TLS or HTTP is read, on every listener;
+`send_timeout` bounds the pause between two writes to a client, and `0` turns
+it off; `keepalive_requests` retires a connection after that many requests;
+`negotiate markdown` serves a page's Markdown twin to a client that prefers
+it. The integration tests for the last three now run from a Pingclairfile.
+
 ### 🔒 The HTTPS port never serves plaintext
 
 A configuration that would serve plaintext HTTP on port 443, or on the port

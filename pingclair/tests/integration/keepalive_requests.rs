@@ -13,22 +13,22 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use super::TestServer;
 
-/// 🔌 A site answering `ok`, with `keepaliveRequests:` when one is given.
+/// 🔌 A site answering `ok`, with `keepalive_requests` when one is given.
 fn responding_site(keepalive_requests: Option<u32>) -> String {
     let limits = keepalive_requests
-        .map(|value| format!("\n.limits(keepaliveRequests: {value})\n"))
+        .map(|value| format!("    limits {{\n        keepalive_requests {value}\n    }}\n"))
         .unwrap_or_default();
     format!(
         r#"
-HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
-    Site(host: "*") {{
-        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
-            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
-        }}
-        Fallback {{ Respond(body: "ok") }}
+:__PINGCLAIR_TEST_PORT__ {{
+{limits}    handle __PINGCLAIR_TEST_READINESS_PATH__ {{
+        respond "__PINGCLAIR_TEST_READINESS_TOKEN__"
+    }}
+    handle {{
+        respond "ok"
     }}
 }}
-{limits}"#
+"#
     )
 }
 
@@ -69,7 +69,7 @@ async fn get(writer: &mut OwnedWriteHalf) {
 #[tokio::test]
 async fn keepalive_requests_retires_the_connection_after_the_bound() {
     let config = responding_site(Some(2));
-    let mut server = TestServer::new_native(&config);
+    let mut server = TestServer::new_pingclairfile(&config);
     assert!(server.wait_until_ready().await, "server failed to start");
 
     let stream = TcpStream::connect(server.address(0)).await.unwrap();
@@ -99,7 +99,7 @@ async fn keepalive_requests_retires_the_connection_after_the_bound() {
 #[tokio::test]
 async fn the_default_bound_is_the_references_thousand_requests() {
     let config = responding_site(None);
-    let mut server = TestServer::new_native(&config);
+    let mut server = TestServer::new_pingclairfile(&config);
     assert!(server.wait_until_ready().await, "server failed to start");
 
     let stream = TcpStream::connect(server.address(0)).await.unwrap();

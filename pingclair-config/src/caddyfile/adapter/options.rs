@@ -345,6 +345,14 @@ pub(super) fn adapt_global(d: Directive) -> Result<GlobalBlock, AdapterError> {
                 "client_ip_headers" => {
                     global.client_ip_headers = parse_client_ip_headers(&sub.args)?;
                 }
+                // 🚫 nginx's `deny`: peers refused before any TLS or HTTP is
+                // read, on every TCP listener and the HTTP/3 socket. It
+                // compares the socket peer, so a client behind a trusted
+                // proxy is blocked per site with a `client_ip` matcher and
+                // `abort` instead. Lines accumulate, as nginx's do.
+                "deny" => {
+                    parse_deny(&sub.args, &mut global.blocked_ips)?;
+                }
                 "expected_underscore_headers" => {
                     global.expected_underscore_headers = super::underscore_headers::parse(&sub)?;
                 }
@@ -771,6 +779,31 @@ fn parse_trusted_proxies(args: &[String], into: &mut Vec<String>) -> Result<(), 
             ));
         }
         into.push(rule.clone());
+    }
+    Ok(())
+}
+
+/// 🚫 Parses one global `deny` line: addresses, CIDR ranges, or
+/// `private_ranges`, the same shorthand `trusted_proxies` takes.
+fn parse_deny(args: &[String], into: &mut Vec<String>) -> Result<(), AdapterError> {
+    if args.is_empty() {
+        return Err(AdapterError::ArgumentCount("deny".into(), 1, 0));
+    }
+    for rule in args {
+        if rule == "private_ranges" {
+            into.extend(
+                pingclair_core::config::PRIVATE_RANGES
+                    .iter()
+                    .map(|range| (*range).to_string()),
+            );
+        } else if looks_like_address(rule) {
+            into.push(rule.clone());
+        } else {
+            return Err(AdapterError::InvalidArgument(
+                "deny".into(),
+                format!("invalid IP or CIDR `{rule}`"),
+            ));
+        }
     }
     Ok(())
 }

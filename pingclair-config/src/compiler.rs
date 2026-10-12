@@ -384,6 +384,7 @@ fn compile_global(global: &GlobalBlock, config: &mut PingclairConfig) -> Compile
     }
 
     config.global.trusted_proxies = global.trusted_proxies.clone();
+    config.global.blocked_ips = global.blocked_ips.clone();
     config.global.client_ip_headers = global.client_ip_headers.clone();
     config.global.expected_underscore_headers = global.expected_underscore_headers.clone();
     config.global.storage_path = global.storage_path.clone();
@@ -545,15 +546,11 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
             body_timeout_ms: server.limits.body_timeout_ms,
             idle_timeout_ms: server.limits.idle_timeout_ms,
             request_timeout_ms: server.limits.request_timeout_ms,
-            // 📮 The compatibility dialect does not spell this one: new limits
-            // options are native-only (docs/guardrails/config.md, 2026-10-10).
-            send_timeout_ms: None,
+            send_timeout_ms: server.limits.send_timeout_ms,
             max_header_count: server.limits.max_header_count,
             max_header_bytes: server.limits.max_header_bytes,
             max_connections: server.limits.max_connections,
-            // 🔁 Native-only as well: the compatibility dialect keeps its
-            // frozen surface (docs/guardrails/config.md).
-            keepalive_requests: None,
+            keepalive_requests: server.limits.keepalive_requests,
             upload_bytes_per_sec: server.limits.upload_bytes_per_sec,
             download_bytes_per_sec: server.limits.download_bytes_per_sec,
             long_connections: pingclair_core::config::LongConnectionLimits {
@@ -3489,7 +3486,7 @@ fn compile_handler(
             pass_thru: fs.pass_thru,
             canonical_uris: fs.canonical_uris,
             etag_file_extensions: fs.etag_file_extensions.clone(),
-            negotiate: Vec::new(),
+            negotiate: fs.negotiate.clone(),
         }),
 
         Handler::Templates => Ok(HandlerConfig::Templates {

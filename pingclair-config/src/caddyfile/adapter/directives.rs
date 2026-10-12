@@ -132,6 +132,7 @@ pub(super) fn adapt_handler(
                 // is upstream's default and the shape relative links need.
                 canonical_uris: true,
                 etag_file_extensions: Vec::new(),
+                negotiate: Vec::new(),
             };
 
             // Whatever is left is `file_server`'s own block; the `browse` form
@@ -252,6 +253,39 @@ pub(super) fn adapt_handler(
                                 ));
                             }
                             config.etag_file_extensions.extend(sub.args.iter().cloned());
+                        }
+                        // 🧭 Serves a page's Markdown twin (`X.md`,
+                        // `X/index.md`) to a client whose `Accept` prefers
+                        // it. Neither reference server has this, so it sits
+                        // where a file server's options already live.
+                        "negotiate" => {
+                            if sub.args.is_empty() {
+                                return Err(AdapterError::ArgumentCount(
+                                    "file_server negotiate".into(),
+                                    1,
+                                    0,
+                                ));
+                            }
+                            for representation in &sub.args {
+                                let negotiation = match representation.as_str() {
+                                    "markdown" => pingclair_core::config::Negotiation::Markdown,
+                                    other => {
+                                        return Err(AdapterError::InvalidArgument(
+                                            "file_server negotiate".into(),
+                                            format!(
+                                                "`{other}` is not a representation; expected `markdown`"
+                                            ),
+                                        ));
+                                    }
+                                };
+                                if config.negotiate.contains(&negotiation) {
+                                    return Err(AdapterError::InvalidArgument(
+                                        "file_server negotiate".into(),
+                                        format!("`{representation}` is listed twice"),
+                                    ));
+                                }
+                                config.negotiate.push(negotiation);
+                            }
                         }
                         // 🚩 `fs` selects a file-system *module*, which is a
                         // subsystem this build does not have — there is no
@@ -1919,6 +1953,38 @@ pub(super) fn adapt_resource_limits(
             }
             "max_connections" => {
                 limits.max_connections = Some(parse_positive_usize(sub)?);
+            }
+            // 📮 nginx's name and reading: the longest pause between two
+            // successive writes to the client, not a ceiling on the whole
+            // response, so a slow download of a large file keeps going while
+            // it makes progress. `0` turns the bound off.
+            "send_timeout" => {
+                let [value] = sub.args.as_slice() else {
+                    return Err(AdapterError::ArgumentCount(
+                        sub.name.clone(),
+                        1,
+                        sub.args.len(),
+                    ));
+                };
+                // 📌 `0` is spelled bare, as nginx and Go durations both
+                // accept it; the duration parser refuses anything under a
+                // millisecond.
+                let millis = (value == "0")
+                    .then_some(0)
+                    .or_else(|| parse_duration_ms(value))
+                    .filter(|millis| *millis <= 31_536_000_000)
+                    .ok_or_else(|| {
+                        AdapterError::InvalidArgument(sub.name.clone(), value.clone())
+                    })?;
+                limits.send_timeout_ms = Some(millis);
+            }
+            // 🔁 nginx's name: how many requests one keepalive connection
+            // serves before it is closed.
+            "keepalive_requests" => {
+                let requests = parse_positive_u64(sub)?;
+                limits.keepalive_requests = Some(u32::try_from(requests).map_err(|_| {
+                    AdapterError::InvalidArgument(sub.name.clone(), requests.to_string())
+                })?);
             }
             "upload_bytes_per_sec" => {
                 limits.upload_bytes_per_sec = Some(parse_positive_u64(sub)?);

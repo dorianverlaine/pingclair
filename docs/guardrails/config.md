@@ -123,11 +123,19 @@ readings behind it are the whole argument — no other server's behaviour is.
    why we follow it or diverge. A behaviour that a configuration can reach and
    that differs from that reading is a finding until either the behaviour
    changes or the divergence is written down as deliberate.
-3. **The compatibility frontend is a frozen migration layer.** It keeps
-   accepting the syntax it accepts today and lowers it into the same
-   `PingclairConfig`, so an existing file keeps running. It does not grow: **a
-   new feature gets a native spelling only**, and a file that uses a directive
-   this build does not accept is refused rather than taught.
+3. **The Pingclairfile follows the upstream Caddyfile (2026-10-12).** A
+   directive the Caddyfile defines means here what it means there, and a file
+   upstream refuses is refused here too. A capability upstream has no word for
+   still gets a Pingclairfile spelling, chosen by two rules so nobody has to
+   invent one: it sits **where upstream keeps options of that kind** —
+   `limits` or `servers` for listener bounds, `file_server` for file serving,
+   `reverse_proxy` for proxying, the global options for process-wide settings,
+   `layer4` for TCP — and it takes **nginx's name when nginx has the concept**
+   (`send_timeout`, `keepalive_requests`, `deny`). An extension adds a word; it
+   never changes what an existing one means. A directive this build does not
+   implement is refused by name rather than ignored. The one deliberate
+   departure is that plaintext on the HTTPS port is refused even where upstream
+   accepts it (`docs/guardrails/tls.md`).
 
 > 📌 The reference readings themselves — which implementation, which version,
 > which symbol, which measurement — live in the memory repository, not here.

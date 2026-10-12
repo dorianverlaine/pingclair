@@ -21,15 +21,18 @@ fn payload_site(bytes: usize, send_timeout: &str) -> (tempfile::TempDir, String)
     std::fs::write(dir.path().join("payload.bin"), vec![b'x'; bytes]).unwrap();
     let config = format!(
         r#"
-HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
-    Site(host: "*") {{
-        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
-            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
-        }}
-        Fallback {{ ServeFiles(root: "{}") }}
+:__PINGCLAIR_TEST_PORT__ {{
+    root * {}
+    limits {{
+        send_timeout {send_timeout}
+    }}
+    handle __PINGCLAIR_TEST_READINESS_PATH__ {{
+        respond "__PINGCLAIR_TEST_READINESS_TOKEN__"
+    }}
+    handle {{
+        file_server
     }}
 }}
-.limits(sendTimeout: {send_timeout})
 "#,
         dir.path().display()
     );
@@ -39,8 +42,8 @@ HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
 /// 🚫 A reader that stops reading is cut, and the process stays up.
 #[tokio::test]
 async fn a_stalled_reader_loses_the_connection() {
-    let (_dir, config) = payload_site(4 * 1024 * 1024, ".seconds(1)");
-    let mut server = TestServer::new_native(&config);
+    let (_dir, config) = payload_site(4 * 1024 * 1024, "1s");
+    let mut server = TestServer::new_pingclairfile(&config);
     assert!(server.wait_until_ready().await, "server failed to start");
 
     // 📏 A deliberately tiny receive buffer: without it the loopback socket
@@ -93,8 +96,8 @@ async fn a_stalled_reader_loses_the_connection() {
 #[tokio::test]
 async fn a_slow_reader_is_not_cut() {
     const BYTES: usize = 2 * 1024 * 1024;
-    let (_dir, config) = payload_site(BYTES, ".seconds(1)");
-    let mut server = TestServer::new_native(&config);
+    let (_dir, config) = payload_site(BYTES, "1s");
+    let mut server = TestServer::new_pingclairfile(&config);
     assert!(server.wait_until_ready().await, "server failed to start");
 
     let mut stream = TcpStream::connect(server.address(0)).await.unwrap();
@@ -121,15 +124,15 @@ async fn a_slow_reader_is_not_cut() {
     );
 }
 
-/// 🔌 `sendTimeout: .milliseconds(0)` turns the bound off.
+/// 🔌 `send_timeout 0` turns the bound off.
 ///
 /// The control for the first test: the same stall, the same window, and the
 /// connection is still open — so the cut there came from the bound and not
 /// from something else in the stack.
 #[tokio::test]
 async fn send_timeout_zero_keeps_the_connection_open() {
-    let (_dir, config) = payload_site(4 * 1024 * 1024, ".milliseconds(0)");
-    let mut server = TestServer::new_native(&config);
+    let (_dir, config) = payload_site(4 * 1024 * 1024, "0");
+    let mut server = TestServer::new_pingclairfile(&config);
     assert!(server.wait_until_ready().await, "server failed to start");
 
     let socket = TcpSocket::new_v4().unwrap();

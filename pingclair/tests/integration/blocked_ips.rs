@@ -8,9 +8,10 @@
 //! outright. An operator who mistyped one address in a block list got a list
 //! that let exactly that address through, and every door said "valid".
 //!
-//! 📌 The posted document is JSON because `blocked_ips` has no Pingclairfile
-//! spelling: Caddy has no global block-list option, and this one exists only
-//! in the JSON schema. The running server itself is configured in the DSL.
+//! 📌 The posted document is JSON because the Admin path is the subject: it is
+//! the one entry that never passes through an adapter. The Pingclairfile
+//! spells the list as the global `deny` option. The running server itself is
+//! configured in the DSL.
 //!
 //! 🧭 The Pingclairfile way to block addresses is the Caddy one, a `client_ip`
 //! matcher with `abort`; the tests below prove that spelling blocks what it

@@ -308,13 +308,12 @@ redesign helps, create a measurement task instead.
   alternative was evaluated and rejected must record the dependency/version,
   symbol, date, and concrete reason. Conclusion-only rejection folklore has
   cost this project unnecessary implementation work.
-- **🌐 The semantic reference is nginx, and the Caddyfile frontend is frozen
-  (2026-10-10).** Behaviour is decided by [`docs/guardrails/config.md`](docs/guardrails/config.md)'s
-  authority order (**RFC > nginx**), and a new feature gets a **native spelling
-  only**: do not add a Caddyfile directive for it, and do not grow the
-  compatibility adapter's surface. That frontend keeps accepting what it
-  accepts today so a migrated file keeps running. Caddy is where a migrated
-  file's spelling comes from; it is not a reason for behaviour.
+- **🌐 The Pingclairfile follows Caddy; extensions follow nginx (2026-10-12).**
+  Where the Caddyfile defines a behaviour, Pingclair does what Caddy does. A
+  capability Caddy lacks is spelled where Caddy keeps options of that kind and
+  named after nginx's directive when nginx has the concept — rule 3 of
+  [`docs/guardrails/config.md`](docs/guardrails/config.md)'s authority order.
+  RFC requirements still win over both.
 
 ## 🧠 Keep `pingclair-core` small
 
