@@ -18,11 +18,14 @@ Pingclair serves static content and proxies HTTP applications through one
 configuration model. It supports HTTP/1.1 and HTTP/2 over TCP, HTTP/3 over
 QUIC, automatic HTTPS, health-aware load balancing, and configuration reloads.
 
-The primary configuration format is the Pingclairfile, a deliberately bounded
-implementation of commonly used Caddyfile syntax. Unsupported Caddy features
-are rejected during configuration loading rather than accepted as no-ops.
-The 0.3 development line on `main` adds a native declarative language beside
-it; the Caddy-style frontend remains supported.
+The configuration format is the Pingclairfile (`Pingclairfile`, `*.pingclair`),
+a deliberately bounded implementation of commonly used Caddyfile syntax.
+Where the Caddyfile defines a behaviour, Pingclair follows it, and unsupported
+Caddy features are rejected during configuration loading rather than accepted
+as no-ops. A capability Caddy has no word for is spelled where Caddy keeps that
+kind of option, under nginx's name when nginx has the concept — `deny`,
+`send_timeout`, `keepalive_requests`, `negotiate markdown`
+([examples/extensions.pingclair](examples/extensions.pingclair)).
 
 The latest release is `v0.2.2`, the newest patch on the 0.2 line. Review the
 [project status](https://pingclair.com/project/status/) before using it for a
@@ -40,23 +43,9 @@ bounded fallback only before TCP establishment.
 Explicit dynamic A/AAAA sources refresh in the background and enforce TTL,
 stale deadlines and destination policy. DNS failure leaves unrelated local routes
 available, and established tunnels keep their connected streams.
-A [native declarative language](docs/guardrails/native-config.md) introduces
-Swift-inspired labels and SwiftUI-inspired TCP components in 0.3 alpha.
-Native HTTP routes also accept `Abort()` to close an exchange without sending
-an HTTP response. Error routes reject proxies until their upstream lifecycle
-is supported; use `Respond` or `ServeFiles` to render an error locally.
-Inside an error route, `Respond(body:)` keeps the original error status; an
-explicit `status:` overrides it, and a Caddyfile `handle_errors` block follows
-the same rule. Outside an error route, omission means 200. JSON export and
-reload preserve the distinction between omitted and explicit status.
-Text values stay literal unless written as dynamic values:
-`Redirect(to: Format("https://example.com{uri}", uri: .uri))` keeps the
-request target, and `.set("X-Real-IP", from: .clientIP)` feeds a header from a
-typed request source. Error sources exist only inside error routes.
-Native request and response header values are literal text, including braces;
-that interpretation survives JSON export and reload on HTTP/1.1, HTTP/2 and HTTP/3.
-TCP uses `.limits(maxConnections:)`, matching HTTP, and typed source-IP
-conditions such as `Route(when: .from(["10.0.0.0/8"]))`.
+TCP routing is written in a `layer4` block among the global options
+([examples/layer4.pingclair](examples/layer4.pingclair)), with nginx's
+stream-module names for its timeouts and buffers.
 See the [L4 boundaries](docs/guardrails/layer4.md) for syntax and current limits.
 
 ## ✨ Highlights

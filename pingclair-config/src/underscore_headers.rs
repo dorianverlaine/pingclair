@@ -6,20 +6,13 @@
 use crate::compiler::{CompileError, CompileResult};
 use pingclair_core::config::PingclairConfig;
 
-/// 🏷️ What one allowlist entry has to be, in the words both readers use.
-///
-/// 📌 The native frontend points at the offending line, the shared validator
-/// cannot (it sees a `PingclairConfig`, not a file). They still say the same
-/// thing about the same rule, because a rule stated twice drifts.
-pub(crate) const ENTRY_REQUIREMENT: &str =
+/// 🏷️ What one allowlist entry has to be, in the words every refusal uses.
+const ENTRY_REQUIREMENT: &str =
     "must be an ASCII header name containing `_`, with at most one trailing `*`";
 
-/// 🛡️ Whether one allowlist entry is well-formed.
-///
-/// 📌 The frontend and the shared validator both call this: the frontend so
-/// the error can carry a position, the validator because the Admin JSON path
-/// never goes through the frontend at all.
-pub(crate) fn well_formed(entry: &str) -> bool {
+/// 🛡️ Whether one allowlist entry is well-formed. Checked here rather than in
+/// an adapter because the Admin JSON path never goes through one.
+fn well_formed(entry: &str) -> bool {
     let name = entry.strip_suffix('*').unwrap_or(entry);
     name.contains('_')
         && !name.contains('*')

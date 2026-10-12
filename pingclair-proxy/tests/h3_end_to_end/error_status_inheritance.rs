@@ -1,24 +1,36 @@
-//! 🚨 Native error response status inheritance also applies over HTTP/3.
+//! 🚨 `respond` keeps the error status in `handle_errors` over HTTP/3 too.
 
 use super::*;
 
 #[tokio::test]
-async fn h3_native_respond_inherits_errors_and_honors_overrides() {
-    let source = r#"HTTPListener(on: ":8080") {
-        Site(host: "*") {
-            ErrorRoute(for: [.status(503), .status(504)]) {
-                ResponseHeader(.set("X-Error-Route", "inherited"))
-                Respond(body: "inherited")
-            }
-            ErrorRoute(for: [.status(404)]) { Respond(body: "overridden", status: 200) }
-            ErrorRoute(for: [.status(502)]) { Respond(body: "created", status: 201) }
-            Route(when: .path(exact: "/503")) { Fail(status: 503) }
-            Route(when: .path(exact: "/504")) { Fail(status: 504) }
-            Route(when: .path(exact: "/404")) { Fail(status: 404) }
-            Route(when: .path(exact: "/502")) { Fail(status: 502) }
-            Fallback { Respond(body: "ordinary") }
-        }
-    }"#;
+async fn h3_respond_inherits_errors_and_honors_overrides() {
+    let source = r#":8080 {
+    handle_errors 503 504 {
+        header X-Error-Route inherited
+        respond "inherited"
+    }
+    handle_errors 404 {
+        respond "overridden" 200
+    }
+    handle_errors 502 {
+        respond "created" 201
+    }
+    handle /503 {
+        error 503
+    }
+    handle /504 {
+        error 504
+    }
+    handle /404 {
+        error 404
+    }
+    handle /502 {
+        error 502
+    }
+    handle {
+        respond "ordinary"
+    }
+}"#;
     let site = pingclair_config::compile(source).unwrap().servers.remove(0);
     let server = spawn_h3_server_with(|address| ServerConfig {
         listen: vec![address.to_string()],

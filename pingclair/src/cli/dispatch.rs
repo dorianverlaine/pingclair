@@ -13,7 +13,7 @@
 //! knowing before changing one: the quick commands are not a separate server,
 //! they are the same server with a configuration nobody had to write down.
 
-use super::{Cli, Commands, DescribeFormat};
+use super::{Cli, Commands};
 use crate::addr::{host_only, listen_for_site, upstream_hostport};
 use crate::cli::admin::{admin_request, trust_internal_ca};
 use crate::cli::service::manage_system_service;
@@ -253,54 +253,6 @@ fn module_version() -> String {
 /// this binary instead of dying on argument parsing — which is what it did
 /// before, with exit 2.
 const MODULE_PACKAGE: &str = "pingclair";
-
-/// ✍️ Renders parsed directives back to canonical Pingclairfile text: two
-/// spaces per block level, one directive per line, arguments re-quoted only
-/// when whitespace or a comment marker demands it.
-fn format_directives(
-    directives: &[pingclair_config::caddyfile::parser::caddy_ast::Directive],
-) -> String {
-    fn quote_argument(argument: &str) -> String {
-        if argument.contains([' ', '\t', '#', '"']) {
-            format!("\"{}\"", argument.replace('"', "\\\""))
-        } else {
-            argument.to_string()
-        }
-    }
-
-    fn format_block(
-        directives: &[pingclair_config::caddyfile::parser::caddy_ast::Directive],
-        indent: usize,
-        out: &mut String,
-    ) {
-        // 🗂️ One tab per level, which is what `caddy fmt` writes. Two spaces
-        // was this formatter's own choice, and it meant the two formatters
-        // rewrote each other's output forever: a CI gate that runs `caddy fmt`
-        // on a repository formatted by `pingclair fmt` reported a diff on every
-        // file.
-        let padding = "\t".repeat(indent);
-        for directive in directives {
-            out.push_str(&padding);
-            out.push_str(&directive.name);
-            for argument in &directive.args {
-                out.push(' ');
-                out.push_str(&quote_argument(argument));
-            }
-            if let Some(block) = &directive.block {
-                out.push_str(" {\n");
-                format_block(&block.directives, indent + 1, out);
-                out.push_str(&padding);
-                out.push_str("}\n");
-            } else {
-                out.push('\n');
-            }
-        }
-    }
-
-    let mut out = String::new();
-    format_block(directives, 0, &mut out);
-    out
-}
 
 /// 🗄️ The store a command should work on.
 ///
@@ -1060,14 +1012,10 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                 std::fs::read_to_string(&path)
                     .map_err(|error| anyhow::anyhow!("❌ Failed to read {path}: {error}"))?
             };
-            let formatted = if pingclair_config::frontend::is_native(&source) {
-                pingclair_config::format::format(&source)
-                    .map_err(|error| anyhow::anyhow!("❌ Failed to format {path}: {error}"))?
-            } else {
-                let directives = pingclair_config::caddyfile::parser::parse(&source)
-                    .map_err(|error| anyhow::anyhow!("❌ Failed to parse {path}: {error}"))?;
-                format_directives(&directives)
-            };
+            // 🛑 A file the parser cannot read is reported, not reformatted.
+            pingclair_config::caddyfile::parser::parse(&source)
+                .map_err(|error| anyhow::anyhow!("❌ Failed to parse {path}: {error}"))?;
+            let formatted = pingclair_config::caddyfile::format::format(&source);
             // 🎯 `caddy fmt` is a linter as well as a formatter: it exits
             // non-zero when the input was not already formatted, which is the
             // whole mechanism behind a `caddy fmt && git diff --exit-code` gate
@@ -1097,21 +1045,6 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
             }
             if !overwrite && !already_formatted {
                 std::process::exit(1);
-            }
-        }
-
-        Commands::Describe { name, format } => {
-            let rendered = match format {
-                DescribeFormat::Text => pingclair_config::describe::render_text(name.as_deref()),
-                DescribeFormat::Json => pingclair_config::describe::render_json(name.as_deref()),
-                DescribeFormat::Agents => {
-                    pingclair_config::describe::render_agents(name.as_deref())
-                }
-            }
-            .map_err(|error| anyhow::anyhow!("❌ {error}"))?;
-            print!("{rendered}");
-            if !rendered.ends_with('\n') {
-                println!();
             }
         }
 

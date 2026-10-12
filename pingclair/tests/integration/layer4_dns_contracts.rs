@@ -37,10 +37,10 @@ async fn zero_ttl_has_no_implicit_freshness_but_explicit_valid_can_override_it()
         let origin = AsyncListener::bind("127.0.0.1:0").await.unwrap();
         let address = origin.local_addr().unwrap();
         let _origin = Echo::new(origin, b'A');
-        let config = observed(native(dns.address, address, address, 0))
-            .replace("versions: .ip,", "versions: .ipv4,")
-            .replace(", valid: .seconds(1)", "");
-        let mut server = TestServer::new_native(&config);
+        let config = observed(dns_pool(dns.address, address, address, 0))
+            .replace("versions ip\n", "versions ipv4\n")
+            .replace(" valid 1s\n", "");
+        let mut server = TestServer::new_pingclairfile(&config);
         assert!(server.wait_until_ready().await);
         let l4 = server.listener_address(0, 1);
         wait_reason(&server, "reason=\"available\"", 0.0).await;
@@ -54,12 +54,11 @@ async fn zero_ttl_has_no_implicit_freshness_but_explicit_valid_can_override_it()
         );
         assert!(dns.queries.lock().unwrap().len() <= started.elapsed().as_secs() as usize + 3);
         let resolved =
-            std::fs::read_to_string(server._temp_dir.path().join("config.pingclair")).unwrap();
-        let override_ttl =
-            resolved.replace("versions: .ipv4,", "versions: .ipv4, valid: .seconds(2),");
+            std::fs::read_to_string(server._temp_dir.path().join("Pingclairfile")).unwrap();
+        let override_ttl = resolved.replace("versions ipv4\n", "versions ipv4\n valid 2s\n");
         let applied = no_proxy_client()
             .post(server.admin_url("/load"))
-            .header("Content-Type", "text/pingclair")
+            .header("Content-Type", "text/caddyfile")
             .body(override_ttl)
             .send()
             .await
@@ -132,10 +131,10 @@ async fn excessive_cnames_addresses_and_empty_answers_revoke_the_whole_live_pool
         let origin = AsyncListener::bind("127.0.0.1:0").await.unwrap();
         let address = origin.local_addr().unwrap();
         let _origin = Echo::new(origin, b'A');
-        let config = observed(native(dns.address, address, address, 60))
-            .replace("versions: .ip,", "versions: .ipv4,")
-            .replace("\"127.0.0.1/32\", \"::1/128\"", "\"127.0.0.0/8\"");
-        let mut server = TestServer::new_native(&config);
+        let config = observed(dns_pool(dns.address, address, address, 60))
+            .replace("versions ip\n", "versions ipv4\n")
+            .replace("allow_ip 127.0.0.1/32 ::1/128", "allow_ip 127.0.0.0/8");
+        let mut server = TestServer::new_pingclairfile(&config);
         assert!(server.wait_until_ready().await);
         let l4 = server.listener_address(0, 1);
         let mut old = wait_tag(l4, b'A').await;
@@ -200,9 +199,9 @@ async fn dns_timeout_and_shutdown_release_tcp_workers_while_existing_tunnels_sur
         let origin = AsyncListener::bind("127.0.0.1:0").await.unwrap();
         let address = origin.local_addr().unwrap();
         let _origin = Echo::new(origin, b'A');
-        let config = observed(native(dns.address, address, address, 1))
-            .replace("versions: .ip,", "versions: .ipv4,");
-        let mut server = TestServer::new_native(&config);
+        let config = observed(dns_pool(dns.address, address, address, 1))
+            .replace("versions ip\n", "versions ipv4\n");
+        let mut server = TestServer::new_pingclairfile(&config);
         assert!(server.wait_until_ready().await);
         let l4 = server.listener_address(0, 1);
         let mut old = wait_tag(l4, b'A').await;

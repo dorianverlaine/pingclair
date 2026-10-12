@@ -2,7 +2,7 @@
 // Copyright 2026 Dorian Verlaine
 
 //! 🔌 Pin the dependency's upgrade race through its public proxy interface.
-//! A native configuration cannot delay the original empty-body task, so this
+//! No configuration can delay the original empty-body task, so this
 //! fixture supplies the scheduler hook directly, as upstream PR #947 does.
 
 use async_trait::async_trait;

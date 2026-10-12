@@ -1,0 +1,159 @@
+# 🏝️ pingclair.com — the docs site, served by Pingclair from a FreeBSD
+# node, with pingclair.pingclair.com kept as the staging alias and
+# www redirected to the apex.
+{
+	email team@pingclair.com
+	storage file_system /var/db/pingclair
+
+	# 🔁 The Admin API on loopback, so `pingclair reload` can hot-reload this
+	# file instead of a restart dropping connections.
+	admin 127.0.0.1:2019
+}
+
+# 🔗 The headers the documentation Worker published through the build output's
+# `_headers` file; the file server does not read that file, so the same set is
+# stated once here and imported by every site.
+(edge_headers) {
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		X-Frame-Options DENY
+		Link "</.well-known/api-catalog>; rel=\"api-catalog\", </llms.txt>; rel=\"describedby\", </sitemap.xml>; rel=\"sitemap\""
+	}
+}
+
+# 🧊 The one-line install address: `https://pingclair.com/install.sh`.
+#
+# The script lives in the server repository and is published to the release
+# bucket by every release; proxying it here rather than keeping a copy is the
+# same choice the Cloudflare Worker made — there is no second file to drift.
+(installer) {
+	rewrite * /pingclair/install.sh
+	reverse_proxy releases.pingclair.com:443 {
+		header_up Host releases.pingclair.com
+		header_down ?X-Installer-Source r2
+		transport http {
+			tls
+			tls_server_name releases.pingclair.com
+		}
+		cache {
+			ttl 5m
+			max_size 16777216
+		}
+	}
+}
+
+# 🤖 The agent endpoints still served by the documentation Worker; the docs
+# node proxies them so `pingclair.com/mcp` and `/a2a` keep the URL contract
+# the Worker era established.
+(worker) {
+	reverse_proxy cf.pingclair.com:443 {
+		header_up Host cf.pingclair.com
+		transport http {
+			tls
+			tls_server_name cf.pingclair.com
+		}
+	}
+}
+
+(docs) {
+	root * /usr/local/www/pingclair.pingclair.com
+	encode zstd gzip
+
+	# 📓 One JSON line per request, rotated by Pingclair itself.
+	log {
+		output file /var/log/pingclair-access.log {
+			roll_size 100MiB
+			roll_keep 7
+		}
+		format json
+		headers {
+			request User-Agent
+		}
+	}
+
+	# 📌 A `route` keeps these in the order written: the first block that
+	# matches answers.
+	route {
+		handle /install.sh {
+			import installer
+		}
+		handle /install {
+			import installer
+		}
+		handle /mcp {
+			import worker
+		}
+		handle /a2a {
+			import worker
+		}
+
+		# 🗂️ Rules the Cloudflare side applied at the edge: immutable cache
+		# for build assets, a short cache for the search index, plain text for
+		# direct Markdown fetches, cross-origin discovery catalogs, and the API
+		# catalog's RFC 9727 media type.
+		handle /_astro/* {
+			import edge_headers
+			header Cache-Control "public, max-age=31536000, immutable"
+			file_server
+		}
+		handle /pagefind/* {
+			import edge_headers
+			header Cache-Control "public, max-age=3600"
+			file_server
+		}
+		@markdown_file path *.md
+		handle @markdown_file {
+			import edge_headers
+			header Content-Type "text/plain; charset=utf-8"
+			file_server
+		}
+		handle /.well-known/api-catalog {
+			import edge_headers
+			header Access-Control-Allow-Origin *
+			header Content-Type application/linkset+json
+			file_server
+		}
+		handle /.well-known/* {
+			import edge_headers
+			header Access-Control-Allow-Origin *
+			file_server
+		}
+
+		# 📄 Agents that ask for Markdown get the twin on the same URL: the
+		# directory's `index.md`, or the sibling `<name>.md`; a miss carries on
+		# to the normal file server unchanged. The `index.md` copies are made
+		# at deploy time.
+		@markdown header Accept *text/markdown*
+		handle @markdown {
+			try_files {path}index.md {path}.md
+			file_server
+		}
+
+		handle {
+			import edge_headers
+			file_server
+		}
+	}
+
+	# 🧾 Starlight ships a 404 page; unknown paths answer with it, the same as
+	# the Cloudflare deployment's `not_found_handling`.
+	handle_errors 404 {
+		rewrite * /404.html
+		file_server
+	}
+}
+
+pingclair.com {
+	import docs
+}
+
+pingclair.pingclair.com {
+	import docs
+}
+
+# ➡️ 308 to the apex, the same permanent move the Cloudflare zone answered,
+# now with the path and query riding along.
+www.pingclair.com {
+	redir https://pingclair.com{uri} 308
+}

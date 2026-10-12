@@ -1,23 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-//! 🚪 Native terminals enforce the same contract on real connections.
+//! 🚪 `abort` closes the exchange without an HTTP response, on H1 and H2.
 
 use super::{TestServer, no_proxy_client};
 use std::time::Duration;
 
 #[tokio::test]
 async fn abort_closes_the_exchange_without_an_http_response() {
-    let config = r#"HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {
-        Site(host: "*") {
-            Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {
-                Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
-            }
-            Route(when: .path(exact: "/abort")) { Abort() }
-            Fallback { Respond(body: "healthy") }
-        }
-    }"#;
-    let mut server = TestServer::new_native(config);
+    let config = r#":__PINGCLAIR_TEST_PORT__ {
+    handle __PINGCLAIR_TEST_READINESS_PATH__ {
+        respond "__PINGCLAIR_TEST_READINESS_TOKEN__"
+    }
+    handle /abort {
+        abort
+    }
+    handle {
+        respond "healthy"
+    }
+}"#;
+    let mut server = TestServer::new_pingclairfile(config);
     assert!(server.wait_until_ready().await, "server failed to start");
     let h2 = reqwest::Client::builder()
         .no_proxy()

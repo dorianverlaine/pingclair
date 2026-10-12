@@ -17,15 +17,6 @@
 //! A block that is deliberately invalid — showing what *not* to write — should
 //! be fenced as `text` rather than `pingclair`, which is also how a reader
 //! tells the two apart.
-//!
-//! # 📚 The example corpus has three rules
-//!
-//! The examples are the language's style reference, so the test enforces more
-//! than "it compiles": a `.pingclair` file has to *be* native syntax, a
-//! `caddyfile/` file has to be the dialect that directory is named after, and
-//! every example has to be in the formatter's canonical shape. The extension
-//! naming the language is the one convention a reader should be able to trust
-//! without opening the file.
 
 use std::path::{Path, PathBuf};
 
@@ -134,52 +125,20 @@ fn every_shipped_example_still_compiles() {
         broken.join("\n  ")
     );
 
-    // 🗂️ Which language each file is written in, by the name it is filed under.
-    let native_example = |path: &Path| {
-        path.parent() == Some(examples_dir.as_path())
-            && (path.file_name().is_some_and(|name| name == "Pingclairfile")
-                || path.extension().is_some_and(|ext| ext == "pingclair"))
-    };
-    let caddyfile_example = |path: &Path| {
-        path.parent() == Some(examples_dir.join("caddyfile").as_path())
-            && path.extension().is_some_and(|ext| ext == "caddyfile")
-    };
-    let mut misfiled = Vec::new();
-    for path in &examples {
-        let Ok(source) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let native = pingclair_config::frontend::is_native(&source);
-        if native_example(path) && !native {
-            misfiled.push(format!(
-                "{}: named as a native example but not written in the native language",
-                path.display()
-            ));
-        }
-        if caddyfile_example(path) && native {
-            misfiled.push(format!(
-                "{}: filed under caddyfile/ but written in the native language",
-                path.display()
-            ));
-        }
-        // 🖋️ The corpus is the style guide, so the native files are in the
-        // formatter's canonical shape. The formatter reads the native language
-        // only; a Caddyfile is formatted the way its own dialect says.
-        if native {
-            match pingclair_config::format::format(&source) {
-                Ok(formatted) if formatted == source => {}
-                Ok(_) => misfiled.push(format!(
-                    "{}: not in canonical form; run `pingclair fmt --overwrite`",
-                    path.display()
-                )),
-                Err(error) => misfiled.push(format!("{}: {error}", path.display())),
-            }
-        }
-    }
+    // 🖋️ The corpus is also the style guide, so every example is already in
+    // the formatter's canonical shape, comments included.
+    let unformatted: Vec<String> = examples
+        .iter()
+        .filter_map(|path| {
+            let source = std::fs::read_to_string(path).ok()?;
+            (pingclair_config::caddyfile::format::format(&source) != source)
+                .then(|| format!("{}: run `pingclair fmt --overwrite` on it", path.display()))
+        })
+        .collect();
     assert!(
-        misfiled.is_empty(),
-        "the example corpus drifted:\n  {}",
-        misfiled.join("\n  ")
+        unformatted.is_empty(),
+        "examples not in canonical form:\n  {}",
+        unformatted.join("\n  ")
     );
 }
 

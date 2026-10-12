@@ -6,11 +6,17 @@
 use super::super::metrics::{scrape, value};
 use super::*;
 
+/// 📊 The same configuration with metrics collected and served at `/metrics`.
 pub(super) fn observed(config: String) -> String {
-    format!("Metrics(enabled: true)\n{config}").replace(
-        "Site(host: \"*\") { Fallback",
-        "Site(host: \"*\") { Route(when: .path(exact: \"/metrics\")) { ServeMetrics() } Fallback",
-    )
+    config
+        .replace(
+            "    grace_period 5s\n",
+            "    grace_period 5s\n    metrics\n",
+        )
+        .replace(
+            "    respond @ready \"__PINGCLAIR_TEST_READINESS_TOKEN__\"\n",
+            "    respond @ready \"__PINGCLAIR_TEST_READINESS_TOKEN__\"\n    metrics /metrics\n",
+        )
 }
 
 pub(super) async fn wait_value(
@@ -41,7 +47,7 @@ async fn pool_availability_expires_without_clients_and_refresh_reasons_are_bound
         let address = origin.local_addr().unwrap();
         let _origin = Echo::new(origin, b'A');
         let mut server =
-            TestServer::new_native(&observed(native(dns.address, address, address, 3)));
+            TestServer::new_pingclairfile(&observed(dns_pool(dns.address, address, address, 3)));
         assert!(server.wait_until_ready().await);
         let l4 = server.listener_address(0, 1);
         wait_value(&server, "l4_dns_pool_available", &[], 1.0).await;
@@ -106,7 +112,7 @@ async fn fallback_counts_each_tcp_attempt_and_round_robin_rotates_the_next_start
         drop(refused);
         let _origin = Echo::new(origin, b'B');
         let mut server =
-            TestServer::new_native(&observed(native(dns.address, address, address, 3)));
+            TestServer::new_pingclairfile(&observed(dns_pool(dns.address, address, address, 3)));
         assert!(server.wait_until_ready().await);
         wait_value(&server, "l4_dns_pool_available", &[], 1.0).await;
         let l4 = server.listener_address(0, 1);

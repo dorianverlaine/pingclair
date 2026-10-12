@@ -105,26 +105,22 @@ async fn quota_survives_reload_and_releases_after_disconnect() {
 async fn incomplete_client_hello_occupies_admission_until_timeout() {
     timeout(Duration::from_secs(20), async {
         let origin = AsyncListener::bind("127.0.0.1:0").await.unwrap();
-        let config = format!(
-            r#"Admin(listen: "__PINGCLAIR_TEST_ADMIN_LISTEN__")
-Metrics(enabled: true)
-Shutdown(grace: .seconds(5))
-TCPListener(on: ":__PINGCLAIR_TEST_HTTP_PORT__") {{
-    Route(when: .all([.tls(), .from(["127.0.0.0/8"])])) {{ Proxy(to: "{}") }}
-}}
-.limits(maxConnections: 1)
-.timeouts(preread: .seconds(2))
-HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
-    Site(host: "*") {{
-        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
-            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
-        }}
-        Fallback {{ ServeMetrics() }}
-    }}
-}}"#,
+        let routes = format!(
+            "@hello {{\n tls\n remote_ip 127.0.0.0/8\n }}\n route @hello {{\n proxy {}\n }}",
             origin.local_addr().unwrap(),
         );
-        let mut server = TestServer::new_native(&config);
+        // 📊 Metrics on, and served at `/metrics`, so the test can watch the
+        // admission gauge.
+        let config = fixture("max_connections 1\n preread_timeout 2s", &routes)
+            .replace(
+                "    grace_period 5s\n",
+                "    grace_period 5s\n    metrics\n",
+            )
+            .replace(
+                "    respond @ready \"__PINGCLAIR_TEST_READINESS_TOKEN__\"\n",
+                "    respond @ready \"__PINGCLAIR_TEST_READINESS_TOKEN__\"\n    metrics /metrics\n",
+            );
+        let mut server = TestServer::new_pingclairfile(&config);
         assert!(server.wait_until_ready().await);
         while metrics::value(
             &metrics::scrape(&server).await,

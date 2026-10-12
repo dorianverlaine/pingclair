@@ -7,27 +7,27 @@
 
 # Global options. The block is unnamed and comes first in the file.
 {
-    # 🚩 `debug` is a bare flag.
-    debug
+	# 🚩 `debug` is a bare flag.
+	debug
 
-    # 🌐 Protocols are a server-scoped option, so they live in `servers`.
-    servers {
-        protocols h1 h2 h3
-    }
+	# 🌐 Protocols are a server-scoped option, so they live in `servers`.
+	servers {
+		protocols h1 h2 h3
+	}
 }
 
 # Simple reverse proxy. The scheme in the site address is what selects plain
 # HTTP; there is no separate listen directive to keep in agreement with it.
 http://example.com {
-    reverse_proxy localhost:3000
+	reverse_proxy localhost:3000
 }
 
 # Multiple upstreams and path matching. A bare hostname is served over HTTPS
 # with an automatically issued certificate.
 api.example.com {
-    handle /api/* {
-        reverse_proxy localhost:8080 localhost:8081
-    }
+	handle /api/* {
+		reverse_proxy localhost:8080 localhost:8081
+	}
 
-    respond "Not Found" 404
+	respond "Not Found" 404
 }

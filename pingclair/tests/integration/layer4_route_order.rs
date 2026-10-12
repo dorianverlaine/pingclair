@@ -1,41 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-//! 🔌 Native matcher composition selects a tunnel before forwarding original bytes.
+//! 🔌 Matcher sets select a tunnel in route order before forwarding original bytes.
 
 use super::*;
 
 #[tokio::test]
-async fn native_conditions_preserve_route_order_bytes_and_half_close() {
+async fn matcher_sets_preserve_route_order_bytes_and_half_close() {
     timeout(Duration::from_secs(30), async {
         let selected = AsyncListener::bind("127.0.0.1:0").await.unwrap();
         let fallback = AsyncListener::bind("127.0.0.1:0").await.unwrap();
         let wrong = AsyncListener::bind("127.0.0.1:0").await.unwrap();
-        let config = format!(
-            r#"
-Admin(listen: "__PINGCLAIR_TEST_ADMIN_LISTEN__")
-Shutdown(grace: .seconds(5))
-@Matcher
-let local = .from(["127.0.0.0/8"])
-TCPListener(on: ":__PINGCLAIR_TEST_HTTP_PORT__") {{
-    Route(when: .all([.tls(), .from(["192.0.2.0/24"])])) {{ Proxy(to: "{}") }}
-    Route(when: .all([.tls(sni: ["example.test"], alpn: ["h2"]), local])) {{ Proxy(to: "{}") }}
-    Fallback {{ Proxy(to: "{}") }}
-}}
-.limits(maxConnections: 8, preread: .kibibytes(16), relay: .kibibytes(1))
-.timeouts(preread: .seconds(2), connect: .seconds(2), idle: .seconds(5))
-.halfClose(enabled: true)
-HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
-    Site(host: "*") {{
-        Fallback {{ Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__") }}
-    }}
-}}
-"#,
+        let routes = format!(
+            "@wrong {{\n tls\n remote_ip 192.0.2.0/24\n }}\n route @wrong {{\n proxy {}\n }}\n\
+             @selected {{\n tls {{\n sni example.test\n alpn h2\n }}\n remote_ip 127.0.0.0/8\n }}\n\
+             route @selected {{\n proxy {}\n }}\n route {{\n proxy {}\n }}",
             wrong.local_addr().unwrap(),
             selected.local_addr().unwrap(),
             fallback.local_addr().unwrap()
         );
-        let mut server = TestServer::new_native(&config);
+        let config = fixture(
+            "max_connections 8\n preread_buffer_size 16k\n proxy_buffer_size 1k\n \
+             preread_timeout 2s\n proxy_connect_timeout 2s\n proxy_timeout 5s",
+            &routes,
+        );
+        let mut server = TestServer::new_pingclairfile(&config);
         assert!(server.wait_until_ready().await);
         for (origin, mut payload) in [(selected, hello()), (fallback, b"plain\0bytes".to_vec())] {
             payload.extend(std::iter::repeat_n(0x5a, 2 * 1024 * 1024));

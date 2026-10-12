@@ -14,11 +14,23 @@ fact.
 
 ## [Unreleased]
 
-### 🧩 Every capability has a Pingclairfile spelling again
+### 🖋️ `fmt` keeps comments
 
-Four capabilities that only the native language could spell now have
-Pingclairfile directives. Each sits where the upstream Caddyfile keeps options
-of its kind, under nginx's name where nginx has the concept:
+`pingclair fmt` used to parse the file and print the directive tree back, and
+comments are not part of that tree: `fmt --overwrite` deleted every comment in
+the file it tidied. It now formats the text itself, the way the upstream
+formatter does — one tab per block level, a `{` on the line it opens, a `}` on
+its own line, at most one blank line, and a blank line after each top-level
+block — and writes every token and comment back verbatim. The result is
+checked before it is used: the tokens must be unchanged, a second pass must
+change nothing, and the parser must read the same directive tree; otherwise
+the input is returned as written.
+
+### 🧩 Pingclairfile words for what upstream has no word for
+
+Four capabilities get Pingclairfile directives. Each sits where the upstream
+Caddyfile keeps options of its kind, under nginx's name where nginx has the
+concept:
 
 ```caddyfile
 {
@@ -41,7 +53,7 @@ of its kind, under nginx's name where nginx has the concept:
 `send_timeout` bounds the pause between two writes to a client, and `0` turns
 it off; `keepalive_requests` retires a connection after that many requests;
 `negotiate markdown` serves a page's Markdown twin to a client that prefers
-it. The integration tests for the last three now run from a Pingclairfile.
+it.
 
 ### 🔒 The HTTPS port never serves plaintext
 
@@ -49,8 +61,7 @@ A configuration that would serve plaintext HTTP on port 443, or on the port
 `https_port` names, is now refused at load, by `validate`, `run`, a reload and
 the Admin `/load` endpoint alike. Before, it loaded and served cleartext there
 when spelled as a Pingclairfile `http://example.com:443`, `tls off` on the HTTPS
-port, a native `HTTPListener(on: ":443")` without `.tls`, or a JSON
-`plaintext_listen` entry. The same refusal covers the plaintext Admin API on the
+port, or a JSON `plaintext_listen` entry. The same refusal covers the plaintext Admin API on the
 HTTPS port and an `http_port` set to it. The check and the runtime now share one
 rule for whether a socket speaks TLS, so they cannot disagree.
 
@@ -90,59 +101,38 @@ CI gate, and the expired retry exemption is removed. Other Pingora crates
 remain on their existing registry versions; tunnel half-close (#274) remains
 outstanding.
 
-### 🧩 Native configuration language for 0.3 alpha
+### 🧹 The 0.3 native language is gone before its first release
 
-Native declarations sit at the top level; the frontend is selected by the
-`.pingclair` extension or the declaration shape, and the `Pingclair(version: 1)`
-header is no longer used. TCP listeners, routes and proxies compose through
-typed arguments and listener modifiers; `HTTPListener`/`Site` serve plaintext
-HTTP with `Respond`. Both use the existing common validation and runtime.
-File-level `let` bindings reuse values and component subtrees with bounded
-expansion. Existing Caddy-style files remain supported during migration. Admin
-accepts `text/pingclair`; `fmt` formats native files with comments preserved,
-and `describe` prints the component table.
+The Swift-style configuration language that `main` carried during 0.3
+development (`HTTPListener`, `Site`, `TCPListener`, `describe`) is removed
+before any release shipped it. The Pingclairfile is the configuration
+language, and `.pingclair` files read as Pingclairfiles again, as they did in
+0.2. The last commit with the native language is tagged
+`archive/swift-native-config`.
 
-Native `Abort()` now ends a route and closes the exchange without an HTTP
-response. Error-route proxies are rejected by common validation, including
-JSON loads, instead of accepting a configuration that cannot contact its
-upstream (#303).
+Error routes that proxy are rejected by common validation, including JSON
+loads, instead of accepting a configuration that cannot contact its upstream
+(#303).
 
-`Respond` now preserves an omitted status through JSON export and reload. In
-an error route it keeps the original error status; elsewhere it defaults to
-200, and an explicit `status: 200` still overrides an error. The Caddyfile
-frontend follows: `handle_errors { respond "page" }` now answers with the
-original error status instead of 200, matching Caddy's own error handlers.
-Existing numeric JSON statuses remain explicit, and common validation rejects
-explicit statuses outside 200–599 because `Respond` sends a final HTTP
-response.
+A `respond` without a status now keeps that omission through JSON export and
+reload. Inside `handle_errors` it answers with the original error status
+instead of 200, matching Caddy's own static response; an explicit status still
+overrides it, and elsewhere omission means 200. Existing numeric JSON statuses
+remain explicit, and common validation rejects explicit statuses outside
+200–599 because `respond` sends a final HTTP response.
 
 Signal handlers are claimed before the readiness announcement, so a SIGHUP
 delivered in the first moments after startup is ignored instead of killing the
 process through its default action. This closes a startup window that could
 terminate the server with no log line (#299).
 
-Native text values can be dynamic: `Format("…{name}…", name: .source)` combines
-literal text with request facts, and `from: .source` names one for a header
-value. The sources are `.clientIP`, `.remoteHost`, `.remotePort`, `.scheme`,
-`.host`, `.path`, `.method` and `.uri` — the request target, path and query,
-after rewrites — plus `.errorStatus` / `.errorMessage`, which exist only
-inside an error route. `Redirect(to: Format("https://example.com{uri}",
-uri: .uri))` now keeps the request target instead of emitting `{uri}`
-verbatim (#330). Common validation refuses unknown names, unused or duplicated
-parameters, unbalanced braces and error sources outside an error route,
-including from JSON.
-
 Proxy `header_down` values resolve against the request. `header_down X "{host}"`
 used to put a literal `{host}` on the wire on every transport; the value is now
 the request's host, matching the `header` directive and Caddy's own behavior.
+HTTP/3 now also forwards appended proxy upstream headers instead of dropping
+them.
 
-`pingclair validate` (and every load, including a reload) now warns when a
-`Redirect` target is a literal string containing placeholder-shaped braces —
-`Redirect(to: "https://example.com{uri}")` would send `{uri}` exactly as
-written, and the warning points at `Format(…)`. A lint, not a refusal: literal
-braces stay legal text.
-
-`ServeFiles(…).negotiate([.markdown])` lets the static file server answer a
+`file_server { negotiate markdown }` lets the static file server answer a
 page request with its Markdown sibling: a directory URL reads `X/index.md` or
 `X.md`, an `X.html` URL reads `X.md`, and only when the client's `Accept`
 prefers `text/markdown` by RFC 9110's rules (`q=0` refuses; equal quality or
@@ -151,22 +141,8 @@ build- or deploy-time copies — and every answer for a negotiated page carries
 `Vary: Accept`; a page whose HTML is refused with no sibling to stand in
 answers 406 instead of silently falling back.
 
-Native `RequestHeader`, `ResponseHeader` and `Proxy` header set, append and
-default values retain literal braces through JSON export and reload. Legacy
-template strings remain templates. HTTP/3 now also forwards appended proxy
-upstream headers instead of dropping them.
-
-TCP limits now use `.limits(maxConnections:)`, the same label as HTTP.
-Source-IP routes use `when: .from([...])`; `.all` combines TLS and source IP,
-and `.any` selects alternative matcher sets. The alpha spellings `connections:`
-and route-level `from:` are refused. `describe TCPListener` now reports `on:`;
-TCP policy modifiers report their parser's argument labels.
-
-`BlockedIPs([...])` is the native spelling of the deny list the configuration
-model already carried: addresses, CIDRs or `.privateRanges`, the same values
-`TrustedProxies(ranges:)` takes. A matching peer is refused before anything is
-read, on HTTP and L4 alike; the compatibility dialect keeps refusing to spell
-it (#325).
+The global `deny` list refuses a matching peer before anything is read, on
+HTTP and L4 alike: addresses, CIDRs or `private_ranges` (#325).
 
 ### 💡 Early hints reach HTTP/3 clients
 
@@ -179,22 +155,11 @@ already used. HTTP/2 still cannot carry a hint — Pingora's h2 session ignores
 informational responses by design — so hints reach HTTP/1.1 and HTTP/3 clients
 only (#207).
 
-### 🔁 `maxAttempts` is spellable
-
-`.retry(maxAttempts: N)` sets the cap on upstream attempts (1..=16) that the
-runtime already read from JSON and that the compatibility dialect already
-spelled as `retry { max_attempts N }` — the last runtime knob of the retry
-policy without a native spelling. With the default policy a connect failure is
-retried once per distinct peer and a failing peer stays in the passive cooldown,
-so the cap only binds when a pool has more peers than it allows; measured tests
-pin both the once-per-peer property (five refused peers → five dials → `502`)
-and the cap (two attempts → two dials).
-
 ### 📮 A stalled client gives up its connection
 
-`.limits(sendTimeout: .seconds(n))` bounds the pause between two consecutive
+`limits { send_timeout <duration> }` bounds the pause between two consecutive
 writes of a response — the reference's `send_timeout`, 60 seconds by default
-and `sendTimeout: .milliseconds(0)` to turn it off. It is per write, not per
+and `send_timeout 0` to turn it off. It is per write, not per
 response: a client that reads slowly is never cut, while one that stops reading
 stops holding a connection, its buffers and its admission slot. Measured
 integration tests pin the stalled case, the slow case, and the off switch.
@@ -223,11 +188,10 @@ with two seconds per attempt inside the configured total connect timeout.
 Single-address dials retain their configured timeout. Local resource errors
 stop immediately; established TCP sessions are never replayed to another peer.
 
-Explicit DNS sources are available as native
-`Proxy(dynamic: .a("backend.example.test", port: 443))` and Caddy-style
-`proxy { dynamic a { ... } }`. A fixed name and port are required. Optional
-`resolvers`, `versions`, `valid`, `stale` and `allowIP` (`allow_ip` in Caddy)
-configure address families, snapshot lifetime and non-public destination policy.
+Explicit DNS sources are available as `proxy { dynamic a { ... } }`. A fixed
+name and port are required. Optional `resolvers`, `versions`, `valid`, `stale`
+and `allow_ip` configure address families, snapshot lifetime and non-public
+destination policy.
 Static `to:` addresses keep their load-time resolution behavior.
 
 One process-owned coordinator bounds DNS work across reloads. TTL or `valid`
@@ -275,18 +239,18 @@ reported nothing (#326).
 
 ### 🔌 Unconfigured listeners get the reference's connection ceiling
 
-A listener whose sites set no `limits(maxConnections:)` now admits 512
+A listener whose sites set no `limits { max_connections }` now admits 512
 connections per worker thread — the reference's `worker_connections` default
 — instead of taking connections without a ceiling. The bound applies to
 HTTP/1 and HTTP/2 clients, HTTP/3 clients, and the PROXY-protocol ingress
 alike. Excess connections are refused before a request is read: HTTP/1
 clients get `503`, HTTP/2 and HTTP/3 connections are closed. Writing
-`.limits(maxConnections: N)` sets the number explicitly; `0` stays refused,
+`limits { max_connections N }` sets the number explicitly; `0` stays refused,
 on TCP listeners as well (#58).
 
 ### 🔁 A keepalive connection is retired after its request budget
 
-`.limits(keepaliveRequests: N)` sets how many requests one downstream
+`limits { keepalive_requests N }` sets how many requests one downstream
 keepalive connection serves before it is closed; the default is the
 reference's `keepalive_requests`, 1000. `0` is refused, because the
 listener-wide value is the strictest configured one and an "off" zero would

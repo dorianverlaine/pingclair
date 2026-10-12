@@ -8,6 +8,7 @@
 //! layer that keeps running an existing Pingclairfile unchanged.
 
 pub mod adapter;
+pub mod format;
 mod json;
 pub mod parser;
 

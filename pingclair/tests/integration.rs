@@ -46,9 +46,6 @@ mod cli_args;
 #[path = "integration/cli_empty.rs"]
 mod cli_empty;
 
-#[path = "integration/cli_text_lint.rs"]
-mod cli_text_lint;
-
 #[path = "integration/markdown_negotiation.rs"]
 mod markdown_negotiation;
 
@@ -338,11 +335,6 @@ enum LaunchRecipe {
         template: String,
         nofile_limit: Option<u64>,
     },
-    /// 📄 A `.pingclair` file: the extension decides the language, so this is
-    /// the native frontend's own entry point.
-    Native {
-        template: String,
-    },
 }
 
 /// 🛡️ A real bind defect fails every attempt, so a small bound still reports
@@ -382,9 +374,6 @@ impl TestServer {
                 template,
                 nofile_limit,
             } => Self::launch_pingclairfile(template, *nofile_limit, recipe.clone()),
-            LaunchRecipe::Native { template } => {
-                Self::launch_config_file("config.pingclair", template, None, recipe.clone())
-            }
         }
     }
 
@@ -435,13 +424,6 @@ impl TestServer {
         Self::launch(LaunchRecipe::Pingclairfile {
             template: config_template.to_owned(),
             nofile_limit,
-        })
-    }
-
-    /// 📄 Starts the real binary from a `.pingclair` file.
-    fn new_native(config_template: &str) -> Self {
-        Self::launch(LaunchRecipe::Native {
-            template: config_template.to_owned(),
         })
     }
 
@@ -4969,42 +4951,10 @@ async fn test_pingclairfile_header_replace_rewrites_an_upstream_value() {
     upstream_task.await.unwrap();
 }
 
-/// 🧭 The native language's first real-binary coverage: routes match, fall
-/// through in order, and answer from the same runtime a Caddyfile uses.
+/// 🧭 A proxy-scoped `handle_response` rewrites the status of the upstream's
+/// response and keeps its body.
 #[tokio::test]
-async fn test_native_routes_serve_real_requests() {
-    let config = r#"
-HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {
-    Site(host: "*") {
-        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {
-            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
-        }
-        Route(when: .path(prefix: "/api")) {
-            Respond(body: "api")
-        }
-        Fallback { Respond(body: "site") }
-    }
-}
-"#;
-    let mut server = TestServer::new_native(config);
-    assert!(server.wait_until_ready().await, "server failed to start");
-
-    let client = no_proxy_client();
-    let body = |path: &'static str| {
-        let client = client.clone();
-        let url = server.url(0, path);
-        async move { client.get(url).send().await.unwrap().text().await.unwrap() }
-    };
-    assert_eq!(body("/api/users").await, "api");
-    // 📌 `.path(prefix:)` matches path segments, not raw string prefixes: the
-    // fallback is what `/apiv2` gets, unlike Caddy's `/api/*`.
-    assert_eq!(body("/apiv2").await, "site");
-    assert_eq!(body("/").await, "site");
-}
-
-/// 🗄️ A native reverse proxy reaches an upstream through the real binary.
-#[tokio::test]
-async fn test_native_reverse_proxy_reaches_an_upstream() {
+async fn test_handle_response_rewrites_a_proxied_response() {
     use tokio::io::AsyncWriteExt;
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -5012,207 +4962,7 @@ async fn test_native_reverse_proxy_reaches_an_upstream() {
         .unwrap();
     let upstream_address = listener.local_addr().unwrap();
     let upstream_task = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nnative")
-            .await
-            .unwrap();
-    });
-
-    let config = format!(
-        r#"
-HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
-    Site(host: "*") {{
-        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
-            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
-        }}
-        Fallback {{ Proxy(to: "{upstream_address}") }}
-    }}
-}}
-"#
-    );
-    let mut server = TestServer::new_native(&config);
-    assert!(server.wait_until_ready().await, "server failed to start");
-
-    let response = no_proxy_client()
-        .get(server.url(0, "/proxied"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.text().await.unwrap(), "native");
-    upstream_task.await.unwrap();
-}
-
-/// 📊 A native access log reaches the file the configuration named, with the
-/// headers it asked to capture.
-#[tokio::test]
-async fn test_native_access_log_writes_captured_headers() {
-    let dir = tempfile::tempdir().unwrap();
-    let log_path = dir.path().join("access.log");
-    let config = format!(
-        r#"
-HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
-    Site(host: "*") {{
-        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
-            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
-        }}
-        Fallback {{ Respond(body: "ok") }}
-    }}
-}}
-.accessLog(output: .file("{}"), format: .json, headers: [.request("X-Trace")])
-"#,
-        log_path.display()
-    );
-    let mut server = TestServer::new_native(&config);
-    assert!(server.wait_until_ready().await, "server failed to start");
-
-    let response = no_proxy_client()
-        .get(server.url(0, "/logged"))
-        .header("X-Trace", "trace-7")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-
-    // 🔄 The writer is a thread; give it a bounded moment rather than a sleep
-    // long enough to hide a real failure.
-    let mut content = String::new();
-    for _ in 0..50 {
-        content = std::fs::read_to_string(&log_path).unwrap_or_default();
-        if content.contains("trace-7") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(content.contains("\"x-trace\":\"trace-7\""), "{content}");
-}
-
-/// 🛡️ Two listener-level decisions reach the real socket: which underscore
-/// names survive, and whose forwarded client address is believed.
-///
-/// 📌 Both are per-listener on purpose. One listener inherits the file-level
-/// allowlist and trusts the peer in front of it; the other replaces the
-/// allowlist with its own and trusts nobody.
-#[tokio::test]
-async fn test_native_listener_trust_and_allowlist_reach_the_socket() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    // 🔎 An origin that answers with the fields these assertions read.
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let origin = listener.local_addr().unwrap();
-    let origin_task = tokio::spawn(async move {
-        for _ in 0..2 {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buffer = vec![0u8; 16384];
-            let read = stream.read(&mut buffer).await.unwrap();
-            let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
-            let mut lines: Vec<String> = request
-                .lines()
-                .skip(1)
-                .take_while(|line| !line.is_empty())
-                .filter(|line| {
-                    let name = line.split(':').next().unwrap_or_default();
-                    ["x_probe", "webhook_event", "x-forwarded-for", "x-real-ip"].contains(&name)
-                })
-                .map(str::to_owned)
-                .collect();
-            lines.sort();
-            let body = lines.join("\n");
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
-        }
-    });
-
-    let config = format!(
-        r#"
-UnderscoreHeaders(["X_Probe"])
-HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
-    Site(host: "*") {{
-        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
-            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
-        }}
-        Fallback {{ Proxy(to: "{origin}") }}
-    }}
-}}
-.trustedProxies(ranges: ["127.0.0.1/32"], headers: [.xRealIP])
-
-HTTPListener(on: "127.0.0.1:__PINGCLAIR_TEST_HTTP_PORT__") {{
-    Site(host: "*") {{
-        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
-            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
-        }}
-        Fallback {{ Proxy(to: "{origin}") }}
-    }}
-}}
-.underscoreHeaders(["Webhook_*"])
-"#
-    );
-    let mut server = TestServer::new_native(&config);
-    assert!(server.wait_until_ready().await, "server failed to start");
-
-    let probe = |url: String| {
-        let client = no_proxy_client();
-        async move {
-            client
-                .get(url)
-                .header("X_Probe", "kept")
-                .header("Webhook_Event", "kept")
-                .header("X-Real-IP", "203.0.113.8")
-                .send()
-                .await
-                .unwrap()
-                .text()
-                .await
-                .unwrap()
-        }
-    };
-
-    // 🧭 The first listener keeps the file-level allowlist and believes the
-    // address `X-Real-IP` names, because it stated the ranges and the field.
-    let trusted = probe(server.url(0, "/")).await;
-    assert!(trusted.contains("x_probe: kept"), "{trusted}");
-    assert!(!trusted.contains("webhook_event"), "{trusted}");
-    assert!(trusted.contains("x-real-ip: 203.0.113.8"), "{trusted}");
-    assert!(
-        trusted.contains("x-forwarded-for: 203.0.113.8"),
-        "{trusted}"
-    );
-
-    // 🛡️ The second replaced the allowlist (so `X_Probe` is gone) and trusts
-    // no peer, so the same spoofed field is overwritten with the real one.
-    let second = format!("http://{}/", server.listener_address(0, 1));
-    let untrusted = probe(second).await;
-    assert!(untrusted.contains("webhook_event: kept"), "{untrusted}");
-    assert!(!untrusted.contains("x_probe"), "{untrusted}");
-    assert!(untrusted.contains("x-real-ip: 127.0.0.1"), "{untrusted}");
-    assert!(
-        untrusted.contains("x-forwarded-for: 127.0.0.1"),
-        "{untrusted}"
-    );
-    origin_task.await.unwrap();
-}
-
-/// 🧭 The native `Intercept` covers the Caddyfile's proxy-scoped
-/// `handle_response`: the same upstream response comes out rewritten the same
-/// way on both.
-#[tokio::test]
-async fn test_native_intercept_rewrites_a_proxied_response_like_handle_response() {
-    use tokio::io::AsyncWriteExt;
-
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let upstream_address = listener.local_addr().unwrap();
-    let upstream_task = tokio::spawn(async move {
-        for _ in 0..2 {
+        for _ in 0..1 {
             let (mut stream, _) = listener.accept().await.unwrap();
             let _ = read_until_marker(&mut stream, b"\r\n\r\n", Duration::from_secs(2)).await;
             stream
@@ -5225,28 +4975,7 @@ async fn test_native_intercept_rewrites_a_proxied_response_like_handle_response(
         }
     });
 
-    // 🧭 Native: the response handlers are a pipeline element wrapping the
-    // proxy that follows it.
-    let native_config = format!(
-        r#"
-HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
-    Site(host: "*") {{
-        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
-            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
-        }}
-        Fallback {{
-            Intercept {{
-                Response(when: .status(.serverError)) {{ CopyResponse(status: 502) }}
-            }}
-            Proxy(to: "{upstream_address}")
-        }}
-    }}
-}}
-"#
-    );
-    // 🗄️ Caddyfile: the same rewriting lives inside the proxy's own
-    // `handle_response` block.
-    let legacy_config = format!(
+    let config = format!(
         r#"
 http://__PINGCLAIR_TEST_LISTEN__ {{
     @readiness path __PINGCLAIR_TEST_READINESS_PATH__
@@ -5261,26 +4990,16 @@ http://__PINGCLAIR_TEST_LISTEN__ {{
 }}
 "#
     );
-    let mut native = TestServer::new_native(&native_config);
-    let mut legacy = TestServer::new_pingclairfile(&legacy_config);
-    assert!(
-        native.wait_until_ready().await,
-        "native server failed to start"
-    );
-    assert!(
-        legacy.wait_until_ready().await,
-        "caddyfile server failed to start"
-    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
 
-    for (label, server) in [("native", &native), ("caddyfile", &legacy)] {
-        let response = no_proxy_client()
-            .get(server.url(0, "/broken"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 502, "{label}");
-        assert_eq!(response.text().await.unwrap(), "boom", "{label}");
-    }
+    let response = no_proxy_client()
+        .get(server.url(0, "/broken"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    assert_eq!(response.text().await.unwrap(), "boom");
     upstream_task.await.unwrap();
 }
 
@@ -5297,22 +5016,7 @@ async fn test_php_fastcgi_leaves_static_files_to_the_file_server() {
     std::fs::write(dir.path().join("plain.txt"), "static-ok").unwrap();
     let root = dir.path().display();
 
-    let native_config = format!(
-        r#"
-HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
-    Site(host: "*") {{
-        Route(when: .path(exact: "__PINGCLAIR_TEST_READINESS_PATH__")) {{
-            Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__")
-        }}
-        Fallback {{
-            PHPFastCGI(to: "unix//tmp/pingclair-no-such-fpm.sock", root: "{root}")
-            ServeFiles(root: "{root}")
-        }}
-    }}
-}}
-"#
-    );
-    let legacy_config = format!(
+    let config = format!(
         r#"
 http://__PINGCLAIR_TEST_LISTEN__ {{
     @readiness path __PINGCLAIR_TEST_READINESS_PATH__
@@ -5324,26 +5028,16 @@ http://__PINGCLAIR_TEST_LISTEN__ {{
 }}
 "#
     );
-    let mut native = TestServer::new_native(&native_config);
-    let mut legacy = TestServer::new_pingclairfile(&legacy_config);
-    assert!(
-        native.wait_until_ready().await,
-        "native server failed to start"
-    );
-    assert!(
-        legacy.wait_until_ready().await,
-        "caddyfile server failed to start"
-    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
 
-    for (label, server) in [("native", &native), ("caddyfile", &legacy)] {
-        let response = no_proxy_client()
-            .get(server.url(0, "/plain.txt"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200, "{label}");
-        assert_eq!(response.text().await.unwrap(), "static-ok", "{label}");
-    }
+    let response = no_proxy_client()
+        .get(server.url(0, "/plain.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "static-ok");
 }
 
 /// 🗄️ `header_up` takes the same shapes `header_down` does.
@@ -16637,17 +16331,14 @@ mod retry_duration;
 #[path = "integration/error_routes.rs"]
 mod error_routes;
 
-#[path = "integration/native_terminals.rs"]
-mod native_terminals;
+#[path = "integration/abort_terminal.rs"]
+mod abort_terminal;
 
-#[path = "integration/native_header_text.rs"]
-mod native_header_text;
+#[path = "integration/error_status_inheritance.rs"]
+mod error_status_inheritance;
 
-#[path = "integration/native_error_status.rs"]
-mod native_error_status;
-
-#[path = "integration/native_typed_text.rs"]
-mod native_typed_text;
+#[path = "integration/header_down_values.rs"]
+mod header_down_values;
 
 // 🔌 An IP-literal site and a hostname site on one port share one socket.
 #[path = "integration/shared_port_sites.rs"]

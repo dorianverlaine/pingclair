@@ -10,14 +10,13 @@
 //! failure, and any client that does speak plain HTTP to it sends its cookies
 //! and `Authorization` header across the network in the clear.
 //!
-//! 🤡 Before this module, four spellings loaded without complaint and served
-//! cleartext HTTP there: a native `HTTPListener(on: ":443")` without `.tls`,
-//! a Pingclairfile `http://example.com:443`, `tls off` on the HTTPS port, and a
-//! JSON document whose `plaintext_listen` named it. `validate` passed all four.
+//! 🤡 Before this module, several spellings loaded without complaint and served
+//! cleartext HTTP there: a Pingclairfile `http://example.com:443`, `tls off` on
+//! the HTTPS port, and a JSON document whose `plaintext_listen` named it.
+//! `validate` passed them all.
 //!
-//! The check runs in [`crate::compiler::validate_config`], so the Pingclairfile,
-//! the native language, a JSON file and an Admin `/load` body are all refused
-//! by the same rule. It judges each socket with
+//! The check runs in [`crate::compiler::validate_config`], so a Pingclairfile,
+//! a JSON file and an Admin `/load` body are all refused by the same rule. It judges each socket with
 //! [`ServerConfig::requires_tls_on`] — the rule the runtime uses to install its
 //! acceptor — so "refused here" and "would have been plaintext there" are the
 //! same set.
@@ -113,8 +112,8 @@ fn plaintext_refusal(server: &ServerConfig, address: &str) -> String {
         .iter()
         .any(|declared| normalize_listen_addr(declared) == address);
     let reason = if declared {
-        "the configuration declares that socket plaintext (an `http://` address, a JSON \
-         `plaintext_listen` entry, or a native listener without `.tls`)"
+        "the configuration declares that socket plaintext (an `http://` address or a JSON \
+         `plaintext_listen` entry)"
     } else {
         "it has no TLS"
     };
@@ -152,16 +151,6 @@ mod tests {
             message.contains("declares that socket plaintext"),
             "{message}"
         );
-    }
-
-    /// 🌐 A native listener on 443 without `.tls` used to serve cleartext.
-    #[test]
-    fn a_native_listener_on_the_https_port_without_tls_is_refused() {
-        let message = refusal(
-            "HTTPListener(on: \":443\") {\n    Site(host: \"example.test\") {\n        \
-             Fallback { Respond(body: \"x\") }\n    }\n}\n",
-        );
-        assert!(message.contains("the HTTPS port"), "{message}");
     }
 
     /// 🔢 With `https_port 8443`, 443 is still protected. The address check

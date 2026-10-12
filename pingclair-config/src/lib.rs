@@ -24,21 +24,14 @@
 //! let config = compile(source).unwrap();
 //! ```
 
-mod attributes;
-mod bindings;
 pub mod caddyfile;
 pub mod compiler;
-pub mod describe;
-pub mod format;
-pub mod frontend;
 mod header_fields;
 mod https_port;
 mod layer4;
 mod layer4_dynamic;
-mod lint;
 mod retired_placeholders;
 mod shared_ports;
-mod syntax;
 mod typed_text;
 mod underscore_headers;
 mod upstream_weights;
@@ -49,7 +42,6 @@ pub use caddyfile::parser::{
 };
 
 pub use compiler::{CompileError, compile_ast};
-pub use lint::lints;
 
 use pingclair_core::config::PingclairConfig;
 use std::path::Path;
@@ -111,51 +103,6 @@ fn compile_named_with(
     name: Option<&Path>,
     validate: bool,
 ) -> Result<PingclairConfig, FullCompileError> {
-    // 🗂️ The name decides when it can: `.pingclair` is the native language and
-    // `.caddyfile` is the compatibility layer, so a file that reads as the
-    // other one is refused with the rename it needs. `Pingclairfile`,
-    // `Caddyfile` and standard input have no extension to trust, so the shape
-    // of the text decides for them.
-    let named = name
-        .and_then(|path| path.extension())
-        .and_then(|ext| ext.to_str());
-    let native = match named {
-        Some("pingclair") => true,
-        Some("caddyfile") => false,
-        _ => frontend::is_native(source),
-    };
-    if native && !frontend::is_native(source) {
-        return Err(FullCompileError::Io(format!(
-            "{} is named as a native configuration but does not read as one; write it in the \
-             native language or rename it to `.caddyfile`",
-            name.map(|path| path.display().to_string())
-                .unwrap_or_else(|| "standard input".to_string())
-        )));
-    }
-    if !native && frontend::is_native(source) {
-        return Err(FullCompileError::Io(format!(
-            "{} is named as a Caddyfile but reads as the native language; rename it to \
-             `.pingclair`",
-            name.map(|path| path.display().to_string())
-                .unwrap_or_else(|| "standard input".to_string())
-        )));
-    }
-    if native {
-        let config = frontend::adapt(source).map_err(|error| {
-            let error = FullCompileError::Native(error);
-            match name {
-                Some(path) => FullCompileError::InFile {
-                    path: path.display().to_string(),
-                    source: Box::new(error),
-                },
-                None => error,
-            }
-        })?;
-        if validate {
-            compiler::validate_config(&config)?;
-        }
-        return Ok(config);
-    }
     // 🧩 Parse and analyze the human-readable configuration. The file's own
     // directory goes with it, because a relative `import` resolves against the
     // importing file rather than the working directory — a configuration that
@@ -225,19 +172,11 @@ fn merge_files(
     for path in paths {
         let source = std::fs::read_to_string(path.as_ref())
             .map_err(|e| FullCompileError::Io(e.to_string()))?;
-        // 🗂️ A native file says what it declared, so two files naming the same
-        // global option are refused even when the second one spells the value
-        // the default already had.
-        if frontend::is_native(&source) {
-            for name in frontend::declared_globals(&source).map_err(FullCompileError::Native)? {
-                claims.claim(Box::leak(name.into_boxed_str()), path.as_ref())?;
-            }
-        }
         let config = compile_source_unvalidated(&source, path.as_ref())?;
 
         final_config.debug = final_config.debug || config.debug;
         // 🌐 One socket may be served by one listener, no matter how many
-        // files declare it: two `HTTPListener(on: ":8080")` blocks in two files
+        // files declare it: two sites on `:8080` in two files
         // would race for the same address, and the runtime can only bind one.
         // Merging them would mean deciding how the *options* of two blocks
         // combine, which nothing here knows how to do.
@@ -602,8 +541,6 @@ fn configuration_paths(dir_path: &Path) -> Result<Vec<std::path::PathBuf>, FullC
 /// Full compilation error
 #[derive(Debug, thiserror::Error)]
 pub enum FullCompileError {
-    #[error("Native configuration error: {0}")]
-    Native(#[from] frontend::Error),
     #[error("IO error: {0}")]
     Io(String),
 

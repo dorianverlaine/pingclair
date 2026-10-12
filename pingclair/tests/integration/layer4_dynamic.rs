@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dorian Verlaine
 
-//! 🌐 Controlled DNS drives real-binary native and Caddy TCP routes.
+//! 🌐 Controlled DNS drives real-binary TCP routes.
 
 use super::*;
 use hickory_resolver::proto::op::ResponseCode;
@@ -102,22 +102,20 @@ async fn controlled(mode: Arc<AtomicU8>) -> dns::Dns {
     .await
 }
 
-fn native(resolver: SocketAddr, origin: SocketAddr, local: SocketAddr, stale: u64) -> String {
-    format!(
-        r#"
-Admin(listen: "__PINGCLAIR_TEST_ADMIN_LISTEN__")
-Shutdown(grace: .seconds(5))
-TCPListener(on: ":__PINGCLAIR_TEST_HTTP_PORT__") {{
-    Route(when: .tls(sni: ["example.test"])) {{ Proxy(to: "{local}") }}
-    Fallback {{ Proxy(dynamic: .a("pool.test", port: {}, resolvers: ["{resolver}"], versions: .ip, valid: .seconds(1), stale: .seconds({stale}), allowIP: ["127.0.0.1/32", "::1/128"])) }}
-}}
-.timeouts(preread: .seconds(1), connect: .seconds(1), idle: .seconds(30))
-.halfClose(enabled: true)
-HTTPListener(on: "__PINGCLAIR_TEST_LISTEN__") {{
-    Site(host: "*") {{ Fallback {{ Respond(body: "__PINGCLAIR_TEST_READINESS_TOKEN__") }} }}
-}}
-"#,
+/// 🌐 One TCP listener: SNI `example.test` goes to `local`, and everything
+/// else to the pool `pool.test` resolves to. Tests vary the pool by replacing
+/// one of its lines (`versions ip`, `valid 1s`, `allow_ip …`).
+fn dns_pool(resolver: SocketAddr, origin: SocketAddr, local: SocketAddr, stale: u64) -> String {
+    let routes = format!(
+        "@secure {{\n tls {{\n sni example.test\n }}\n }}\n\
+         route @secure {{\n proxy {local}\n }}\n\
+         route {{\n proxy {{\n dynamic a {{\n name pool.test\n port {}\n resolvers {resolver}\n \
+         versions ip\n valid 1s\n stale {stale}s\n allow_ip 127.0.0.1/32 ::1/128\n }}\n }}\n }}",
         origin.port()
+    );
+    fixture(
+        "preread_timeout 1s\n proxy_connect_timeout 1s\n proxy_timeout 30s",
+        &routes,
     )
 }
 
@@ -165,20 +163,20 @@ async fn retained(stream: &mut TcpStream) {
 }
 
 #[tokio::test]
-async fn native_dns_updates_reload_and_failures_preserve_existing_streams() {
+async fn dns_updates_reload_and_failures_preserve_existing_streams() {
     timeout(Duration::from_secs(60), async {
         let mode = Arc::new(AtomicU8::new(0));
         let dns = controlled(mode.clone()).await;
         let (first, second) = origins().await;
         let origin = first.local_addr().unwrap();
         let local = AsyncListener::bind("127.0.0.1:0").await.unwrap();
-        let config = native(dns.address, origin, local.local_addr().unwrap(), 60);
+        let config = dns_pool(dns.address, origin, local.local_addr().unwrap(), 60);
         let (_first, _second, _local) = (
             Echo::new(first, b'A'),
             Echo::new(second, b'B'),
             Echo::new(local, b'L'),
         );
-        let mut server = TestServer::new_native(&config);
+        let mut server = TestServer::new_pingclairfile(&config);
         assert!(server.wait_until_ready().await);
         let address = server.listener_address(0, 1);
         let mut secure = TcpStream::connect(address).await.unwrap();
@@ -290,14 +288,14 @@ async fn native_dns_updates_reload_and_failures_preserve_existing_streams() {
 }
 
 #[tokio::test]
-async fn native_dns_transient_failures_cannot_extend_the_stale_deadline() {
+async fn dns_transient_failures_cannot_extend_the_stale_deadline() {
     timeout(Duration::from_secs(30), async {
         let mode = Arc::new(AtomicU8::new(1));
         let dns = controlled(mode.clone()).await;
         let first = AsyncListener::bind("127.0.0.1:0").await.unwrap();
         let origin = first.local_addr().unwrap();
         let _origin = Echo::new(first, b'A');
-        let mut server = TestServer::new_native(&native(dns.address, origin, origin, 1));
+        let mut server = TestServer::new_pingclairfile(&dns_pool(dns.address, origin, origin, 1));
         assert!(server.wait_until_ready().await);
         let address = server.listener_address(0, 1);
         let mut old = wait_tag(address, b'A').await;
@@ -313,7 +311,7 @@ async fn native_dns_transient_failures_cannot_extend_the_stale_deadline() {
 }
 
 #[tokio::test]
-async fn caddy_dns_truncation_uses_tcp_and_closes_its_scoped_socket() {
+async fn dns_truncation_uses_tcp_and_closes_its_scoped_socket() {
     timeout(Duration::from_secs(15), async {
         let (dns, tcp) = dns::truncated_dns().await;
         let origin = AsyncListener::bind("127.0.0.1:0").await.unwrap();

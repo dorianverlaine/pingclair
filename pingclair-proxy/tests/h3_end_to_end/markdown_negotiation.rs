@@ -31,11 +31,12 @@ async fn h3_markdown_negotiation_serves_the_twin_and_refuses_what_it_must() {
     std::fs::write(root.path().join("index.md"), "# home").unwrap();
     std::fs::write(root.path().join("bare.html"), "<h1>bare</h1>").unwrap();
     let source = format!(
-        r#"HTTPListener(on: ":8080") {{
-        Site(host: "*") {{
-            Fallback {{ ServeFiles(root: "{}").negotiate([.markdown]) }}
-        }}
-    }}"#,
+        r#":8080 {{
+    root * {}
+    file_server {{
+        negotiate markdown
+    }}
+}}"#,
         root.path().display()
     );
     let site = pingclair_config::compile(&source)

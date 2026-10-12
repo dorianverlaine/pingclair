@@ -1,126 +1,97 @@
-// 🧭 Every feature the native language has today, in one file.
-//
-// 📌 This is the corpus's widest example and the one that will keep growing:
-// when a batch lands, it gets a line here. Every file in `examples/` is
-// compiled by `pingclair-config/tests/documentation.rs`, so nothing here can
-// quietly stop being true.
-// 🔐 A secret binding: its value never appears in diagnostics, JSON or logs.
-// The one field that stores secrets — the DNS-01 provider arguments — is where
-// it is allowed to flow; `examples/tls.pingclair` shows that case, and every
-// other position is refused at load.
-@Secret
-let metricsToken = "placeholder-secret"
+# Full-featured example — every directive below compiles, and the file is a
+# valid Caddyfile: nothing here is spelled a way the format does not spell it.
+# Simpler starting points: Pingclairfile.example, basic.pingclair.
+#
+# 📌 `pingclair validate` still rejects this file, and correctly so: it checks
+# that the TLS certificate paths below exist, and they are illustrative paths
+# on a machine that is not yours. Point `tls` at real files, or switch it to
+# `tls auto`, and it validates.
 
-let publicRoot = "./public"
+# Global options block
+{
+	# ACME account email (Let's Encrypt)
+	email admin@example.com
 
-@Matcher
-let api = .path(prefix: "/api")
+	# Automatic HTTPS: on | off | disable_redirects
+	auto_https off
 
-Metrics(enabled: true)
-Shutdown(grace: .seconds(10))
-TrustedProxies(ranges: [.privateRanges], headers: [.xForwardedFor, .xRealIP])
+	# Admin API on 127.0.0.1:2019, protected by a Bearer token.
+	# Without a token the API only accepts loopback connections.
+	admin 127.0.0.1:2019 your-secret-key-here
 
-// 🛡️ Underscore-named request fields are dropped before routing unless a
-// listener lists them: a CGI backend folds `x_probe` and `x-probe` onto one
-// variable, so the underscore spelling is the alias an attacker picks. This
-// declaration is the default; a listener's `.underscoreHeaders(…)` replaces it
-// for that socket.
-UnderscoreHeaders(["X_Probe", "Webhook_*"])
-Storage(root: "./.pingclair-store")
-Log(output: .file("/tmp/pingclair-process.log"), level: .info)
-AutomaticTLS(mode: .automatic, httpPort: 80, httpsPort: 443)
+	# 📊 Collect Prometheus metrics, served at the admin API's /metrics.
+	# Collection is off unless this line is present, as in Caddy.
+	metrics
 
-// 🔌 Layer 4 passthrough, routed by SNI.
-TCPListener(on: ":9443") {
-    Route(when: .tls(sni: ["tunnel.example.test"])) { Proxy(to: "10.0.0.20:8443") }
-    Fallback { Proxy(to: "10.0.0.21:443") }
+	# 🛡️ Only proxies you operate may supply client identity headers.
+	# Changes to this global policy currently require a restart.
+	# trusted_proxies 10.0.0.0/8 2001:db8::/32
 }
-.limits(maxConnections: 2048, preread: .kibibytes(16))
-.timeouts(preread: .seconds(30), connect: .seconds(5), idle: .minutes(5))
-.halfClose(enabled: true)
 
-// 🌐 One TLS listener, one plaintext listener.
-HTTPListener(on: ":8443") {
-    Site(host: "www.example.test") {
-        Route(when: api) {
-            // 🏷️ Not `X-Real-IP`: that field names the client's address, and
-            // this build has no typed source for it yet. A name that does not
-            // claim more than it knows is the honest placeholder until
-            // `.clientIP` lands.
-            RequestHeader(.set("X-Forwarded-By", "pingclair"), .remove("Cookie"))
-            Rewrite(stripPrefix: "/api")
-            ResponseHeader(.setIfAbsent("X-Served-By", "pingclair"))
-            Proxy(to: ["10.0.0.10:8080", "10.0.0.11:8080"])
-        }
-        Route(when: .path(exact: "/metrics")) {
-            AccessControl(allowedIPs: ["10.0.0.0/8"])
-            SkipLog()
-            ServeMetrics()
-        }
-        Route(when: .path(prefix: "/admin")) {
-            // 🛡️ The budget runs first: bcrypt is deliberately slow, so
-            // checking a password before counting the attempt is how a
-            // password-guessing flood turns into CPU load.
-            RateLimit(requests: 30, per: .minutes(1), key: .ip)
+# Main site. The port belongs in the site address, exactly as upstream writes
+# it — a separate listen directive would be a second place to keep in agreement
+# with the first.
+example.com:8080 {
+	# 📂 The site root. `file_server` accepts a `root` of its own, but setting
+	# it here instead is what lets `try_files` and the file server agree about
+	# where the site lives — they both read this one.
+	root * ./public
 
-            // 🔑 A test vector from this repository's corpus, not a password
-            // worth keeping: `pingclair hash-password --bcrypt-cost 14`.
-            BasicAuth(users: [.user("alice", hash: "$2y$04$BjuNmKvAV.mEi7.yFrazX.S6w6OO7H0BzQfyVVFZBq/qbVXCVNX4W")], realm: "Admin Area")
-            ServeFiles(root: "./admin")
-        }
-        Route(when: .path(exact: "/upload")) {
-            LimitRequestBody(max: .mebibytes(64), readTimeout: .minutes(5))
-            Respond(status: 201, body: "stored")
-        }
+	# Manual certificate + HTTP/3 (QUIC). Use `tls auto` for ACME instead.
+	tls {
+		cert /etc/pingclair/certs/example.com.pem
+		key /etc/pingclair/certs/example.com.key
+		http3
+	}
 
-        // 📌 A `.file(...)` condition decides *whether*, never *what*: the
-        // component after it serves the request path, not the candidate that
-        // matched. `TryFiles` in the fallback below is the spelling that hands
-        // the matched file on, and this route is deliberately not written with
-        // a candidate that always exists — `/index.html` beside the request
-        // path would make it match every request and the fallback unreachable.
-        ErrorRoute(for: [.status(404)]) { Respond(status: 404, body: "no such route") }
-        ErrorRoute(for: [.anyError]) { Respond(status: 500, body: "something broke") }
-        Fallback {
-            TryFiles(candidates: [.requestPath, .requestPath(appending: "/index.html"), "/index.html"], root: publicRoot)
-            Templates(root: publicRoot)
-            ServeFiles(
-                root: publicRoot,
-                index: ["index.html"],
-                hide: [".git"],
-                precompressed: [.br, .zstd, .gzip],
-                etagFileExtensions: [".etag"],
-                browse: false,
-            )
-        }
-    }
-    .encode(.zstd, .gzip)
-    // 🖼️ A page answers a status no error route claims: the 404 route above
-    // already answers that one, and the loader refuses a page it shadows.
-    .errorPage(for: [.status(403)], file: "./public/index.html")
-}
-.tls(.automatic(email: "admin@example.test"), defaultSNI: "www.example.test", renewalWindow: .ratio(0.1))
-.protocols([.http1, .http2])
-// 🛡️ Only the half a modifier writes is replaced: this listener keeps a
-// narrower allowlist than the file-level one, and keeps the file-level ranges
-// while reading the client address from the two fields it names.
-.underscoreHeaders(["Webhook_*"])
-.trustedProxies(headers: [.xForwardedFor, .xRealIP])
-.limits(maxConnections: 4096, headerTimeout: .seconds(30))
-.accessLog(
-    output: .file("/tmp/pingclair-access.log"),
-    format: .text,
-    headers: [.request("User-Agent"), .response("Content-Type"), .tls],
-    rotation: .roll(size: .mebibytes(100), keep: 7, compress: true),
-)
+	# Response compression. Argument order is the server's preference when
+	# more than one coding is acceptable to the client, so zstd comes first.
+	# Brotli is deliberately absent: the proxy has no streaming Brotli
+	# encoder, and `encode br` is a compile error rather than a silent
+	# downgrade to gzip.
+	encode zstd gzip
+	# 🗜️ Reverse-proxy gzip uses these exact or wildcard MIME patterns.
+	gzip_types text/* application/json application/*+json application/x-ndjson
 
-// 🔀 A plaintext listener that redirects, and nothing else.
-HTTPListener(on: ":8080") {
-    Site(host: "www.example.test") {
-        // 📌 It used to answer `/api` here while the comment above it said it
-        // only redirected: an API over cleartext is a different promise than a
-        // redirect, and CORS is not a TLS policy. Anything that answers belongs
-        // on the TLS listener above.
-        Fallback { Redirect(to: "https://www.example.test", status: .permanent) }
-    }
+	# Response headers: set, append with +, remove with -
+	header {
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-X-Powered-By
+	}
+
+	# 🔐 The admin area uses a bcrypt hash; replace this demonstration hash.
+	# Its example plaintext is "change-me". The arguments are the hash
+	# algorithm and the realm, in that order; accounts go in the block, one
+	# `<username> <hashed_password>` per line.
+	handle /admin/* {
+		basic_auth bcrypt "Admin Area" {
+			admin "$2y$12$iKzVHkDoCr2oz1DAOzX9wec0yf3A.FZM3SmsP9dYHmhE2O.3TSpSW"
+		}
+		respond "Welcome to the admin area"
+	}
+
+	# API backend. flush_interval -1 enables per-chunk streaming, which
+	# keeps SSE / LLM-style endpoints responsive through the proxy.
+	handle /api/* {
+		reverse_proxy localhost:3000 localhost:3001 {
+			header_up X-Forwarded-Host {host}
+			flush_interval -1
+			transport http {
+				read_timeout 300s
+				write_timeout 300s
+			}
+		}
+	}
+
+	# Custom response for a health-check endpoint
+	handle /healthz {
+		respond "ok"
+	}
+
+	# Static files for everything else
+	file_server {
+		index index.html
+	}
 }

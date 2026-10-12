@@ -153,31 +153,52 @@ async def run(args, result):
         payload = outgoing.read()
 
     def config(generation=None):
-        terminal = "Route(when: .tls())" if args.tls else "Fallback"
+        # 🔌 With `--tls`, every route requires a ClientHello, so the listener
+        # prereads before it forwards; without it, the final route is bare.
+        hello = "@hello tls\n" if args.tls else ""
+        final = "route @hello" if args.tls else "route"
         def source(name):
-            return (f'Proxy(dynamic: .a("{name}", port: {origin_port}, resolvers: '
-                    f'["127.0.0.1:{dns_port}"], versions: .ipv4, valid: .seconds(1), '
-                    'stale: .seconds(60), allowIP: ["127.0.0.1/32"]))')
+            return (f"proxy {{\n dynamic a {{\n name {name}\n port {origin_port}\n "
+                    f"resolvers 127.0.0.1:{dns_port}\n versions ipv4\n valid 1s\n "
+                    "stale 60s\n allow_ip 127.0.0.1/32\n }\n }")
         routes = "" if generation is None else "\n".join(
-            f'Route(when: .from(["203.0.113.10/32"])) {{ {source(f"slow-{generation}-{i}.test")} }}'
+            f"@slow{i} remote_ip 203.0.113.10/32\n"
+            f"route @slow{i} {{\n {source(f'slow-{generation}-{i}.test')}\n }}"
             for i in range(16))
-        return f'''Admin(listen: "127.0.0.1:{admin}")
-Metrics(enabled: true)
-Shutdown(grace: .seconds(5))
-TCPListener(on: "127.0.0.1:{static}") {{ {terminal} {{ Proxy(to: "127.0.0.1:{origin_port}") }} }}
-.limits(maxConnections: {args.sessions})
-.timeouts(connect: .seconds(1), idle: .seconds(60))
-TCPListener(on: "127.0.0.1:{dynamic}") {{
+        bounds = (f"max_connections {args.sessions}\n proxy_connect_timeout 1s\n "
+                  "proxy_timeout 60s")
+        return f"""{{
+    auto_https off
+    admin 127.0.0.1:{admin}
+    metrics
+    grace_period 5s
+    layer4 {{
+        127.0.0.1:{static} {{
+            {bounds}
+            {hello}
+            {final} {{
+                proxy 127.0.0.1:{origin_port}
+            }}
+        }}
+        127.0.0.1:{dynamic} {{
+            {bounds}
+            {hello}
 {routes}
-{terminal} {{ {source("main.test")} }}
+            {final} {{
+                {source("main.test")}
+            }}
+        }}
+    }}
 }}
-.limits(maxConnections: {args.sessions})
-.timeouts(connect: .seconds(1), idle: .seconds(60))
-HTTPListener(on: "127.0.0.1:{web}") {{ Site(host: "*") {{
-Route(when: .path(exact: "/ready")) {{ Respond(body: "{token}") }}
-Fallback {{ ServeMetrics() }}
-}} }}
-'''
+http://127.0.0.1:{web} {{
+    handle /ready {{
+        respond "{token}"
+    }}
+    handle {{
+        metrics
+    }}
+}}
+"""
 
     samples = result["samples"] = []
     held = []
@@ -227,7 +248,7 @@ Fallback {{ ServeMetrics() }}
         for generation in range(args.reloads):
             payload = config(generation)
             (args.results / f"reload-{generation}.pingclair").write_text(payload)
-            await http(admin, "/load", payload.encode(), "text/pingclair")
+            await http(admin, "/load", payload.encode(), "text/caddyfile")
             await asyncio.sleep(0.25)
             for endpoint in (static, dynamic):
                 reader, writer = await asyncio.open_connection("127.0.0.1", endpoint)

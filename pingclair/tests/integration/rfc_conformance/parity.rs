@@ -22,9 +22,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// survive, and replacing the unknown name with nothing is the one answer that
 /// silently changes content the operator wrote.
 ///
-/// 📌 This is the **frozen compatibility dialect's** replacer rule, not a
-/// decision about new surface: the native language has no interpolation in
-/// literals (`Format` carries dynamic values), so nothing here constrains it.
+/// 📌 This is the upstream Caddyfile's replacer rule, which the Pingclairfile
+/// follows.
 #[tokio::test]
 async fn test_unknown_placeholder_is_preserved() {
     let mut server = TestServer::new_pingclairfile(&site(r#"respond "open {brace} close""#));

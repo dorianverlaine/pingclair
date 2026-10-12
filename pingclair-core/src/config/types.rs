@@ -2094,12 +2094,7 @@ fn default_redirect_code() -> u16 {
 }
 
 /// 🚦 Methods a `CORS` handler allows when it names none.
-///
-/// 📌 Public because the value has two callers: the serde default below and
-/// the native frontend, which builds the handler without going through the
-/// Caddyfile compiler's mapping. One definition means the two cannot drift
-/// into allowing different methods for the same configuration.
-pub fn default_cors_methods() -> Vec<String> {
+fn default_cors_methods() -> Vec<String> {
     vec![
         "GET".into(),
         "POST".into(),

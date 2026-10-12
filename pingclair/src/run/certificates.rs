@@ -290,8 +290,8 @@ pub(super) fn prepare(
 /// 🏛️ The sites that configure an ACME server, however deeply it is wrapped.
 ///
 /// 📌 The scan used to look only at a route's top-level handler, so a
-/// middleware-wrapped `acme_server` — native `SkipLog() ACMEServer()`, or a
-/// Caddyfile `route { templates; acme_server }` — started cleanly and then
+/// middleware-wrapped `acme_server` — a Caddyfile
+/// `route { templates; acme_server }` — started cleanly and then
 /// answered 500 per request. It has to see the same tree the request path will.
 fn acme_server_sites(config: &pingclair_core::config::PingclairConfig) -> Vec<&str> {
     config
@@ -370,9 +370,7 @@ mod tests {
     #[test]
     fn a_wrapped_acme_server_is_still_refused_at_startup() {
         let cases = [
-            // native: a middleware wraps the ACME server in one pipeline
-            "HTTPListener(on: \":8443\") {\n    Site(host: \"ca.example.test\") {\n        Fallback {\n            SkipLog()\n            ACMEServer()\n        }\n    }\n}\n.tls(.internal)\n",
-            // caddyfile: the same shape written as a route block
+            // 🧩 A middleware wraps the ACME server in one route block.
             "https://ca.example.test:8443 {\n\ttls internal\n\troute {\n\t\ttemplates\n\t\tacme_server\n\t}\n}\n",
         ];
         for source in cases {
@@ -385,10 +383,9 @@ mod tests {
     /// 🏛️ And a configuration without one reports nothing to refuse.
     #[test]
     fn an_ordinary_site_names_no_acme_server() {
-        let config = pingclair_config::compile(
-            "HTTPListener(on: \":8080\") {\n    Site(host: \"www.example.test\") {\n        Fallback { Respond(body: \"hi\") }\n    }\n}\n",
-        )
-        .expect("compiles");
+        let config =
+            pingclair_config::compile("http://www.example.test:8080 {\n\trespond \"hi\"\n}\n")
+                .expect("compiles");
         assert!(acme_server_sites(&config).is_empty());
     }
 }

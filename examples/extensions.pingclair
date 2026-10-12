@@ -1,0 +1,26 @@
+# 🧩 Words Pingclair adds to the Caddyfile.
+#
+# 📌 Each one sits where upstream keeps options of its kind, and takes nginx's
+# name when nginx has the concept. None of them changes what an upstream
+# directive means.
+{
+	# 🚫 Peers refused before any TLS or HTTP is read, on every listener.
+	deny 192.0.2.0/24 203.0.113.7
+}
+
+:8080 {
+	root * ./public
+
+	limits {
+		# 📮 The longest pause between two writes to a client; `0` turns it off.
+		send_timeout 60s
+		# 🔁 Requests one keepalive connection serves before it is closed.
+		keepalive_requests 1000
+	}
+
+	file_server {
+		# 🧭 Serves `page.md` beside `page.html` to a client whose `Accept`
+		# prefers Markdown; browsers keep getting HTML.
+		negotiate markdown
+	}
+}

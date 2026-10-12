@@ -1,14 +1,33 @@
-// 🔌 Layer 4: raw TCP with TLS passthrough, routed by SNI without terminating.
-//
-// 📌 `TCPListener` never decrypts. The ClientHello is read, matched and
-// replayed to the upstream, so the certificate and the session belong to the
-// server behind this one.
-TCPListener(on: ":443") {
-    Route(when: .tls(sni: ["tunnel.example.test"], alpn: ["h2"])) { Proxy(to: "10.0.0.20:8443") }
-    Route(when: .from(["10.0.0.0/8"])) { Proxy(to: "10.0.0.21:9000") }
-    Fallback { Proxy(to: "10.0.0.22:443") }
+# 🔌 TCP routing by TLS ClientHello, written where upstream keeps it: a
+# `layer4` block among the global options.
+#
+# The listener reads the ClientHello without terminating TLS, picks a route by
+# SNI and ALPN, and forwards the original bytes, so TLS stays end to end. Timeouts
+# and buffers take nginx's stream-module names.
+{
+	layer4 {
+		:9443 {
+			preread_timeout 10s
+			proxy_connect_timeout 5s
+			proxy_timeout 5m
+			proxy_half_close on
+
+			@git tls sni git.example.test
+			route @git {
+				proxy 10.0.0.20:443
+			}
+
+			@internal {
+				tls
+				remote_ip 10.0.0.0/8
+			}
+			route @internal {
+				proxy 10.0.0.21:443
+			}
+
+			route {
+				proxy 127.0.0.1:8443
+			}
+		}
+	}
 }
-.limits(maxConnections: 4096, preread: .kibibytes(16), relay: .kibibytes(64))
-.timeouts(preread: .seconds(30), connect: .seconds(5), idle: .minutes(5))
-.halfClose(enabled: true)
-.sessionLog(output: .file("/tmp/pingclair-sessions.log"), format: .json, rotation: .roll(size: .mebibytes(50), keep: 3))

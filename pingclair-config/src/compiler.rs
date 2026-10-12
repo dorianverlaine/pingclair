@@ -808,11 +808,7 @@ fn compile_server(server: &ServerBlock) -> CompileResult<ServerConfig> {
 /// 📌 `file_server { compress off }` is unaffected: it is already false, and
 /// this pass never raises the flag, so a site with a coding still honours a file
 /// server that opted out on its own.
-///
-/// 📌 Shared with the native frontend, which builds its sites from typed
-/// components rather than from this module's AST but must lower the same
-/// setting the same way.
-pub(crate) fn apply_site_compression(handler: &mut pingclair_core::config::HandlerConfig) {
+fn apply_site_compression(handler: &mut pingclair_core::config::HandlerConfig) {
     use pingclair_core::config::HandlerConfig;
     match handler {
         HandlerConfig::FileServer { compress, .. } => *compress = false,
@@ -3652,11 +3648,7 @@ fn compile_handler_element(
 /// string become a literal password. Anything that is not a valid hash of
 /// the declared kind is refused, so plaintext cannot be configured at all.
 /// 🔐 Checks one credential's hash against its declared algorithm.
-///
-/// 📌 Shared with the native frontend: a plaintext password written in either
-/// spelling has to fail at load, and only one function should decide what a
-/// well-formed hash looks like.
-pub(crate) fn compile_basic_auth_credential(
+fn compile_basic_auth_credential(
     username: &str,
     password: &str,
     algorithm: CoreBasicAuthAlgorithm,

@@ -69,21 +69,8 @@ protocol, wildcard SNI or weighted balancing in this alpha.
 
 ## 🌐 Explicit dynamic DNS sources
 
-Native TCP routes select exactly one `to:` or `dynamic:` source:
-
-```pingclair
-TCPListener(on: ":9443") {
-    Route(when: .tls(sni: ["local.example.test"])) {
-        Proxy(to: "127.0.0.1:8443")
-    }
-    Fallback {
-        Proxy(dynamic: .a("backend.example.test", port: 443, versions: .ip,
-            valid: .seconds(30), stale: .seconds(60)))
-    }
-}
-```
-
-The equivalent source in the compatibility dialect is:
+A TCP `proxy` names exactly one source: a static address, or a `dynamic a`
+block that resolves a name in the background:
 
 ```caddyfile
 {
@@ -110,7 +97,7 @@ The equivalent source in the compatibility dialect is:
 ```
 
 The source requires a fixed ASCII DNS name and nonzero port. `versions` accepts
-`ipv4`, `ipv6` or `ip` (both, the default); native cases have a leading dot.
+`ipv4`, `ipv6` or `ip` (both, the default).
 Omitting `valid` preserves the minimum answer and CNAME TTL, including zero.
 An explicit positive `valid` overrides freshness. `stale` adds at most 300 seconds
 to that freshness deadline and defaults to 60 seconds; transient errors cannot
@@ -127,10 +114,8 @@ generations, one job per pool and at least one second between starts. A job has
 one five-second deadline, at most eight CNAME hops and 64 unique addresses.
 Transient errors back off with bounded jitter. Truncated UDP replies use TCP.
 
-By default, only public destinations are allowed. A nonempty native
-`allowIP: ["10.0.0.0/8"]` or the compatibility dialect's `allow_ip 10.0.0.0/8`
-explicitly permits
-listed non-public ranges. Loopback and link-local access require CIDRs confined
+By default, only public destinations are allowed. A nonempty
+`allow_ip 10.0.0.0/8` explicitly permits listed non-public ranges. Loopback and link-local access require CIDRs confined
 to those classes; a broad CIDR cannot grant them incidentally. Unspecified,
 multicast and known local HTTP, L4 or Admin destinations remain forbidden.
 Wildcard listener policy includes local interface addresses enumerated during
@@ -138,8 +123,8 @@ preparation. Address policy rejects the entire answer if any address is forbidde
 Changing resolver, lifetime, family or destination policy cannot reuse an old
 snapshot. Failed reload preparation leaves the published configuration intact.
 
-L4 sources support A/AAAA only. HTTP `refresh`, `grace`, `dialTimeout` and SRV
-options are refused here; listener connect timeouts own the dial budget.
+L4 sources support A/AAAA only. HTTP `refresh`, `grace`, `dial_timeout` and SRV
+options are refused here; `proxy_connect_timeout` owns the dial budget.
 
 
 ## 📊 Connection observability

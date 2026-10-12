@@ -131,8 +131,8 @@ full suite early. See `.github/workflows/README.md` for the workflow map.
 ### Configuration becomes precomputed state, once
 
 `pingclair-config` turns a Pingclairfile into `PingclairConfig`: the Caddyfile
-path is `caddyfile/parser/` → `caddyfile/adapter/` (JSON uses `caddyfile/json.rs`),
-and the native language goes `frontend.rs` → `compiler.rs`. `compiler.rs` also
+path is `caddyfile/parser/` → `caddyfile/adapter/` → `compiler.rs` (JSON uses
+`caddyfile/json.rs`). `compiler.rs` also
 owns `validate_config`, which is meant to be the single validation path — rules
 belong there rather than in the DSL adapter, or JSON configs bypass them.
 

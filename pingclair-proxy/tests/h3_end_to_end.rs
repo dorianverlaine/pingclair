@@ -19,14 +19,8 @@ use pingclair_proxy::server::PingclairProxy;
 use tokio_quiche::quiche;
 use tokio_quiche::quiche::h3::NameValue;
 
-#[path = "h3_end_to_end/native_header_text.rs"]
-mod native_header_text;
-
-#[path = "h3_end_to_end/native_error_status.rs"]
-mod native_error_status;
-
-#[path = "h3_end_to_end/native_typed_text.rs"]
-mod native_typed_text;
+#[path = "h3_end_to_end/error_status_inheritance.rs"]
+mod error_status_inheritance;
 
 #[path = "h3_end_to_end/markdown_negotiation.rs"]
 mod markdown_negotiation;
