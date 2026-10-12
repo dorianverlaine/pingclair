@@ -62,6 +62,10 @@ pub fn compile_ast(ast: &Ast) -> CompileResult<PingclairConfig> {
     for server_node in &ast.servers {
         let block = &server_node.inner;
         let mut server_config = compile_server(block)?;
+        // 🔀 One proxy per route: the runtime keeps one pool per route, so a
+        // `route` of several proxying `handle` blocks becomes one route each.
+        server_config.routes =
+            crate::proxy_routes::split_proxy_routes(std::mem::take(&mut server_config.routes));
         // 🌐 A site that named no `bind` of its own inherits the global
         // default. Applied here rather than inside `compile_server` because
         // this is where the global block is in scope, and because "the site
@@ -1258,6 +1262,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
     validate_listener_options(&bound)?;
     validate_plaintext_listeners(&bound)?;
     crate::https_port::refuse_plaintext_on_https_port(&bound)?;
+    crate::proxy_routes::refuse_shared_proxy_routes(config)?;
     crate::shared_ports::validate_shared_ports(&bound)?;
     validate_cache_ceiling_agrees(config)?;
     validate_log_channels_exist(config)?;

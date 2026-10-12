@@ -14,6 +14,17 @@ fact.
 
 ## [Unreleased]
 
+### 🔀 Each proxy in a `route` block reaches its own upstream
+
+A route kept one upstream pool and one proxy policy, taken from the first
+`reverse_proxy` in it, so a `route` block of several proxying `handle` blocks
+sent every proxied request to the first block's upstream, with that block's
+headers and TLS name. A `route` of mutually exclusive `handle` blocks, and a
+`handle` nested in a `handle`, now compile to one route per block, in order;
+when no block matches, the request carries on to the routes after them, as
+upstream's `route` does. A route that would still hold two proxies is refused
+at load, from a Pingclairfile, a JSON file or the Admin API alike.
+
 ### 🖋️ `fmt` keeps comments
 
 `pingclair fmt` used to parse the file and print the directive tree back, and
