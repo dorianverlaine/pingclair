@@ -28,6 +28,7 @@ pub mod adapter;
 pub mod compiler;
 mod header_fields;
 pub mod parser;
+mod proxy_routes;
 mod retired_placeholders;
 mod shared_ports;
 mod underscore_headers;

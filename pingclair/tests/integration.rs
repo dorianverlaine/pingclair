@@ -16244,6 +16244,10 @@ mod site_bind;
 #[path = "integration/default_bind_json.rs"]
 mod default_bind_json;
 
+// 🔀 Proxies in one `route` block each reach their own upstream.
+#[path = "integration/route_block_proxies.rs"]
+mod route_block_proxies;
+
 // 🎯 An explicit site's name outranks a wildcard's `client_auth` (#259).
 #[path = "integration/client_auth_precedence.rs"]
 mod client_auth_precedence;
