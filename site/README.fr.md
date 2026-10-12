@@ -6,467 +6,221 @@
 
 Site officiel : [https://pingclair.com](https://pingclair.com)
 
-Le code source du site officiel de Pingclair est désormais hébergé dans un dépôt distinct :
+Le code source du site vit dans son propre dépôt,
+**[dorianverlaine/pingclair-docs](https://github.com/dorianverlaine/pingclair-docs)**.
+Ce répertoire ne conserve que la configuration de production, [`Pingclairfile`](Pingclairfile),
+comme exemple concret de déploiement d'un site de documentation statique avec Pingclair :
 
-**[dorianverlaine/pingclair-docs](https://github.com/dorianverlaine/pingclair-docs)**
+- certificats TLS automatiques et HTTP/3
+- hébergement virtuel par nom pour trois noms d'hôte
+- fichiers statiques, page 404 personnalisée et compression
+- proxy inverse avec cache de réponses
+- Markdown pour les agents IA sur les mêmes URL
+- redirection permanente vers le domaine canonique
+- journaux d'accès JSON avec rotation intégrée
 
-Depuis cette migration, le présent répertoire ne contient plus les sources du site. L'ancienne arborescence et les fichiers `.gitkeep` qui permettaient de conserver les répertoires vides ont également été supprimés.
+Le site tourne sur un serveur FreeBSD. `pingclair.pingclair.com` est conservé comme
+nom d'hôte de préproduction, et `www.pingclair.com` redirige de façon permanente
+vers le domaine principal. Le fichier est un Pingclairfile — la syntaxe du
+Caddyfile — et les extraits ci-dessous en sont tirés.
 
-Seule la configuration du site en production est conservée ici. Elle constitue un exemple concret de déploiement avec le langage de configuration natif de Pingclair.
+## La configuration, section par section
 
-Ce `Pingclairfile` illustre la mise en place d'un site de documentation statique et regroupe plusieurs fonctionnalités :
+### 1. Options globales
 
-- Gestion automatique des certificats TLS et prise en charge de HTTP/3
-- Hébergement de plusieurs sites virtuels sur un même point d'écoute
-- Distribution de fichiers statiques et pages d'erreur personnalisées
-- Proxy inverse et mise en cache des réponses
-- Sélection d'une représentation Markdown pour les agents IA
-- Redirections permanentes et gestion du domaine principal
-- Journalisation structurée des accès et rotation automatique des journaux
-
-## Configuration en production
-
-Le fichier `Pingclairfile` ci-dessous correspond à la configuration utilisée pour `pingclair.com`.
-
-Le site est hébergé sur un serveur FreeBSD, avec Pingclair comme serveur HTTP. Le sous-domaine `pingclair.pingclair.com` reste disponible pour les essais et la préproduction, tandis que `www.pingclair.com` redirige définitivement vers le domaine principal.
-
-Les commentaires en anglais sont conservés afin de faciliter la comparaison avec le fichier déployé.
-
-```swift
-// 🏝️ pingclair.com — the docs site, served by Pingclair from a FreeBSD
-// node, with pingclair.pingclair.com kept as the staging alias and
-// www redirected to the apex.
-
-AutomaticTLS(mode: .automatic, httpPort: 80, httpsPort: 443)
-Storage(root: "/var/db/pingclair")
-
-// 🔁 The Admin API on loopback, so `pingclair reload` can hot-reload this
-// file instead of a restart dropping connections.
-Admin(listen: "127.0.0.1:2019")
-
-// 🧊 The one-line install address: `https://pingclair.com/install.sh`.
-//
-// The script lives in the server repository and is published to the release
-// bucket by every release; proxying it here rather than keeping a copy is the
-// same choice the Cloudflare Worker made — there is no second file to drift.
-let installerHost = "releases.pingclair.com:443"
-
-// 🤖 The agent endpoints still served by the documentation Worker; the
-// docs node proxies them so `pingclair.com/mcp` and `/a2a` keep the URL
-// contract the Worker era established.
-let cfWorker = "cf.pingclair.com:443"
-
-// 🔗 The discovery links the documentation Worker published through the build
-// output's `_headers` file; the native file server does not read that file, so
-// the same value is stated once here and reused by every route that serves
-// files. The escape keeps the real quotes in the value.
-let agentLink = "</.well-known/api-catalog>; rel=\"api-catalog\", </llms.txt>; rel=\"describedby\", </sitemap.xml>; rel=\"sitemap\""
-
-HTTPListener(on: ":443") {
-    Site(host: "pingclair.com") {
-        Route(when: .path(exact: "/install.sh")) {
-            Rewrite(to: "/pingclair/install.sh")
-            Proxy(
-                to: installerHost,
-                headersUp: [.set("Host", "releases.pingclair.com")],
-                headersDown: [.setIfAbsent("X-Installer-Source", "r2")],
-            )
-            .upstreamTLS(.enabled(serverName: "releases.pingclair.com"))
-            .cache(ttl: .minutes(5), maxSize: .mebibytes(16))
-        }
-        Route(when: .path(exact: "/install")) {
-            Rewrite(to: "/pingclair/install.sh")
-            Proxy(
-                to: installerHost,
-                headersUp: [.set("Host", "releases.pingclair.com")],
-                headersDown: [.setIfAbsent("X-Installer-Source", "r2")],
-            )
-            .upstreamTLS(.enabled(serverName: "releases.pingclair.com"))
-            .cache(ttl: .minutes(5), maxSize: .mebibytes(16))
-        }
-        Route(when: .path(exact: "/mcp")) {
-            Proxy(to: cfWorker, headersUp: [.set("Host", "cf.pingclair.com")])
-            .upstreamTLS(.enabled(serverName: "cf.pingclair.com"))
-        }
-        Route(when: .path(exact: "/a2a")) {
-            Proxy(to: cfWorker, headersUp: [.set("Host", "cf.pingclair.com")])
-            .upstreamTLS(.enabled(serverName: "cf.pingclair.com"))
-        }
-        // 🗂️ Rules the Cloudflare side applied at the edge — the `_headers`
-        // file does not exist for the native file server — stated natively:
-        // immutable cache for build assets, a short cache for the search
-        // index, plain text for direct Markdown fetches, cross-origin
-        // discovery catalogs, and the API catalog's RFC 9727 media type
-        // (which the Worker set itself).
-        Route(when: .path(prefix: "/_astro")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Cache-Control", "public, max-age=31536000, immutable"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(prefix: "/pagefind")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Cache-Control", "public, max-age=3600"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(glob: "*.md")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Content-Type", "text/plain; charset=utf-8"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(exact: "/.well-known/api-catalog")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Access-Control-Allow-Origin", "*"), .set("Content-Type", "application/linkset+json"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(prefix: "/.well-known")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Access-Control-Allow-Origin", "*"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        // 📄 Agents that ask for markdown get the twin on the same URL: the
-        // directory's `index.md`, or the sibling `<name>.md`; a miss carries
-        // on to the normal file server unchanged. The `index.md` copies are
-        // made at deploy time.
-        Route(when: .header(name: "Accept", contains: "text/markdown")) {
-            TryFiles(candidates: [.requestPath(appending: "index.md"), .requestPath(appending: ".md")], root: "/usr/local/www/pingclair.pingclair.com")
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Fallback {
-            // 🔗 `public/_headers` states these on the Cloudflare deployment;
-            // the native file server does not read that file, so the same
-            // rules are stated here.
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-    }
-    // 🧾 Starlight ships a 404 page; unknown paths answer with it, the same
-    // as the Cloudflare deployment's `not_found_handling`.
-    .errorPage(for: [.status(404)], file: "/usr/local/www/pingclair.pingclair.com/404.html")
-    .encode(.zstd, .gzip)
-
-    Site(host: "www.pingclair.com") {
-        // ➡️ 308 to the apex, the same permanent move the Cloudflare zone
-        // answered. The native language has no request-time placeholders yet,
-        // so the path does not ride along; a `keepPath:` argument on Redirect
-        // is the design idea on file for that.
-        Fallback { Redirect(to: "https://pingclair.com", status: .permanentRedirect) }
-    }
-
-    Site(host: "pingclair.pingclair.com") {
-        Route(when: .path(exact: "/install.sh")) {
-            Rewrite(to: "/pingclair/install.sh")
-            Proxy(
-                to: installerHost,
-                headersUp: [.set("Host", "releases.pingclair.com")],
-                headersDown: [.setIfAbsent("X-Installer-Source", "r2")],
-            )
-            .upstreamTLS(.enabled(serverName: "releases.pingclair.com"))
-            .cache(ttl: .minutes(5), maxSize: .mebibytes(16))
-        }
-        Route(when: .path(exact: "/mcp")) {
-            Proxy(to: cfWorker, headersUp: [.set("Host", "cf.pingclair.com")])
-            .upstreamTLS(.enabled(serverName: "cf.pingclair.com"))
-        }
-        Route(when: .path(exact: "/a2a")) {
-            Proxy(to: cfWorker, headersUp: [.set("Host", "cf.pingclair.com")])
-            .upstreamTLS(.enabled(serverName: "cf.pingclair.com"))
-        }
-        // 🗂️ The same edge rules as the apex site.
-        Route(when: .path(prefix: "/_astro")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Cache-Control", "public, max-age=31536000, immutable"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(prefix: "/pagefind")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Cache-Control", "public, max-age=3600"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(glob: "*.md")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Content-Type", "text/plain; charset=utf-8"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(exact: "/.well-known/api-catalog")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Access-Control-Allow-Origin", "*"), .set("Content-Type", "application/linkset+json"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(prefix: "/.well-known")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Access-Control-Allow-Origin", "*"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        // 📄 The same markdown negotiation as the apex site.
-        Route(when: .header(name: "Accept", contains: "text/markdown")) {
-            TryFiles(candidates: [.requestPath(appending: "index.md"), .requestPath(appending: ".md")], root: "/usr/local/www/pingclair.pingclair.com")
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Fallback {
-            // 🔗 The same header set as the apex site.
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-    }
-    .errorPage(for: [.status(404)], file: "/usr/local/www/pingclair.pingclair.com/404.html")
-    .encode(.zstd, .gzip)
-}
-.tls(.automatic(email: "team@pingclair.com"))
-// 📓 One JSON line per request, rotated by Pingclair itself.
-.accessLog(
-    output: .file("/var/log/pingclair-access.log"),
-    format: .json,
-    headers: [.request("User-Agent")],
-    rotation: .roll(size: .mebibytes(100), keep: 7, compress: true),
-)
-```
-
-## Explication de la configuration
-
-### 1. Paramètres globaux et définition des serveurs en amont
-
-Les directives `AutomaticTLS` et `Storage` définissent respectivement la gestion des certificats TLS et l'emplacement des données persistantes du service.
-
-```swift
-AutomaticTLS(mode: .automatic, httpPort: 80, httpsPort: 443)
-Storage(root: "/var/db/pingclair")
-Admin(listen: "127.0.0.1:2019")
-```
-
-`AutomaticTLS` active la gestion automatique des certificats et précise les ports HTTP et HTTPS utilisés notamment pour leur émission et leur renouvellement.
-
-`Storage` définit le répertoire dans lequel Pingclair conserve les certificats TLS, les clés des comptes ACME et les données associées.
-
-`Admin` publie l'API d'administration sur l'adresse de bouclage, ce qui permet d'appliquer une modification de configuration par un rechargement à chaud plutôt que par un redémarrage.
-
-Deux déclarations `let` permettent également de définir les adresses des serveurs en amont :
-
-```swift
-let installerHost = "releases.pingclair.com:443"
-let cfWorker = "cf.pingclair.com:443"
-```
-
-Ces déclarations évitent de répéter les mêmes adresses dans plusieurs règles et garantissent leur cohérence dans l'ensemble de la configuration.
-
-Dans le langage natif de Pingclair, les chaînes de caractères sont toujours interprétées littéralement. L'interpolation de variables dans une chaîne n'est volontairement pas prise en charge.
-
-Les références explicites aux valeurs déclarées avec `let` permettent ainsi de résoudre la configuration dès son chargement et d'en vérifier le contenu sans dépendre d'une substitution effectuée au moment des requêtes.
-
-### 2. Points d'écoute et hôtes virtuels
-
-```swift
-HTTPListener(on: ":443") {
-    Site(host: "pingclair.com") { ... }
-    Site(host: "www.pingclair.com") { ... }
-    Site(host: "pingclair.pingclair.com") { ... }
+```caddyfile
+{
+    email team@pingclair.com
+    storage file_system /var/db/pingclair
+    admin 127.0.0.1:2019
 }
 ```
 
-`HTTPListener` définit un point d'écoute réseau. Chaque bloc `Site` décrit ensuite le comportement à appliquer selon le nom d'hôte demandé.
+`email` est le contact du compte ACME pour les certificats automatiques. `storage`
+désigne le répertoire qui conserve les certificats, les clés de compte et l'état
+associé. `admin` publie l'API d'administration sur l'interface de bouclage
+uniquement, ce qui permet à `pingclair reload` d'appliquer un fichier modifié
+sans couper les connexions.
 
-Plusieurs sites virtuels peuvent donc partager un même point d'écoute, sans qu'il soit nécessaire d'ouvrir une connexion d'écoute distincte pour chacun.
+### 2. Des snippets pour ce qui se répète
 
-Le déploiement actuel comprend trois hôtes virtuels :
+Les éléments répétés sont définis une seule fois, sous forme de snippets, puis importés :
 
-| Nom d'hôte | Fonction |
-|---|---|
-| `pingclair.com` | Site officiel et principaux points d'entrée de l'API |
+| Snippet | Contenu |
+| --- | --- |
+| `(edge_headers)` | Les en-têtes de sécurité et l'en-tête `Link` de découverte pour agents que le déploiement Cloudflare déclarait dans son fichier `_headers` |
+| `(installer)` | Le proxy qui sert `install.sh` depuis le stockage des publications |
+| `(worker)` | Le proxy des points d'accès pour agents `/mcp` et `/a2a` |
+| `(access_log)` | Le journal d'accès commun à tous les sites |
+| `(docs)` | Tout le site de documentation, partagé par le domaine principal et l'hôte de préproduction |
+
+### 3. Hôtes virtuels
+
+```caddyfile
+pingclair.com {
+    import docs
+}
+
+pingclair.pingclair.com {
+    import docs
+}
+
+www.pingclair.com {
+    import access_log
+    redir https://pingclair.com{uri} 308
+}
+```
+
+Une adresse de site avec un nom d'hôte obtient automatiquement HTTPS sur le port
+443, HTTP/3 sur UDP 443, et une écoute sur le port 80 qui redirige vers HTTPS et
+répond aux défis ACME.
+
+| Nom d'hôte | Rôle |
+| --- | --- |
+| `pingclair.com` | Le site et ses points d'accès pour agents |
+| `pingclair.pingclair.com` | Préproduction, qui sert le même site |
 | `www.pingclair.com` | Redirection permanente vers le domaine principal |
-| `pingclair.pingclair.com` | Environnement de préproduction et point d'accès conservé pour des raisons de compatibilité |
 
-Cette organisation sépare la gestion des connexions réseau des règles propres à chaque site. Les paramètres TLS, la journalisation et les autres fonctionnalités communes restent ainsi centralisés au niveau du point d'écoute.
+### 4. Ordre des routes
 
-### 3. Ordre d'évaluation des routes
-
-Pingclair examine les blocs `Route` dans leur ordre de déclaration. Dès qu'une règle correspond à la requête, celle-ci est prise en charge par la route concernée.
-
-Si aucune règle ne correspond, le bloc `Fallback` assure le traitement par défaut.
-
-Pour le site officiel, les règles sont organisées dans l'ordre suivant :
-
-1. Scripts d'installation : `/install.sh` et `/install`
-2. Interfaces destinées aux agents : `/mcp` et `/a2a`
-3. Sélection du contenu Markdown selon l'en-tête `Accept`
-4. Distribution des fichiers statiques par `Fallback`
-
-Les routes correspondant à des chemins précis sont placées avant la règle plus générale fondée sur les en-têtes HTTP. Les interfaces dédiées ne risquent donc pas d'être interceptées par la logique de sélection du format ou de distribution des fichiers.
-
-L'ordre de traitement est directement visible dans le fichier de configuration. Aucun système de priorité numérique ni aucune règle implicite supplémentaire ne sont nécessaires.
-
-### 4. Proxy inverse et mise en cache
-
-Le script d'installation du projet est distribué par un service de publication indépendant. Le site de documentation n'en conserve pas de copie locale.
-
-Les chemins `/install.sh` et `/install` sont associés à un proxy inverse qui transmet les requêtes à `releases.pingclair.com` :
-
-```swift
-Rewrite(to: "/pingclair/install.sh")
-Proxy(
-    to: installerHost,
-    headersUp: [.set("Host", "releases.pingclair.com")],
-    headersDown: [.setIfAbsent("X-Installer-Source", "r2")],
-)
-.upstreamTLS(.enabled(serverName: "releases.pingclair.com"))
-.cache(ttl: .minutes(5), maxSize: .mebibytes(16))
-```
-
-Plusieurs opérations interviennent dans ce traitement :
-
-1. **Réécriture du chemin** : `Rewrite` remplace le chemin demandé par celui utilisé sur le service de publication.
-2. **Transmission de la requête** : `Proxy` établit une connexion avec le serveur HTTPS en amont.
-3. **Définition de l'en-tête Host** : `headersUp` renseigne explicitement le nom d'hôte à transmettre au serveur distant.
-4. **Configuration TLS** : `upstreamTLS` précise le nom de serveur utilisé lors de la connexion TLS en amont.
-5. **Mise en cache** : `cache` définit une durée de validité de cinq minutes et une limite de taille de 16 MiB.
-6. **Identification de la source** : `headersDown` ajoute l'en-tête `X-Installer-Source: r2` si celui-ci est absent de la réponse.
-
-Le choix explicite des noms d'hôte HTTP et TLS est essentiel dans cette architecture.
-
-Si la requête transmise conservait `pingclair.com` comme en-tête `Host`, Cloudflare pourrait la rediriger vers le serveur du site officiel et provoquer une boucle de proxy.
-
-La configuration distingue donc clairement le domaine public utilisé par les visiteurs du nom d'hôte du service en amont.
-
-La distribution du script par un service dédié évite également de devoir synchroniser plusieurs copies entre le site web et l'infrastructure de publication des versions.
-
-#### Interfaces destinées aux agents
-
-Les chemins `/mcp` et `/a2a` utilisent le même mécanisme de proxy inverse, mais sans mise en cache des réponses.
-
-```swift
-Route(when: .path(exact: "/mcp")) {
-    Proxy(to: cfWorker, headersUp: [.set("Host", "cf.pingclair.com")])
-    .upstreamTLS(.enabled(serverName: "cf.pingclair.com"))
-}
-```
-
-Ces interfaces restent hébergées sur un Cloudflare Worker. Le serveur du site officiel se charge uniquement de lui transmettre les requêtes.
-
-Cette organisation permet de conserver les adresses publiques existantes, sans imposer de modification aux clients lors du changement d'infrastructure.
-
-### 5. Contenu Markdown pour les agents IA
-
-Le site officiel peut fournir une page au format HTML ou Markdown à une même adresse, selon l'en-tête HTTP `Accept` envoyé par le client.
-
-```swift
-Route(when: .header(name: "Accept", contains: "text/markdown")) {
-    TryFiles(
-        candidates: [
-            .requestPath(appending: "index.md"),
-            .requestPath(appending: ".md")
-        ],
-        root: "/usr/local/www/pingclair.pingclair.com"
-    )
-    ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-}
-```
-
-*Cet extrait a été remis en forme pour en faciliter la lecture. Son fonctionnement est identique à celui de la configuration en production.*
-
-Lorsqu'un client transmet un en-tête `Accept` contenant `text/markdown`, Pingclair recherche une version Markdown de la ressource demandée.
-
-`TryFiles` examine successivement deux chemins possibles :
-
-1. Le fichier `index.md` situé dans le répertoire correspondant à l'URL demandée
-2. Un fichier `.md` correspondant au chemin demandé
-
-Si un fichier existe, son chemin est retenu pour la suite du traitement. `ServeFiles` se charge alors de le transmettre au client.
-
-Si aucun des fichiers recherchés n'est présent, `TryFiles` ne renvoie pas immédiatement d'erreur. La requête poursuit son traitement avec son chemin initial.
-
-Les ressources statiques ordinaires et les pages dépourvues de version Markdown restent donc accessibles sans modification.
-
-Lors du déploiement, les fichiers `index.md` nécessaires sont également générés à partir des fichiers Markdown correspondants, afin de prendre en charge les URL de documentation se terminant par un répertoire.
-
-Pour les navigateurs classiques, le site continue de fournir les pages HTML. Les fichiers Markdown ne figurent pas dans la liste des fichiers d'index par défaut du serveur et ne remplacent donc pas les pages `index.html`.
-
-**Limite de l'implémentation actuelle :** Pingclair vérifie simplement si l'en-tête `Accept` contient `text/markdown`. Ce mécanisme permet de sélectionner une représentation, mais ne constitue pas une implémentation complète de la négociation de contenu HTTP, notamment en ce qui concerne les préférences et les coefficients de qualité.
-
-L'objectif est de permettre aux agents IA de récupérer directement une version textuelle structurée de la documentation, tout en conservant les mêmes URL et le comportement habituel des navigateurs.
-
-Pour une présentation plus générale des enjeux liés à l'accessibilité des sites pour les agents IA, voir l'article de Cloudflare :
-
-[Agent Readiness](https://blog.cloudflare.com/agent-readiness/)
-
-### 6. Domaine principal et redirections permanentes
-
-Le domaine principal du site est `pingclair.com`. Les requêtes adressées à `www.pingclair.com` font l'objet d'une redirection permanente HTTP 308.
-
-```swift
-Site(host: "www.pingclair.com") {
-    Fallback {
-        Redirect(
-            to: "https://pingclair.com",
-            status: .permanentRedirect
-        )
+```caddyfile
+route {
+    handle /install.sh {
+        import installer
+    }
+    …
+    handle {
+        import edge_headers
+        file_server
     }
 }
 ```
 
-Le code HTTP 308 indique que la redirection est permanente et impose au client de conserver la méthode de la requête initiale.
+Dans `route`, les blocs s'exécutent dans l'ordre où ils sont écrits, et le
+premier `handle` qui correspond répond à la requête. Le site suit cet ordre :
 
-**Une limitation subsiste : le chemin de la requête n'est pas conservé lors de la redirection.**
+1. le script d'installation, `/install.sh` et `/install` ;
+2. les points d'accès pour agents, `/mcp` et `/a2a` ;
+3. les règles de bordure pour les ressources de build, l'index de recherche,
+   les fichiers Markdown et les documents de découverte `/.well-known` ;
+4. le Markdown pour les clients qui le demandent ;
+5. tout le reste, servi depuis le disque.
 
-Par exemple, une requête vers `https://www.pingclair.com/docs/example` est redirigée vers `https://pingclair.com`, et non vers la page correspondante sur le domaine principal.
+### 5. Proxy du script d'installation, avec cache
 
-Cette limitation tient au fait que le langage de configuration natif ne permet pas encore de construire une destination de redirection dynamique à partir du chemin demandé.
-
-Plusieurs solutions sont à l'étude dans le [ticket nº 330](https://github.com/dorianverlaine/pingclair/issues/330), dont l'ajout éventuel d'un paramètre `keepPath` à `Redirect`.
-
-### 7. TLS et HTTP/3
-
-```swift
-.tls(.automatic(email: "team@pingclair.com"))
+```caddyfile
+(installer) {
+    rewrite * /pingclair/install.sh
+    reverse_proxy releases.pingclair.com:443 {
+        header_up Host releases.pingclair.com
+        header_down ?X-Installer-Source r2
+        transport http {
+            tls
+            tls_server_name releases.pingclair.com
+        }
+        cache {
+            ttl 5m
+            max_size 16777216
+        }
+    }
+}
 ```
 
-La configuration TLS du point d'écoute assure la gestion automatique des certificats, depuis leur émission jusqu'à leur renouvellement.
+Le site ne garde aucune copie du script d'installation : chaque publication le
+dépose dans le stockage des publications, et le site sert de proxy vers lui. Le
+chemin est réécrit vers celui du stockage, l'en-tête `Host` et le nom de serveur
+TLS amont sont fixés explicitement, les réponses sont mises en cache cinq
+minutes dans 16 Mio au plus, et `X-Installer-Source: r2` est ajouté si l'amont
+ne l'a pas défini.
 
-L'adresse `team@pingclair.com` est utilisée comme adresse de contact du compte ACME associé.
+L'en-tête `Host` explicite compte ici : une requête amont qui garderait
+`pingclair.com` pourrait être renvoyée par Cloudflare vers ce même serveur, en boucle.
 
-Le déploiement prend également en charge HTTP/3, qui repose sur QUIC et utilise UDP sur le port 443.
+Les points d'accès `/mcp` et `/a2a` sont toujours servis par un Cloudflare
+Worker ; le snippet `(worker)` les relaie de la même façon, sans cache, si bien
+que leurs URL n'ont pas changé lors du déménagement du site.
 
-HTTP/3 et les connexions HTTPS classiques peuvent utiliser le même numéro de port : les premières reposent sur UDP, tandis que les secondes utilisent TCP.
+### 6. Règles de bordure
 
-### 8. Pages d'erreur et compression des réponses
-
-Le site officiel utilise la page `404.html` générée par Starlight pour les ressources introuvables.
-
-```swift
-.errorPage(
-    for: [.status(404)],
-    file: "/usr/local/www/pingclair.pingclair.com/404.html"
-)
-.encode(.zstd, .gzip)
+```caddyfile
+handle /_astro/* {
+    import edge_headers
+    header Cache-Control "public, max-age=31536000, immutable"
+    file_server
+}
 ```
 
-`errorPage` associe le code HTTP 404 au fichier HTML indiqué, afin de présenter une page d'erreur cohérente avec le reste du site.
+Le déploiement Cloudflare les appliquait en bordure ; ici, chacune est un bloc
+`handle` : cache immuable pour les ressources de build, cache d'une heure pour
+l'index de recherche, `text/plain` pour les accès directs aux fichiers Markdown,
+accès inter-origines aux documents `/.well-known`, avec le type de média RFC 9727
+pour le catalogue d'API.
 
-La directive `encode` active les encodages Zstandard et Gzip. Les réponses peuvent ainsi être compressées en fonction des formats acceptés par le client.
+### 7. Du Markdown pour les agents IA
 
-### 9. Journaux d'accès et rotation automatique
-
-```swift
-.accessLog(
-    output: .file("/var/log/pingclair-access.log"),
-    format: .json,
-    headers: [.request("User-Agent")],
-    rotation: .roll(
-        size: .mebibytes(100),
-        keep: 7,
-        compress: true
-    ),
-)
+```caddyfile
+@markdown header Accept *text/markdown*
+handle @markdown {
+    try_files {path}index.md {path}.md
+    file_server
+}
 ```
 
-Les journaux d'accès sont enregistrés au format JSON dans le fichier :
+Un client dont l'en-tête `Accept` contient `text/markdown` reçoit la version
+Markdown de la page à la même URL : le `index.md` du répertoire, ou le fichier
+voisin `<nom>.md`. Si aucun n'existe, la requête continue avec son chemin
+d'origine, de sorte que les ressources et les pages sans version Markdown restent
+servies. Les navigateurs continuent de recevoir du HTML. Les copies `index.md`
+sont générées au déploiement.
 
-`/var/log/pingclair-access.log`
+Il s'agit d'un test d'en-tête, pas d'une négociation de contenu HTTP complète.
+Pingclair propose aussi `file_server { negotiate markdown }`, qui suit les valeurs
+de qualité de la RFC 9110 et pose `Vary: Accept` ; le site pourrait l'adopter.
 
-Chaque requête donne lieu à une entrée JSON distincte, ce qui facilite la collecte, la recherche et l'analyse automatisée des journaux.
+Pour le contexte, voir l'article de Cloudflare [Agent Readiness](https://blog.cloudflare.com/agent-readiness/).
 
-L'en-tête `User-Agent` est également enregistré. La rotation des fichiers est assurée directement par Pingclair, selon les paramètres suivants :
+### 8. Page 404 et compression
 
-- Rotation dès que le fichier atteint 100 MiB
-- Conservation de sept fichiers après rotation au maximum
-- Compression des fichiers après rotation
+```caddyfile
+encode zstd gzip
 
-Le serveur peut ainsi gérer ses journaux d'accès sans recourir à un outil externe tel que `logrotate`.
+handle_errors 404 {
+    rewrite * /404.html
+    file_server
+}
+```
 
-## Documentation et références
+`encode` propose Zstandard et gzip aux clients qui les acceptent. Une requête
+pour un fichier absent reçoit le `404.html` généré par Starlight, avec le statut
+404 conservé.
 
-Pour en savoir plus sur le langage de configuration natif de Pingclair et les fonctionnalités disponibles :
+### 9. Journaux d'accès
 
-- **[Documentation officielle](https://pingclair.com)** : référence du langage de configuration, présentation des fonctionnalités et guides de déploiement
-- **`pingclair describe`** : affiche la liste des composants de configuration reconnus par le parseur ainsi que leurs définitions
-- **`pingclair validate`** : vérifie un fichier de configuration et signale les erreurs de syntaxe ou de configuration en indiquant leur emplacement
-- **[Dépôt du site officiel](https://github.com/dorianverlaine/pingclair-docs)** : code source du site et documentation associée
+```caddyfile
+(access_log) {
+    log {
+        output file /var/log/pingclair-access.log {
+            roll_size 100MiB
+            roll_keep 7
+        }
+        format json
+        headers {
+            request User-Agent
+        }
+    }
+}
+```
 
-Cette configuration présente un cas réel de déploiement de Pingclair en production. Pour connaître les paramètres disponibles et les fonctionnalités prises en charge, il convient de consulter la documentation correspondant à la version utilisée.
+Chaque requête est une ligne JSON dans `/var/log/pingclair-access.log`, avec le
+`User-Agent` de la requête. Pingclair assure lui-même la rotation : à 100 Mio,
+en gardant sept fichiers, compressés.
+
+## Références
+
+- **[Documentation officielle](https://pingclair.com)** — référence de
+  configuration et guides de déploiement.
+- **`pingclair validate`** — vérifie une configuration et indique l'emplacement
+  des erreurs.
+- **`pingclair fmt`** — met en forme un Pingclairfile en conservant ses commentaires.
+- **[Source du site](https://github.com/dorianverlaine/pingclair-docs)** — le
+  dépôt du site lui-même.

@@ -4,465 +4,204 @@
 
 ## 概述
 
-Pingclair 官方網站：[https://pingclair.com](https://pingclair.com)
+官方網站：[https://pingclair.com](https://pingclair.com)
 
-官方網站的原始碼已遷移至獨立儲存庫：
+網站原始碼放在獨立的儲存庫
+**[dorianverlaine/pingclair-docs](https://github.com/dorianverlaine/pingclair-docs)**。
+這個目錄只保留正式環境的設定檔 [`Pingclairfile`](Pingclairfile)，作為用 Pingclair
+部署靜態文件網站的實際範例：
 
-**[dorianverlaine/pingclair-docs](https://github.com/dorianverlaine/pingclair-docs)**
+- 自動 TLS 憑證與 HTTP/3
+- 以主機名稱區分的三個虛擬主機
+- 靜態檔案、自訂 404 頁面與壓縮
+- 反向代理與回應快取
+- 在同一個網址提供 Markdown 給 AI 代理
+- 永久轉址到正規網域
+- JSON 存取日誌與內建輪替
 
-遷移完成後，本目錄不再維護網站原始碼。原有的目錄結構，以及用於保留空目錄的 `.gitkeep` 佔位檔案，均已一併移除。
+網站跑在一台 FreeBSD 伺服器上。`pingclair.pingclair.com` 保留作為測試用主機名稱，
+`www.pingclair.com` 則永久轉址到主網域。設定檔是 Pingclairfile，也就是 Caddyfile
+語法；以下的節錄都取自這份檔案。
 
-本目錄目前僅保留官方網站的正式環境設定，作為 Pingclair 原生設定語言的實際部署範例。
+## 設定逐段說明
 
-此設定展示如何透過單一 `Pingclairfile` 部署靜態文件網站，涵蓋以下功能：
+### 1. 全域選項
 
-- 自動 TLS 憑證管理及 HTTP/3 支援
-- 基於主機名稱的虛擬主機設定
-- 靜態檔案服務與自訂錯誤頁面
-- 上游反向代理及回應快取
-- 面向 AI Agent 的 Markdown 內容協商
-- 永久重新導向與標準網域名稱管理
-- 結構化存取日誌及自動輪替
-
-## 正式環境設定
-
-以下為 `pingclair.com` 正式環境使用的 `Pingclairfile`。
-
-網站由部署於 FreeBSD 伺服器上的 Pingclair 提供服務。`pingclair.pingclair.com` 保留作為預發布環境網域，`www.pingclair.com` 則永久重新導向至主網域。
-
-設定中的英文註解保留原文，以便與實際部署檔案進行對照。
-
-```swift
-// 🏝️ pingclair.com — the docs site, served by Pingclair from a FreeBSD
-// node, with pingclair.pingclair.com kept as the staging alias and
-// www redirected to the apex.
-
-AutomaticTLS(mode: .automatic, httpPort: 80, httpsPort: 443)
-Storage(root: "/var/db/pingclair")
-
-// 🔁 The Admin API on loopback, so `pingclair reload` can hot-reload this
-// file instead of a restart dropping connections.
-Admin(listen: "127.0.0.1:2019")
-
-// 🧊 The one-line install address: `https://pingclair.com/install.sh`.
-//
-// The script lives in the server repository and is published to the release
-// bucket by every release; proxying it here rather than keeping a copy is the
-// same choice the Cloudflare Worker made — there is no second file to drift.
-let installerHost = "releases.pingclair.com:443"
-
-// 🤖 The agent endpoints still served by the documentation Worker; the
-// docs node proxies them so `pingclair.com/mcp` and `/a2a` keep the URL
-// contract the Worker era established.
-let cfWorker = "cf.pingclair.com:443"
-
-// 🔗 The discovery links the documentation Worker published through the build
-// output's `_headers` file; the native file server does not read that file, so
-// the same value is stated once here and reused by every route that serves
-// files. The escape keeps the real quotes in the value.
-let agentLink = "</.well-known/api-catalog>; rel=\"api-catalog\", </llms.txt>; rel=\"describedby\", </sitemap.xml>; rel=\"sitemap\""
-
-HTTPListener(on: ":443") {
-    Site(host: "pingclair.com") {
-        Route(when: .path(exact: "/install.sh")) {
-            Rewrite(to: "/pingclair/install.sh")
-            Proxy(
-                to: installerHost,
-                headersUp: [.set("Host", "releases.pingclair.com")],
-                headersDown: [.setIfAbsent("X-Installer-Source", "r2")],
-            )
-            .upstreamTLS(.enabled(serverName: "releases.pingclair.com"))
-            .cache(ttl: .minutes(5), maxSize: .mebibytes(16))
-        }
-        Route(when: .path(exact: "/install")) {
-            Rewrite(to: "/pingclair/install.sh")
-            Proxy(
-                to: installerHost,
-                headersUp: [.set("Host", "releases.pingclair.com")],
-                headersDown: [.setIfAbsent("X-Installer-Source", "r2")],
-            )
-            .upstreamTLS(.enabled(serverName: "releases.pingclair.com"))
-            .cache(ttl: .minutes(5), maxSize: .mebibytes(16))
-        }
-        Route(when: .path(exact: "/mcp")) {
-            Proxy(to: cfWorker, headersUp: [.set("Host", "cf.pingclair.com")])
-            .upstreamTLS(.enabled(serverName: "cf.pingclair.com"))
-        }
-        Route(when: .path(exact: "/a2a")) {
-            Proxy(to: cfWorker, headersUp: [.set("Host", "cf.pingclair.com")])
-            .upstreamTLS(.enabled(serverName: "cf.pingclair.com"))
-        }
-        // 🗂️ Rules the Cloudflare side applied at the edge — the `_headers`
-        // file does not exist for the native file server — stated natively:
-        // immutable cache for build assets, a short cache for the search
-        // index, plain text for direct Markdown fetches, cross-origin
-        // discovery catalogs, and the API catalog's RFC 9727 media type
-        // (which the Worker set itself).
-        Route(when: .path(prefix: "/_astro")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Cache-Control", "public, max-age=31536000, immutable"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(prefix: "/pagefind")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Cache-Control", "public, max-age=3600"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(glob: "*.md")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Content-Type", "text/plain; charset=utf-8"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(exact: "/.well-known/api-catalog")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Access-Control-Allow-Origin", "*"), .set("Content-Type", "application/linkset+json"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(prefix: "/.well-known")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Access-Control-Allow-Origin", "*"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        // 📄 Agents that ask for markdown get the twin on the same URL: the
-        // directory's `index.md`, or the sibling `<name>.md`; a miss carries
-        // on to the normal file server unchanged. The `index.md` copies are
-        // made at deploy time.
-        Route(when: .header(name: "Accept", contains: "text/markdown")) {
-            TryFiles(candidates: [.requestPath(appending: "index.md"), .requestPath(appending: ".md")], root: "/usr/local/www/pingclair.pingclair.com")
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Fallback {
-            // 🔗 `public/_headers` states these on the Cloudflare deployment;
-            // the native file server does not read that file, so the same
-            // rules are stated here.
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-    }
-    // 🧾 Starlight ships a 404 page; unknown paths answer with it, the same
-    // as the Cloudflare deployment's `not_found_handling`.
-    .errorPage(for: [.status(404)], file: "/usr/local/www/pingclair.pingclair.com/404.html")
-    .encode(.zstd, .gzip)
-
-    Site(host: "www.pingclair.com") {
-        // ➡️ 308 to the apex, the same permanent move the Cloudflare zone
-        // answered. The native language has no request-time placeholders yet,
-        // so the path does not ride along; a `keepPath:` argument on Redirect
-        // is the design idea on file for that.
-        Fallback { Redirect(to: "https://pingclair.com", status: .permanentRedirect) }
-    }
-
-    Site(host: "pingclair.pingclair.com") {
-        Route(when: .path(exact: "/install.sh")) {
-            Rewrite(to: "/pingclair/install.sh")
-            Proxy(
-                to: installerHost,
-                headersUp: [.set("Host", "releases.pingclair.com")],
-                headersDown: [.setIfAbsent("X-Installer-Source", "r2")],
-            )
-            .upstreamTLS(.enabled(serverName: "releases.pingclair.com"))
-            .cache(ttl: .minutes(5), maxSize: .mebibytes(16))
-        }
-        Route(when: .path(exact: "/mcp")) {
-            Proxy(to: cfWorker, headersUp: [.set("Host", "cf.pingclair.com")])
-            .upstreamTLS(.enabled(serverName: "cf.pingclair.com"))
-        }
-        Route(when: .path(exact: "/a2a")) {
-            Proxy(to: cfWorker, headersUp: [.set("Host", "cf.pingclair.com")])
-            .upstreamTLS(.enabled(serverName: "cf.pingclair.com"))
-        }
-        // 🗂️ The same edge rules as the apex site.
-        Route(when: .path(prefix: "/_astro")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Cache-Control", "public, max-age=31536000, immutable"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(prefix: "/pagefind")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Cache-Control", "public, max-age=3600"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(glob: "*.md")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Content-Type", "text/plain; charset=utf-8"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(exact: "/.well-known/api-catalog")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Access-Control-Allow-Origin", "*"), .set("Content-Type", "application/linkset+json"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Route(when: .path(prefix: "/.well-known")) {
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink), .set("Access-Control-Allow-Origin", "*"))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        // 📄 The same markdown negotiation as the apex site.
-        Route(when: .header(name: "Accept", contains: "text/markdown")) {
-            TryFiles(candidates: [.requestPath(appending: "index.md"), .requestPath(appending: ".md")], root: "/usr/local/www/pingclair.pingclair.com")
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-        Fallback {
-            // 🔗 The same header set as the apex site.
-            ResponseHeader(.set("X-Content-Type-Options", "nosniff"), .set("Referrer-Policy", "strict-origin-when-cross-origin"), .set("X-Frame-Options", "DENY"), .set("Link", agentLink))
-            ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-        }
-    }
-    .errorPage(for: [.status(404)], file: "/usr/local/www/pingclair.pingclair.com/404.html")
-    .encode(.zstd, .gzip)
-}
-.tls(.automatic(email: "team@pingclair.com"))
-// 📓 One JSON line per request, rotated by Pingclair itself.
-.accessLog(
-    output: .file("/var/log/pingclair-access.log"),
-    format: .json,
-    headers: [.request("User-Agent")],
-    rotation: .roll(size: .mebibytes(100), keep: 7, compress: true),
-)
-```
-
-## 設定說明
-
-### 1. 全域設定與上游定義
-
-`AutomaticTLS` 與 `Storage` 用於定義服務層級的 TLS 管理及持久化儲存行為。
-
-```swift
-AutomaticTLS(mode: .automatic, httpPort: 80, httpsPort: 443)
-Storage(root: "/var/db/pingclair")
-Admin(listen: "127.0.0.1:2019")
-```
-
-`AutomaticTLS` 啟用自動憑證管理，並設定 HTTP 與 HTTPS 連接埠，以支援憑證簽發及續期流程。
-
-`Storage` 指定持久化資料目錄，用於儲存 TLS 憑證、ACME 帳戶金鑰及相關狀態資訊。
-
-`Admin` 在本機迴環位址上開放管理 API；這讓設定變更可以熱重載套用，而不必重新啟動服務。
-
-此外，設定使用 `let` 宣告兩個上游位址：
-
-```swift
-let installerHost = "releases.pingclair.com:443"
-let cfWorker = "cf.pingclair.com:443"
-```
-
-透過集中定義上游位址，可以減少重複設定，並確保相同上游在不同路由中的參照保持一致。
-
-Pingclair 原生設定語言將字串視為字面值，不支援在字串內進行執行階段變數插值。上游位址透過明確的綁定進行參照，相關設定可於載入階段完成解析與檢查。
-
-### 2. HTTP 監聽器與虛擬主機
-
-```swift
-HTTPListener(on: ":443") {
-    Site(host: "pingclair.com") { ... }
-    Site(host: "www.pingclair.com") { ... }
-    Site(host: "pingclair.pingclair.com") { ... }
+```caddyfile
+{
+    email team@pingclair.com
+    storage file_system /var/db/pingclair
+    admin 127.0.0.1:2019
 }
 ```
 
-`HTTPListener` 定義監聽端點，`Site` 則根據請求的主機名稱設定虛擬主機。
+`email` 是自動憑證的 ACME 帳號聯絡信箱。`storage` 指定存放憑證、帳號金鑰與相關狀態
+的目錄。`admin` 只在 loopback 上開放 Admin API，`pingclair reload` 因此能在不中斷
+連線的情況下套用修改過的設定檔。
 
-多個 `Site` 可以共用同一個監聽器，無須分別建立網路監聽端點。
+### 2. 用 snippet 收納重複的部分
 
-目前部署包含三個虛擬主機：
+重複出現的設定都只定義一次，寫成 snippet 再 import：
+
+| Snippet | 內容 |
+| --- | --- |
+| `(edge_headers)` | 安全相關 header，以及 Cloudflare 部署時在 `_headers` 檔裡宣告、供代理程式探索的 `Link` header |
+| `(installer)` | 從發布儲存空間提供 `install.sh` 的代理 |
+| `(worker)` | `/mcp` 與 `/a2a` 代理端點的代理 |
+| `(access_log)` | 所有站點共用的存取日誌 |
+| `(docs)` | 整個文件網站，主網域與測試主機共用 |
+
+### 3. 虛擬主機
+
+```caddyfile
+pingclair.com {
+    import docs
+}
+
+pingclair.pingclair.com {
+    import docs
+}
+
+www.pingclair.com {
+    import access_log
+    redir https://pingclair.com{uri} 308
+}
+```
+
+帶有主機名稱的站點位址會自動得到：443 埠的 HTTPS、UDP 443 埠的 HTTP/3，以及一個
+80 埠的監聽，負責轉址到 HTTPS 並回應 ACME 驗證。
 
 | 主機名稱 | 用途 |
-|---|---|
-| `pingclair.com` | 官方網站及主要 API 入口 |
-| `www.pingclair.com` | 永久重新導向至主網域 |
-| `pingclair.pingclair.com` | 預發布環境及相容性入口 |
+| --- | --- |
+| `pingclair.com` | 官方網站與代理端點 |
+| `pingclair.pingclair.com` | 測試環境，提供同一個網站 |
+| `www.pingclair.com` | 永久轉址到主網域 |
 
-此設計將網路監聽設定與網站層級的路由邏輯分離，便於集中管理 TLS、日誌及其他監聽器層級的功能。
+### 4. 路由順序
 
-### 3. 路由比對與執行順序
-
-Pingclair 依照宣告順序對網站中的 `Route` 進行比對，由第一個符合條件的路由負責處理請求。
-
-當沒有任何路由符合條件時，請求將由 `Fallback` 處理。
-
-官方網站採用以下比對優先順序：
-
-1. 安裝腳本：`/install.sh` 與 `/install`
-2. Agent 介面：`/mcp` 與 `/a2a`
-3. 根據 `Accept` 請求標頭選擇 Markdown 內容
-4. 透過 `Fallback` 提供一般靜態檔案
-
-精確路徑比對優先於通用請求標頭比對，可避免靜態檔案服務或內容協商邏輯影響專用介面。
-
-路由執行順序直接體現在設定檔中，不依賴額外的優先權數值或隱含規則。
-
-### 4. 上游代理與回應快取
-
-官方網站的安裝腳本由獨立的發布服務維護，不在文件網站中儲存副本。
-
-`/install.sh` 與 `/install` 均透過反向代理存取 `releases.pingclair.com`：
-
-```swift
-Rewrite(to: "/pingclair/install.sh")
-Proxy(
-    to: installerHost,
-    headersUp: [.set("Host", "releases.pingclair.com")],
-    headersDown: [.setIfAbsent("X-Installer-Source", "r2")],
-)
-.upstreamTLS(.enabled(serverName: "releases.pingclair.com"))
-.cache(ttl: .minutes(5), maxSize: .mebibytes(16))
-```
-
-此設定包含以下處理步驟：
-
-1. **路徑改寫**：`Rewrite` 將請求路徑轉換為發布服務使用的資源路徑。
-2. **上游代理**：`Proxy` 將請求轉送至指定的 HTTPS 上游。
-3. **Host 標頭設定**：`headersUp` 明確設定上游請求的 `Host`。
-4. **TLS 伺服器名稱**：`upstreamTLS` 指定上游 TLS 連線使用的伺服器名稱。
-5. **回應快取**：`cache` 設定五分鐘的快取有效期限，以及 16 MiB 的大小限制。
-6. **回應來源識別**：`headersDown` 在回應標頭不存在時加入 `X-Installer-Source: r2`。
-
-明確設定上游 `Host` 與 TLS 伺服器名稱，對目前的部署架構尤其重要。
-
-若請求繼續使用原始主機名稱 `pingclair.com`，可能被 Cloudflare 路由回官方網站伺服器，形成非預期的代理迴圈。因此，此設定明確區分用戶端存取網域與上游服務網域。
-
-安裝腳本透過獨立發布服務提供，也避免了網站部署與軟體發行版本之間出現多份需要同步維護的檔案。
-
-#### Agent 介面代理
-
-`/mcp` 與 `/a2a` 使用相同的反向代理機制，但不設定回應快取。
-
-```swift
-Route(when: .path(exact: "/mcp")) {
-    Proxy(to: cfWorker, headersUp: [.set("Host", "cf.pingclair.com")])
-    .upstreamTLS(.enabled(serverName: "cf.pingclair.com"))
-}
-```
-
-這些介面仍由 Cloudflare Worker 提供服務，官方網站伺服器則負責將請求轉送至既有上游。
-
-此部署方式保留既有介面路徑，使網站基礎設施遷移時，無須同時變更用戶端使用的 API 位址。
-
-### 5. 面向 AI Agent 的 Markdown 內容協商
-
-官方網站支援根據 HTTP `Accept` 請求標頭，在相同 URL 下提供 HTML 或 Markdown 格式的內容。
-
-```swift
-Route(when: .header(name: "Accept", contains: "text/markdown")) {
-    TryFiles(
-        candidates: [
-            .requestPath(appending: "index.md"),
-            .requestPath(appending: ".md")
-        ],
-        root: "/usr/local/www/pingclair.pingclair.com"
-    )
-    ServeFiles(root: "/usr/local/www/pingclair.pingclair.com")
-}
-```
-
-*以上程式碼僅為提高可讀性而調整排版，處理邏輯與正式環境設定一致。*
-
-當用戶端傳送包含 `text/markdown` 的 `Accept` 請求標頭時，Pingclair 會嘗試尋找對應的 Markdown 檔案。
-
-`TryFiles` 依序檢查以下候選路徑：
-
-1. 請求路徑所對應目錄中的 `index.md`
-2. 請求路徑所對應的 `.md` 檔案
-
-找到檔案後，後續的 `ServeFiles` 會使用選定的路徑提供內容。
-
-若兩個候選路徑均不存在，`TryFiles` 不會直接回傳錯誤，而是繼續使用原始請求路徑進行處理。
-
-因此，一般靜態資源及沒有 Markdown 版本的路徑，仍可由檔案服務正常處理。
-
-部署流程也會根據對應的 Markdown 來源檔案產生所需的 `index.md`，以支援目錄形式的文件路徑。
-
-對於一般瀏覽器請求，網站會繼續提供 HTML 頁面。Markdown 檔案不在預設目錄索引清單中，因此不會取代一般的 HTML 索引頁面。
-
-需要注意的是，目前的實作透過檢查 `Accept` 請求標頭是否包含 `text/markdown` 來選擇內容，屬於基於請求標頭條件的格式選擇，而非完整的 HTTP 內容協商演算法。
-
-此機制旨在讓 AI Agent 能夠直接取得文件的結構化文字版本，同時維持既有 URL 與瀏覽器存取行為不變。
-
-關於網站面向 AI Agent 的整體可存取性與內容組織方式，可參考 Cloudflare 的相關文章：
-
-[Agent Readiness](https://blog.cloudflare.com/agent-readiness/)
-
-### 6. 標準網域名稱與永久重新導向
-
-官方網站使用 `pingclair.com` 作為標準網域名稱，並透過 HTTP 308 將 `www.pingclair.com` 的請求永久重新導向至主網域。
-
-```swift
-Site(host: "www.pingclair.com") {
-    Fallback {
-        Redirect(
-            to: "https://pingclair.com",
-            status: .permanentRedirect
-        )
+```caddyfile
+route {
+    handle /install.sh {
+        import installer
+    }
+    …
+    handle {
+        import edge_headers
+        file_server
     }
 }
 ```
 
-HTTP 308 表示永久重新導向，並要求用戶端在重新導向過程中保留原始請求方法。
+在 `route` 裡，區塊依書寫順序執行，第一個符合的 `handle` 負責回應。網站的順序是：
 
-目前設定存在一項已知限制：**重新導向不會保留原始請求路徑。**
+1. 安裝腳本：`/install.sh` 與 `/install`；
+2. 代理端點：`/mcp` 與 `/a2a`；
+3. 建置產物、搜尋索引、Markdown 檔案與 `/.well-known` 探索文件的邊緣規則；
+4. 提供 Markdown 給要求它的用戶端；
+5. 其他一律從磁碟提供。
 
-例如，存取 `https://www.pingclair.com/docs/example` 將被重新導向至 `https://pingclair.com`，而非對應的文件路徑。
+### 5. 代理安裝腳本並快取
 
-這是因為目前的原生設定語言尚未提供可用於建構動態重新導向目標的請求路徑參照機制。
-
-相關改善方案正在 [Issue #330](https://github.com/dorianverlaine/pingclair/issues/330) 中追蹤，其中包括為 `Redirect` 引入 `keepPath` 參數的設計提案。
-
-### 7. TLS 與 HTTP/3
-
-```swift
-.tls(.automatic(email: "team@pingclair.com"))
+```caddyfile
+(installer) {
+    rewrite * /pingclair/install.sh
+    reverse_proxy releases.pingclair.com:443 {
+        header_up Host releases.pingclair.com
+        header_down ?X-Installer-Source r2
+        transport http {
+            tls
+            tls_server_name releases.pingclair.com
+        }
+        cache {
+            ttl 5m
+            max_size 16777216
+        }
+    }
+}
 ```
 
-監聽器透過自動 TLS 設定管理憑證簽發與續期。
+網站本身不保存安裝腳本的副本；每次發布都會把它上傳到發布儲存空間，網站再代理過去。
+請求路徑會改寫成儲存空間裡的路徑，上游的 `Host` 與 TLS 伺服器名稱都明確指定，回應快取
+五分鐘、上限 16 MiB，上游沒有設定時會補上 `X-Installer-Source: r2`。
 
-`team@pingclair.com` 作為相關 ACME 帳戶的聯絡電子郵件地址。
+明確指定 `Host` 在這裡很重要：如果上游請求保留了 `pingclair.com`，Cloudflare 可能把它
+轉回這台伺服器，形成迴圈。
 
-目前部署同時支援 HTTP/3，透過 UDP/443 提供基於 QUIC 的 HTTP 連線。
+`/mcp` 與 `/a2a` 仍由 Cloudflare Worker 提供；`(worker)` snippet 用同樣的方式代理它們，
+但不快取，所以網站搬家時這兩個網址都不必改。
 
-HTTP/3 與傳統的 TLS-over-TCP 連線可以使用相同的連接埠號碼，但分別使用 UDP 與 TCP 作為傳輸協定。
+### 6. 邊緣規則
 
-### 8. 自訂錯誤頁面與內容壓縮
-
-官方網站使用 Starlight 產生的 `404.html` 作為自訂錯誤頁面。
-
-```swift
-.errorPage(
-    for: [.status(404)],
-    file: "/usr/local/www/pingclair.pingclair.com/404.html"
-)
-.encode(.zstd, .gzip)
+```caddyfile
+handle /_astro/* {
+    import edge_headers
+    header Cache-Control "public, max-age=31536000, immutable"
+    file_server
+}
 ```
 
-`errorPage` 將 HTTP 404 狀態對應至指定的靜態錯誤頁面，確保網站在資源不存在時維持一致的呈現方式。
+這些規則原本由 Cloudflare 在邊緣套用，這裡每一條都是一個 `handle` 區塊：建置產物使用
+不可變快取，搜尋索引快取一小時，直接抓取的 Markdown 以 `text/plain` 回應，`/.well-known`
+文件開放跨來源存取，API 目錄使用 RFC 9727 的媒體型別。
 
-`encode` 設定支援 Zstandard 與 Gzip 內容編碼，讓用戶端能夠依據支援的編碼格式接收壓縮後的回應。
+### 7. 給 AI 代理的 Markdown
 
-### 9. 存取日誌與檔案輪替
-
-```swift
-.accessLog(
-    output: .file("/var/log/pingclair-access.log"),
-    format: .json,
-    headers: [.request("User-Agent")],
-    rotation: .roll(
-        size: .mebibytes(100),
-        keep: 7,
-        compress: true
-    ),
-)
+```caddyfile
+@markdown header Accept *text/markdown*
+handle @markdown {
+    try_files {path}index.md {path}.md
+    file_server
+}
 ```
 
-此設定啟用 JSON 格式的存取日誌，並將其寫入：
+`Accept` header 含有 `text/markdown` 的用戶端，會在同一個網址拿到頁面的 Markdown 版本：
+目錄的 `index.md`，或同名的 `<name>.md`。兩者都不存在時，請求會以原本的路徑繼續處理，
+所以靜態資源和沒有 Markdown 版本的頁面照樣能取得；瀏覽器拿到的仍然是 HTML。`index.md`
+副本在部署時產生。
 
-`/var/log/pingclair-access.log`
+這是 header 判斷，不是完整的 HTTP 內容協商。Pingclair 另外提供
+`file_server { negotiate markdown }`，它依照 RFC 9110 的品質值判斷並設定
+`Vary: Accept`，網站之後可能改用它。
 
-每筆存取日誌均以獨立的 JSON 紀錄儲存，便於日誌蒐集、查詢及自動化分析。
+背景說明可參考 Cloudflare 的 [Agent Readiness](https://blog.cloudflare.com/agent-readiness/)。
 
-日誌額外包含請求的 `User-Agent` 標頭，並由 Pingclair 內建的輪替機制管理日誌檔案：
+### 8. 404 頁面與壓縮
 
-- 單一日誌檔案達到 100 MiB 時觸發輪替
-- 最多保留七個輪替檔案
-- 對輪替後的日誌檔案啟用壓縮
+```caddyfile
+encode zstd gzip
 
-因此，此部署無須額外依賴外部日誌輪替程式，即可完成上述日誌生命週期管理。
+handle_errors 404 {
+    rewrite * /404.html
+    file_server
+}
+```
 
-## 參考資料
+`encode` 對支援的用戶端提供 Zstandard 與 gzip。請求不存在的檔案時，回應 Starlight
+產生的 `404.html`，狀態碼維持 404。
 
-關於 Pingclair 原生設定語言及其元件的完整說明，請參閱以下資源：
+### 9. 存取日誌
 
-- **[官方文件](https://pingclair.com)**：設定語言、功能說明及部署指南
-- **`pingclair describe`**：檢視解析器支援的設定元件及其定義
-- **`pingclair validate`**：驗證設定檔，並回報語法或設定錯誤及其對應位置
-- **[官方網站原始碼](https://github.com/dorianverlaine/pingclair-docs)**：網站內容與文件維護儲存庫
+```caddyfile
+(access_log) {
+    log {
+        output file /var/log/pingclair-access.log {
+            roll_size 100MiB
+            roll_keep 7
+        }
+        format json
+        headers {
+            request User-Agent
+        }
+    }
+}
+```
 
-本文所示設定用於說明 Pingclair 在實際正式環境中的部署方式。具體設定參數及功能支援情況，請以對應版本的官方文件為準。
+每個請求在 `/var/log/pingclair-access.log` 裡記成一行 JSON，並記錄請求的
+`User-Agent`。Pingclair 自己負責輪替：檔案達到 100 MiB 時輪替，保留七個舊檔，並加以壓縮。
+
+## 參考資源
+
+- **[官方文件](https://pingclair.com)**：設定參考與部署指南。
+- **`pingclair validate`**：檢查設定檔，並標出錯誤所在位置。
+- **`pingclair fmt`**：格式化 Pingclairfile，保留註解。
+- **[網站原始碼](https://github.com/dorianverlaine/pingclair-docs)**：網站本身的儲存庫。

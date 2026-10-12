@@ -56,11 +56,9 @@
 	}
 }
 
-(docs) {
-	root * /usr/local/www/pingclair.pingclair.com
-	encode zstd gzip
-
-	# 📓 One JSON line per request, rotated by Pingclair itself.
+# 📓 One JSON line per request, rotated by Pingclair itself. Every site imports
+# it, so the redirecting www host is logged too.
+(access_log) {
 	log {
 		output file /var/log/pingclair-access.log {
 			roll_size 100MiB
@@ -71,6 +69,13 @@
 			request User-Agent
 		}
 	}
+}
+
+(docs) {
+	root * /usr/local/www/pingclair.pingclair.com
+	encode zstd gzip
+
+	import access_log
 
 	# 📌 A `route` keeps these in the order written: the first block that
 	# matches answers.
@@ -155,5 +160,6 @@ pingclair.pingclair.com {
 # ➡️ 308 to the apex, the same permanent move the Cloudflare zone answered,
 # now with the path and query riding along.
 www.pingclair.com {
+	import access_log
 	redir https://pingclair.com{uri} 308
 }
