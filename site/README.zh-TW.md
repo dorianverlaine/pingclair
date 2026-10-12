@@ -8,8 +8,8 @@
 
 網站原始碼放在獨立的儲存庫
 **[dorianverlaine/pingclair-docs](https://github.com/dorianverlaine/pingclair-docs)**。
-這個目錄只保留正式環境的設定檔 [`Pingclairfile`](Pingclairfile)，作為用 Pingclair
-部署靜態文件網站的實際範例：
+這個目錄保留正式環境的設定檔 [`Pingclairfile`](Pingclairfile)，以及讓網站檔案保持
+最新的腳本 [`sync-docs.sh`](sync-docs.sh)，作為用 Pingclair 部署靜態文件網站的實際範例：
 
 - 自動 TLS 憑證與 HTTP/3
 - 以主機名稱區分的三個虛擬主機
@@ -202,6 +202,32 @@ handle_errors 404 {
 
 每個請求在 `/var/log/pingclair-access.log` 裡記成一行 JSON，並記錄請求的
 `User-Agent`。Pingclair 自己負責輪替：檔案達到 100 MiB 時輪替，保留七個舊檔，並加以壓縮。
+
+## 讓網站保持最新
+
+伺服器本身從不建置網站：Astro 建置的記憶體峰值接近 800 MB，而伺服器的記憶體不到
+1 GiB。網站儲存庫的 CI 會建置每一次推到 `main` 的內容，把結果發佈到固定的
+`site-latest` release，內容是 `site.tar.gz`，以及記錄 commit 與壓縮檔 sha256 的
+`site.json`。
+
+[`sync-docs.sh`](sync-docs.sh) 由 cron 每五分鐘執行一次。`site.json` 裡的 commit
+跟伺服器正在提供的不同時，它會下載壓縮檔、檢查 sha256 與幾個關鍵頁面，解壓到
+`/usr/local/www/pingclair-site/<commit>`，再把新的 symlink 改名覆蓋
+`/usr/local/www/pingclair.pingclair.com`，也就是 Pingclairfile 提供的根目錄。改名是
+原子操作，所以請求不會看到兩個版本各一半的內容，Pingclair 也不需要重載。切換後如果
+網站沒有正常回應，連結會改回上一個版本。磁碟上保留最新的三個版本。
+
+安裝步驟（只需一次，以 root 執行）：
+
+```sh
+install -m 755 sync-docs.sh /usr/local/sbin/pingclair-site-sync
+mkdir -p /usr/local/www/pingclair-site
+mv /usr/local/www/pingclair.pingclair.com /usr/local/www/pingclair-site/initial
+ln -s /usr/local/www/pingclair-site/initial /usr/local/www/pingclair.pingclair.com
+echo '*/5 * * * * root /usr/local/sbin/pingclair-site-sync' > /etc/cron.d/pingclair-site-sync
+```
+
+每次切換都會以 `pingclair-site-sync` 為標籤記錄到 syslog。
 
 ## 參考資源
 

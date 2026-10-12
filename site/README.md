@@ -8,7 +8,8 @@ Official website: [https://pingclair.com](https://pingclair.com)
 
 The website's source code lives in its own repository,
 **[dorianverlaine/pingclair-docs](https://github.com/dorianverlaine/pingclair-docs)**.
-This directory keeps only the production configuration, [`Pingclairfile`](Pingclairfile),
+This directory keeps the production configuration, [`Pingclairfile`](Pingclairfile),
+and the script that keeps the served files current, [`sync-docs.sh`](sync-docs.sh),
 as a worked example of deploying a static documentation site with Pingclair:
 
 - automatic TLS certificates and HTTP/3
@@ -215,6 +216,34 @@ missing file answers with Starlight's `404.html`, with the 404 status kept.
 Each request is one JSON line in `/var/log/pingclair-access.log`, with the
 request's `User-Agent`. Pingclair rotates the file itself at 100 MiB, keeps
 seven rotated files, and compresses them.
+
+## Keeping the site up to date
+
+The server never builds the site: an Astro build peaks near 800 MB, and the
+server has under 1 GiB. The website repository's CI builds every push to
+`main` and publishes the result to its rolling `site-latest` release, as
+`site.tar.gz` and a `site.json` naming the commit and the tarball's sha256.
+
+[`sync-docs.sh`](sync-docs.sh) runs from cron every five minutes. When
+`site.json` names a commit the server is not serving, it downloads the tarball,
+checks the sha256 and the key pages, unpacks it into
+`/usr/local/www/pingclair-site/<commit>`, and renames a new symlink over
+`/usr/local/www/pingclair.pingclair.com`, the root the Pingclairfile serves.
+The rename is atomic, so a request never sees half of two builds, and
+Pingclair needs no reload. If the live site stops answering afterwards, the
+link goes back to the previous build. The three newest builds stay on disk.
+
+Installation, once, as root:
+
+```sh
+install -m 755 sync-docs.sh /usr/local/sbin/pingclair-site-sync
+mkdir -p /usr/local/www/pingclair-site
+mv /usr/local/www/pingclair.pingclair.com /usr/local/www/pingclair-site/initial
+ln -s /usr/local/www/pingclair-site/initial /usr/local/www/pingclair.pingclair.com
+echo '*/5 * * * * root /usr/local/sbin/pingclair-site-sync' > /etc/cron.d/pingclair-site-sync
+```
+
+Each switch is logged to syslog under `pingclair-site-sync`.
 
 ## References
 

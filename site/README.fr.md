@@ -8,7 +8,8 @@ Site officiel : [https://pingclair.com](https://pingclair.com)
 
 Le code source du site vit dans son propre dépôt,
 **[dorianverlaine/pingclair-docs](https://github.com/dorianverlaine/pingclair-docs)**.
-Ce répertoire ne conserve que la configuration de production, [`Pingclairfile`](Pingclairfile),
+Ce répertoire conserve la configuration de production, [`Pingclairfile`](Pingclairfile),
+et le script qui tient les fichiers servis à jour, [`sync-docs.sh`](sync-docs.sh),
 comme exemple concret de déploiement d'un site de documentation statique avec Pingclair :
 
 - certificats TLS automatiques et HTTP/3
@@ -221,6 +222,36 @@ pour un fichier absent reçoit le `404.html` généré par Starlight, avec le st
 Chaque requête est une ligne JSON dans `/var/log/pingclair-access.log`, avec le
 `User-Agent` de la requête. Pingclair assure lui-même la rotation : à 100 Mio,
 en gardant sept fichiers, compressés.
+
+## Tenir le site à jour
+
+Le serveur ne construit jamais le site : un build Astro monte à près de 800 Mo,
+et le serveur dispose de moins de 1 Gio. La CI du dépôt du site construit chaque
+push sur `main` et publie le résultat dans sa release glissante `site-latest`,
+sous forme de `site.tar.gz` et d'un `site.json` qui indique le commit et le
+sha256 de l'archive.
+
+[`sync-docs.sh`](sync-docs.sh) tourne depuis cron toutes les cinq minutes. Quand
+`site.json` désigne un commit que le serveur ne sert pas, il télécharge
+l'archive, vérifie le sha256 et les pages clés, la décompresse dans
+`/usr/local/www/pingclair-site/<commit>`, puis renomme un nouveau lien
+symbolique par-dessus `/usr/local/www/pingclair.pingclair.com`, la racine que
+sert le Pingclairfile. Le renommage est atomique : une requête ne voit jamais la
+moitié de deux builds, et Pingclair n'a pas besoin d'être rechargé. Si le site
+cesse de répondre ensuite, le lien revient au build précédent. Les trois builds
+les plus récents restent sur le disque.
+
+Installation, une seule fois, en root :
+
+```sh
+install -m 755 sync-docs.sh /usr/local/sbin/pingclair-site-sync
+mkdir -p /usr/local/www/pingclair-site
+mv /usr/local/www/pingclair.pingclair.com /usr/local/www/pingclair-site/initial
+ln -s /usr/local/www/pingclair-site/initial /usr/local/www/pingclair.pingclair.com
+echo '*/5 * * * * root /usr/local/sbin/pingclair-site-sync' > /etc/cron.d/pingclair-site-sync
+```
+
+Chaque bascule est journalisée dans syslog sous `pingclair-site-sync`.
 
 ## Références
 
