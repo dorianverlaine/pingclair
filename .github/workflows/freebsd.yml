@@ -98,12 +98,21 @@ jobs:
             fi
             "${BIN}" --version
 
+            # 🧾 The examples that validate on any machine, and the production
+            # Pingclairfile of pingclair.com, which runs on FreeBSD.
+            # `full_featured.pingclair` names certificate files that only
+            # exist on a real deployment, so it is left out on purpose.
             echo "🧾 Validating the examples"
-            "${BIN}" validate examples/basic.pingclair
-            "${BIN}" validate examples/full_featured.pingclair
+            for config in examples/basic.pingclair examples/reverse_proxy.pingclair \
+              examples/layer4.pingclair examples/extensions.pingclair site/Pingclairfile; do
+              "${BIN}" validate --config "${config}"
+            done
 
-            echo "🚀 Booting examples/basic.pingclair"
-            "${BIN}" run examples/basic.pingclair > /tmp/pingclair-smoke.log 2>&1 &
+            # 🚀 A configuration of its own, so the boot check does not depend
+            # on what an example happens to serve.
+            printf 'http://example.test:8080 {\n    respond "hello from Pingclair"\n}\n' > /tmp/smoke.pingclair
+            echo "🚀 Booting /tmp/smoke.pingclair"
+            "${BIN}" run /tmp/smoke.pingclair > /tmp/pingclair-smoke.log 2>&1 &
             SERVER_PID=$!
             TRIES=0
             # 🌐 `:8080` resolves to the IPv6 wildcard, and FreeBSD keeps such
