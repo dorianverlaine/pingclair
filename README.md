@@ -27,7 +27,7 @@ kind of option, under nginx's name when nginx has the concept — `deny`,
 `send_timeout`, `keepalive_requests`, `negotiate markdown`
 ([examples/extensions.pingclair](examples/extensions.pingclair)).
 
-The latest release is `v0.2.2`, the newest patch on the 0.2 line. Review the
+The latest release is `v0.2.3`, the newest patch on the 0.2 line. Review the
 [project status](https://pingclair.com/project/status/) before using it for a
 production deployment. Pingclair is pre-1.0: a minor version is where breaking
 changes live, and a patch release promises nothing breaks.
@@ -80,7 +80,7 @@ and `pc` commands:
 curl -fsSL https://pingclair.com/install.sh | sudo bash
 ```
 
-The current release is `v0.2.2`, a patch on the 0.2 line. The `v0.1.x` line is
+The current release is `v0.2.3`, a patch on the 0.2 line. The `v0.1.x` line is
 unmaintained and should not be used for a new deployment.
 
 After installation, inspect the service before loading a configuration:
@@ -271,7 +271,7 @@ the same commands and configuration surface.
 
 ## 📌 Release status
 
-The latest published version is `v0.2.2`. `main` carries the 0.3 development
+The latest published version is `v0.2.3`. `main` carries the 0.3 development
 line, so the source tree contains behavior the published release does not;
 release documentation describes the published release, not `main`.
 
