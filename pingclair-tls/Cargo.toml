@@ -51,5 +51,9 @@ arc-swap.workspace = true
 # Testing
 tempfile = "3"
 
+[dev-dependencies]
+# 🧪 Captures what the store logs, for tests about warnings it must not emit.
+tracing-subscriber.workspace = true
+
 [lints]
 workspace = true

@@ -324,6 +324,13 @@ impl CertStore {
         Ok(())
     }
 
+    /// 📄 Files in the store root that are not certificate bundles: the
+    /// persistent ACME challenge journal, and the document the Admin API
+    /// autosaves beside the certificates (`pingclair/src/run/admin.rs`).
+    /// Loading either as a certificate logs a misleading "corrupt cert file"
+    /// warning on every start.
+    const NOT_CERTIFICATES: [&str; 2] = ["acme-challenges.json", "autosave.json"];
+
     /// 📚 Loads every `<site>.json` a flat store holds.
     ///
     /// A file that will not parse is reported and skipped, not fatal: one
@@ -341,10 +348,11 @@ impl CertStore {
             {
                 continue;
             }
-            // 📄 The persistent challenge journal lives in the store root but is
-            // not a certificate bundle; loading it as one would emit a
-            // misleading "corrupt cert" warning on every start.
-            if path.file_name().and_then(|name| name.to_str()) == Some("acme-challenges.json") {
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| Self::NOT_CERTIFICATES.contains(&name))
+            {
                 continue;
             }
 
@@ -756,6 +764,44 @@ mod tests {
         let params = CertificateParams::new(vec![domain.to_string()]).unwrap();
         let certificate = params.self_signed(&key).unwrap();
         (certificate.pem(), key.serialize_pem())
+    }
+
+    /// 🧾 The Admin API autosaves the active document into the store root, and
+    /// every start read it as a certificate and warned that it was corrupt —
+    /// twice a day on pingclair.com until 2026-10-13, a warning nobody could act on.
+    #[tokio::test]
+    async fn the_autosaved_document_is_not_read_as_a_certificate() {
+        use std::sync::{Arc, Mutex};
+
+        /// 🧪 Collects everything the subscriber writes.
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("autosave.json"), r#"{"servers":[]}"#).unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || Sink(sink.clone()))
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        CertStore::new(temp_dir.path())
+            .init()
+            .await
+            .expect("Init failed");
+
+        let logged = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(!logged.contains("autosave.json"), "{logged}");
     }
 
     /// 🔄 A site's own renewal window covers that site's names, and only those.
