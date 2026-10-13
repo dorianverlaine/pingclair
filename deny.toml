@@ -9,6 +9,7 @@ ignore = [
     { id = "RUSTSEC-2024-0320", reason = "yaml-rust is unmaintained; pulled in via foundations -> serde_yaml under quiche/tokio-quiche; no upstream fix yet" },
     { id = "RUSTSEC-2024-0388", reason = "derivative is unmaintained; pulled in via pingora-core; no upstream fix yet" },
     { id = "RUSTSEC-2025-0069", reason = "daemonize is unmaintained; pulled in via pingora-core daemon mode; no upstream fix yet" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained; pulled in via pingora-core -> serde_yaml for ServerConf::from_yaml, which pingclair never calls (it builds ServerConf itself, conf: None in run.rs); no upstream fix in pingora-core 0.9.0" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained; direct in pingclair-tls but only wraps rustls-pki-types; migrate to PemObject in a follow-up" },
 ]
 
