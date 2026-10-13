@@ -77,6 +77,15 @@
 
 	import access_log
 
+	# 😈 Vulnerability scanners walk a fixed list of paths this static site has
+	# never had: environment files, VCS metadata, PHP entry points, admin
+	# panels. They get a 404 with one emoji instead of the 404 page, so the
+	# answer costs nothing and says nothing.
+	@scanner path */.env* */.git* */.svn* */.hg/* */.aws* */.ssh* */.DS_Store *.php *.php7 *.phtml */wp-* */phpmyadmin* */pma/* */cgi-bin/* */actuator* */.vscode* */.idea* *.sql *.bak *.old *.swp /config.json /server-status /server-info
+	handle @scanner {
+		respond "😈" 404
+	}
+
 	# 📌 Each `reverse_proxy` sits in its own top-level `handle`: a build of
 	# Pingclair before the fix for proxies nested in one `route` sent every
 	# request of that route to its first proxy. Mutually exclusive `handle`

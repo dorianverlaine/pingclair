@@ -155,6 +155,23 @@ l'index de recherche, `text/plain` pour les accès directs aux fichiers Markdown
 accès inter-origines aux documents `/.well-known`, avec le type de média RFC 9727
 pour le catalogue d'API.
 
+Les scanners de vulnérabilités parcourent une liste fixe de chemins que ce site
+statique n'a jamais eus : fichiers d'environnement, métadonnées de gestion de
+versions, points d'entrée PHP, panneaux d'administration. Un seul matcher nommé
+les intercepte en premier :
+
+```caddyfile
+@scanner path */.env* */.git* *.php */wp-* */phpmyadmin* */.aws* *.sql …
+handle @scanner {
+    respond "😈" 404
+}
+```
+
+Ils reçoivent un 404 avec un seul emoji au lieu de la page 404. Le statut reste
+404 exprès : un scanner décide d'après le statut, et un 200 lui ferait croire
+qu'il y a quelque chose à revenir chercher. Aucun motif ne correspond à un
+fichier produit par le build.
+
 ### 7. Du Markdown pour les agents IA
 
 ```caddyfile

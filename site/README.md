@@ -152,6 +152,22 @@ search index, `text/plain` for direct Markdown fetches, and cross-origin access
 to the `/.well-known` documents, with the RFC 9727 media type for the API
 catalog.
 
+Vulnerability scanners walk a fixed list of paths this static site has never
+had: environment files, version-control metadata, PHP entry points, admin
+panels. One named matcher catches them first:
+
+```caddyfile
+@scanner path */.env* */.git* *.php */wp-* */phpmyadmin* */.aws* *.sql …
+handle @scanner {
+    respond "😈" 404
+}
+```
+
+They get a 404 with a single emoji instead of the 404 page. The status stays
+404 on purpose: a scanner decides by the status, and a 200 would tell it there
+is something to come back for. None of the patterns matches a file the build
+produces.
+
 ### 7. Markdown for AI agents
 
 ```caddyfile

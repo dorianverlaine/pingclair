@@ -140,6 +140,19 @@ handle /_astro/* {
 不可变缓存，搜索索引缓存一小时，直接获取的 Markdown 以 `text/plain` 响应，`/.well-known`
 文档允许跨源访问，API 目录使用 RFC 9727 的媒体类型。
 
+漏洞扫描器会照着一份固定清单探测这个静态网站从来没有过的路径：环境变量文件、版本控制的
+元数据、PHP 入口、管理后台。一个具名匹配器先把它们全部拦下：
+
+```caddyfile
+@scanner path */.env* */.git* *.php */wp-* */phpmyadmin* */.aws* *.sql …
+handle @scanner {
+    respond "😈" 404
+}
+```
+
+它们得到的是只有一个 emoji 的 404，而不是 404 页面。状态码刻意保持 404：扫描器依据状态码
+做判断，返回 200 会让它以为这里有东西、值得再来。所有规则都不会匹配到构建生成的文件。
+
 ### 7. 面向 AI 代理的 Markdown
 
 ```caddyfile
