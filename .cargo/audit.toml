@@ -12,23 +12,6 @@
 
 [advisories]
 ignore = [
-    # protobuf 2.28.0 — RUSTSEC-2024-0437 (uncontrolled recursion, DoS on
-    # decode). Reaches us via `prometheus 0.13` → `pingora-core 0.8.1`
-    # (pingora-core pins `prometheus = "0.13"` with default features, which
-    # includes `protobuf`). `pingora-core` is exact-pinned across this repo
-    # for the BoringSSL/H3 reasons in docs/guardrails/tls.md, so we cannot bump
-    # past it alone. `pingclair_proxy::metrics::gather()` only ever calls
-    # prometheus's `TextEncoder` — nothing in this codebase decodes a
-    # protobuf-format metrics payload from any input, trusted or not — so the
-    # vulnerable recursion has no path from a request to reach it. That is a
-    # reachability check on our own call sites, not a claim about what
-    # `pingora-core` itself does internally, which has not been audited here.
-    "RUSTSEC-2024-0437",
-
-    # daemonize 0.5.0 — RUSTSEC-2025-0069 (unmaintained, no CVE). Direct
-    # dependency of `pingora-core 0.8.1`, same exact-pin constraint as above.
-    "RUSTSEC-2025-0069",
-
     # unsafe-libyaml 0.2.11 — RUSTSEC-2024-0449 (unmaintained, no CVE). Reaches
     # us via `serde_yaml 0.9` → `pingora-core 0.9.0`, which uses it only in
     # `ServerConf::from_yaml` to read a YAML server configuration file. Pingclair
