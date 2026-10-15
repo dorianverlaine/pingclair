@@ -3030,13 +3030,12 @@ async fn test_basic_auth_argon2id_end_to_end() {
     // argon2id` does — same crate, same PHC spelling — and verify the server
     // accepts it. This is the exact trap the P1 row described: the CLI used
     // to print a hash the server compared as literal text.
-    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::password_hash::PasswordHasher;
     use argon2::{Argon2, Params};
 
-    let salt = SaltString::encode_b64(b"pingclair-integration").unwrap();
     let params = Params::new(16 * 1024, 1, 1, Some(32)).unwrap();
     let hash = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
-        .hash_password(b"clihash", &salt)
+        .hash_password(b"clihash")
         .unwrap()
         .to_string();
     assert!(hash.starts_with("$argon2id$v=19$"), "{hash}");

@@ -153,7 +153,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 
 # File system
-dirs = "6"
+dirs = "7"
 
 # 🔐 Password hashing support.
 bcrypt = "0.19"

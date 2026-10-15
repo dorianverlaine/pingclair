@@ -19,12 +19,12 @@ thiserror.workspace = true
 bytes.workspace = true
 http.workspace = true
 bcrypt.workspace = true
-argon2 = "0.5"
+argon2 = "0.6"
 
 # Router
 regex = "1"
-base64 = "0.22"  # Decoding Basic auth credentials
-matchit = "0.8"  # Radix tree router
+base64 = "0.23"  # Decoding Basic auth credentials
+matchit = "0.9"  # Radix tree router
 pingclair-tls = { path = "../pingclair-tls" }
 
 

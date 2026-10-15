@@ -1090,8 +1090,7 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                     println!("{hash}");
                 }
                 "argon2id" => {
-                    use argon2::password_hash::rand_core::OsRng;
-                    use argon2::password_hash::{PasswordHasher, SaltString};
+                    use argon2::password_hash::PasswordHasher;
                     use argon2::{Argon2, Params};
 
                     let params = Params::new(
@@ -1102,9 +1101,9 @@ pub(crate) fn run(command: Commands) -> anyhow::Result<()> {
                     )
                     .map_err(|error| anyhow::anyhow!("❌ Invalid argon2id parameters: {error}"))?;
                     let argon = Argon2::new(Default::default(), Default::default(), params);
-                    let salt = SaltString::generate(&mut OsRng);
+                    // 🧂 password-hash 0.6 draws the random salt inside the hasher.
                     let hash = argon
-                        .hash_password(password.as_bytes(), &salt)
+                        .hash_password(password.as_bytes())
                         .map_err(|error| anyhow::anyhow!("❌ Failed to hash password: {error}"))?
                         .to_string();
                     println!("{hash}");

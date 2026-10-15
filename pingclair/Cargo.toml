@@ -49,7 +49,7 @@ rustls.workspace = true
 
 clap.workspace = true
 clap_complete = "4"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 tar = "0.4"
 async-trait.workspace = true
 
@@ -65,7 +65,7 @@ tracing-log = "0.2"
 anyhow.workspace = true
 serde_json.workspace = true
 bcrypt.workspace = true
-argon2 = { version = "0.5", features = ["rand"] }
+argon2 = { version = "0.6", features = ["getrandom"] }
 parking_lot = "0.12"
 # 🧭 Names the parsed PROXY-protocol and blocklist networks that startup
 # hands from `run_server` to the listener phase.
@@ -75,7 +75,7 @@ ipnet.workspace = true
 [target.'cfg(unix)'.dependencies]
 # 🌐 Enumerates local addresses covered by wildcard listeners for L4 DNS policy.
 nix = { version = "=0.31.3", features = ["net"] }
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.7"
 # 📐 `getrlimit` for the startup descriptor-budget warning (issue #33).
 libc.workspace = true
 
@@ -90,7 +90,7 @@ hickory-resolver.workspace = true
 # where HTTP/2 came for free with hyper 0.14), so turning `default-features`
 # off drops it too unless named here — the test suite drives h2/h2c requests
 # through `http2_prior_knowledge()`, which does not compile without it.
-reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "blocking", "rustls", "http2"] }
 tokio = { workspace = true, features = ["full"] }
 tempfile = "3.8"
 uuid = { version = "1.0", features = ["v4"] }
