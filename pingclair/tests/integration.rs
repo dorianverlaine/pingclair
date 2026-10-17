@@ -202,6 +202,10 @@ mod max_forwards;
 #[path = "integration/connect.rs"]
 mod connect;
 
+// 🧾 The access log names the path the client requested, after rewrites.
+#[path = "integration/access_log_path.rs"]
+mod access_log_path;
+
 // 🧱 `request_buffers`/`response_buffers` on the FastCGI transport.
 #[path = "integration/fastcgi_buffering.rs"]
 mod fastcgi_buffering;

@@ -1727,6 +1727,55 @@ async fn h3_requests_reach_the_access_log_selected_by_hostnames() {
     );
 }
 
+/// 🧭 HTTP/3 keeps the client's path in the access record after a rewrite.
+///
+/// The H1/H2 path needed an explicit capture because Pingora hands the
+/// rewrite phase the mutated request header; H3 carries the original path
+/// beside its effective URI. This pins that the two records agree.
+#[tokio::test]
+async fn h3_access_log_records_the_requested_path_after_a_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("access.log");
+    let source = format!(
+        r#"h3.pingclair.test {{
+            log {{
+                output file {}
+                format json
+            }}
+            rewrite * /rewritten
+            respond "ok" 200
+        }}"#,
+        log.display()
+    );
+    let compiled = pingclair_config::compile(&source).expect("the log block compiles");
+    let template = compiled.servers[0].clone();
+    let server = spawn_h3_server_with(move |address| ServerConfig {
+        listen: vec![address.to_string()],
+        ..template
+    })
+    .await;
+
+    let response = h3_get(server, "/original").await.unwrap();
+    assert_eq!(response.status, 200);
+
+    let mut recorded = String::new();
+    for _ in 0..50 {
+        recorded = std::fs::read_to_string(&log).unwrap_or_default();
+        if recorded.contains("HTTP/3") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        recorded.contains("\"path\":\"/original\""),
+        "the H3 record must name the requested path: {recorded:?}"
+    );
+    assert!(
+        !recorded.contains("\"path\":\"/rewritten\""),
+        "the rewritten path must not replace the request: {recorded:?}"
+    );
+}
+
 // MARK: - Mutual TLS (K4): HTTP/3 gives the same answer as HTTP/1.1 and HTTP/2
 
 /// 🏛️ A throwaway CA and the leaves it signs.

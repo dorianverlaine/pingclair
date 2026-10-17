@@ -9637,10 +9637,17 @@ impl ProxyHttp for PingclairProxy {
                 // 🙈 Log the full request target, but redact secret-looking query
                 // parameters first. Operators need the query to debug; a logged
                 // `?api_key=...` is a leaked credential.
-                let target = req_header
-                    .uri
+                // 🧭 The record says what the client asked for, not what a
+                // `rewrite` or `handle_errors` page turned it into. `orig_uri`
+                // is cloned once in `request_filter`, before routing or any
+                // handler can run; the fallback covers a refusal written before
+                // that capture, where no rewrite has happened either.
+                let target = ctx
+                    .orig_uri
                     .path_and_query()
-                    .map_or_else(|| req_header.uri.path(), |value| value.as_str());
+                    .map(|value| value.as_str())
+                    .or_else(|| req_header.uri.path_and_query().map(|value| value.as_str()))
+                    .unwrap_or_else(|| req_header.uri.path());
                 let logged_path = pingclair_runtime::redaction::redact_target(target);
                 // 🙈 Referer carries the *previous* page's URL, so it can leak a
                 // token this request never contained.
