@@ -91,7 +91,12 @@ async fn handle_errors_rewrite_keeps_the_requested_path_in_the_log() {
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
     assert_eq!(response.text().await.unwrap(), "not found");
 
-    let recorded = wait_for_captured_line(&log, "\"path\":", Duration::from_secs(10)).await;
+    let recorded = wait_for_captured_line(
+        &log,
+        "\"path\":\"/missing-page?from=test\"",
+        Duration::from_secs(10),
+    )
+    .await;
     assert!(
         recorded.contains("\"path\":\"/missing-page?from=test\""),
         "the client's path must survive the error-page rewrite: {recorded}"
@@ -143,7 +148,8 @@ async fn proxy_rewrite_keeps_the_requested_path_in_the_log() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(response.text().await.unwrap(), "installer");
 
-    let recorded = wait_for_captured_line(&log, "\"path\":", Duration::from_secs(10)).await;
+    let recorded =
+        wait_for_captured_line(&log, "\"path\":\"/install.sh\"", Duration::from_secs(10)).await;
     assert!(
         recorded.contains("\"path\":\"/install.sh\""),
         "the client's installer URL must survive the upstream rewrite: {recorded}"
