@@ -193,6 +193,33 @@ impl<'a> Parser<'a> {
             text.starts_with('(') && text.ends_with(')')
         };
 
+        // 🧭 A site block may put its `{` on the next line. Caddy accepts that
+        // spelling (and warns only that the file is not formatted), while a
+        // directive's block must keep its brace on the directive's own line.
+        // This layer sees only top-level blocks here, so the brace found after
+        // the newline belongs to the site; a brace that starts a directive
+        // segment is refused by `parse_segments` or `parse_bare_segments`.
+        if matches!(self.peek().map(|t| &t.value), Some(Token::Newline))
+            && !matches!(
+                keys.first().map(|token| &token.value),
+                Some(Token::Word(word)) if word == "import"
+            )
+        {
+            let mut lookahead = self.cursor;
+            while matches!(
+                self.tokens.get(lookahead).map(|token| &token.value),
+                Some(Token::Newline)
+            ) {
+                lookahead += 1;
+            }
+            if matches!(
+                self.tokens.get(lookahead).map(|token| &token.value),
+                Some(Token::BlockOpen)
+            ) {
+                self.cursor = lookahead;
+            }
+        }
+
         match self.peek().map(|t| t.value.clone()) {
             Some(Token::BlockOpen) => {
                 let open = self.here();
@@ -213,7 +240,15 @@ impl<'a> Parser<'a> {
                 if !matches!(self.peek().map(|t| &t.value), None | Some(Token::Newline)) {
                     return Err(BlockParseError::TokenAfterOpenBrace { location: open });
                 }
-                let segments = self.parse_segments(open)?;
+                // 🧭 `import name address { … }` may carry an anonymous block
+                // as its argument; the import adapter names and refuses that
+                // shape itself. Everywhere else a segment that starts with `{`
+                // is a directive's brace placed on the wrong line.
+                let allow_anonymous_segments = matches!(
+                    keys.first().map(|token| &token.value),
+                    Some(Token::Word(word)) if word == "import"
+                );
+                let segments = self.parse_segments(open, allow_anonymous_segments)?;
                 Ok(ServerBlock {
                     keys,
                     segments,
@@ -253,7 +288,11 @@ impl<'a> Parser<'a> {
     }
 
     /// Collects segments until the brace that closes this block.
-    fn parse_segments(&mut self, open: Location) -> Result<Vec<Segment>, BlockParseError> {
+    fn parse_segments(
+        &mut self,
+        open: Location,
+        allow_anonymous_segments: bool,
+    ) -> Result<Vec<Segment>, BlockParseError> {
         let mut segments = Vec::new();
         loop {
             self.skip_newlines();
@@ -262,6 +301,11 @@ impl<'a> Parser<'a> {
                 Some(Token::BlockClose) => {
                     self.cursor += 1;
                     return Ok(segments);
+                }
+                Some(Token::BlockOpen) if !allow_anonymous_segments => {
+                    return Err(BlockParseError::OpenBraceOnOwnLine {
+                        location: self.here(),
+                    });
                 }
                 _ => segments.push(self.parse_segment()?),
             }
@@ -279,6 +323,11 @@ impl<'a> Parser<'a> {
                 // nothing.
                 Some(Token::BlockClose) => {
                     return Err(BlockParseError::UnmatchedCloseBrace {
+                        location: self.here(),
+                    });
+                }
+                Some(Token::BlockOpen) => {
+                    return Err(BlockParseError::OpenBraceOnOwnLine {
                         location: self.here(),
                     });
                 }
@@ -432,6 +481,69 @@ mod tests {
         // counts as one address — a question that also involves ports, schemes
         // and IPv6 brackets.
         assert_eq!(parsed[0].key_texts(), vec!["a.example,", "b.example"]);
+    }
+
+    /// 🧭 Caddy accepts a site whose opening brace sits on the next line. The
+    /// brace still opens the site block, not a directive inside a braceless
+    /// shorthand.
+    #[test]
+    fn a_sites_brace_may_sit_on_the_next_line() {
+        for source in [
+            "example.com\n{\n\trespond \"ok\"\n}\n",
+            ":8080\n{\n\trespond \"ok\"\n}\n",
+            ":8080 :8081\n{\n\trespond \"ok\"\n}\n",
+        ] {
+            let parsed = blocks(source);
+            assert_eq!(parsed.len(), 1, "one site: {parsed:#?}");
+            assert!(parsed[0].has_braces, "the brace still opens a block");
+            assert_eq!(
+                parsed[0].segments.len(),
+                1,
+                "the body is the site's directives: {parsed:#?}"
+            );
+            assert_eq!(
+                texts(&parsed[0].segments[0]),
+                vec!["respond", "\"ok\""],
+                "the body is the site's directives: {parsed:#?}"
+            );
+        }
+    }
+
+    /// 🎯 The two spellings compile to the same configuration.
+    #[test]
+    fn a_site_brace_on_the_next_line_has_the_same_configuration() {
+        for (next_line, same_line) in [
+            (
+                "example.com\n{\n\trespond \"ok\"\n}\n",
+                "example.com {\n\trespond \"ok\"\n}\n",
+            ),
+            (
+                ":8080\n{\n\trespond \"ok\"\n}\n",
+                ":8080 {\n\trespond \"ok\"\n}\n",
+            ),
+            (
+                ":8080 :8081\n{\n\trespond \"ok\"\n}\n",
+                ":8080 :8081 {\n\trespond \"ok\"\n}\n",
+            ),
+        ] {
+            assert_eq!(
+                format!("{:?}", crate::compile(next_line).expect("next-line brace")),
+                format!("{:?}", crate::compile(same_line).expect("same-line brace")),
+                "the two spellings must mean the same thing"
+            );
+        }
+    }
+
+    /// 🚫 Only top-level site blocks may move their brace. A directive's brace
+    /// belongs on the directive's line, and Caddy says so explicitly.
+    #[test]
+    fn a_directives_brace_on_the_next_line_is_refused() {
+        let error = parse_server_blocks("example.com {\n\theader\n\t{\n\t\tX-A b\n\t}\n}\n")
+            .expect_err("a directive brace on its own line must be refused");
+        assert!(
+            matches!(error, BlockParseError::OpenBraceOnOwnLine { .. }),
+            "got {error:?}"
+        );
     }
 
     /// 🌐 No address plus braces is the global options block, and that is how it

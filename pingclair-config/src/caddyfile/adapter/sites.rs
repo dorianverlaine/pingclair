@@ -554,7 +554,9 @@ pub(super) fn adapt_server(
                         return Err(AdapterError::InvalidArgument(
                             "site address".into(),
                             format!(
-                                "`{}` looks like a second site. Bare (unbraced) directives run                                  to the end of the file, so wrap every site in {{ }} when there                                  is more than one",
+                                "`{}` looks like a second site. Bare (unbraced) directives run \
+                                 to the end of the file, so wrap every site in {{ }} when there \
+                                 is more than one",
                                 sub_d.name
                             ),
                         ));

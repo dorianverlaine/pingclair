@@ -414,6 +414,14 @@ mod tests {
         assert_eq!(format(&format(source)), format(source));
     }
 
+    /// 🧭 A site brace on the next line is valid Caddyfile, and formatting
+    /// joins it to the address the same way it does for every other block.
+    #[test]
+    fn a_site_brace_on_the_next_line_is_joined() {
+        let source = "example.com\n{\n\trespond \"ok\"\n}\n";
+        assert_eq!(format(source), "example.com {\n\trespond \"ok\"\n}\n");
+    }
+
     /// 📜 Heredocs, placeholders and multi-line strings are written back
     /// verbatim; only their lines' leading tokens are re-indented.
     #[test]
