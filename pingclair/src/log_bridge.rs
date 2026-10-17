@@ -31,6 +31,13 @@
 
 use tracing_log::AsLog;
 
+use pingclair_proxy::metrics::{ACCEPT_ERRORS_TOTAL, DOWNSTREAM_HANDSHAKE_FAILURES_TOTAL};
+
+/// 🎧 The Pingora listener emits the two client-caused failures this bridge
+/// re-levels. Their messages are formatted, so they cannot live in the exact
+/// table below; the target check keeps formatting off every other record.
+const LISTENER_TARGET: &str = "pingora_core::services::listening";
+
 /// 🗂️ Records known to describe routine operation, by `(target, message)`.
 ///
 /// The message must be a literal in the emitting crate — that is what lets
@@ -98,7 +105,8 @@ fn relevel(record: &log::Record<'_>, emit: impl FnOnce(&log::Record<'_>)) {
         .find(|(target, message, _)| {
             record.target() == *target && record.args().as_str() == Some(*message)
         })
-        .map(|(_, _, level)| *level);
+        .map(|(_, _, level)| *level)
+        .or_else(|| client_caused_listener_level(record));
     let Some(level) = routine else {
         emit(record);
         return;
@@ -113,6 +121,43 @@ fn relevel(record: &log::Record<'_>, emit: impl FnOnce(&log::Record<'_>)) {
             .line(record.line())
             .build(),
     );
+}
+
+/// 🎚️ Re-levels the listener records caused by a client that went away.
+///
+/// Formatting the message happens only after the target matched, so an
+/// ordinary process log costs one string comparison. These records arrive at
+/// most once per failed connection, never per request.
+fn client_caused_listener_level(record: &log::Record<'_>) -> Option<log::Level> {
+    if record.target() != LISTENER_TARGET {
+        return None;
+    }
+    let message = record.args().to_string();
+
+    if message.starts_with("Downstream handshake error")
+        || message.starts_with("Downstream handshake timeout")
+    {
+        DOWNSTREAM_HANDSHAKE_FAILURES_TOTAL.inc();
+        return Some(log::Level::Debug);
+    }
+
+    if message.starts_with("Accept() failed") && is_client_abort(&message) {
+        ACCEPT_ERRORS_TOTAL.inc();
+        return Some(log::Level::Debug);
+    }
+
+    None
+}
+
+/// 🔌 Whether an accept/setup failure is the peer going away.
+///
+/// The `io::Error` display text is the only cross-platform signal Pingora
+/// puts in the record. `EMFILE` says "Too many open files" and deliberately
+/// stays an ERROR: the client did not cause it.
+fn is_client_abort(message: &str) -> bool {
+    message.contains("Connection reset by peer")
+        || message.contains("Software caused connection abort")
+        || message.contains("Connection aborted")
 }
 
 /// 🧭 Installs the bridge as the process's `log` logger, after the `tracing`
@@ -217,5 +262,73 @@ mod tests {
             format_args!("offload runtime failure"),
         );
         assert_eq!(record["level"], "ERROR");
+    }
+
+    /// 🔇 A client that leaves during the TLS handshake is routine, and the
+    /// counter still makes a rising rate visible.
+    #[test]
+    fn a_client_caused_handshake_failure_is_debug_and_counted() {
+        let before = DOWNSTREAM_HANDSHAKE_FAILURES_TOTAL.get();
+        let record = bridged(
+            "pingora_core::services::listening",
+            log::Level::Error,
+            format_args!(
+                "Downstream handshake error from 203.0.113.9:43122: TLS handshake failure"
+            ),
+        );
+        assert_eq!(record["level"], "DEBUG");
+        assert!(
+            DOWNSTREAM_HANDSHAKE_FAILURES_TOTAL.get() > before,
+            "the handshake counter must move"
+        );
+    }
+
+    /// 🔌 An accepted socket the client reset is DEBUG; a descriptor shortage
+    /// is still the server's ERROR and must not be folded into the client count.
+    #[test]
+    fn client_aborted_accepts_are_debug_but_emfile_stays_error() {
+        let before = ACCEPT_ERRORS_TOTAL.get();
+        let reset = bridged(
+            "pingora_core::services::listening",
+            log::Level::Error,
+            format_args!(
+                "Accept() failed failed to set_nodelay cause: Connection reset by peer (os error 54)"
+            ),
+        );
+        assert_eq!(reset["level"], "DEBUG");
+        assert!(
+            ACCEPT_ERRORS_TOTAL.get() > before,
+            "the aborted-accept counter must move"
+        );
+
+        let counted = ACCEPT_ERRORS_TOTAL.get();
+        let emfile = bridged(
+            "pingora_core::services::listening",
+            log::Level::Error,
+            format_args!("Accept() failed Too many open files (os error 24)"),
+        );
+        assert_eq!(emfile["level"], "ERROR");
+        assert_eq!(
+            ACCEPT_ERRORS_TOTAL.get(),
+            counted,
+            "a server-side accept failure is not a client abort"
+        );
+    }
+
+    /// 📊 Both counters are registered on the shared `/metrics` registry.
+    #[test]
+    fn listener_failure_counters_are_registered() {
+        pingclair_proxy::metrics::init();
+        let names: Vec<String> = pingclair_proxy::metrics::REGISTRY
+            .gather()
+            .iter()
+            .map(|family| family.name().to_string())
+            .collect();
+        for name in [
+            "pingclair_downstream_handshake_failures_total",
+            "pingclair_accept_errors_total",
+        ] {
+            assert!(names.iter().any(|candidate| candidate == name), "{name}");
+        }
     }
 }

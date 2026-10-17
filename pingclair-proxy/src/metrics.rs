@@ -6,7 +6,9 @@
 //! Provides metrics collection for requests, errors, and latency.
 
 use parking_lot::Mutex;
-use prometheus::{Encoder, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, TextEncoder};
+use prometheus::{
+    Encoder, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, TextEncoder,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Once};
 
@@ -422,6 +424,32 @@ pub static TLS_HANDSHAKES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("metric can be created")
 });
 
+/// 🔇 Downstream TLS handshakes that failed before a request existed.
+///
+/// Most are clients that gave up, scanners speaking the wrong protocol, or
+/// an expired certificate discovered by the client. The log line is DEBUG;
+/// this counter is what makes a sudden rise visible without reading it.
+pub static DOWNSTREAM_HANDSHAKE_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "pingclair_downstream_handshake_failures_total",
+        "Downstream TLS handshakes that failed before reaching HTTP",
+    )
+    .expect("metric can be created")
+});
+
+/// 🔇 Accepted sockets whose setup failed because the peer went away.
+///
+/// `ECONNRESET` and `ECONNABORTED` mean the client closed between the kernel
+/// accepting it and Pingora picking it up. Other accept errors, notably
+/// `EMFILE`, stay ERROR and are not counted here: they are the server's problem.
+pub static ACCEPT_ERRORS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "pingclair_accept_errors_total",
+        "Accepted connections lost because the client aborted before setup",
+    )
+    .expect("metric can be created")
+});
+
 /// 🚀 HTTP/3 connections currently open.
 pub static H3_CONNECTIONS: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
@@ -638,6 +666,8 @@ pub fn init() {
         let _ = REGISTRY.register(Box::new(UPSTREAM_RETRIES_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(UPSTREAM_CONNECTIONS_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(TLS_HANDSHAKES_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(DOWNSTREAM_HANDSHAKE_FAILURES_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(ACCEPT_ERRORS_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(H3_CONNECTIONS.clone()));
         let _ = REGISTRY.register(Box::new(H3_REQUESTS_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(READY.clone()));

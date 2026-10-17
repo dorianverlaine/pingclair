@@ -206,6 +206,10 @@ mod connect;
 #[path = "integration/access_log_path.rs"]
 mod access_log_path;
 
+// 🔇 Client-caused listener failures are counters rather than ERROR lines.
+#[path = "integration/listener_errors.rs"]
+mod listener_errors;
+
 // 🧱 `request_buffers`/`response_buffers` on the FastCGI transport.
 #[path = "integration/fastcgi_buffering.rs"]
 mod fastcgi_buffering;
