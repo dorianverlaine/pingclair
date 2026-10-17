@@ -14,6 +14,14 @@ fact.
 
 ## [Unreleased]
 
+### 🔌 HTTP/2 connections wait at the connection ceiling
+
+An unconfigured listener now admits the reference's 512 connections per worker
+thread, but an HTTP/2 connection over that ceiling used to be closed before
+its handshake. A high-concurrency client saw connection errors rather than a
+retryable request refusal. HTTP/2 connections now wait for a slot for at most
+the header deadline; HTTP/1.1 keeps its immediate 503.
+
 ### 🔀 Each proxy in a `route` block reaches its own upstream
 
 A route kept one upstream pool and one proxy policy, taken from the first
