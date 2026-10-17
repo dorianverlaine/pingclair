@@ -250,30 +250,7 @@ impl ServerApp for ResourceGuardedProxy {
         stream: Stream,
         shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
-        let h2 = matches!(stream.selected_alpn_proto(), Some(ALPN::H2));
         let _permit = match &self.connections {
-            // 🌊 HTTP/2 clients multiplex many requests onto one connection.
-            // Closing an excess connection before the handshake gives the
-            // client a connection error it cannot retry as a request; waiting
-            // for a slot, bounded by the same header deadline, lets the client
-            // proceed when an earlier connection finishes. H1 keeps the
-            // immediate, visible 503 below.
-            Some(connections) if h2 => {
-                let mut shutdown = shutdown.clone();
-                let permit = tokio::select! {
-                    _ = shutdown.changed() => return None,
-                    permit = tokio::time::timeout(self.header_timeout, connections.acquire()) => permit,
-                };
-                match permit {
-                    Ok(Ok(permit)) => Some(permit),
-                    _ => {
-                        tracing::warn!(
-                            "⏳ An HTTP/2 connection waited past the header deadline for a connection slot"
-                        );
-                        return None;
-                    }
-                }
-            }
             Some(connections) => match connections.try_acquire() {
                 Ok(permit) => Some(permit),
                 Err(_) => {
