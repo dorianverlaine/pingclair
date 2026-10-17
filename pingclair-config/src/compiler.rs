@@ -1894,6 +1894,27 @@ fn validate_dynamic_upstream(
 fn validate_proxy_protection_handler(handler: &HandlerConfig) -> CompileResult<()> {
     match handler {
         HandlerConfig::ReverseProxy(proxy) => {
+            // 🚫 A static upstream whose host still contains a colon is not a
+            // host: `127.0.0.1:127.0.0.1:54321` used to pass validation and
+            // fail only when the first request tried to dial it. Placeholders
+            // are skipped because their final shape is decided per request.
+            for upstream in proxy
+                .upstreams
+                .iter()
+                .chain(proxy.upstream_options.iter().map(|option| &option.address))
+                .filter(|upstream| !upstream.contains('{'))
+            {
+                if pingclair_proxy_address_is_invalid(upstream) {
+                    return Err(CompileError::InvalidRoute {
+                        message: format!(
+                            "upstream `{upstream}` is not a valid host:port address; \
+                             bracket IPv6 literals and use a scheme only where the upstream \
+                             accepts one"
+                        ),
+                    });
+                }
+            }
+
             if let Some(source) = proxy.dynamic_upstream.as_deref() {
                 validate_dynamic_upstream(source)?;
             }
@@ -4031,6 +4052,58 @@ mod tests {
         .unwrap();
 
         assert!(validate_config(&config).is_err());
+    }
+
+    /// 🚫 An upstream host that still contains a colon is refused at load.
+    ///
+    /// The runtime splits on the last colon, so `127.0.0.1:127.0.0.1:54321`
+    /// used to validate and then answer the first request with a 502. The
+    /// valid spellings — bracketed IPv6, a bare port, and a Unix socket — must
+    /// keep loading.
+    #[test]
+    fn an_unbracketed_colon_in_an_upstream_host_is_refused() {
+        let error = crate::compile(":18080 {\n\treverse_proxy 127.0.0.1:127.0.0.1:54321\n}\n")
+            .expect_err("a doubled host must not validate")
+            .to_string();
+        assert!(
+            error.contains("127.0.0.1:127.0.0.1:54321") && error.contains("host:port"),
+            "the message must name the address and the contract: {error}"
+        );
+
+        for address in [
+            "[::1]:54321",
+            ":54321",
+            "localhost:54321",
+            "unix//tmp/backend.sock",
+        ] {
+            assert!(
+                crate::compile(&format!(":18080 {{\n\treverse_proxy {address}\n}}\n")).is_ok(),
+                "`{address}` is a legitimate upstream spelling"
+            );
+        }
+
+        let config: PingclairConfig = serde_json::from_value(serde_json::json!({
+            "servers": [{
+                "listen": ["127.0.0.1:8080"],
+                "routes": [{
+                    "path": "/*",
+                    "handler": {
+                        "type": "reverse_proxy",
+                        "upstreams": [],
+                        "upstream_options": [{
+                            "address": "127.0.0.1:127.0.0.1:54321",
+                            "weight": 1,
+                            "backup": false
+                        }]
+                    }
+                }]
+            }]
+        }))
+        .expect("the document parses; the address is what must be refused");
+        assert!(
+            validate_config(&config).is_err(),
+            "the Admin API path must apply the same address grammar"
+        );
     }
 
     fn admin_listening_on(listen: &str) -> pingclair_core::config::AdminConfig {
