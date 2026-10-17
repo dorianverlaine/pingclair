@@ -210,6 +210,10 @@ mod access_log_path;
 #[path = "integration/listener_errors.rs"]
 mod listener_errors;
 
+// 🚪 `limits { max_connections }` controls the listener admission semaphore.
+#[path = "integration/connection_ceiling.rs"]
+mod connection_ceiling;
+
 // 🧱 `request_buffers`/`response_buffers` on the FastCGI transport.
 #[path = "integration/fastcgi_buffering.rs"]
 mod fastcgi_buffering;
