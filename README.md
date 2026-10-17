@@ -208,6 +208,24 @@ http://localhost:8080 {
 }
 ```
 
+The listener admits 512 downstream connections per worker thread when no
+ceiling is written, matching nginx's `worker_connections` default. Set the
+whole listener's ceiling when the workload needs more:
+
+```caddyfile
+http://localhost:8080 {
+    limits {
+        max_connections 2048
+    }
+    reverse_proxy localhost:3000
+}
+```
+
+At the ceiling, an excess HTTP/1.1 connection receives `503 Service
+Unavailable`; an HTTP/2 connection that has not completed its handshake is
+closed, as it is in nginx. A configured `max_connections` is not multiplied by
+the worker-thread count.
+
 For a public hostname, Pingclair can obtain and renew the certificate and
 serve HTTP/1.1, HTTP/2, and HTTP/3:
 

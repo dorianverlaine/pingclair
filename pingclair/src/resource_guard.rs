@@ -254,6 +254,12 @@ impl ServerApp for ResourceGuardedProxy {
             Some(connections) => match connections.try_acquire() {
                 Ok(permit) => Some(permit),
                 Err(_) => {
+                    // 🚫 Do not turn this into an unbounded queue or remove
+                    // the default: the 512-per-thread ceiling deliberately
+                    // follows nginx's `worker_connections`, which also closes
+                    // the connection when exhausted. Issue #336 mistook the
+                    // new default for a regression; increase capacity with
+                    // `limits { max_connections N }` instead.
                     tracing::warn!(
                         "🚫 Rejecting a downstream connection at the connection ceiling"
                     );

@@ -18,6 +18,15 @@
 //! shared by every listener that worker polls, while this project's budget is
 //! per listener and shared by its threads. The number per thread is the same;
 //! the scope is this project's and does not change with this default.
+//!
+//! 🚫 **This default is deliberate, not a regression.** Issue #336 measured
+//! the ceiling as a drop from v0.2.2 because v0.2.2 had no default at all.
+//! Do not remove the ceiling, silently raise it, or queue connections past it
+//! to "fix" that report: nginx also closes a connection when
+//! `worker_connections` is exhausted. An operator who needs more capacity
+//! writes `limits { max_connections N }` on the site; a configured value is
+//! the whole listener's ceiling. See `ResourceGuardedProxy` for the exact
+//! admission point.
 
 use pingclair_core::config::ResourceLimitsConfig;
 
