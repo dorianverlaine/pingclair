@@ -1341,7 +1341,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
             validate_basic_auth_credentials(&route.handler)?;
             validate_subrequest_handler(&route.handler)?;
             validate_map_handler(&route.handler)?;
-            reject_unimplemented_handler(&route.handler, false)?;
+            reject_unimplemented_handler(&route.handler)?;
             if let Some(matcher) = &route.matcher {
                 validate_matcher(matcher)?;
             }
@@ -1355,7 +1355,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
                 validate_basic_auth_credentials(&element.handler)?;
                 validate_subrequest_handler(&element.handler)?;
                 validate_map_handler(&element.handler)?;
-                reject_unimplemented_handler(&element.handler, true)?;
+                reject_unimplemented_handler(&element.handler)?;
                 if let Some(matcher) = &element.matcher {
                     validate_matcher(matcher)?;
                 }
@@ -1665,16 +1665,8 @@ fn pingclair_proxy_address_is_invalid(address: &str) -> bool {
 /// Living here rather than in the DSL adapter is deliberate: the Admin API
 /// deserializes straight into core types, so an adapter-only check is a
 /// bypass — see the note on `validate_config` being the single validation path.
-fn reject_unimplemented_handler(handler: &HandlerConfig, error_route: bool) -> CompileResult<()> {
+fn reject_unimplemented_handler(handler: &HandlerConfig) -> CompileResult<()> {
     match handler {
-        // 🚫 Every frontend needs this check: error routes have no upstream
-        // slot yet, so accepting a proxy would run another route's policy.
-        HandlerConfig::ReverseProxy(_) if error_route => Err(CompileError::InvalidRoute {
-            message:
-                "an error route cannot proxy yet: its upstream exchange has no execution slot; \
-                      proxy in a site route and render its errors with Respond or ServeFiles"
-                    .to_string(),
-        }),
         HandlerConfig::Plugin { name, .. } => Err(CompileError::InvalidRoute {
             message: format!(
                 "handler `plugin` is not implemented, so the route named `{name}` would \
@@ -1707,26 +1699,26 @@ fn reject_unimplemented_handler(handler: &HandlerConfig, error_route: bool) -> C
         | HandlerConfig::FirstMatch { handlers }
         | HandlerConfig::HandlePath { handlers, .. } => {
             for element in handlers {
-                reject_unimplemented_handler(&element.handler, error_route)?;
+                reject_unimplemented_handler(&element.handler)?;
             }
             Ok(())
         }
         HandlerConfig::HandleErrors { errors } => {
             for handlers in errors.values() {
                 for handler in handlers {
-                    reject_unimplemented_handler(handler, true)?;
+                    reject_unimplemented_handler(handler)?;
                 }
             }
             Ok(())
         }
         HandlerConfig::TryFiles { fallback, .. } => match fallback {
-            Some(fallback) => reject_unimplemented_handler(fallback, error_route),
+            Some(fallback) => reject_unimplemented_handler(fallback),
             None => Ok(()),
         },
         HandlerConfig::Intercept { handlers } => {
             for entry in handlers {
                 for handler in &entry.handlers {
-                    reject_unimplemented_handler(handler, error_route)?;
+                    reject_unimplemented_handler(handler)?;
                 }
             }
             Ok(())

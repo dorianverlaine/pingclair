@@ -65,6 +65,114 @@ async fn h3_handle_errors_file_server_serves_the_error_page() {
     );
 }
 
+/// 🚨 An error route's reverse proxy answers from its own upstream on H3.
+#[tokio::test]
+async fn h3_handle_errors_reverse_proxy_answers_from_upstream() {
+    use tokio::io::AsyncWriteExt;
+
+    let origin = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let origin_address = origin.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = origin.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let request = read_http_head(&mut stream).await;
+                let method = request.split_whitespace().next().unwrap_or("-");
+                let path = request.split_whitespace().nth(1).unwrap_or("-");
+                let body = format!("{method} {path} ");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+        }
+    });
+
+    let source = format!(
+        r#":443 {{
+            handle_errors {{
+                reverse_proxy http://{origin_address}
+            }}
+            handle /boom {{
+                error "gone" 404
+            }}
+            respond "ok"
+        }}"#
+    );
+    let config = pingclair_config::compile(&source).expect("the error proxy compiles");
+    let site = config.servers[0].clone();
+    let server = spawn_h3_server_with(|address| ServerConfig {
+        listen: vec![address.to_string()],
+        ..site
+    })
+    .await;
+
+    let response = h3_get(server, "/boom").await.unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"GET /boom ");
+
+    let response = h3_attempt(
+        H3Attempt {
+            method: "POST",
+            ..H3Attempt::to(server, "/boom")
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"POST /boom ");
+}
+
+/// 🚨 An upstream 5xx redispatches into the error route's proxy on H3.
+#[tokio::test]
+async fn h3_handle_errors_reverse_proxy_replaces_an_upstream_503() {
+    async fn fixed(status: u16, body: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = stream.read(&mut [0u8; 4096]).await;
+            let response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        address
+    }
+
+    let primary = fixed(503, "primary-failed").await;
+    let error_origin = fixed(200, "error-route-answered").await;
+    let source = format!(
+        r#":443 {{
+            handle_errors {{
+                reverse_proxy http://{error_origin}
+            }}
+            reverse_proxy http://{primary}
+        }}"#
+    );
+    let config = pingclair_config::compile(&source).expect("the error proxy compiles");
+    let site = config.servers[0].clone();
+    let server = spawn_h3_server_with(|address| ServerConfig {
+        listen: vec![address.to_string()],
+        ..site
+    })
+    .await;
+
+    let response = h3_get(server, "/b").await.unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"error-route-answered");
+}
+
 /// 🔤 A regex `rewrite` inside `handle_errors` resolves against the error
 /// route's own compiled pattern table over HTTP/3 too (#245).
 #[tokio::test]

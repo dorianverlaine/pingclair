@@ -55,30 +55,15 @@ fn matcher_scoped_root_inside_handle_errors_is_refused() {
     );
 }
 
-/// 🚫 A `reverse_proxy` inside `handle_errors` is refused by name.
-///
-/// The upstream exchange is a lifecycle step outside the handler chain here,
-/// and an error route has no route slot for it to read, so the handler used to
-/// compile and then answer nothing — the silent no-op this repository refuses
-/// instead of accepting (#245). The check walks the containers too, so a proxy
-/// behind `handle` is found as well as one at the top of the block.
+/// 🚨 A `reverse_proxy` inside `handle_errors` is an ordinary route body.
 #[test]
-fn reverse_proxy_inside_handle_errors_is_refused() {
+fn reverse_proxy_inside_handle_errors_is_accepted() {
     for source in [
         "example.com {\n\thandle_errors {\n\t\treverse_proxy 127.0.0.1:9000\n\t}\n}",
         "example.com {\n\thandle_errors {\n\t\thandle {\n\t\t\treverse_proxy 127.0.0.1:9000\n\t\t}\n\t}\n}",
     ] {
-        let error = crate::compile(source)
-            .expect_err("a `reverse_proxy` inside `handle_errors` must not load");
-        let message = error.to_string();
-        assert!(message.contains("cannot proxy yet"), "{message}");
-        assert!(message.contains("do nothing"), "{message}");
+        crate::compile(source).expect("an error route may proxy");
     }
-
-    // 📌 The refusal is about the proxy, not about the block: an error route
-    // that answers with its own page still loads.
-    crate::compile("example.com {\n\thandle_errors {\n\t\trespond \"gone\" 503\n\t}\n}")
-        .expect("an error route that does not proxy must load");
 }
 
 /// 🔢 Directives inside `handle_errors` run in Caddy's directive order, not in

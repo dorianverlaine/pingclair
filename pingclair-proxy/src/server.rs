@@ -292,6 +292,11 @@ pub struct RequestContext {
     /// 🚨 The error route running and the status it answers, while one runs.
     /// A `file_server` reads it to serve the route's own page with that status.
     pub(crate) error_scope: Option<crate::error_routes::ErrorScope>,
+    /// 🚨 The error route selected a reverse proxy, so the upstream phase
+    /// must run instead of writing a local error response.
+    pub(crate) defer_error_proxy: bool,
+    /// 🚨 The next retry must switch to an error-route proxy after 5xx.
+    pub(crate) error_proxy_retry: bool,
     /// 🚫 Whether a `log_skip` middleware excluded this request from access
     /// logging.
     pub log_skip: bool,
@@ -390,6 +395,8 @@ impl Default for RequestContext {
             orig_uri: http::Uri::default(),
             handling_error: false,
             error_scope: None,
+            defer_error_proxy: false,
+            error_proxy_retry: false,
             log_skip: false,
             request_deadline: None,
             long_connection: false,
@@ -725,6 +732,8 @@ pub(crate) struct ProxySlot {
     pub(crate) hash_key_source: Option<HashKeySource>,
     pub(crate) upstream_tls: RouteUpstreamTls,
     pub(crate) buffering: RouteBuffering,
+    /// 🚨 The error-route index when this proxy belongs to `handle_errors`.
+    pub(crate) error_route: Option<usize>,
 }
 
 /// 🔤 One compiled `map` handler.
@@ -839,6 +848,23 @@ impl ProxyState {
     ) -> Option<&Arc<MapPlan>> {
         self.map_plans
             .get(&(config as *const pingclair_core::config::MapConfig as usize))
+    }
+
+    /// 🚨 The first error route matching `status` that owns a reverse proxy.
+    pub(crate) fn error_proxy_for_status(&self, status: u16) -> Option<(usize, usize)> {
+        for (route_index, route) in self.config.error_routes.iter().enumerate() {
+            if !route.matches(status) {
+                continue;
+            }
+            if let Some(proxy_index) = self
+                .proxy_slots
+                .iter()
+                .position(|slot| slot.error_route == Some(route_index))
+            {
+                return Some((route_index, proxy_index));
+            }
+        }
+        None
     }
 }
 
@@ -1613,12 +1639,14 @@ impl ProxyState {
                                 proxy_config.response_buffer_bytes,
                             ),
                         },
+                        error_route: None,
                     });
                 } else {
                     proxy_slots.push(build_extra_proxy_slot(
                         proxy_config,
                         &route.path,
                         &host_label,
+                        None,
                     ));
                 }
             }
@@ -1688,6 +1716,27 @@ impl ProxyState {
                     })
                     .unwrap_or_default(),
             );
+        }
+
+        // 🚨 Error routes are executable route bodies too. Give their
+        // reverse proxies their own slots so the upstream phase can dial the
+        // proxy that `handle_errors` actually reached.
+        for (error_index, prepared) in error_routes.iter().enumerate() {
+            let mut error_proxies = Vec::new();
+            collect_reverse_proxies(&prepared.pipeline, &mut error_proxies);
+            for proxy_config in error_proxies {
+                let slot_index = proxy_slots.len();
+                proxy_lookup.insert(
+                    proxy_config as *const ReverseProxyConfig as usize,
+                    slot_index,
+                );
+                proxy_slots.push(build_extra_proxy_slot(
+                    proxy_config,
+                    &format!("error[{error_index}]"),
+                    &host_label,
+                    Some(error_index),
+                ));
+            }
         }
 
         // A misconfigured log sink must not take the whole server down at
@@ -4769,6 +4818,7 @@ impl PingclairProxy {
         ctx: &mut RequestContext,
         status: u16,
     ) -> PingoraResult<()> {
+        ctx.defer_error_proxy = false;
         let message = ctx.error_message.take();
         // 🚨 Published before the routes run, so a `respond "err={err.status_code}"`
         // inside `handle_errors` renders the status that was raised rather than
@@ -4813,6 +4863,7 @@ impl PingclairProxy {
                 route: index,
                 status,
             });
+            ctx.proxy_index = None;
             if self
                 .handle_config(
                     session,
@@ -4833,6 +4884,18 @@ impl PingclairProxy {
                     self.write_error_response(session, ctx, inner_status, inner_message)
                         .await?;
                 }
+                return Ok(());
+            }
+            // 🚨 The error route reached a reverse proxy. Nothing in this
+            // local-response path can perform the upstream exchange, so hand
+            // the request back to Pingora with the error proxy's slot.
+            if !ctx.upstream_attempted
+                && ctx
+                    .proxy_index
+                    .and_then(|proxy_index| state.proxy_slot(proxy_index))
+                    .is_some_and(|slot| slot.error_route == Some(index))
+            {
+                ctx.defer_error_proxy = true;
                 return Ok(());
             }
         }
@@ -8188,6 +8251,9 @@ impl ProxyHttp for PingclairProxy {
                     if let Some(status) = ctx.error_status.take() {
                         self.handle_raised_error(session, ctx, status).await?;
                     }
+                    if ctx.defer_error_proxy {
+                        return Ok(false);
+                    }
                     return Ok(true);
                 }
             }
@@ -8950,6 +9016,32 @@ impl ProxyHttp for PingclairProxy {
         // fields that cannot be forwarded downstream are dropped instead
         // (#273). The H3 path carries the same rule.
 
+        // 🚨 A matching `handle_errors` reverse proxy owns the next exchange.
+        // Re-enter Pingora's existing retry loop with that proxy's slot instead
+        // of writing the failed upstream response straight through.
+        if !ctx.handling_error
+            && upstream_response.status.is_server_error()
+            && let Some((route_index, proxy_index)) = ctx
+                .state
+                .as_ref()
+                .and_then(|state| state.error_proxy_for_status(upstream_response.status.as_u16()))
+        {
+            ctx.error_scope = Some(crate::error_routes::ErrorScope {
+                route: route_index,
+                status: upstream_response.status.as_u16(),
+            });
+            ctx.handling_error = true;
+            ctx.proxy_index = Some(proxy_index);
+            ctx.error_proxy_retry = true;
+            ctx.retry_attempts = 0;
+            ctx.retry_deadline = None;
+            ctx.retry_excluded.clear();
+            return Err(pingora_core::Error::explain(
+                pingora_core::ErrorType::HTTPStatus(upstream_response.status.as_u16()),
+                "redispatching to the error route proxy",
+            ));
+        }
+
         let retry_policy = self
             .request_proxy_config(ctx)
             .map(|config| config.retry.clone())
@@ -9554,6 +9646,13 @@ impl ProxyHttp for PingclairProxy {
         // 🏷️ The same memory as in `fail_to_connect`, for a failure after
         // the connection was made.
         ctx.proxy_error = Some(crate::proxy_status::ProxyError::from_upstream_error(&e));
+        // 🚨 A 5xx selected an error-route proxy. This is not a healthy
+        // upstream failure; ask Pingora's loop for exactly one redispatch.
+        if ctx.error_proxy_retry {
+            ctx.error_proxy_retry = false;
+            e.retry = true.into();
+            return e;
+        }
         // 🩹 A failure after the connection was made is the backend's too, when
         // the error names the response side: a truncated body, a reset
         // mid-response, a malformed response. A downstream abort or an internal
@@ -10244,6 +10343,7 @@ fn build_extra_proxy_slot(
     config: &ReverseProxyConfig,
     route_path: &str,
     host_label: &str,
+    error_route: Option<usize>,
 ) -> ProxySlot {
     let (primary, backup, dynamic_templates) = build_weighted_upstreams(config);
     let primary_is_empty = primary.is_empty();
@@ -10373,6 +10473,7 @@ fn build_extra_proxy_slot(
             request: crate::body_buffer::resolve_limit(config.request_buffer_bytes),
             response: crate::body_buffer::resolve_limit(config.response_buffer_bytes),
         },
+        error_route,
     }
 }
 

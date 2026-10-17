@@ -14,6 +14,15 @@ fact.
 
 ## [Unreleased]
 
+### 🚨 `reverse_proxy` works inside `handle_errors`
+
+An error route can now answer through its own reverse proxy on HTTP/1.1,
+HTTP/2, and HTTP/3. A locally raised error hands the original method and URI
+to the error proxy; a 5xx from the site's upstream redispatches into the
+matching error route's upstream instead of being written through. The error
+proxy gets its own load balancer, TLS policy, and protection slot, so it never
+borrows the policy of the route that raised the error.
+
 ### 🔤 Map, invoke, and access-log fields
 
 `map` derives request-scoped variables from a literal, regular-expression, or

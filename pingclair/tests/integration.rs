@@ -222,6 +222,10 @@ mod map_variables;
 #[path = "integration/access_log_extras.rs"]
 mod access_log_extras;
 
+// 🚨 `handle_errors` can answer through a reverse proxy.
+#[path = "integration/error_route_proxy.rs"]
+mod error_route_proxy;
+
 // 🧱 `request_buffers`/`response_buffers` on the FastCGI transport.
 #[path = "integration/fastcgi_buffering.rs"]
 mod fastcgi_buffering;

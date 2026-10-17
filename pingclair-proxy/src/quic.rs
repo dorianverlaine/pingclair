@@ -6658,6 +6658,48 @@ async fn reverse_proxy_upstream(
         break (session, peer, base_request_deadline, admission);
     };
 
+    // 🚨 A 5xx from a site route may hand the same request to a
+    // `handle_errors` proxy. The response header has been read but nothing has
+    // been sent yet, so the original exchange can be abandoned and the same
+    // `reverse_proxy_upstream` path reused with the error proxy's slot.
+    let status = session
+        .response_header()
+        .map(|response| response.status.as_u16())
+        .unwrap_or(502);
+    if state
+        .proxy_slot(proxy_index)
+        .and_then(|slot| slot.error_route)
+        .is_none()
+        && (500..=599).contains(&status)
+        && let Some((_error_route, error_proxy_index)) = state.error_proxy_for_status(status)
+    {
+        session.shutdown().await;
+        return Box::pin(reverse_proxy_upstream(
+            proxy,
+            connector,
+            state,
+            route_index,
+            error_proxy_index,
+            req,
+            client_header,
+            effective_uri,
+            peer_ip,
+            verified_client_ip,
+            request_id,
+            response_policy,
+            body_limit,
+            body_timeout_ms,
+            stream_id,
+            body_rx,
+            resp_tx,
+            body_notify,
+            request_started,
+            request_vars,
+            standalone_response_handlers,
+        ))
+        .await;
+    }
+
     let response_streaming = session
         .response_header()
         .and_then(|response| response.headers.get("content-type"))
