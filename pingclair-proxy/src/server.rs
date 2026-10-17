@@ -157,6 +157,12 @@ pub struct RequestContext {
     pub(crate) generation: Option<Arc<crate::listener_generation::ListenerGeneration>>,
     /// Matched route index
     pub route_index: Option<usize>,
+    /// 🔀 The reverse proxy this request reached, when it reached one.
+    ///
+    /// A route may hold several proxies in mutually exclusive `handle`
+    /// branches. The route index identifies the routing entry; this index
+    /// identifies the upstream policy that branch owns.
+    pub(crate) proxy_index: Option<usize>,
     /// Selected upstream (kept for connection tracking)
     pub upstream: Option<Upstream>,
     /// Extra headers to add upstream
@@ -339,6 +345,7 @@ impl Default for RequestContext {
             state: None,
             generation: None,
             route_index: None,
+            proxy_index: None,
             cache_ttl_secs: None,
             cache_scope: None,
             cache_upstream: None,
@@ -611,6 +618,16 @@ pub struct ProxyState {
     pub vars_precompiles: Vec<Option<CompiledMatcher>>,
     /// Load balancers per route
     pub load_balancers: Vec<Option<Arc<LoadBalancer>>>,
+    /// 🔀 Every reverse proxy's own upstream policy, in handler order.
+    ///
+    /// `load_balancers` and its siblings remain the route's first proxy for
+    /// callers that run before handler dispatch. Once a request reaches a
+    /// `reverse_proxy`, `proxy_index` selects the exact slot here instead.
+    pub(crate) proxy_slots: Vec<ProxySlot>,
+    /// 🔎 Maps a `ReverseProxyConfig` address in `config.routes` to its slot.
+    proxy_lookup: HashMap<usize, usize>,
+    /// 🧭 Slot indices belonging to each route, in handler order.
+    pub(crate) route_proxy_slots: Vec<Vec<usize>>,
     /// 🧭 Per-route dial templates with request placeholders, parallel to
     /// `load_balancers`; `None` means the route dials only static peers.
     pub dynamic_dials: Vec<Option<Arc<DynamicDialPlan>>>,
@@ -654,8 +671,6 @@ pub struct ProxyState {
     /// 🔑 Per-route consistent-hash key source, parallel to `load_balancers`.
     /// `None` means the route hashes the client address, or does not hash.
     pub(crate) hash_key_sources: Vec<Option<HashKeySource>>,
-    /// 🔐 Compiled upstream TLS trust and identity per reverse-proxy route.
-    pub(crate) upstream_tls: Vec<RouteUpstreamTls>,
     /// 🛡️ Compiled access policies per route, each with the element matcher
     /// it was written under; see [`HoistedGuard`].
     access_controls: Vec<Vec<HoistedGuard<Arc<RouteAccessControl>>>>,
@@ -694,6 +709,22 @@ pub struct ProxyState {
     pub(crate) strict_transport: crate::http_policy::StrictTransport,
 }
 
+/// 🔀 One reverse proxy's precomputed runtime policy.
+///
+/// Built once at configuration load. The configuration itself is cloned into
+/// the slot so request-time lookups never walk the handler tree to find the
+/// pool that belongs to the branch that actually matched.
+#[derive(Clone)]
+pub(crate) struct ProxySlot {
+    pub(crate) config: Arc<ReverseProxyConfig>,
+    pub(crate) load_balancer: Option<Arc<LoadBalancer>>,
+    pub(crate) dynamic_dial: Option<Arc<DynamicDialPlan>>,
+    pub(crate) protection: Option<Arc<RouteProtection>>,
+    pub(crate) hash_key_source: Option<HashKeySource>,
+    pub(crate) upstream_tls: RouteUpstreamTls,
+    pub(crate) buffering: RouteBuffering,
+}
+
 impl ProxyState {
     /// 🪵 The access-log destinations this server can reach, for the HTTP/3
     /// path, which builds its record outside this module.
@@ -708,6 +739,45 @@ impl ProxyState {
             .get(route_index)
             .copied()
             .unwrap_or_default()
+    }
+
+    /// 🔎 The runtime slot for a handler the request just reached.
+    pub(crate) fn proxy_index_for(&self, proxy: &ReverseProxyConfig) -> Option<usize> {
+        self.proxy_lookup
+            .get(&(proxy as *const ReverseProxyConfig as usize))
+            .copied()
+    }
+
+    /// 🧭 The first proxy on a route, for phases that run before dispatch.
+    pub(crate) fn first_proxy_index(&self, route_index: usize) -> Option<usize> {
+        self.route_proxy_slots
+            .get(route_index)
+            .and_then(|indices| indices.first())
+            .copied()
+    }
+
+    /// 🍃 Borrows one proxy slot.
+    pub(crate) fn proxy_slot(&self, proxy_index: usize) -> Option<&ProxySlot> {
+        self.proxy_slots.get(proxy_index)
+    }
+
+    /// 🍃 The configuration belonging to one proxy slot.
+    pub(crate) fn proxy_config_at(&self, proxy_index: usize) -> Option<&ReverseProxyConfig> {
+        self.proxy_slots
+            .get(proxy_index)
+            .map(|slot| slot.config.as_ref())
+    }
+
+    /// 🔐 The TLS policy belonging to one proxy slot.
+    pub(crate) fn proxy_upstream_tls_at(&self, proxy_index: usize) -> Option<&RouteUpstreamTls> {
+        self.proxy_slots
+            .get(proxy_index)
+            .map(|slot| &slot.upstream_tls)
+    }
+
+    /// 🧱 The buffering policy belonging to one proxy slot.
+    pub(crate) fn proxy_buffering_at(&self, proxy_index: usize) -> Option<RouteBuffering> {
+        self.proxy_slots.get(proxy_index).map(|slot| slot.buffering)
     }
 }
 
@@ -1180,17 +1250,20 @@ impl ProxyState {
         let mut rate_limiters = Vec::new();
         let mut route_protections = Vec::new();
         let mut hash_key_sources = Vec::new();
-        let mut upstream_tls = Vec::new();
         let mut access_controls = Vec::new();
         let mut route_regexes = Vec::new();
         let mut route_body_ceilings = Vec::new();
         let mut route_body_timeouts = Vec::new();
         let mut route_buffering = Vec::new();
+        let mut proxy_slots = Vec::new();
+        let mut proxy_lookup = HashMap::new();
+        let mut route_proxy_slots = Vec::new();
 
         for (route_index, route) in config.routes.iter().enumerate() {
             let mut route_subrequests = Vec::new();
             collect_subrequest_plans(&route.handler, &mut route_subrequests);
             subrequests.push(route_subrequests);
+            let mut first_proxy_tls = RouteUpstreamTls::Default;
             // Each per-route slot is resolved independently by walking the
             // route's handler tree. A `reverse_proxy`/`file_server`/
             // `rate_limit` may sit at the top level *or* be nested inside a
@@ -1307,6 +1380,7 @@ impl ProxyState {
                 // 🔐 Compile the route policy before its probe peer so health and
                 // ordinary traffic use identical trust roots, client identity, and SNI.
                 let route_tls = compile_route_upstream_tls(&route.path, &proxy_config.upstream_tls);
+                first_proxy_tls = route_tls.clone();
                 if let Some(hc_config) = &proxy_config.health_check {
                     let tls_policy = match &route_tls {
                         RouteUpstreamTls::Default => Some(None),
@@ -1432,15 +1506,55 @@ impl ProxyState {
                         proxy_config.upstreams.clone(),
                     ))
                 })));
-
-                upstream_tls.push(route_tls);
             } else {
                 load_balancers.push(None);
                 dynamic_dials.push(None);
                 route_protections.push(None);
                 hash_key_sources.push(None);
-                upstream_tls.push(RouteUpstreamTls::Default);
             }
+
+            // 🔀 Record every proxy in handler order. The first slot reuses
+            // the route-level build above (including active health checks);
+            // additional branches get their own pool and TLS policy instead
+            // of inheriting the first branch's. This is what makes a shared
+            // `route { header … handle /a { … } handle /b { … } }` reach two
+            // different origins without splitting the configuration.
+            let mut route_proxies = Vec::new();
+            collect_reverse_proxies(&route.handler, &mut route_proxies);
+            let mut route_slot_indices = Vec::with_capacity(route_proxies.len());
+            for (position, proxy_config) in route_proxies.into_iter().enumerate() {
+                let slot_index = proxy_slots.len();
+                proxy_lookup.insert(
+                    proxy_config as *const ReverseProxyConfig as usize,
+                    slot_index,
+                );
+                route_slot_indices.push(slot_index);
+                if position == 0 {
+                    proxy_slots.push(ProxySlot {
+                        config: Arc::new(proxy_config.clone()),
+                        load_balancer: load_balancers.last().cloned().flatten(),
+                        dynamic_dial: dynamic_dials.last().cloned().flatten(),
+                        protection: route_protections.last().cloned().flatten(),
+                        hash_key_source: hash_key_sources.last().cloned().flatten(),
+                        upstream_tls: first_proxy_tls.clone(),
+                        buffering: RouteBuffering {
+                            request: crate::body_buffer::resolve_limit(
+                                proxy_config.request_buffer_bytes,
+                            ),
+                            response: crate::body_buffer::resolve_limit(
+                                proxy_config.response_buffer_bytes,
+                            ),
+                        },
+                    });
+                } else {
+                    proxy_slots.push(build_extra_proxy_slot(
+                        proxy_config,
+                        &route.path,
+                        &host_label,
+                    ));
+                }
+            }
+            route_proxy_slots.push(route_slot_indices);
 
             // Health checker is stored inside the LB object; this slot is a
             // tombstone kept only for index alignment with load_balancers.
@@ -1613,6 +1727,9 @@ impl ProxyState {
             error_routes,
             vars_precompiles,
             load_balancers,
+            proxy_slots,
+            proxy_lookup,
+            route_proxy_slots,
             dynamic_dials,
             subrequests,
             health_checkers,
@@ -1623,7 +1740,6 @@ impl ProxyState {
             rate_limiters,
             route_protections,
             hash_key_sources,
-            upstream_tls,
             access_controls,
             route_regexes,
             route_body_ceilings,
@@ -1637,20 +1753,14 @@ impl ProxyState {
         }
     }
 
-    /// 🔐 Returns the compiled TLS policy for a route, or `None` for the default.
-    ///
-    /// `Err(())` means the route's TLS material failed to load and the request
-    /// must be refused rather than downgraded.
-    pub(crate) fn upstream_tls_for(
+    /// 🔐 The same answer for the proxy that actually matched.
+    pub(crate) fn upstream_tls_for_proxy(
         &self,
-        route_index: usize,
+        proxy_index: usize,
     ) -> Result<Option<&Arc<crate::upstream_tls::UpstreamTls>>, ()> {
-        match self.upstream_tls.get(route_index) {
+        match self.proxy_upstream_tls_at(proxy_index) {
             Some(RouteUpstreamTls::Compiled(policy)) => Ok(Some(policy)),
             Some(RouteUpstreamTls::Broken) => Err(()),
-            // 🧩 A missing slot can only mean an index-alignment bug; treating
-            // it as the default keeps behaviour identical to before this field
-            // existed rather than inventing a new failure mode.
             Some(RouteUpstreamTls::Default) | None => Ok(None),
         }
     }
@@ -2525,18 +2635,17 @@ impl PingclairProxy {
         )
     }
 
-    /// 🔁 Selects a healthy backend outside the current request's attempted set.
-    pub(crate) fn select_upstream_excluding(
+    /// 🔀 The same selection, scoped to one reverse proxy.
+    pub(crate) fn select_upstream_excluding_at(
         &self,
         state: &ProxyState,
-        route_index: usize,
+        proxy_index: usize,
         remote_addr: Option<&[u8]>,
         excluded: &HashSet<SocketAddr>,
     ) -> Option<Upstream> {
         state
-            .load_balancers
-            .get(route_index)
-            .and_then(|load_balancer| load_balancer.as_ref())
+            .proxy_slot(proxy_index)
+            .and_then(|slot| slot.load_balancer.as_ref())
             .and_then(|load_balancer| load_balancer.select_excluding(remote_addr, excluded))
     }
 
@@ -2546,10 +2655,25 @@ impl PingclairProxy {
         state: &ProxyState,
         route_index: usize,
     ) -> Result<RouteAdmission, AdmissionError> {
+        let protection = state
+            .first_proxy_index(route_index)
+            .and_then(|proxy_index| state.proxy_slot(proxy_index))
+            .and_then(|slot| slot.protection.as_ref());
+        match protection {
+            Some(protection) => protection.admit_route().await,
+            None => Err(AdmissionError::QueueFull),
+        }
+    }
+
+    /// 🔀 Acquires the execution slot belonging to the matched reverse proxy.
+    pub(crate) async fn admit_proxy(
+        &self,
+        state: &ProxyState,
+        proxy_index: usize,
+    ) -> Result<RouteAdmission, AdmissionError> {
         match state
-            .route_protections
-            .get(route_index)
-            .and_then(|protection| protection.as_ref())
+            .proxy_slot(proxy_index)
+            .and_then(|slot| slot.protection.as_ref())
         {
             Some(protection) => protection.admit_route().await,
             None => Err(AdmissionError::QueueFull),
@@ -2568,6 +2692,7 @@ impl PingclairProxy {
         Self::balancing_identity_for_request(
             state,
             ctx.route_index?,
+            ctx.proxy_index,
             session.req_header(),
             fallback_ip,
         )
@@ -2577,6 +2702,7 @@ impl PingclairProxy {
     pub(crate) fn balancing_identity_for_request(
         state: &ProxyState,
         route_index: usize,
+        proxy_index: Option<usize>,
         request: &RequestHeader,
         fallback_ip: Option<IpAddr>,
     ) -> Option<Vec<u8>> {
@@ -2584,11 +2710,16 @@ impl PingclairProxy {
         // session header, a cookie, a query parameter. The source was decided
         // at configuration time and precomputed into `ProxyState`, so this is a
         // lookup rather than a per-request parse of the strategy string.
-        if let Some(source) = state
-            .hash_key_sources
-            .get(route_index)
-            .and_then(|source| source.as_ref())
-        {
+        let source = proxy_index
+            .and_then(|index| state.proxy_slot(index))
+            .and_then(|slot| slot.hash_key_source.as_ref())
+            .or_else(|| {
+                state
+                    .hash_key_sources
+                    .get(route_index)
+                    .and_then(|source| source.as_ref())
+            });
+        if let Some(source) = source {
             return extract_hash_key(request, source);
         }
 
@@ -2606,19 +2737,31 @@ impl PingclairProxy {
         remote_addr: Option<&[u8]>,
         excluded: &HashSet<SocketAddr>,
     ) -> Result<(Upstream, Option<UpstreamAdmission>), UpstreamSelectionError> {
-        let protection = state
-            .route_protections
-            .get(route_index)
-            .and_then(|protection| protection.as_ref());
+        let proxy_index = state
+            .first_proxy_index(route_index)
+            .ok_or(UpstreamSelectionError::NoUpstream)?;
+        self.select_admitted_upstream_at(state, proxy_index, remote_addr, excluded)
+    }
+
+    /// 🔀 The same admission walk, scoped to one reverse proxy.
+    pub(crate) fn select_admitted_upstream_at(
+        &self,
+        state: &ProxyState,
+        proxy_index: usize,
+        remote_addr: Option<&[u8]>,
+        excluded: &HashSet<SocketAddr>,
+    ) -> Result<(Upstream, Option<UpstreamAdmission>), UpstreamSelectionError> {
+        let slot = state
+            .proxy_slot(proxy_index)
+            .ok_or(UpstreamSelectionError::NoUpstream)?;
+        let protection = slot.protection.as_ref();
 
         // ♻️ Drop protection state for backends that have left the pool. The
         // load balancer bumps a generation on every republish, so this is one
         // atomic comparison unless a DNS refresh actually moved something —
         // without it, an upstream that changes address leaves a dead circuit
         // and a dead semaphore behind on every move, forever.
-        if let (Some(protection), Some(Some(balancer))) =
-            (protection, state.load_balancers.get(route_index))
-        {
+        if let (Some(protection), Some(balancer)) = (protection, slot.load_balancer.as_ref()) {
             protection.reconcile_backends(balancer.generation(), || balancer.backend_addresses());
         }
 
@@ -2626,7 +2769,7 @@ impl PingclairProxy {
         let mut rejected = false;
         loop {
             let Some(upstream) =
-                self.select_upstream_excluding(state, route_index, remote_addr, &local_excluded)
+                self.select_upstream_excluding_at(state, proxy_index, remote_addr, &local_excluded)
             else {
                 return Err(if rejected {
                     UpstreamSelectionError::Unavailable
@@ -2660,50 +2803,35 @@ impl PingclairProxy {
         route_index: usize,
         address: &SocketAddr,
     ) {
-        self.mark_upstream(state, route_index, address, false);
+        if let Some(proxy_index) = state.first_proxy_index(route_index) {
+            self.mark_upstream_at(state, proxy_index, address, false);
+        }
     }
 
-    /// 🩹 The same, for a failure *after* the connection was made. The last
-    /// selectable backend is kept in rotation: a response-phase failure is
-    /// ambiguous, and taking the only backend out turns a flaky origin into
-    /// an outage until the window expires (#262).
-    pub(crate) fn mark_upstream_response_failure(
+    /// 🔻 Marks one address down in the pool that belongs to `proxy_index`.
+    pub(crate) fn mark_upstream_at(
         &self,
         state: &ProxyState,
-        route_index: usize,
-        address: &SocketAddr,
-    ) {
-        self.mark_upstream(state, route_index, address, true);
-    }
-
-    fn mark_upstream(
-        &self,
-        state: &ProxyState,
-        route_index: usize,
+        proxy_index: usize,
         address: &SocketAddr,
         response_phase: bool,
     ) {
-        if let Some(load_balancer) = state
-            .load_balancers
-            .get(route_index)
-            .and_then(|load_balancer| load_balancer.as_ref())
+        if let Some(slot) = state.proxy_slot(proxy_index)
+            && let Some(load_balancer) = slot.load_balancer.as_ref()
         {
             // 🩹 The route's passive policy: Caddy's `max_fails` and
             // `fail_duration` when written down, this proxy's own default
             // (one failure, ten seconds) when not.
-            let policy = self
-                .get_proxy_config(state, route_index)
-                .map(|config| crate::load_balancer::PassiveHealth {
-                    max_fails: config.max_fails.unwrap_or(1),
-                    // 🤔 `None` keeps the default cooldown; `Some(0)` is
-                    // Caddy's "do not remember failures" — passive health off.
-                    window: match config.fail_duration_ms {
-                        None => Some(crate::FAIL_COOLDOWN),
-                        Some(0) => None,
-                        Some(millis) => Some(std::time::Duration::from_millis(millis)),
-                    },
-                })
-                .unwrap_or_default();
+            let policy = crate::load_balancer::PassiveHealth {
+                max_fails: slot.config.max_fails.unwrap_or(1),
+                // 🤔 `None` keeps the default cooldown; `Some(0)` is
+                // Caddy's "do not remember failures" — passive health off.
+                window: match slot.config.fail_duration_ms {
+                    None => Some(crate::FAIL_COOLDOWN),
+                    Some(0) => None,
+                    Some(millis) => Some(std::time::Duration::from_millis(millis)),
+                },
+            };
             if response_phase {
                 load_balancer.mark_response_failure(address, policy);
             } else {
@@ -2747,8 +2875,13 @@ impl PingclairProxy {
     /// the allocator at all.
     fn route_cache_config<'a>(&self, ctx: &'a RequestContext) -> Option<&'a CacheConfig> {
         let state = ctx.state.as_ref()?;
-        let route_index = ctx.route_index?;
-        let proxy = self.get_proxy_config(state, route_index)?;
+        let proxy = ctx
+            .proxy_index
+            .and_then(|proxy_index| state.proxy_config_at(proxy_index))
+            .or_else(|| {
+                let route_index = ctx.route_index?;
+                self.get_proxy_config(state, route_index)
+            })?;
         proxy.cache.as_deref()
     }
 
@@ -2800,6 +2933,18 @@ impl PingclairProxy {
         // headers/timeouts are picked up, matching how ProxyState::new sets
         // up its load balancer.
         find_reverse_proxy_config(&route.handler)
+    }
+
+    /// 🔀 The proxy the request actually reached, falling back to the route's
+    /// first proxy only for phases that run before handler dispatch.
+    fn request_proxy_config<'a>(&self, ctx: &'a RequestContext) -> Option<&'a ReverseProxyConfig> {
+        let state = ctx.state.as_ref()?;
+        ctx.proxy_index
+            .and_then(|proxy_index| state.proxy_config_at(proxy_index))
+            .or_else(|| {
+                ctx.route_index
+                    .and_then(|route_index| self.get_proxy_config(state, route_index))
+            })
     }
 
     /// 🌐 Builds an [`HttpPeer`] with the selected upstream protocol and timeouts.
@@ -5838,6 +5983,14 @@ impl PingclairProxy {
             // FastCGI transport cannot ride Pingora's HTTP lifecycle, so it
             // answers inline instead.
             HandlerConfig::ReverseProxy(config) => {
+                // 🔀 Bind the request to this branch's own pool before the
+                // upstream phase runs. The route index still identifies the
+                // matcher that delivered the request; this one identifies the
+                // reverse proxy that will dial it.
+                ctx.proxy_index = ctx
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.proxy_index_for(config));
                 if config.subrequest.is_some() {
                     let prepared = ctx
                         .state
@@ -6759,15 +6912,6 @@ macro_rules! log_at_level {
         }
     };
 }
-
-/// 🔁 The policy a request without a proxy route is judged by.
-///
-/// Shared rather than built per failure: the retry decision runs on every
-/// upstream response, and cloning a route's policy there copied its whole
-/// predicate tree — a heap allocation per response for a question that only
-/// needs to borrow it.
-static DEFAULT_RETRY_POLICY: std::sync::LazyLock<RetryConfig> =
-    std::sync::LazyLock::new(RetryConfig::default);
 
 /// 🔁 Applies Pingora's reuse-safety rule, the replay-safety rule, and the route
 /// retry budget to an upstream error before the retry loop reads it.
@@ -7888,7 +8032,20 @@ impl ProxyHttp for PingclairProxy {
             //
             // 🧭 After `handle_config`, so a `header` directive around the proxy
             // has already claimed its fields and keeps winning a shared `set`.
-            if let Some(proxy_config) = self.get_proxy_config(&state, index) {
+            // 🔀 The branch that matched owns the buffering limits and
+            // response-header operations, not the route's first proxy.
+            if let Some(proxy_index) = ctx.proxy_index
+                && let Some(buffering) = state.proxy_buffering_at(proxy_index)
+            {
+                ctx.request_buffer = buffering.request.map(crate::body_buffer::BufferedBody::new);
+                ctx.response_buffer = buffering
+                    .response
+                    .map(crate::body_buffer::BufferedBody::new);
+            }
+            if let Some(proxy_config) = ctx
+                .proxy_index
+                .and_then(|proxy_index| state.proxy_config_at(proxy_index))
+            {
                 let verified_client_ip = proxy_down_needs_resolution(proxy_config)
                     .then(|| ctx.verified_client_ip.map(|ip| ip.to_string()))
                     .flatten();
@@ -8038,11 +8195,17 @@ impl ProxyHttp for PingclairProxy {
         let (Some(state), Some(route_index)) = (ctx.state.clone(), ctx.route_index) else {
             return Ok(true);
         };
+        let Some(proxy_index) = ctx
+            .proxy_index
+            .or_else(|| state.first_proxy_index(route_index))
+        else {
+            return Ok(true);
+        };
 
         // 🧭 A reverse_proxy `method`/`rewrite` mutates the request before
         // Pingora clones it for the upstream connection, so the change is
         // visible to routing, retry policy, and the upstream request alike.
-        if let Some(proxy_config) = self.get_proxy_config(&state, route_index) {
+        if let Some(proxy_config) = state.proxy_config_at(proxy_index) {
             if let Some(rewritten) = &proxy_config.rewrite_method
                 && let Ok(rewritten) = http::Method::from_bytes(rewritten.as_bytes())
             {
@@ -8063,9 +8226,9 @@ impl ProxyHttp for PingclairProxy {
         }
 
         let client_ip = self.balancing_identity(session, ctx);
-        match self.select_admitted_upstream(
+        match self.select_admitted_upstream_at(
             &state,
-            route_index,
+            proxy_index,
             client_ip.as_deref(),
             &ctx.retry_excluded,
         ) {
@@ -8125,7 +8288,10 @@ impl ProxyHttp for PingclairProxy {
             }
         };
 
-        let proxy_config = self.get_proxy_config(&state, route_index);
+        let proxy_index = ctx
+            .proxy_index
+            .or_else(|| state.first_proxy_index(route_index));
+        let proxy_config = proxy_index.and_then(|index| state.proxy_config_at(index));
         // 🚫 A FastCGI route is answered entirely in `request_filter`; a
         // request that reaches upstream selection (an element matcher that
         // did not match, say) must not be HTTP-proxied to php-fpm.
@@ -8175,7 +8341,9 @@ impl ProxyHttp for PingclairProxy {
         // 🔐 Checked before a backend is chosen: a route whose TLS material
         // failed to load must not connect at all, so there is nothing to gain
         // from selecting, admitting, and then dropping an upstream.
-        let Ok(tls_policy) = state.upstream_tls_for(route_index) else {
+        let Ok(tls_policy) =
+            proxy_index.map_or(Ok(None), |index| state.upstream_tls_for_proxy(index))
+        else {
             tracing::error!(
                 route = route_index,
                 "🚫 Refusing to dispatch: this route's upstream TLS material did not load"
@@ -8190,10 +8358,9 @@ impl ProxyHttp for PingclairProxy {
         // request. The plan was precomputed at configuration time, so this
         // branch only substitutes captured values and consults the bounded
         // resolution cache — no parsing or DNS setup work repeats here.
-        if let Some(dial_plan) = state
-            .dynamic_dials
-            .get(route_index)
-            .and_then(|plan| plan.as_ref())
+        if let Some(dial_plan) = proxy_index
+            .and_then(|index| state.proxy_slot(index))
+            .and_then(|slot| slot.dynamic_dial.as_ref())
         {
             let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
             let Some(spec) = dial_plan.resolve(
@@ -8248,9 +8415,9 @@ impl ProxyHttp for PingclairProxy {
             Some(preadmitted) => Ok(preadmitted),
             None => {
                 client_ip = self.balancing_identity(session, ctx);
-                self.select_admitted_upstream(
+                self.select_admitted_upstream_at(
                     &state,
-                    route_index,
+                    proxy_index.unwrap_or(0),
                     client_ip.as_deref(),
                     &ctx.retry_excluded,
                 )
@@ -8261,9 +8428,9 @@ impl ProxyHttp for PingclairProxy {
         {
             // ♻️ A status policy may revisit a backend after every candidate was tried once.
             ctx.retry_excluded.clear();
-            selected = self.select_admitted_upstream(
+            selected = self.select_admitted_upstream_at(
                 &state,
-                route_index,
+                proxy_index.unwrap_or(0),
                 client_ip.as_deref(),
                 &ctx.retry_excluded,
             );
@@ -8614,12 +8781,10 @@ impl ProxyHttp for PingclairProxy {
         // fields that cannot be forwarded downstream are dropped instead
         // (#273). The H3 path carries the same rule.
 
-        let retry_policy = ctx
-            .state
-            .as_ref()
-            .zip(ctx.route_index)
-            .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
-            .map_or(&*DEFAULT_RETRY_POLICY, |config| &*config.retry);
+        let retry_policy = self
+            .request_proxy_config(ctx)
+            .map(|config| config.retry.clone())
+            .unwrap_or_default();
         // 💡 An informational response is a prediction about the answer still
         // to come (RFC 8297 §2), not the answer. The breaker keeps only the
         // first verdict it is given, so reporting a `103` here would record
@@ -8678,7 +8843,7 @@ impl ProxyHttp for PingclairProxy {
                 .and_then(|(state, index)| state.route_regex_arc(index, pattern))
         };
         if crate::retry::permits_retry(
-            retry_policy,
+            &retry_policy,
             &facts,
             body_is_empty,
             ctx.retry_attempts,
@@ -8842,11 +9007,8 @@ impl ProxyHttp for PingclairProxy {
             .get(http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(is_streaming_content_type)
-            || ctx
-                .state
-                .as_ref()
-                .zip(ctx.route_index)
-                .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
+            || self
+                .request_proxy_config(ctx)
                 .is_some_and(|config| wants_immediate_flush(config.flush_interval));
         let body_is_coming = session.req_header().method != http::Method::HEAD
             && crate::http_policy::ResponseContent::for_status(upstream_response.status.as_u16())
@@ -9155,7 +9317,11 @@ impl ProxyHttp for PingclairProxy {
                 // claim as marking it down — that this address is the problem —
                 // so the two travel together.
                 ctx.retry_excluded.insert(*address);
-                if let (Some(state), Some(route_index)) = (ctx.state.as_ref(), ctx.route_index) {
+                if let (Some(state), Some(route_index)) = (ctx.state.as_ref(), ctx.route_index)
+                    && let Some(proxy_index) = ctx
+                        .proxy_index
+                        .or_else(|| state.first_proxy_index(route_index))
+                {
                     tracing::warn!(
                         error_type = ?e.etype(),
                         cause = %e,
@@ -9163,7 +9329,7 @@ impl ProxyHttp for PingclairProxy {
                         address,
                         crate::FAIL_COOLDOWN
                     );
-                    self.mark_upstream_unhealthy(state, route_index, address);
+                    self.mark_upstream_at(state, proxy_index, address, false);
                 }
             } else if let Some(suppressed) = crate::upstream_failure::LOCAL_FAILURE_LOG.admit_now()
             {
@@ -9184,8 +9350,14 @@ impl ProxyHttp for PingclairProxy {
         let retry_policy = ctx
             .state
             .as_ref()
-            .zip(ctx.route_index)
-            .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
+            .and_then(|state| {
+                ctx.proxy_index
+                    .and_then(|proxy_index| state.proxy_config_at(proxy_index))
+                    .or_else(|| {
+                        ctx.route_index
+                            .and_then(|route_index| self.get_proxy_config(state, route_index))
+                    })
+            })
             .map(|config| config.retry.clone())
             .unwrap_or_default();
         let retry = crate::retry::permits_another_attempt(
@@ -9221,13 +9393,16 @@ impl ProxyHttp for PingclairProxy {
         if crate::upstream_failure::classify_response_error(&e).implicates_backend()
             && let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) = peer.address()
             && let (Some(state), Some(route_index)) = (ctx.state.as_ref(), ctx.route_index)
+            && let Some(proxy_index) = ctx
+                .proxy_index
+                .or_else(|| state.first_proxy_index(route_index))
         {
             tracing::warn!(
                 error_type = ?e.etype(),
                 cause = %e,
                 "🔻 Marking upstream {address} down after response-phase failure"
             );
-            self.mark_upstream_response_failure(state, route_index, address);
+            self.mark_upstream_at(state, proxy_index, address, true);
         }
         let elapsed = ctx.start_time.elapsed();
         log_at_level!(
@@ -9238,12 +9413,10 @@ impl ProxyHttp for PingclairProxy {
             "❌ Proxy error"
         );
 
-        let retry_policy = ctx
-            .state
-            .as_ref()
-            .zip(ctx.route_index)
-            .and_then(|(state, route_index)| self.get_proxy_config(state, route_index))
-            .map_or(&*DEFAULT_RETRY_POLICY, |config| &*config.retry);
+        let retry_policy = self
+            .request_proxy_config(ctx)
+            .map(|config| config.retry.clone())
+            .unwrap_or_default();
         let retry_buffer_truncated = session.as_ref().retry_buffer_truncated();
         let body_is_empty = session.as_mut().is_body_empty();
         let retry = decide_upstream_error_retry(
@@ -9253,7 +9426,7 @@ impl ProxyHttp for PingclairProxy {
             // 📤 Already the upstream method: `reverse_proxy { method … }`
             // rewrote this header in place before the request went out.
             crate::retry::request_is_repeatable(&session.req_header().method, body_is_empty),
-            retry_policy,
+            &retry_policy,
             ctx.retry_attempts,
             ctx.retry_deadline,
         );
@@ -9804,6 +9977,162 @@ pub(crate) fn find_reverse_proxy_config(handler: &HandlerConfig) -> Option<&Reve
             .iter()
             .find_map(|element| find_reverse_proxy_config(&element.handler)),
         _ => None,
+    }
+}
+
+/// 🔀 Collects every reverse proxy in handler order, including branches.
+fn collect_reverse_proxies<'a>(handler: &'a HandlerConfig, out: &mut Vec<&'a ReverseProxyConfig>) {
+    match handler {
+        HandlerConfig::ReverseProxy(config) if config.subrequest.is_none() => out.push(config),
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::FirstMatch { handlers }
+        | HandlerConfig::HandlePath { handlers, .. } => {
+            for element in handlers {
+                collect_reverse_proxies(&element.handler, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 🧩 Builds the runtime policy for a proxy after the route's first one.
+///
+/// The first proxy reuses the route-level construction above, including its
+/// active health check. A second proxy needs the same pool, TLS and protection
+/// decisions even though it has no route-level slot of its own.
+fn build_extra_proxy_slot(
+    config: &ReverseProxyConfig,
+    route_path: &str,
+    host_label: &str,
+) -> ProxySlot {
+    let (primary, backup, dynamic_templates) = build_weighted_upstreams(config);
+    let primary_is_empty = primary.is_empty();
+    let strategy = match config.load_balance.strategy.as_str() {
+        "" | "random" => Strategy::Random,
+        "round_robin" => Strategy::RoundRobin,
+        "least_conn" => Strategy::LeastConn,
+        "ip_hash" | "header" | "cookie" | "query" => Strategy::IpHash,
+        "first" => Strategy::First,
+        _ => Strategy::Random,
+    };
+    let load_balancer = Arc::new(
+        if let Some(dynamic_config) = config.dynamic_upstream.as_ref() {
+            match crate::dynamic_upstream::dynamic_source(dynamic_config) {
+                Ok(source) => LoadBalancer::from_dynamic(source, primary, backup, strategy),
+                Err(error) => {
+                    tracing::error!(
+                        route = %route_path,
+                        %error,
+                        "🚫 Dynamic upstream source failed to build"
+                    );
+                    LoadBalancer::from_entries(vec![], vec![], strategy)
+                }
+            }
+        } else if primary_is_empty {
+            LoadBalancer::from_entries(backup, vec![], strategy)
+        } else {
+            LoadBalancer::from_entries(primary, backup, strategy)
+        },
+    );
+    crate::dns::register(&load_balancer);
+
+    let hash_key_source = config.load_balance.hash_key.as_ref().and_then(|field| {
+        match config.load_balance.strategy.as_str() {
+            "header" => Some(HashKeySource::Header(field.clone())),
+            "cookie" => Some(HashKeySource::Cookie(field.clone())),
+            "query" => Some(HashKeySource::Query(field.clone())),
+            _ => None,
+        }
+    });
+    let upstream_tls = compile_route_upstream_tls(route_path, &config.upstream_tls);
+    if let Some(hc_config) = &config.health_check {
+        let tls_policy = match &upstream_tls {
+            RouteUpstreamTls::Default => Some(None),
+            RouteUpstreamTls::Compiled(policy) => Some(Some(policy)),
+            RouteUpstreamTls::Broken => None,
+        };
+        if let (Some(upstream), Some(tls_policy)) = (load_balancer.first_backend(), tls_policy) {
+            let timeout = Duration::from_secs(hc_config.timeout);
+            match PingclairProxy::build_http_peer(
+                &upstream,
+                Some(config),
+                Some(timeout),
+                Some(timeout),
+                tls_policy,
+            ) {
+                Ok(peer_template) => {
+                    let host = hc_config.host.clone().unwrap_or_else(|| {
+                        match upstream.ext.get::<HostName>() {
+                            Some(name) => crate::upstream::authority(
+                                &name.0,
+                                &upstream.addr,
+                                upstream.ext.get::<Scheme>().copied(),
+                            ),
+                            None => upstream.addr.to_string(),
+                        }
+                    });
+                    load_balancer.set_health_check(
+                        crate::health_check::HealthCheckConfig {
+                            path: hc_config.path.clone(),
+                            timeout,
+                            positive_threshold: hc_config.consecutive_success as usize,
+                            negative_threshold: hc_config
+                                .consecutive_failure
+                                .unwrap_or(hc_config.threshold)
+                                as usize,
+                            expected_statuses: hc_config.expected_statuses.clone(),
+                            expected_body: hc_config.expected_body.clone(),
+                            method: hc_config.method.clone(),
+                            host,
+                            host_override: hc_config.host.clone(),
+                            sni_override: tls_policy
+                                .and_then(|policy| policy.server_name())
+                                .map(str::to_string),
+                            headers: hc_config.headers.clone(),
+                            port_override: hc_config.port,
+                            reuse_connection: hc_config.reuse_connection,
+                            max_response_body_bytes: hc_config.max_response_body_bytes,
+                            slow_start: Duration::from_millis(hc_config.slow_start_ms),
+                        },
+                        peer_template,
+                    );
+                    load_balancer
+                        .set_health_check_frequency(Duration::from_secs(hc_config.interval));
+                    crate::health_check::register(&load_balancer);
+                }
+                Err(error) => tracing::error!(
+                    route = %route_path,
+                    %error,
+                    "🚫 Active health checking did not start because no valid probe peer exists"
+                ),
+            }
+        } else {
+            tracing::error!(
+                route = %route_path,
+                "🚫 Active health checking did not start because no valid TLS probe peer exists"
+            );
+        }
+    }
+    let protection = Arc::new(RouteProtection::new(
+        (*config.overload).clone(),
+        (*config.circuit_breaker).clone(),
+        host_label.to_string(),
+        route_path.to_string(),
+        config.upstreams.clone(),
+    ));
+
+    ProxySlot {
+        config: Arc::new(config.clone()),
+        load_balancer: Some(load_balancer),
+        dynamic_dial: (!dynamic_templates.is_empty())
+            .then(|| Arc::new(DynamicDialPlan::new(dynamic_templates))),
+        protection: Some(protection),
+        hash_key_source,
+        upstream_tls,
+        buffering: RouteBuffering {
+            request: crate::body_buffer::resolve_limit(config.request_buffer_bytes),
+            response: crate::body_buffer::resolve_limit(config.response_buffer_bytes),
+        },
     }
 }
 

@@ -30,7 +30,6 @@ mod header_fields;
 mod https_port;
 mod layer4;
 mod layer4_dynamic;
-mod proxy_routes;
 mod retired_placeholders;
 mod shared_ports;
 mod typed_text;

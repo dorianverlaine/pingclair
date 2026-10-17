@@ -68,3 +68,49 @@ async fn each_handle_in_a_route_block_reaches_its_own_upstream() {
         ]
     );
 }
+
+/// 🏷️ A shared `header` in the route reaches both proxy branches.
+///
+/// This is the shape the 0.2.3 split could not honour: the header belongs to
+/// the route, while the upstream belongs to each `reverse_proxy`. Keying pools
+/// by proxy lets both facts be true at once.
+#[tokio::test]
+async fn a_shared_header_reaches_both_route_block_proxies() {
+    let first = tagged_origin("first").await;
+    let second = tagged_origin("second").await;
+    let config = format!(
+        r#"
+:__PINGCLAIR_TEST_PORT__ {{
+    route {{
+        header X-Shared yes
+        handle __PINGCLAIR_TEST_READINESS_PATH__ {{
+            respond "__PINGCLAIR_TEST_READINESS_TOKEN__"
+        }}
+        handle /first {{
+            reverse_proxy {first}
+        }}
+        handle /second {{
+            reverse_proxy {second}
+        }}
+    }}
+}}
+"#
+    );
+    let mut server = TestServer::new_pingclairfile(&config);
+    assert!(server.wait_until_ready().await, "server failed to start");
+
+    let client = no_proxy_client();
+    for (path, expected) in [("/first", "first"), ("/second", "second")] {
+        let response = client.get(server.url(0, path)).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-shared")
+                .and_then(|value| value.to_str().ok()),
+            Some("yes"),
+            "the shared route header must reach the client on {path}"
+        );
+        assert_eq!(response.text().await.unwrap(), expected);
+    }
+}

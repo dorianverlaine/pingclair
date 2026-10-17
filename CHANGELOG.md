@@ -19,11 +19,12 @@ fact.
 A route kept one upstream pool and one proxy policy, taken from the first
 `reverse_proxy` in it, so a `route` block of several proxying `handle` blocks
 sent every proxied request to the first block's upstream, with that block's
-headers and TLS name. A `route` of mutually exclusive `handle` blocks, and a
-`handle` nested in a `handle`, now compile to one route per block, in order;
-when no block matches, the request carries on to the routes after them, as
-upstream's `route` does. A route that would still hold two proxies is refused
-at load, from a Pingclairfile, a JSON file or the Admin API alike.
+headers and TLS name. Upstream pools and proxy policy are now keyed by the
+`reverse_proxy` that actually matched, on HTTP/1.1, HTTP/2 and HTTP/3, so a
+shared `route` block reaches each branch's own upstream with the route's
+headers applied. A configuration that previously had to be split into one
+route per branch, or was refused when it could not be split, now loads as
+written.
 
 ### 🖋️ `fmt` keeps comments
 

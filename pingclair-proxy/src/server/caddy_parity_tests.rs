@@ -451,7 +451,7 @@ fn a_route_whose_trust_material_is_missing_refuses_instead_of_downgrading() {
 
     // Verification
     assert!(
-        state.upstream_tls_for(0).is_err(),
+        state.upstream_tls_for_proxy(0).is_err(),
         "a route that could not load its trust roots must not fall back to system trust"
     );
 }
@@ -463,7 +463,7 @@ fn a_route_with_no_tls_block_keeps_the_shared_default() {
 
     // Verification
     assert!(
-        matches!(state.upstream_tls_for(0), Ok(None)),
+        matches!(state.upstream_tls_for_proxy(0), Ok(None)),
         "an untouched route must not allocate per-route TLS state"
     );
 }
@@ -478,7 +478,7 @@ fn a_route_that_asked_for_an_sni_override_compiles_it() {
 
     // Verification
     let policy = state
-        .upstream_tls_for(0)
+        .upstream_tls_for_proxy(0)
         .expect("policy loads")
         .expect("policy is a customisation");
     assert_eq!(policy.server_name(), Some("origin.internal"));

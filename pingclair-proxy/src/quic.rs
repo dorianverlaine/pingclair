@@ -2709,7 +2709,9 @@ enum H3Terminal {
     FileServer {
         error: Option<crate::error_routes::ErrorScope>,
     },
-    ReverseProxy,
+    ReverseProxy {
+        proxy_index: usize,
+    },
     /// 🧵 Streams a FastCGI exchange without coupling it to Pingora's HTTP session.
     FastCgi,
     /// 🚫 Streams a non-continuing inline proxy response to the H3 client.
@@ -3626,7 +3628,10 @@ async fn plan_h3_handler_with_connector(
                 )
                 .await
             } else {
-                Ok(H3Plan::Terminal(H3Terminal::ReverseProxy))
+                let proxy_index = state
+                    .proxy_index_for(config)
+                    .ok_or((500, "Reverse Proxy Was Not Prepared"))?;
+                Ok(H3Plan::Terminal(H3Terminal::ReverseProxy { proxy_index }))
             }
         }
         // 🗂️ Parity with H1/H2 comes from sharing the resolver, not from
@@ -4420,8 +4425,10 @@ async fn handle_request_inner(
     // 🚨 An error raised by now has not read the body, and must not: it was
     // refused for its size.
     let drained = if raised.is_none()
-        && !matches!(&handler, H3Terminal::ReverseProxy | H3Terminal::FastCgi)
-    {
+        && !matches!(
+            &handler,
+            H3Terminal::ReverseProxy { .. } | H3Terminal::FastCgi
+        ) {
         drain_local_h3_body(
             body_rx,
             body_notify,
@@ -4923,12 +4930,13 @@ async fn handle_request_inner(
                     .await
                 }
 
-                H3Terminal::ReverseProxy => {
+                H3Terminal::ReverseProxy { proxy_index } => {
                     reverse_proxy_upstream(
                         proxy,
                         connector,
                         &state,
                         route_index,
+                        proxy_index,
                         req,
                         &header,
                         &effective_uri,
@@ -5428,6 +5436,7 @@ async fn fastcgi_upstream(
     let balance_key = PingclairProxy::balancing_identity_for_request(
         state,
         route_index,
+        None,
         request_header,
         Some(peer_ip),
     );
@@ -5855,6 +5864,7 @@ async fn reverse_proxy_upstream(
     connector: &pingora_core::connectors::http::Connector,
     state: &crate::server::ProxyState,
     route_index: usize,
+    proxy_index: usize,
     req: &H3Request,
     client_header: &RequestHeader,
     effective_uri: &str,
@@ -5872,7 +5882,7 @@ async fn reverse_proxy_upstream(
     request_vars: &crate::http_policy::RequestVars,
     standalone_response_handlers: Option<&[pingclair_core::config::ResponseHandlerConfig]>,
 ) -> Result<(), HandlerError> {
-    let _route_admission = match proxy.admit_route(state, route_index).await {
+    let _route_admission = match proxy.admit_proxy(state, proxy_index).await {
         Ok(admission) => admission,
         Err(crate::overload::AdmissionError::QueueFull) => {
             return Err((429, "Too Many Requests"));
@@ -5885,7 +5895,7 @@ async fn reverse_proxy_upstream(
         Ok(IpAddr::V6(v6)) => v6.octets().to_vec(),
         Err(_) => Vec::new(),
     };
-    let proxy_config = proxy.get_proxy_config(state, route_index);
+    let proxy_config = state.proxy_config_at(proxy_index);
     let limits = &state.config.limits;
     let immediate_stream = proxy_config
         .as_ref()
@@ -5926,7 +5936,7 @@ async fn reverse_proxy_upstream(
     // 🔐 The H3 bridge answers the same routes as the Pingora path, so it
     // enforces the same rule: a route whose upstream TLS material did not load
     // refuses rather than connecting without the trust it was configured with.
-    let tls_policy = state.upstream_tls_for(route_index).map_err(|()| {
+    let tls_policy = state.upstream_tls_for_proxy(proxy_index).map_err(|()| {
         tracing::error!(
             route = route_index,
             "🚫 Refusing to dispatch: this route's upstream TLS material did not load"
@@ -5939,9 +5949,8 @@ async fn reverse_proxy_upstream(
     // bounded cache, and reuse that peer for every retry attempt.
     let mut dynamic_upstream = None;
     if let Some(dial_plan) = state
-        .dynamic_dials
-        .get(route_index)
-        .and_then(|plan| plan.as_ref())
+        .proxy_slot(proxy_index)
+        .and_then(|slot| slot.dynamic_dial.as_ref())
     {
         let Some(spec) = dial_plan.resolve(client_header, Some(verified_client_ip), request_vars)
         else {
@@ -6003,7 +6012,7 @@ async fn reverse_proxy_upstream(
             (upstream.clone(), None)
         } else {
             let mut selected =
-                proxy.select_admitted_upstream(state, route_index, Some(&ip_bytes), &excluded);
+                proxy.select_admitted_upstream_at(state, proxy_index, Some(&ip_bytes), &excluded);
             if matches!(
                 selected,
                 Err(crate::server::UpstreamSelectionError::NoUpstream)
@@ -6011,8 +6020,12 @@ async fn reverse_proxy_upstream(
             {
                 // ♻️ A status policy may revisit a backend after every candidate was tried once.
                 excluded.clear();
-                selected =
-                    proxy.select_admitted_upstream(state, route_index, Some(&ip_bytes), &excluded);
+                selected = proxy.select_admitted_upstream_at(
+                    state,
+                    proxy_index,
+                    Some(&ip_bytes),
+                    &excluded,
+                );
             }
             selected.map_err(|error| match error {
                 // 🏷️ The same `Proxy-Status` H1/H2 sends from `upstream_peer`.
@@ -6074,7 +6087,7 @@ async fn reverse_proxy_upstream(
                 {
                     if origin.implicates_backend() {
                         excluded.insert(*address);
-                        proxy.mark_upstream_unhealthy(state, route_index, address);
+                        proxy.mark_upstream_at(state, proxy_index, address, false);
                         tracing::warn!(
                             error_type = ?error.etype(),
                             "🔻 Marking H3 upstream {} down after connect failure (cooldown {:?})",
@@ -6108,7 +6121,7 @@ async fn reverse_proxy_upstream(
             session.shutdown().await;
             if let pingora_core::protocols::l4::socket::SocketAddr::Inet(address) = &upstream.addr {
                 excluded.insert(*address);
-                proxy.mark_upstream_unhealthy(state, route_index, address);
+                proxy.mark_upstream_at(state, proxy_index, address, false);
             }
             if crate::retry::permits_another_attempt(&retry_policy, attempts, retry_deadline) {
                 continue;
@@ -6331,7 +6344,8 @@ async fn reverse_proxy_upstream(
         // byte. Built per attempt: a buffer half-drained by a failed attempt
         // must not be reused, or the replay would start mid-body.
         let mut request_buffer = state
-            .buffering(route_index)
+            .proxy_buffering_at(proxy_index)
+            .unwrap_or_default()
             .request
             .map(crate::body_buffer::BufferedBody::new);
         loop {
@@ -6920,7 +6934,8 @@ async fn reverse_proxy_upstream(
     let mut replacement_sent = false;
     // 🧱 `response_buffers`, the same state machine the Pingora path uses.
     let mut response_buffer = state
-        .buffering(route_index)
+        .proxy_buffering_at(proxy_index)
+        .unwrap_or_default()
         .response
         .map(crate::body_buffer::BufferedBody::new);
     loop {
@@ -8642,6 +8657,7 @@ mod tests {
             &connector,
             &state,
             0,
+            state.first_proxy_index(0).unwrap(),
             &request,
             &client_header,
             &request.path,
@@ -8766,6 +8782,7 @@ mod tests {
             &connector,
             &state,
             0,
+            state.first_proxy_index(0).unwrap(),
             &request,
             &client_header,
             &request.path,
@@ -8884,6 +8901,7 @@ mod tests {
             &connector,
             &state,
             0,
+            state.first_proxy_index(0).unwrap(),
             &request,
             &client_header,
             &request.path,
@@ -8973,6 +8991,7 @@ mod tests {
             &connector,
             &state,
             0,
+            state.first_proxy_index(0).unwrap(),
             &request,
             &client_header,
             &request.path,
@@ -9004,6 +9023,7 @@ mod tests {
             &connector,
             &state,
             0,
+            state.first_proxy_index(0).unwrap(),
             &request,
             &client_header,
             &request.path,
@@ -9100,6 +9120,7 @@ mod tests {
             &connector,
             &state,
             0,
+            state.first_proxy_index(0).unwrap(),
             &request,
             &client_header,
             &request.path,
@@ -9184,7 +9205,7 @@ mod tests {
         let mut policy = ResponseHeaderPolicy::default();
 
         let plan = plan_h3_handler(
-            &handler,
+            &state.config.routes[0].handler,
             &state,
             0,
             &mut request,
@@ -9347,7 +9368,7 @@ mod tests {
         let mut policy = ResponseHeaderPolicy::default();
 
         let plan = plan_h3_handler(
-            &handler,
+            &state.config.routes[0].handler,
             &state,
             0,
             &mut request,
@@ -9559,7 +9580,7 @@ mod tests {
         let mut policy = ResponseHeaderPolicy::default();
 
         let plan = plan_h3_handler(
-            &handler,
+            &state.config.routes[0].handler,
             &state,
             0,
             &mut request,
@@ -9575,7 +9596,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(plan, H3Plan::Terminal(H3Terminal::ReverseProxy)));
+        assert!(matches!(
+            plan,
+            H3Plan::Terminal(H3Terminal::ReverseProxy { .. })
+        ));
         assert_eq!(uri, "/users?q=1");
     }
 
@@ -9595,7 +9619,7 @@ mod tests {
         let mut policy = ResponseHeaderPolicy::default();
 
         let plan = plan_h3_handler(
-            &handler,
+            &state.config.routes[0].handler,
             &state,
             0,
             &mut request,
@@ -9611,7 +9635,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(plan, H3Plan::Terminal(H3Terminal::ReverseProxy)));
+        assert!(matches!(
+            plan,
+            H3Plan::Terminal(H3Terminal::ReverseProxy { .. })
+        ));
         assert_eq!(
             (uri.as_str(), request.uri.to_string()),
             ("/users?q=1", "/users?q=1".to_string())
@@ -9644,7 +9671,7 @@ mod tests {
         let mut registered = None;
 
         let plan = plan_h3_handler(
-            &handler,
+            &state.config.routes[0].handler,
             &state,
             0,
             &mut request,
@@ -9660,7 +9687,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(plan, H3Plan::Terminal(H3Terminal::ReverseProxy)));
+        assert!(matches!(
+            plan,
+            H3Plan::Terminal(H3Terminal::ReverseProxy { .. })
+        ));
         let registered = registered.expect("the intercept handlers must survive planning");
         assert_eq!(registered.len(), 1);
         assert_eq!(registered[0].status_code.as_deref(), Some("201"));
@@ -9754,7 +9784,7 @@ mod tests {
         let mut policy = ResponseHeaderPolicy::default();
 
         let plan = plan_h3_handler(
-            &handler,
+            &state.config.routes[0].handler,
             &state,
             0,
             &mut request,
@@ -9796,7 +9826,7 @@ mod tests {
         let mut policy = ResponseHeaderPolicy::default();
 
         let plan = plan_h3_handler(
-            &handler,
+            &state.config.routes[0].handler,
             &state,
             0,
             &mut request,
@@ -9855,7 +9885,7 @@ mod tests {
         let mut uri = "/admin/secrets".to_string();
         let mut policy = ResponseHeaderPolicy::default();
         let plan = plan_h3_handler(
-            &handler,
+            &state.config.routes[0].handler,
             &state,
             0,
             &mut request,
@@ -9879,7 +9909,7 @@ mod tests {
         let mut uri = "/public".to_string();
         let mut policy = ResponseHeaderPolicy::default();
         let plan = plan_h3_handler(
-            &handler,
+            &state.config.routes[0].handler,
             &state,
             0,
             &mut request,

@@ -954,6 +954,69 @@ async fn h3_header_replace_rewrites_an_upstream_value() {
     backend_task.await.unwrap();
 }
 
+/// 🏷️ A `header` shared by a `route` reaches both proxy branches on H3.
+///
+/// The H1/H2 and H3 paths now key pools by the reverse proxy that the branch
+/// selected, not by the route's first proxy. This exercises the second branch
+/// too, which the old route-splitting workaround could not represent without
+/// hoisting the shared header into it.
+#[tokio::test]
+async fn h3_shared_route_header_reaches_each_proxy_branch() {
+    use tokio::io::AsyncWriteExt;
+
+    async fn backend(tag: &'static str) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_head(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{tag}",
+                tag.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        address
+    }
+
+    let first = backend("first").await;
+    let second = backend("second").await;
+    let source = format!(
+        r#":443 {{
+            route {{
+                header X-Shared yes
+                handle /first {{
+                    reverse_proxy http://{first}
+                }}
+                handle /second {{
+                    reverse_proxy http://{second}
+                }}
+            }}
+        }}"#
+    );
+    let config = pingclair_config::compile(&source).expect("the shared route compiles");
+    let handler = config.servers[0].routes[0].handler.clone();
+    let server = spawn_h3_server(handler).await;
+
+    for (path, expected) in [("/first", "first"), ("/second", "second")] {
+        let response = h3_get(server, path).await.unwrap();
+        assert_eq!(response.status, 200);
+        let shared = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-shared"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(
+            shared,
+            Some("yes"),
+            "the shared route header must reach the H3 client on {path}"
+        );
+        assert_eq!(response.body, expected.as_bytes());
+    }
+}
+
 /// 🔤🏷️ `method` and `request_header` change the upstream request on H3 too.
 ///
 /// Both are request setters, and this repository has shipped two defects where
