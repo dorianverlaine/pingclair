@@ -44,11 +44,23 @@ async fn max_connections_is_enforced_from_the_configuration_file() {
     let mut server = TestServer::new_pingclairfile(config);
     assert!(server.wait_until_ready().await, "server failed to start");
 
-    let mut held = tokio::net::TcpStream::connect(server.address(0))
-        .await
-        .expect("open the held connection");
-    let first = send_get(&mut held, "keep-alive").await;
-    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    // The readiness client may still be dropping its keep-alive connection.
+    // Retry until the one configured slot is actually free; otherwise the
+    // test measures that probe rather than the held connection below.
+    let mut held = None;
+    for _ in 0..100 {
+        let mut stream = tokio::net::TcpStream::connect(server.address(0))
+            .await
+            .expect("open the held connection");
+        let first = send_get(&mut stream, "keep-alive").await;
+        if first.starts_with("HTTP/1.1 200") {
+            held = Some(stream);
+            break;
+        }
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let held = held.expect("the configured slot never became available");
 
     let mut rejected = tokio::net::TcpStream::connect(server.address(0))
         .await
@@ -62,11 +74,17 @@ async fn max_connections_is_enforced_from_the_configuration_file() {
     let _ = tokio::time::timeout(Duration::from_secs(2), rejected.read_to_end(&mut tail)).await;
 
     drop(held);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut next = tokio::net::TcpStream::connect(server.address(0))
-        .await
-        .expect("connect after releasing the slot");
-    let third = send_get(&mut next, "close").await;
+    let mut third = String::new();
+    for _ in 0..100 {
+        let mut next = tokio::net::TcpStream::connect(server.address(0))
+            .await
+            .expect("connect after releasing the slot");
+        third = send_get(&mut next, "close").await;
+        if third.starts_with("HTTP/1.1 200") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(
         third.starts_with("HTTP/1.1 200"),
         "the released slot must admit the next connection: {third}"

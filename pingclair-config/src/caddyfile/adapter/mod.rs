@@ -116,6 +116,12 @@ pub enum AdapterError {
 
     #[error("Recursive snippet import detected: '{0}'")]
     RecursiveSnippet(String),
+
+    #[error("Undefined named route '{0}'")]
+    UndefinedNamedRoute(String),
+
+    #[error("Recursive named route invocation detected: '{0}'")]
+    RecursiveNamedRoute(String),
 }
 
 /// 🔢 Renders the argument-count refusal with the noun agreeing with the
@@ -159,6 +165,67 @@ pub(crate) fn collect_snippets(
     }
 
     Ok((snippets, remaining))
+}
+
+/// 🏷️ Named routes defined at top level as `&(name) { … }`.
+pub(crate) type NamedRouteMap = std::collections::HashMap<String, Vec<Directive>>;
+
+/// 🏷️ Removes `&(name) { … }` definitions from the top-level stream.
+fn collect_named_routes(
+    directives: Vec<Directive>,
+) -> Result<(NamedRouteMap, Vec<Directive>), AdapterError> {
+    let mut named = NamedRouteMap::new();
+    let mut remaining = Vec::new();
+    for d in directives {
+        if d.name.starts_with("&(") && d.name.ends_with(')') {
+            let name = d.name[2..d.name.len() - 1].to_string();
+            let body = d.block.map(|block| block.directives).unwrap_or_default();
+            named.insert(name, body);
+        } else {
+            remaining.push(d);
+        }
+    }
+    Ok((named, remaining))
+}
+
+/// 🔁 Replaces every `invoke name` with the named route's directives.
+fn expand_named_routes(
+    directives: Vec<Directive>,
+    named: &NamedRouteMap,
+    stack: &mut Vec<String>,
+) -> Result<Vec<Directive>, AdapterError> {
+    let mut expanded = Vec::new();
+    for mut directive in directives {
+        if directive.name == "invoke" {
+            if directive.block.is_some() {
+                return Err(AdapterError::BlockNotAllowed("invoke".into()));
+            }
+            let [name] = directive.args.as_slice() else {
+                return Err(AdapterError::ArgumentCount(
+                    "invoke".into(),
+                    1,
+                    directive.args.len(),
+                ));
+            };
+            if stack.iter().any(|active| active == name) {
+                return Err(AdapterError::RecursiveNamedRoute(name.clone()));
+            }
+            let Some(body) = named.get(name) else {
+                return Err(AdapterError::UndefinedNamedRoute(name.clone()));
+            };
+            stack.push(name.clone());
+            let replacement = expand_named_routes(body.clone(), named, stack)?;
+            stack.pop();
+            expanded.extend(replacement);
+            continue;
+        }
+        if let Some(block) = directive.block.as_mut() {
+            block.directives =
+                expand_named_routes(std::mem::take(&mut block.directives), named, stack)?;
+        }
+        expanded.push(directive);
+    }
+    Ok(expanded)
 }
 
 // MARK: - Main Adapter (Pass 2)
@@ -264,13 +331,15 @@ pub fn adapt_from(
     base: Option<&std::path::Path>,
 ) -> Result<Ast, AdapterError> {
     // Pass 1: Snippet collection + import expansion
+    let (named, directives) = collect_named_routes(directives)?;
     let (mut snippets, remaining) = collect_snippets(directives)?;
     // 📦 Snippets, files, globs, arguments and cycle detection all live in
     // `self::imports` now; the old expansion only knew about snippets, so
     // `import ./part.conf` failed with "undefined snippet" — a message about the
     // wrong concept entirely.
     let mut context = self::imports::ImportContext::new(base);
-    let expanded = self::imports::expand(remaining, &mut snippets, &mut context)?;
+    let mut expanded = self::imports::expand(remaining, &mut snippets, &mut context)?;
+    expanded = expand_named_routes(expanded, &named, &mut Vec::new())?;
     let expanded = coalesce_bare_single_site(expanded)?;
 
     // Pass 2: Convert to typed AST

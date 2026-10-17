@@ -730,6 +730,15 @@ pub enum Handler {
     /// 🧰 Sets request-scoped variables (`vars` handler).
     Vars(VarsConfig),
 
+    /// 🔤 Derives request variables from one source value (`map`).
+    Map(pingclair_core::config::MapConfig),
+
+    /// 🔇 Adds one field to the access-log entry (`log_append`).
+    LogAppend(pingclair_core::config::LogAppendConfig),
+
+    /// 🏷️ Selects named loggers for this request (`log_name`).
+    LogName(Vec<String>),
+
     /// Multiple matcher-guarded elements (pipeline, file order preserved)
     Pipeline(Vec<HandlerElement>),
 

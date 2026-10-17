@@ -364,6 +364,12 @@ pub fn execute_handler(config: &HandlerConfig, headers: &http::HeaderMap) -> Han
 
         HandlerConfig::LogSkip => Ok(HandlerResponse::status(200)),
         HandlerConfig::Vars { .. } => Ok(HandlerResponse::status(200)),
+        // 🔤 Map writes request variables in the transports, where placeholders
+        // and the request itself are available.
+        HandlerConfig::Map(_) => Ok(HandlerResponse::status(200)),
+        HandlerConfig::LogAppend(_) | HandlerConfig::LogName { .. } => {
+            Ok(HandlerResponse::status(200))
+        }
 
         // 🧭 These three act on the request or the connection, and this
         // function only builds a response out of a handler. The transports

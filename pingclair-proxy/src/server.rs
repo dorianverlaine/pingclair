@@ -628,6 +628,8 @@ pub struct ProxyState {
     proxy_lookup: HashMap<usize, usize>,
     /// 🧭 Slot indices belonging to each route, in handler order.
     pub(crate) route_proxy_slots: Vec<Vec<usize>>,
+    /// 🔤 Compiled `map` handlers, keyed by their configuration address.
+    map_plans: HashMap<usize, Arc<MapPlan>>,
     /// 🧭 Per-route dial templates with request placeholders, parallel to
     /// `load_balancers`; `None` means the route dials only static peers.
     pub dynamic_dials: Vec<Option<Arc<DynamicDialPlan>>>,
@@ -725,6 +727,56 @@ pub(crate) struct ProxySlot {
     pub(crate) buffering: RouteBuffering,
 }
 
+/// 🔤 One compiled `map` handler.
+pub(crate) struct MapPlan {
+    source: pingclair_core::config::ConfigText,
+    destinations: Vec<String>,
+    mappings: Vec<MapMappingPlan>,
+    defaults: Vec<String>,
+}
+
+struct MapMappingPlan {
+    input: Option<String>,
+    regex: Option<Regex>,
+    outputs: Vec<Option<String>>,
+}
+
+impl MapPlan {
+    fn new(config: &pingclair_core::config::MapConfig) -> Result<Self, regex::Error> {
+        let mappings = config
+            .mappings
+            .iter()
+            .map(|mapping| {
+                Ok(MapMappingPlan {
+                    input: mapping.input.clone(),
+                    regex: mapping
+                        .input_regex
+                        .as_ref()
+                        .map(|pattern| Regex::new(pattern))
+                        .transpose()?,
+                    outputs: mapping.outputs.clone(),
+                })
+            })
+            .collect::<Result<_, regex::Error>>()?;
+        Ok(Self {
+            source: config.source.clone().into(),
+            destinations: config
+                .destinations
+                .iter()
+                .map(|destination| {
+                    destination
+                        .strip_prefix('{')
+                        .and_then(|value| value.strip_suffix('}'))
+                        .unwrap_or(destination)
+                        .to_string()
+                })
+                .collect(),
+            mappings,
+            defaults: config.defaults.clone(),
+        })
+    }
+}
+
 impl ProxyState {
     /// 🪵 The access-log destinations this server can reach, for the HTTP/3
     /// path, which builds its record outside this module.
@@ -778,6 +830,15 @@ impl ProxyState {
     /// 🧱 The buffering policy belonging to one proxy slot.
     pub(crate) fn proxy_buffering_at(&self, proxy_index: usize) -> Option<RouteBuffering> {
         self.proxy_slots.get(proxy_index).map(|slot| slot.buffering)
+    }
+
+    /// 🔤 The compiled plan for a `map` handler the request reached.
+    pub(crate) fn map_plan_for(
+        &self,
+        config: &pingclair_core::config::MapConfig,
+    ) -> Option<&Arc<MapPlan>> {
+        self.map_plans
+            .get(&(config as *const pingclair_core::config::MapConfig as usize))
     }
 }
 
@@ -1234,6 +1295,13 @@ impl ProxyState {
         });
         let router = Router::new(config.routes.clone());
         let error_routes = crate::error_routes::prepare(&config);
+        let mut map_plans = HashMap::new();
+        for route in &config.routes {
+            collect_map_plans(&route.handler, &mut map_plans);
+        }
+        for prepared in error_routes.iter() {
+            collect_map_plans(&prepared.pipeline, &mut map_plans);
+        }
         let vars_precompiles = config
             .vars_routes
             .iter()
@@ -1702,7 +1770,8 @@ impl ProxyState {
             target_entries.push((Vec::new(), channel.clone()));
         }
         target_entries.extend(named_targets);
-        let log_targets = pingclair_runtime::access_log::LogTargets::new(target_entries);
+        let log_targets = pingclair_runtime::access_log::LogTargets::new(target_entries)
+            .with_named(named_loggers.into_iter().collect());
         let strict_transport = crate::http_policy::StrictTransport::from_security(&config.security);
         let cache_scopes = Arc::new(crate::cache_key::route_scopes(&config, |route| {
             find_reverse_proxy_config(&route.handler).is_some_and(|proxy| proxy.cache.is_some())
@@ -1730,6 +1799,7 @@ impl ProxyState {
             proxy_slots,
             proxy_lookup,
             route_proxy_slots,
+            map_plans,
             dynamic_dials,
             subrequests,
             health_checkers,
@@ -5766,6 +5836,36 @@ impl PingclairProxy {
                 }
                 Ok(false)
             }
+            HandlerConfig::Map(config) => {
+                let plan = ctx
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.map_plan_for(config))
+                    .cloned()
+                    .ok_or_else(|| {
+                        pingora_core::Error::explain(
+                            pingora_core::ErrorType::InternalError,
+                            "map handler was not compiled at load",
+                        )
+                    })?;
+                let verified_client_ip = ctx.verified_client_ip.map(|ip| ip.to_string());
+                apply_map(
+                    &plan,
+                    session.req_header(),
+                    verified_client_ip.as_deref(),
+                    ctx.request_scheme,
+                    &mut ctx.request_vars,
+                );
+                Ok(false)
+            }
+            HandlerConfig::LogAppend(config) => {
+                ctx.request_vars.append_log_field(config.clone());
+                Ok(false)
+            }
+            HandlerConfig::LogName { names } => {
+                ctx.request_vars.set_log_names(names);
+                Ok(false)
+            }
             HandlerConfig::Intercept { handlers } => {
                 // 🧭 Registers response handlers for the response of later
                 // handlers in this request. Local, proxied, and FastCGI
@@ -6380,6 +6480,75 @@ pub(crate) fn resolve_caddy_placeholders<'a, T: crate::config_text::TextInput + 
     }
 
     std::borrow::Cow::Owned(result)
+}
+
+/// 🔤 Applies one compiled `map` handler to the request variables.
+pub(crate) fn apply_map(
+    plan: &MapPlan,
+    request: &RequestHeader,
+    verified_client_ip: Option<&str>,
+    scheme: &'static str,
+    vars: &mut crate::http_policy::RequestVars,
+) {
+    let source =
+        resolve_caddy_placeholders(&plan.source, request, verified_client_ip, scheme, vars)
+            .into_owned();
+    for (index, destination) in plan.destinations.iter().enumerate() {
+        let mut resolved = None;
+        for mapping in &plan.mappings {
+            let captures = match (&mapping.regex, &mapping.input) {
+                (Some(regex), _) => regex.captures(&source),
+                (None, Some(input)) if input == &source => None,
+                (None, Some(_)) | (None, None) => continue,
+            };
+            let matched = match (&mapping.regex, &mapping.input) {
+                (Some(_), _) => captures.is_some(),
+                (None, Some(input)) => input == &source,
+                (None, None) => false,
+            };
+            if !matched {
+                continue;
+            }
+            let Some(Some(output)) = mapping.outputs.get(index) else {
+                // Caddy's `-` means "this destination is not mapped by this
+                // row"; a later row may still supply it.
+                continue;
+            };
+            let expanded = if let Some(captures) = captures {
+                let mut expanded = String::new();
+                captures.expand(output, &mut expanded);
+                expanded
+            } else {
+                output.clone()
+            };
+            resolved = Some(
+                resolve_caddy_placeholders(
+                    &pingclair_core::config::ConfigText::from(expanded),
+                    request,
+                    verified_client_ip,
+                    scheme,
+                    vars,
+                )
+                .into_owned(),
+            );
+            break;
+        }
+        let value = resolved.or_else(|| {
+            plan.defaults.get(index).map(|default| {
+                resolve_caddy_placeholders(
+                    &pingclair_core::config::ConfigText::from(default.clone()),
+                    request,
+                    verified_client_ip,
+                    scheme,
+                    vars,
+                )
+                .into_owned()
+            })
+        });
+        if let Some(value) = value {
+            vars.set(destination.clone(), value);
+        }
+    }
 }
 
 /// 💬 One typed source, resolved through the placeholder lookups.
@@ -9792,8 +9961,13 @@ impl ProxyHttp for PingclairProxy {
         // list. Only when the server configured nothing at all do we fall back
         // to the process-wide tracing output.
         if let Some(state) = ctx.state.as_ref() {
-            let mut selected = state.log_targets.select(host).peekable();
-            if selected.peek().is_none() {
+            let log_names = ctx.request_vars.log_names();
+            let selected: Vec<_> = if log_names.is_empty() {
+                state.log_targets.select(host).collect()
+            } else {
+                state.log_targets.select_named(log_names).collect()
+            };
+            if selected.is_empty() {
                 // 🪵 No configured destination matched this host, so preserve
                 // the process-wide tracing fallback below.
             } else {
@@ -9846,6 +10020,31 @@ impl ProxyHttp for PingclairProxy {
                 } else {
                     (None, None)
                 };
+                // 🔇 Resolve `log_append` fields against the finished request
+                // and its variables, so a value can name a variable written by
+                // a later handler.
+                let mut extra = Vec::new();
+                for append in ctx.request_vars.log_appends() {
+                    let value = if append.value.starts_with('{')
+                        && append.value.ends_with('}')
+                        && append.value.matches('{').count() == 1
+                    {
+                        resolve_caddy_placeholders(
+                            &pingclair_core::config::ConfigText::from(append.value.clone()),
+                            req_header,
+                            ctx.verified_client_ip.map(|ip| ip.to_string()).as_deref(),
+                            ctx.request_scheme,
+                            &ctx.request_vars,
+                        )
+                        .into_owned()
+                    } else {
+                        ctx.request_vars
+                            .get(&append.value)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| append.value.clone())
+                    };
+                    extra.push((append.key.clone(), value));
+                }
 
                 let entry = pingclair_runtime::access_log::AccessEntry {
                     request_headers: Some(logged_request_headers),
@@ -9888,6 +10087,7 @@ impl ProxyHttp for PingclairProxy {
                         _ => "-",
                     },
                     error: error_text.as_deref(),
+                    extra: &extra,
                 };
 
                 // 🪵 One borrowed entry is formatted separately per destination,
@@ -9991,6 +10191,46 @@ fn collect_reverse_proxies<'a>(handler: &'a HandlerConfig, out: &mut Vec<&'a Rev
                 collect_reverse_proxies(&element.handler, out);
             }
         }
+        _ => {}
+    }
+}
+
+/// 🔤 Collects and compiles every `map` handler in one tree.
+fn collect_map_plans(handler: &HandlerConfig, out: &mut HashMap<usize, Arc<MapPlan>>) {
+    match handler {
+        HandlerConfig::Map(config) => match MapPlan::new(config) {
+            Ok(plan) => {
+                out.insert(
+                    config as *const pingclair_core::config::MapConfig as usize,
+                    Arc::new(plan),
+                );
+            }
+            // 🚫 Validation rejects an invalid regex before this point. A
+            // failure here is a wiring bug; the error is reported at load and
+            // the plan is skipped rather than compiled per request.
+            Err(error) => tracing::error!(
+                %error,
+                "🚫 A map handler reached the runtime with an invalid regular expression"
+            ),
+        },
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::FirstMatch { handlers }
+        | HandlerConfig::HandlePath { handlers, .. } => {
+            for element in handlers {
+                collect_map_plans(&element.handler, out);
+            }
+        }
+        HandlerConfig::HandleErrors { errors } => {
+            for handlers in errors.values() {
+                for handler in handlers {
+                    collect_map_plans(handler, out);
+                }
+            }
+        }
+        HandlerConfig::TryFiles {
+            fallback: Some(fallback),
+            ..
+        } => collect_map_plans(fallback, out),
         _ => {}
     }
 }

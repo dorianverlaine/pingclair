@@ -4190,6 +4190,49 @@ mod p3_syntax_tests {
         }
     }
 
+    /// 🏷️ `&(name)` defines a route that `invoke name` expands in place.
+    #[test]
+    fn invoke_expands_a_named_route() {
+        let config = compile(
+            "&(common) {\n\t@api path /api/*\n\theader X-Shared yes\n}\n\
+             example.com {\n\tinvoke common\n\trespond \"ok\"\n}\n",
+        )
+        .expect("the named route compiles");
+        let route = &config.servers[0].routes[0];
+        match &route.handler {
+            HandlerConfig::Pipeline { handlers } => {
+                assert!(
+                    handlers
+                        .iter()
+                        .any(|element| matches!(&element.handler, HandlerConfig::Headers { .. }))
+                );
+                assert!(
+                    handlers
+                        .iter()
+                        .any(|element| matches!(&element.handler, HandlerConfig::Respond { .. }))
+                );
+            }
+            other => panic!("expected an expanded pipeline, got {other:?}"),
+        }
+    }
+
+    /// 🚫 An unknown or recursive named route is refused instead of ignored.
+    #[test]
+    fn invoke_refuses_unknown_and_recursive_names() {
+        let unknown = compile("example.com {\n\tinvoke missing\n}\n")
+            .expect_err("an unknown named route must fail")
+            .to_string();
+        assert!(unknown.contains("Undefined named route"), "{unknown}");
+
+        let recursive = compile(
+            "&(a) {\n\tinvoke b\n}\n&(b) {\n\tinvoke a\n}\n\
+             example.com {\n\tinvoke a\n}\n",
+        )
+        .expect_err("a recursive named route must fail")
+        .to_string();
+        assert!(recursive.contains("Recursive named route"), "{recursive}");
+    }
+
     #[test]
     fn shorthand_cannot_mix_with_braced_sites() {
         let error = compile("localhost\n\nrespond \"x\"\nexample.com {\n    respond \"y\"\n}")
@@ -4202,6 +4245,61 @@ mod p3_syntax_tests {
                 && error.to_string().contains("{ }"),
             "got {error}"
         );
+    }
+
+    /// 🔤 `map` parses literal and regex rows into one request-variable plan.
+    #[test]
+    fn map_parses_literal_regex_and_defaults() {
+        let config = compile(
+            "example.com {\n\
+             \tmap {host} {mapped} {backup} {\n\
+             \t\texample.com literal -\n\
+             \t\t~^api\\.(.*)$ api-$1 fallback\n\
+             \t\tdefault default-a default-b\n\
+             \t}\n\
+             \trespond \"{http.vars.mapped}\"\n\
+             }\n",
+        )
+        .expect("map compiles");
+        let handler = &config.servers[0].routes[0].handler;
+        let map = find_map(handler).expect("the map handler survives adaptation");
+        assert_eq!(map.source, "{host}");
+        assert_eq!(map.destinations, ["mapped", "backup"]);
+        assert_eq!(map.mappings.len(), 2);
+        assert_eq!(map.mappings[0].input.as_deref(), Some("example.com"));
+        assert_eq!(map.mappings[1].input_regex.as_deref(), Some("^api\\.(.*)$"));
+        assert_eq!(map.defaults, ["default-a", "default-b"]);
+    }
+
+    /// 🚫 A malformed map is refused at load, not at the first request.
+    #[test]
+    fn map_refuses_invalid_rows_and_placeholders() {
+        for source in [
+            "example.com {\n map {host} {mapped} {\n ~[ bad\n }\n}\n",
+            "example.com {\n map {host} {mapped} {\n a one\n a two\n }\n}\n",
+            "example.com {\n map {host} not-a-placeholder {\n a one\n }\n}\n",
+            "example.com {\n map {host} {mapped} {\n a one two\n }\n}\n",
+        ] {
+            let error = compile(source)
+                .expect_err("an invalid map must not compile")
+                .to_string();
+            assert!(
+                error.contains("map"),
+                "the refusal must name the directive: {error}"
+            );
+        }
+    }
+
+    fn find_map(handler: &HandlerConfig) -> Option<&pingclair_core::config::MapConfig> {
+        match handler {
+            HandlerConfig::Map(config) => Some(config),
+            HandlerConfig::Pipeline { handlers }
+            | HandlerConfig::FirstMatch { handlers }
+            | HandlerConfig::HandlePath { handlers, .. } => handlers
+                .iter()
+                .find_map(|element| find_map(&element.handler)),
+            _ => None,
+        }
     }
 
     /// 🪪 A top-level TLS option is named as one, not as a second site.

@@ -304,6 +304,9 @@ Important boundaries include:
   instances do not share one distributed certificate store.
 - Pingclair is an HTTP server and reverse proxy. It does not provide generic
   `CONNECT` tunnels or advertise extended CONNECT support.
+- HTTP/2 server push (`push`) is a deliberate non-goal: major browsers have
+  removed support for it, so the directive is refused rather than accepted
+  and ignored.
 - Request trailers are not forwarded to an upstream. Applications that depend
   on request trailers should not be placed behind this release.
 

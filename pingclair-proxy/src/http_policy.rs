@@ -8,7 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http::{HeaderMap, Method};
-use pingclair_core::config::{ConfigText, HandlerConfig, ResponseHandlerConfig, ResponseMatcher};
+use pingclair_core::config::{
+    ConfigText, HandlerConfig, LogAppendConfig, ResponseHandlerConfig, ResponseMatcher,
+};
 use pingora_core::Result as PingoraResult;
 use pingora_http::RequestHeader;
 use pingora_http::ResponseHeader;
@@ -42,6 +44,10 @@ pub(crate) fn respond_status(status: Option<u16>, error_status: Option<u16>) -> 
 #[derive(Debug, Clone, Default)]
 pub struct RequestVars {
     values: BTreeMap<String, String>,
+    /// 🔇 `log_append` fields, resolved when the access record is built.
+    log_appends: Vec<LogAppendConfig>,
+    /// 🏷️ `log_name` overrides for this request.
+    log_names: Vec<String>,
     /// 🔌 The connection's immediate peer, which `{remote_host}`,
     /// `{remote_port}` and `{remote}` report. It rides here because every
     /// placeholder expansion already receives this struct on both transports,
@@ -107,6 +113,27 @@ impl RequestVars {
         self.set("err.status_code", status.to_string());
         self.set("err.status_text", status_text.to_string());
         self.set("err.message", message.unwrap_or("").to_string());
+    }
+
+    /// 🔇 Records one access-log field append for the final record.
+    pub(crate) fn append_log_field(&mut self, config: LogAppendConfig) {
+        self.log_appends.push(config);
+    }
+
+    /// 🔇 The configured appends, in handler order.
+    pub(crate) fn log_appends(&self) -> &[LogAppendConfig] {
+        &self.log_appends
+    }
+
+    /// 🏷️ Replaces the request's named-logger selection.
+    pub(crate) fn set_log_names(&mut self, names: &[String]) {
+        self.log_names.clear();
+        self.log_names.extend(names.iter().cloned());
+    }
+
+    /// 🏷️ The selected named loggers, if any.
+    pub(crate) fn log_names(&self) -> &[String] {
+        &self.log_names
     }
 }
 
@@ -248,6 +275,9 @@ pub fn evaluate_response_handlers(
             // has to be thought about here instead of silently doing nothing.
             HandlerConfig::RequestHeaders { .. }
             | HandlerConfig::RequestBody { .. }
+            | HandlerConfig::Map(_)
+            | HandlerConfig::LogAppend(_)
+            | HandlerConfig::LogName { .. }
             | HandlerConfig::Abort => {}
             HandlerConfig::CopyResponseHeaders { include, exclude } => {
                 copied = collect_copied_headers(upstream_headers, include, exclude);

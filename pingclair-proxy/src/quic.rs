@@ -3328,6 +3328,28 @@ async fn plan_h3_handler_with_connector(
             }
             Ok(H3Plan::Continue)
         }
+        HandlerConfig::Map(config) => {
+            let plan = state
+                .map_plan_for(config)
+                .cloned()
+                .ok_or((500, "Map Handler Was Not Prepared"))?;
+            crate::server::apply_map(
+                &plan,
+                request_header,
+                Some(verified_client_ip),
+                "https",
+                request_vars,
+            );
+            Ok(H3Plan::Continue)
+        }
+        HandlerConfig::LogAppend(config) => {
+            request_vars.append_log_field(config.clone());
+            Ok(H3Plan::Continue)
+        }
+        HandlerConfig::LogName { names } => {
+            request_vars.set_log_names(names);
+            Ok(H3Plan::Continue)
+        }
         HandlerConfig::Rewrite {
             strip_prefix,
             strip_suffix,
@@ -3812,6 +3834,7 @@ async fn handle_request(
     let mut error_state = None;
     let mut matched_route = None;
     let mut response_policy = ResponseHeaderPolicy::default();
+    let mut request_vars = crate::http_policy::RequestVars::default();
     let result = run_until_request_cancelled(
         &mut cancel_rx,
         handle_request_inner(
@@ -3829,6 +3852,7 @@ async fn handle_request(
             &mut error_state,
             &mut matched_route,
             &mut response_policy,
+            &mut request_vars,
         ),
     )
     .await;
@@ -3886,6 +3910,9 @@ async fn handle_request(
     };
 
     if let Some(state) = error_state.as_ref() {
+        let log_header = http::Method::from_bytes(req.method.as_bytes())
+            .ok()
+            .and_then(|method| h3_request_header(&req, method).ok());
         write_h3_access_log(
             state,
             &req,
@@ -3895,6 +3922,8 @@ async fn handle_request(
             &resp_tx,
             request_started,
             error_text,
+            &request_vars,
+            log_header.as_ref(),
         );
     }
 }
@@ -3916,10 +3945,17 @@ fn write_h3_access_log(
     sink: &ResponseSink,
     request_started: Instant,
     error: Option<&str>,
+    request_vars: &crate::http_policy::RequestVars,
+    request_header: Option<&RequestHeader>,
 ) {
     let host = authority_host(&req.authority);
-    let mut destinations = state.log_targets().select(host).peekable();
-    if destinations.peek().is_none() {
+    let log_names = request_vars.log_names();
+    let destinations: Vec<_> = if log_names.is_empty() {
+        state.log_targets().select(host).collect()
+    } else {
+        state.log_targets().select_named(log_names).collect()
+    };
+    if destinations.is_empty() {
         return;
     }
 
@@ -3936,6 +3972,33 @@ fn write_h3_access_log(
             .unwrap_or("")
     };
     let redacted_referer = pingclair_runtime::redaction::redact_referer(header("referer"));
+    let mut extra = Vec::new();
+    let verified_ip = remote_ip.to_string();
+    for append in request_vars.log_appends() {
+        let value = if append.value.starts_with('{')
+            && append.value.ends_with('}')
+            && append.value.matches('{').count() == 1
+        {
+            request_header
+                .map(|request_header| {
+                    resolve_caddy_placeholders(
+                        &pingclair_core::config::ConfigText::from(append.value.clone()),
+                        request_header,
+                        Some(verified_ip.as_str()),
+                        "https",
+                        request_vars,
+                    )
+                    .into_owned()
+                })
+                .unwrap_or_else(|| append.value.clone())
+        } else {
+            request_vars
+                .get(&append.value)
+                .map(str::to_owned)
+                .unwrap_or_else(|| append.value.clone())
+        };
+        extra.push((append.key.clone(), value));
+    }
     let route = matched_route
         .and_then(|index| state.config.routes.get(index))
         .map(|route| route.path.as_str());
@@ -3965,6 +4028,7 @@ fn write_h3_access_log(
         referer: redacted_referer.as_ref(),
         protocol: "HTTP/3",
         error,
+        extra: &extra,
         // 🏷️ Header capture and TLS details are H1/H2-only for now; naming them
         // here with empty values would claim a parity this does not have.
         request_headers: None,
@@ -4020,6 +4084,7 @@ async fn handle_request_inner(
     // H1/H2 record does. Stays `None` when nothing matched.
     matched_route: &mut Option<usize>,
     response_policy: &mut ResponseHeaderPolicy,
+    request_vars: &mut crate::http_policy::RequestVars,
 ) -> Result<(), HandlerError> {
     let request_started = Instant::now();
     // 🧭 Builds one Pingora header map for routing and placeholder resolution.
@@ -4048,7 +4113,6 @@ async fn handle_request_inner(
     // 🧭 Routes through the shared matcher used by the H1 and H2 path. The
     // state is resolved by host first so site-level `vars` rules can run
     // before route matching, exactly as they do on H1/H2.
-    let mut request_vars = crate::http_policy::RequestVars::default();
     // 🔌 `{remote_host}` and friends name the QUIC peer, as on H1/H2.
     request_vars.set_remote(std::net::SocketAddr::new(peer_address, peer_port));
     let (state, route_index) = {
@@ -4142,7 +4206,7 @@ async fn handle_request_inner(
                         &header,
                         Some(&verified_client_ip_text),
                         "https",
-                        &request_vars,
+                        request_vars,
                     );
                     request_vars.set(name.clone(), resolved.into_owned());
                 }
@@ -4308,7 +4372,7 @@ async fn handle_request_inner(
                 &verified_client_ip_text,
                 addresses,
                 None,
-                &mut request_vars,
+                request_vars,
                 &mut response_handlers,
             )
             .await?
@@ -4326,7 +4390,7 @@ async fn handle_request_inner(
                 addresses,
                 route_precompile,
                 None,
-                &mut request_vars,
+                request_vars,
                 &mut response_handlers,
                 &mut body_plan,
             )
@@ -4371,7 +4435,7 @@ async fn handle_request_inner(
             &header,
             Some(&verified_client_ip_text),
             "https",
-            &request_vars,
+            request_vars,
         );
         let (tx, rx) = mpsc::channel::<Bytes>(1);
         // 🔔 Capacity 1 holds exactly the one chunk, so this cannot block, and
@@ -4402,7 +4466,7 @@ async fn handle_request_inner(
                 &header,
                 &effective_uri,
                 &verified_client_ip_text,
-                &request_vars,
+                request_vars,
                 response_handlers.as_deref(),
             )
             .await?;
@@ -4480,7 +4544,7 @@ async fn handle_request_inner(
                         &header,
                         &effective_uri,
                         &verified_client_ip_text,
-                        &request_vars,
+                        request_vars,
                         response_handlers.as_deref(),
                         status,
                         hdrs,
@@ -4505,7 +4569,7 @@ async fn handle_request_inner(
                         &header,
                         &effective_uri,
                         &verified_client_ip_text,
-                        &request_vars,
+                        request_vars,
                         response_handlers.as_deref(),
                         code,
                         hdrs,
@@ -4557,7 +4621,7 @@ async fn handle_request_inner(
                         &header,
                         &effective_uri,
                         &verified_client_ip_text,
-                        &request_vars,
+                        request_vars,
                         response_handlers.as_deref(),
                         200,
                         hdrs,
@@ -4654,7 +4718,7 @@ async fn handle_request_inner(
                                 &header,
                                 &effective_uri,
                                 &verified_client_ip_text,
-                                &request_vars,
+                                request_vars,
                                 response_handlers.as_deref(),
                                 304,
                                 hdrs,
@@ -4677,7 +4741,7 @@ async fn handle_request_inner(
                                 &header,
                                 &effective_uri,
                                 &verified_client_ip_text,
-                                &request_vars,
+                                request_vars,
                                 response_handlers.as_deref(),
                                 405,
                                 hdrs,
@@ -4711,7 +4775,7 @@ async fn handle_request_inner(
                                 &header,
                                 &effective_uri,
                                 &verified_client_ip_text,
-                                &request_vars,
+                                request_vars,
                                 response_handlers.as_deref(),
                                 406,
                                 hdrs,
@@ -4733,7 +4797,7 @@ async fn handle_request_inner(
                                 &header,
                                 &effective_uri,
                                 &verified_client_ip_text,
-                                &request_vars,
+                                request_vars,
                                 response_handlers.as_deref(),
                                 412,
                                 http::HeaderMap::new(),
@@ -4757,7 +4821,7 @@ async fn handle_request_inner(
                                 &header,
                                 &effective_uri,
                                 &verified_client_ip_text,
-                                &request_vars,
+                                request_vars,
                                 response_handlers.as_deref(),
                                 308,
                                 hdrs,
@@ -4807,7 +4871,7 @@ async fn handle_request_inner(
                                 &header,
                                 &effective_uri,
                                 &verified_client_ip_text,
-                                &request_vars,
+                                request_vars,
                                 response_handlers.as_deref(),
                                 stream_status,
                                 hdrs,
@@ -4854,7 +4918,7 @@ async fn handle_request_inner(
                                 &header,
                                 &effective_uri,
                                 &verified_client_ip_text,
-                                &request_vars,
+                                request_vars,
                                 response_handlers.as_deref(),
                                 status_for(file.status),
                                 hdrs,
@@ -4889,7 +4953,7 @@ async fn handle_request_inner(
                                 &header,
                                 &effective_uri,
                                 &verified_client_ip_text,
-                                &request_vars,
+                                request_vars,
                                 response_handlers.as_deref(),
                                 404,
                                 hdrs,
@@ -4918,7 +4982,7 @@ async fn handle_request_inner(
                         &header,
                         &effective_uri,
                         &verified_client_ip_text,
-                        &request_vars,
+                        request_vars,
                         response_handlers.as_deref(),
                         response_policy,
                         request_id,
@@ -4951,7 +5015,7 @@ async fn handle_request_inner(
                         resp_tx,
                         body_notify,
                         request_started,
-                        &request_vars,
+                        request_vars,
                         response_handlers.as_deref(),
                     )
                     .await
@@ -4976,7 +5040,7 @@ async fn handle_request_inner(
                         resp_tx,
                         body_notify,
                         request_started,
-                        &request_vars,
+                        request_vars,
                         response_handlers.as_deref(),
                     )
                     .await
@@ -5004,7 +5068,7 @@ async fn handle_request_inner(
             &verified_client_ip_text,
             addresses,
             None,
-            &mut request_vars,
+            request_vars,
             &mut response_handlers,
         )
         .await?;
@@ -5021,7 +5085,7 @@ async fn handle_request_inner(
                     &header,
                     &effective_uri,
                     &verified_client_ip_text,
-                    &request_vars,
+                    request_vars,
                     None,
                 )
                 .await?;

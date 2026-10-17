@@ -954,6 +954,39 @@ async fn h3_header_replace_rewrites_an_upstream_value() {
     backend_task.await.unwrap();
 }
 
+/// 🔤 `map` variables reach later H3 handlers exactly as they do on H1/H2.
+#[tokio::test]
+async fn h3_map_values_reach_later_handlers() {
+    let source = r#":443 {
+        map {http.request.uri.path} {mapped} {
+            /one first
+            ~^/api/(.*)$ api-$1
+            default none
+        }
+        header X-Mapped {http.vars.mapped}
+        respond "{http.vars.mapped}"
+    }"#;
+    let config = pingclair_config::compile(source).expect("the map compiles");
+    let handler = config.servers[0].routes[0].handler.clone();
+    let server = spawn_h3_server(handler).await;
+
+    for (path, expected) in [
+        ("/one", "first"),
+        ("/api/users", "api-users"),
+        ("/other", "none"),
+    ] {
+        let response = h3_get(server, path).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, expected.as_bytes());
+        let mapped = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-mapped"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(mapped, Some(expected), "H3 map header on {path}");
+    }
+}
+
 /// 🏷️ A `header` shared by a `route` reaches both proxy branches on H3.
 ///
 /// The H1/H2 and H3 paths now key pools by the reverse proxy that the branch
@@ -1836,6 +1869,60 @@ async fn h3_access_log_records_the_requested_path_after_a_rewrite() {
     assert!(
         !recorded.contains("\"path\":\"/rewritten\""),
         "the rewritten path must not replace the request: {recorded:?}"
+    );
+}
+
+/// 🔇 `log_append` and `log_name` work on HTTP/3 too.
+#[tokio::test]
+async fn h3_log_append_and_log_name_reach_the_selected_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let audit = dir.path().join("audit.log");
+    let other = dir.path().join("other.log");
+    let source = format!(
+        r#"h3.pingclair.test {{
+            log audit {{
+                output file {}
+                format json
+            }}
+            log other {{
+                output file {}
+                format json
+            }}
+            log_append trace {{path}}
+            log_name audit
+            respond "ok"
+        }}"#,
+        audit.display(),
+        other.display()
+    );
+    let compiled = pingclair_config::compile(&source).expect("the log block compiles");
+    let template = compiled.servers[0].clone();
+    let server = spawn_h3_server_with(move |address| ServerConfig {
+        listen: vec![address.to_string()],
+        ..template
+    })
+    .await;
+
+    let response = h3_get(server, "/logged").await.unwrap();
+    assert_eq!(response.status, 200);
+
+    let mut recorded = String::new();
+    for _ in 0..50 {
+        recorded = std::fs::read_to_string(&audit).unwrap_or_default();
+        if recorded.contains("\"path\":\"/logged\"") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        recorded.contains("\"trace\":\"/logged\""),
+        "the H3 record must carry the appended field: {recorded:?}"
+    );
+    assert!(
+        std::fs::read_to_string(&other)
+            .unwrap_or_default()
+            .is_empty(),
+        "log_name must select only the named logger"
     );
 }
 

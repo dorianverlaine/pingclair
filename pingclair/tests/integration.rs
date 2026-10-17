@@ -214,6 +214,14 @@ mod listener_errors;
 #[path = "integration/connection_ceiling.rs"]
 mod connection_ceiling;
 
+// 🔤 `map` writes request variables visible to later handlers.
+#[path = "integration/map_variables.rs"]
+mod map_variables;
+
+// 🔇 `log_append` and `log_name` shape and select access records.
+#[path = "integration/access_log_extras.rs"]
+mod access_log_extras;
+
 // 🧱 `request_buffers`/`response_buffers` on the FastCGI transport.
 #[path = "integration/fastcgi_buffering.rs"]
 mod fastcgi_buffering;

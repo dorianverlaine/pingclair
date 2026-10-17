@@ -14,6 +14,15 @@ fact.
 
 ## [Unreleased]
 
+### 🔤 Map, invoke, and access-log fields
+
+`map` derives request-scoped variables from a literal, regular-expression, or
+default table; `&(name)`/`invoke` shares a named route body between sites;
+`log_append` adds request-time fields to the access record; and `log_name`
+selects named loggers for one request. HTTP/2 server push remains a documented
+non-goal. OpenTelemetry tracing is tracked separately so its dependency and
+request-path cost are measured before it ships.
+
 ### 🔀 Each proxy in a `route` block reaches its own upstream
 
 A route kept one upstream pool and one proxy policy, taken from the first

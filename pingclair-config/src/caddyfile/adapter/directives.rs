@@ -326,6 +326,8 @@ pub(super) fn adapt_handler(
         "method" => adapt_method_directive(&d),
         "abort" => adapt_abort_directive(&d),
         "log_skip" => Ok(Handler::LogSkip),
+        "log_append" => adapt_log_append(&d),
+        "log_name" => adapt_log_name(&d),
         "route" => adapt_subroute_block(&d, matchers, order, false),
         "handle" => adapt_subroute_block(&d, matchers, order, true),
         "handle_path" => adapt_handle_path(&d, matchers, order).map(|(_, handler)| handler),
@@ -333,11 +335,21 @@ pub(super) fn adapt_handler(
         "rate_limit" => adapt_rate_limit(d),
         "error" => adapt_error_directive(&d),
         "vars" => adapt_vars_directive(&d),
+        "map" => adapt_map_directive(&d),
         "rewrite" => adapt_rewrite(d),
         "uri" => adapt_uri(d),
         "try_files" => adapt_try_files(d),
         "cors" => adapt_cors(d),
         "access_control" => adapt_access_control(d),
+        // 🚫 Server push is a deliberate non-goal, not a missing feature:
+        // major browsers removed support for it, so accepting the directive
+        // would spend bandwidth on a response nobody can use.
+        "push" => Err(AdapterError::UnsupportedFeature(
+            "push".into(),
+            "HTTP/2 server push is a non-goal because major browsers removed support for it; \
+             serve the asset normally instead"
+                .into(),
+        )),
         // 🚫 A directive that exists in Caddy's standard set but has no
         // implementation here gets a message that says so, instead of being
         // indistinguishable from a typo.
@@ -1468,6 +1480,46 @@ pub(super) fn adapt_error_directive(d: &Directive) -> Result<Handler, AdapterErr
     Ok(Handler::Error(ErrorConfig { status, message }))
 }
 
+/// 🔇 `log_append [<]<key> <value>`.
+fn adapt_log_append(d: &Directive) -> Result<Handler, AdapterError> {
+    if d.block.is_some() {
+        return Err(AdapterError::BlockNotAllowed("log_append".into()));
+    }
+    let [key, value] = d.args.as_slice() else {
+        return Err(AdapterError::ArgumentCount(
+            "log_append".into(),
+            2,
+            d.args.len(),
+        ));
+    };
+    let early = key.starts_with('<') && key.len() > 1;
+    let key = if early { &key[1..] } else { key.as_str() };
+    if key.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            "log_append".into(),
+            "the log field name cannot be empty".into(),
+        ));
+    }
+    Ok(Handler::LogAppend(
+        pingclair_core::config::LogAppendConfig {
+            key: key.to_string(),
+            value: value.clone(),
+            early,
+        },
+    ))
+}
+
+/// 🏷️ `log_name <names...>`.
+fn adapt_log_name(d: &Directive) -> Result<Handler, AdapterError> {
+    if d.block.is_some() {
+        return Err(AdapterError::BlockNotAllowed("log_name".into()));
+    }
+    if d.args.is_empty() {
+        return Err(AdapterError::ArgumentCount("log_name".into(), 1, 0));
+    }
+    Ok(Handler::LogName(d.args.clone()))
+}
+
 // MARK: - vars Directive Adapter
 
 /// Adapt Caddy `vars` directive: an optional inline `<name> <value>` pair,
@@ -1510,6 +1562,132 @@ pub(super) fn adapt_vars_directive(d: &Directive) -> Result<Handler, AdapterErro
     }
 
     Ok(Handler::Vars(VarsConfig { values }))
+}
+
+/// 🔤 `map [<matcher>] <source> <destinations...> { [~]<input> <outputs...> }`
+fn adapt_map_directive(d: &Directive) -> Result<Handler, AdapterError> {
+    let mut args = d.args.iter();
+    let source = args
+        .next()
+        .cloned()
+        .ok_or_else(|| AdapterError::ArgumentCount("map".into(), 2, d.args.len()))?;
+    let destinations: Vec<String> = args
+        .map(|destination| {
+            let name = destination
+                .strip_prefix('{')
+                .and_then(|value| value.strip_suffix('}'))
+                .filter(|name| !name.is_empty() && !name.contains(['{', '}']))
+                .ok_or_else(|| {
+                    AdapterError::InvalidArgument(
+                        "map".into(),
+                        format!(
+                            "destination `{destination}` must be exactly one placeholder, as in `{{my_var}}`"
+                        ),
+                    )
+                })?;
+            Ok(name.to_string())
+        })
+        .collect::<Result<_, AdapterError>>()?;
+    if destinations.is_empty() {
+        return Err(AdapterError::ArgumentCount("map".into(), 2, d.args.len()));
+    }
+    let mut seen_destinations = std::collections::HashSet::new();
+    for destination in &destinations {
+        if !seen_destinations.insert(destination.clone()) {
+            return Err(AdapterError::InvalidArgument(
+                "map".into(),
+                format!("destination `{{{destination}}}` is listed twice"),
+            ));
+        }
+    }
+
+    let mut mappings = Vec::new();
+    let mut defaults = Vec::new();
+    let mut seen_literals = std::collections::HashSet::new();
+    let mut seen_regexes = std::collections::HashSet::new();
+    if let Some(block) = &d.block {
+        for line in &block.directives {
+            if line.name == "default" {
+                if !defaults.is_empty() {
+                    return Err(AdapterError::InvalidArgument(
+                        "map".into(),
+                        "defaults may be declared only once".into(),
+                    ));
+                }
+                if line.args.len() > destinations.len() {
+                    return Err(AdapterError::InvalidArgument(
+                        "map".into(),
+                        format!(
+                            "`default` has {} outputs but only {} destinations",
+                            line.args.len(),
+                            destinations.len()
+                        ),
+                    ));
+                }
+                defaults = line.args.clone();
+                defaults.resize(destinations.len(), String::new());
+                continue;
+            }
+            let (input, input_regex) = if let Some(regex) = line.name.strip_prefix('~') {
+                if regex.is_empty() {
+                    return Err(AdapterError::InvalidArgument(
+                        "map".into(),
+                        "a `~` mapping needs a regular expression".into(),
+                    ));
+                }
+                if !seen_regexes.insert(regex.to_string()) {
+                    return Err(AdapterError::InvalidArgument(
+                        "map".into(),
+                        format!("duplicate regular expression mapping `~{regex}`"),
+                    ));
+                }
+                (None, Some(regex.to_string()))
+            } else {
+                if !seen_literals.insert(line.name.clone()) {
+                    return Err(AdapterError::InvalidArgument(
+                        "map".into(),
+                        format!("duplicate input mapping `{}`", line.name),
+                    ));
+                }
+                (Some(line.name.clone()), None)
+            };
+            if line.args.len() > destinations.len() {
+                return Err(AdapterError::InvalidArgument(
+                    "map".into(),
+                    format!(
+                        "mapping `{}` has {} outputs but only {} destinations",
+                        line.name,
+                        line.args.len(),
+                        destinations.len()
+                    ),
+                ));
+            }
+            let mut outputs: Vec<Option<String>> = line
+                .args
+                .iter()
+                .map(|output| (output != "-").then(|| output.clone()))
+                .collect();
+            outputs.resize(destinations.len(), None);
+            mappings.push(pingclair_core::config::MapMapping {
+                input,
+                input_regex,
+                outputs,
+            });
+        }
+    }
+    if mappings.is_empty() {
+        return Err(AdapterError::InvalidArgument(
+            "map".into(),
+            "at least one mapping row is required".into(),
+        ));
+    }
+
+    Ok(Handler::Map(pingclair_core::config::MapConfig {
+        source,
+        destinations,
+        mappings,
+        defaults,
+    }))
 }
 
 // MARK: - header Directive Adapter

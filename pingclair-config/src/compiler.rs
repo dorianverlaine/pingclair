@@ -1340,6 +1340,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
             validate_proxy_protection_handler(&route.handler)?;
             validate_basic_auth_credentials(&route.handler)?;
             validate_subrequest_handler(&route.handler)?;
+            validate_map_handler(&route.handler)?;
             reject_unimplemented_handler(&route.handler, false)?;
             if let Some(matcher) = &route.matcher {
                 validate_matcher(matcher)?;
@@ -1353,6 +1354,7 @@ pub fn validate_config(config: &PingclairConfig) -> CompileResult<()> {
             for element in &error_route.handlers {
                 validate_basic_auth_credentials(&element.handler)?;
                 validate_subrequest_handler(&element.handler)?;
+                validate_map_handler(&element.handler)?;
                 reject_unimplemented_handler(&element.handler, true)?;
                 if let Some(matcher) = &element.matcher {
                     validate_matcher(matcher)?;
@@ -1680,6 +1682,8 @@ fn reject_unimplemented_handler(handler: &HandlerConfig, error_route: bool) -> C
             ),
         }),
         HandlerConfig::Templates { .. } => Ok(()),
+        HandlerConfig::Map(_) => Ok(()),
+        HandlerConfig::LogAppend(_) | HandlerConfig::LogName { .. } => Ok(()),
         // 🚫 A 1xx is an interim response: it announces that a final one is
         // coming, and it carries no content (RFC 9110 §15.2). `respond` sends
         // exactly one response and then ends the exchange, so a 1xx there
@@ -1754,6 +1758,116 @@ fn reject_unimplemented_handler(handler: &HandlerConfig, error_route: bool) -> C
     }
 }
 
+/// 🔤 Validates `map` handlers on every configuration path.
+fn validate_map_handler(handler: &HandlerConfig) -> CompileResult<()> {
+    match handler {
+        HandlerConfig::Map(config) => validate_map_config(config),
+        HandlerConfig::Pipeline { handlers }
+        | HandlerConfig::FirstMatch { handlers }
+        | HandlerConfig::HandlePath { handlers, .. } => {
+            for element in handlers {
+                validate_map_handler(&element.handler)?;
+            }
+            Ok(())
+        }
+        HandlerConfig::HandleErrors { errors } => {
+            for handlers in errors.values() {
+                for handler in handlers {
+                    validate_map_handler(handler)?;
+                }
+            }
+            Ok(())
+        }
+        HandlerConfig::TryFiles {
+            fallback: Some(fallback),
+            ..
+        } => validate_map_handler(fallback),
+        _ => Ok(()),
+    }
+}
+
+/// 🔤 Validates the map's destinations, defaults, and mapping rows.
+fn validate_map_config(config: &pingclair_core::config::MapConfig) -> CompileResult<()> {
+    if config.source.trim().is_empty() {
+        return Err(CompileError::InvalidRoute {
+            message: "map source must be a placeholder template".to_string(),
+        });
+    }
+    if config.destinations.is_empty() {
+        return Err(CompileError::InvalidRoute {
+            message: "map requires at least one destination".to_string(),
+        });
+    }
+    let mut seen_destinations = HashSet::new();
+    let destinations: Vec<&str> = config
+        .destinations
+        .iter()
+        .map(|destination| {
+            destination
+                .strip_prefix('{')
+                .and_then(|value| value.strip_suffix('}'))
+                .unwrap_or(destination)
+        })
+        .collect();
+    for destination in &destinations {
+        if destination.is_empty()
+            || destination.contains(['{', '}'])
+            || !seen_destinations.insert((*destination).to_string())
+        {
+            return Err(CompileError::InvalidRoute {
+                message: format!(
+                    "map destinations must be unique, non-empty placeholder names; got `{destination}`"
+                ),
+            });
+        }
+    }
+    if config.defaults.len() > destinations.len() {
+        return Err(CompileError::InvalidRoute {
+            message: "map defaults cannot exceed the destination count".to_string(),
+        });
+    }
+    let mut seen_literals = HashSet::new();
+    let mut seen_regexes = HashSet::new();
+    for (index, mapping) in config.mappings.iter().enumerate() {
+        match (&mapping.input, &mapping.input_regex) {
+            (Some(input), None) => {
+                if input.is_empty() || !seen_literals.insert(input.clone()) {
+                    return Err(CompileError::InvalidRoute {
+                        message: format!(
+                            "map mapping {index} has an empty or duplicate literal input"
+                        ),
+                    });
+                }
+            }
+            (None, Some(pattern)) => {
+                if pattern.is_empty()
+                    || !seen_regexes.insert(pattern.clone())
+                    || regex::Regex::new(pattern).is_err()
+                {
+                    return Err(CompileError::InvalidRoute {
+                        message: format!(
+                            "map mapping {index} has an empty, duplicate, or invalid regular expression"
+                        ),
+                    });
+                }
+            }
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(CompileError::InvalidRoute {
+                    message: format!(
+                        "map mapping {index} must set exactly one of input or input_regex"
+                    ),
+                });
+            }
+        }
+        if mapping.outputs.len() > destinations.len() {
+            return Err(CompileError::InvalidRoute {
+                message: format!("map mapping {index} has too many outputs"),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// 🛡️ Refuses plaintext or malformed credentials no matter where the
 /// configuration came from.
 ///
@@ -1825,7 +1939,10 @@ fn validate_basic_auth_credentials(handler: &HandlerConfig) -> CompileResult<()>
         | HandlerConfig::Abort
         | HandlerConfig::Metrics { .. }
         | HandlerConfig::LogSkip
+        | HandlerConfig::LogAppend(_)
+        | HandlerConfig::LogName { .. }
         | HandlerConfig::Vars { .. }
+        | HandlerConfig::Map(_)
         | HandlerConfig::RateLimit { .. }
         | HandlerConfig::Cors { .. }
         | HandlerConfig::AccessControl(_)
@@ -3150,6 +3267,11 @@ fn compile_handler(
     root: Option<&str>,
 ) -> CompileResult<HandlerConfig> {
     match handler {
+        Handler::Map(config) => Ok(HandlerConfig::Map(config.clone())),
+        Handler::LogAppend(config) => Ok(HandlerConfig::LogAppend(config.clone())),
+        Handler::LogName(names) => Ok(HandlerConfig::LogName {
+            names: names.clone(),
+        }),
         Handler::AcmeServer(server) => Ok(HandlerConfig::AcmeServer(server.clone())),
         Handler::Proxy(proxy) => {
             let mut config = ReverseProxyConfig {

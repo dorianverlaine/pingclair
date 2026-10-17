@@ -390,6 +390,8 @@ pub struct AccessEntry<'a> {
     pub referer: &'a str,
     pub protocol: &'a str,
     pub error: Option<&'a str>,
+    /// 🔇 Fields added by `log_append` handlers, in handler order.
+    pub extra: &'a [(String, String)],
 
     /// 🏷️ Borrowed request and response headers. The wrapper keeps raw values
     /// private so every formatter must pass through the masking helper below.
@@ -707,6 +709,8 @@ pub struct LogTargets {
     unrestricted: Vec<Arc<AccessLogger>>,
     /// 🏠 Destinations restricted to particular hosts, most specific first.
     restricted: Vec<(HostPattern, Arc<AccessLogger>)>,
+    /// 🏷️ Named loggers selectable with `log_name`.
+    named: HashMap<String, Arc<AccessLogger>>,
     /// 🔐 Whether any destination needs handshake details. This is compiled
     /// once so the request path skips the session digest in the common case.
     include_tls: bool,
@@ -740,6 +744,13 @@ impl LogTargets {
         targets
     }
 
+    /// 🏷️ Adds the named loggers a request may select with `log_name`.
+    pub fn with_named(mut self, named: HashMap<String, Arc<AccessLogger>>) -> Self {
+        self.include_tls |= named.values().any(|logger| logger.include_tls);
+        self.named = named;
+        self
+    }
+
     /// 📮 Every destination this host's entries belong in.
     ///
     /// A host may reach several: upstream maps one hostname to a list, and a
@@ -752,6 +763,14 @@ impl LogTargets {
                 .filter(move |(pattern, _)| pattern.matches(host))
                 .map(|(_, logger)| logger),
         )
+    }
+
+    /// 🏷️ Destinations selected by `log_name`, in the configured order.
+    pub fn select_named<'a>(
+        &'a self,
+        names: &'a [String],
+    ) -> impl Iterator<Item = &'a Arc<AccessLogger>> + 'a {
+        names.iter().filter_map(|name| self.named.get(name))
     }
 
     /// 🈳 Whether nothing at all is configured, so callers keep the previous
@@ -1433,6 +1452,19 @@ impl AccessLogger {
         if let Some(error) = entry.error {
             str_field!("error", error);
         }
+        for (name, value) in entry.extra {
+            if self.included(name) {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push('"');
+                escape_json_into(&mut out, name);
+                out.push_str("\":\"");
+                escape_json_into(&mut out, value);
+                out.push('"');
+            }
+        }
         // 🔐 TLS details go in as ordinary fields; they are already strings
         // from the handshake and carry nothing client-controlled.
         if self.include_tls
@@ -1531,6 +1563,11 @@ impl AccessLogger {
         }
         if let Some(error) = entry.error {
             let _ = write!(out, " error=\"{error}\"");
+        }
+        for (name, value) in entry.extra {
+            if self.included(name) {
+                let _ = write!(out, " {name}=\"{value}\"");
+            }
         }
 
         out
@@ -1671,6 +1708,7 @@ mod tests {
             referer: "-",
             protocol: "HTTP/1.1",
             error: None,
+            extra: &[],
             request_headers: None,
             response_headers: None,
             tls_version: None,

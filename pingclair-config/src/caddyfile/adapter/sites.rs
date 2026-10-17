@@ -735,7 +735,10 @@ pub(super) fn handler_directive_name(handler: &Handler) -> &'static str {
         Handler::Abort => "abort",
         Handler::Metrics { .. } => "metrics",
         Handler::LogSkip => "log_skip",
+        Handler::LogAppend(_) => "log_append",
+        Handler::LogName(_) => "log_name",
         Handler::Vars(_) => "vars",
+        Handler::Map(_) => "map",
         Handler::Redirect(_) => "redir",
         Handler::Error(_) => "error",
         // 🏷️ `rewrite` and `uri` compile to the same handler and rank one
@@ -833,7 +836,10 @@ pub(super) fn handler_has_terminal(handler: &Handler) -> bool {
         | Handler::Cors(_)
         | Handler::AccessControl(_)
         | Handler::LogSkip
+        | Handler::LogAppend(_)
+        | Handler::LogName(_)
         | Handler::Vars(_)
+        | Handler::Map(_)
         | Handler::Intercept(_)
         | Handler::ForwardAuth(_)
         | Handler::Plugin { .. } => false,

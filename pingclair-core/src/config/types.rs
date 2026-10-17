@@ -1588,6 +1588,45 @@ impl UpstreamHttpVersions {
     }
 }
 
+/// 🔤 One request-value-to-placeholder mapping.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MapConfig {
+    /// The request value to read, as a placeholder template.
+    pub source: String,
+    /// Variable names (without braces) written by this map.
+    pub destinations: Vec<String>,
+    /// Literal and regular-expression mappings, in evaluation order.
+    #[serde(default)]
+    pub mappings: Vec<MapMapping>,
+    /// Values used when no mapping supplies one.
+    #[serde(default)]
+    pub defaults: Vec<String>,
+}
+
+/// One `map` row: a literal or regex input and its positional outputs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MapMapping {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_regex: Option<String>,
+    /// `None` is Caddy's `-`: this destination is not mapped by this row.
+    #[serde(default)]
+    pub outputs: Vec<Option<String>>,
+}
+
+/// 🔇 One `log_append` field and the value template for it.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LogAppendConfig {
+    pub key: String,
+    pub value: String,
+    #[serde(default)]
+    pub early: bool,
+}
+
 /// Handler configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1884,6 +1923,18 @@ pub enum HandlerConfig {
     Vars {
         #[serde(default)]
         values: BTreeMap<String, String>,
+    },
+
+    /// 🔤 Maps one request value to one or more request-scoped variables.
+    Map(MapConfig),
+
+    /// 🔇 Adds a field to the access-log entry.
+    LogAppend(LogAppendConfig),
+
+    /// 🏷️ Selects named access loggers for this request.
+    LogName {
+        #[serde(default)]
+        names: Vec<String>,
     },
 
     /// 🧵 A sequential group: every element whose matcher accepts the request

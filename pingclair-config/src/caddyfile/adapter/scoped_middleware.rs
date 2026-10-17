@@ -301,7 +301,10 @@ fn may_change_path(handler: &Handler) -> bool {
         | Handler::Cors(_)
         | Handler::AccessControl(_)
         | Handler::LogSkip
+        | Handler::LogAppend(_)
+        | Handler::LogName(_)
         | Handler::Vars(_)
+        | Handler::Map(_)
         | Handler::Intercept(_)
         | Handler::ForwardAuth(_) => false,
         Handler::Rewrite(_)
@@ -337,7 +340,10 @@ fn is_site_middleware(handler: &Handler) -> bool {
         | Handler::Cors(_)
         | Handler::AccessControl(_)
         | Handler::LogSkip
+        | Handler::LogAppend(_)
+        | Handler::LogName(_)
         | Handler::Vars(_)
+        | Handler::Map(_)
         | Handler::Intercept(_)
         | Handler::ForwardAuth(_) => true,
         Handler::Proxy(_)
