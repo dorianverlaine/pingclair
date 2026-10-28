@@ -15,6 +15,7 @@ members = [
 ]
 exclude = [
     "vendor/foundations-compat",
+    "vendor/pingora-header-serde",
     "vendor/pingora-proxy",
 ]
 
@@ -199,6 +200,12 @@ tokio-quiche = { git = "https://github.com/cjpatton/quiche.git", rev = "82152d23
 # though it only consumes the settings, logging, metrics, and testing APIs.
 # Remove the shim when that upstream release exposes the safe graph directly.
 foundations = { path = "vendor/foundations-compat" }
+
+# 🛡️ Pingora 0.9.0's header serializer still requests zstd 0.13 and zstd-safe 7,
+# which are affected by the October 2026 RustSec advisories. Pin the reviewed
+# dependency-only fix from cloudflare/pingora#1073 until a release carries it.
+# Provenance and removal criteria live beside the vendored package.
+pingora-header-serde = { path = "vendor/pingora-header-serde" }
 
 # 🔌 Pingora 0.9.0 plus the correctness backport of cloudflare/pingora#947.
 # The upstream PR predates 0.9; only its HTTP/1 state-machine fix is applied

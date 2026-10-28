@@ -165,6 +165,13 @@
   See [`vendor/pingora-proxy/PATCHES.md`](../../vendor/pingora-proxy/PATCHES.md)
   for provenance, audit coverage and removal criteria. This does not fix the
   separate tunnel half-close defect (#274).
+- 🛡️ **Pingora's header serializer must use the patched zstd line.** Pingora
+  0.9.0 requests `zstd 0.13` and `zstd-safe 7`, which are affected by the
+  October 2026 RustSec advisories. The dependency-only fix from
+  [cloudflare/pingora#1073](https://github.com/cloudflare/pingora/pull/1073)
+  is vendored until a release carries it. See
+  [`vendor/pingora-header-serde/PATCHES.md`](../../vendor/pingora-header-serde/PATCHES.md)
+  for provenance, audit coverage and removal criteria.
 - 🔒 **`security-audit.yml` (`cargo audit`) runs on the merge gate and on a
   nightly schedule**, not once before a release. RustSec publishes on its own
   schedule, not this project's, and a dependency that merged clean and was

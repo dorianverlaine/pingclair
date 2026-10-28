@@ -48,10 +48,10 @@
   2026-08-04: a project on `atty 0.2.14` reports RUSTSEC-2021-0145 and
   RUSTSEC-2024-0375, and the same project with `atty` path-patched **reports
   nothing and exits clean**. 🛡️ `just audit` and `security-audit.yml` now audit
-  the resolved graph, then restore the vendored Pingora package's recorded
-  registry coordinate in a temporary copy of the same lockfile. Dependency
-  versions and edges stay unchanged. Every new backport needs explicit origin
-  coverage; a passing ordinary audit alone does not prove that coverage.
+  the resolved graph, then restore every vendored package's recorded registry
+  coordinate in a temporary copy of the same lockfile. Dependency versions and
+  edges stay unchanged. Every new backport needs explicit origin coverage; a
+  passing ordinary audit alone does not prove that coverage.
 
 - **`target/` grows silently until the disk is gone; cargo never reclaims old
   artefacts.** Measured at 77 GB on 2026-08-04 (`incremental` 41 GB, `deps` 44 GB

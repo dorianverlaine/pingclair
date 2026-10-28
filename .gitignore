@@ -89,6 +89,7 @@ __pycache__/
 # 📦 Only explicitly maintained dependency bridges ship with the repository.
 vendor/*
 !vendor/foundations-compat/
+!vendor/pingora-header-serde/
 !vendor/pingora-proxy/
 
 # 🔬 Verification-day working material: the scripts a Day runs against a clean

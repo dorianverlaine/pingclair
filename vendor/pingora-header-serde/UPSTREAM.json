@@ -1,0 +1,10 @@
+{
+  "name": "pingora-header-serde",
+  "version": "0.9.0",
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "checksum": "e2e824dac9612e4b807e55981c2d6b665b6f936a8b4b75ee0ce1922373e93243",
+  "archive": "https://static.crates.io/crates/pingora-header-serde/pingora-header-serde-0.9.0.crate",
+  "pull_request": "https://github.com/cloudflare/pingora/pull/1073",
+  "commit": "777d52c25bbde414d390a28328bd85a74f3d8282",
+  "patch": "zstd-advisories.patch"
+}
