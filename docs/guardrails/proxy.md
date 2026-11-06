@@ -208,7 +208,7 @@ gzip), both caused by buffering a body whole.
   raises `client_max_body_size` for the whole route.
 
 > 🪤 **On the request side, holding a chunk back means returning an empty `Bytes`,
-> never `None`.** `pingora-proxy 0.9.0` recomputes the end flag *after* filters
+> never `None`.** `pingora-proxy 0.9.1` recomputes the end flag *after* filters
 > run, at `proxy_h1.rs:1035`, as `end_of_body || data.is_none()` — so `None` reads
 > as "the client is finished". The upstream body ends early, no error is raised,
 > and the backend receives a truncated body. On the response side the end flag
@@ -288,7 +288,7 @@ match error.etype() {
 }
 ```
 
-`pingora-core` 0.9.0 rewrites `SocketError` and `BindError` into `InternalError`
+`pingora-core` 0.9.1 rewrites `SocketError` and `BindError` into `InternalError`
 **before returning**, at `connectors/l4.rs:184`; the real name survives only in
 the cause chain:
 

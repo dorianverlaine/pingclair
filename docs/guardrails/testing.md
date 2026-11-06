@@ -156,7 +156,7 @@
   property (no two adjacent alike, each got half), not a sequence you observed
   once.
 
-- 🔌 **WebSocket upgrades must pass without retries.** Pingora 0.9.0 is
+- 🔌 **WebSocket upgrades must pass without retries.** Pingora 0.9.1 is
   vendored with the state-machine fix backported from
   [cloudflare/pingora#947](https://github.com/cloudflare/pingora/pull/947).
   `websocket_handshake_ordering.rs` delays the original empty-body task to
@@ -165,13 +165,10 @@
   See [`vendor/pingora-proxy/PATCHES.md`](../../vendor/pingora-proxy/PATCHES.md)
   for provenance, audit coverage and removal criteria. This does not fix the
   separate tunnel half-close defect (#274).
-- 🛡️ **Pingora's header serializer must use the patched zstd line.** Pingora
-  0.9.0 requests `zstd 0.13` and `zstd-safe 7`, which are affected by the
-  October 2026 RustSec advisories. The dependency-only fix from
-  [cloudflare/pingora#1073](https://github.com/cloudflare/pingora/pull/1073)
-  is vendored until a release carries it. See
-  [`vendor/pingora-header-serde/PATCHES.md`](../../vendor/pingora-header-serde/PATCHES.md)
-  for provenance, audit coverage and removal criteria.
+- 🛡️ **Pingora's header serializer must stay on the patched zstd line.**
+  Pingora 0.9.1 requests `zstd 0.14.3` and `zstd-safe 8.2.0`. Older versions
+  are affected by the October 2026 RustSec advisories; do not downgrade these
+  dependencies or reintroduce the retired header-serde bridge.
 - 🔒 **`security-audit.yml` (`cargo audit`) runs on the merge gate and on a
   nightly schedule**, not once before a release. RustSec publishes on its own
   schedule, not this project's, and a dependency that merged clean and was

@@ -230,7 +230,7 @@ Changing a listener quota requires restart. Excess accepted sockets close before
 spawning a session task or allocating preread buffers; no permit wait queue exists.
 The kernel accept backlog remains governed by the operating system.
 
-L4 owns its TCP accept loop inside a Pingora service because Pingora 0.9.0
+L4 owns its TCP accept loop inside a Pingora service because Pingora 0.9.1
 `services::listening::Service::run_endpoint` spawns before calling `ServerApp`.
 Checking admission only in that callback would leave task creation unbounded.
 Accept errors back off for one second, interruptible by shutdown. Accepted work

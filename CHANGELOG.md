@@ -122,14 +122,23 @@ chunk from remaining queued on an otherwise quiet connection (#331), while
 QUIC flow-control blocking still waits without spinning. `just h3` now runs
 both the curl and Go client matrices, matching the Linux CI gate.
 
+### 🛡️ Pingora 0.9.1 closes a connection panic and retires a dependency patch
+
+The Pingora crates now resolve to 0.9.1. This fixes the zero-capacity buffered
+reader that panicked on the first accepted or outgoing connection once Tokio
+1.54 was selected, and fixes an overflow panic in Pingora's estimator. The
+release also moves the header serializer to `zstd 0.14.3` and
+`zstd-safe 8.2.0`, so the temporary header-serde bridge is removed. Pingora
+0.9.1 still does not contain the WebSocket fix from PR #947; that backport
+moves to the matching 0.9.1 proxy crate.
+
 ### 🔌 WebSocket handshakes survive either event ordering
 
-Backport the fix from Pingora PR #947 onto the published `pingora-proxy 0.9.0`
+Backport the fix from Pingora PR #947 onto the published `pingora-proxy 0.9.1`
 crate. An upstream's immediate `101` no longer lets the original request's
 empty-body task close the new tunnel. The regression runs under the normal
-CI gate, and the expired retry exemption is removed. Other Pingora crates
-remain on their existing registry versions; tunnel half-close (#274) remains
-outstanding.
+CI gate, and the expired retry exemption is removed. Tunnel half-close (#274)
+remains outstanding.
 
 ### 🧹 The 0.3 native language is gone before its first release
 

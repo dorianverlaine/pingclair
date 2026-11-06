@@ -1,6 +1,6 @@
 # 🔌 Pingora HTTP/1 upgrade backport
 
-This directory contains the published **pingora-proxy 0.9.0** crate, with
+This directory contains the published **pingora-proxy 0.9.1** crate, with
 only the runtime fix from [upstream PR #947](https://github.com/cloudflare/pingora/pull/947)
 backported to `src/proxy_h1.rs`. It is not a snapshot of the older PR branch.
 `UPSTREAM.json` records the immutable PR commit and registry archive checksum;
