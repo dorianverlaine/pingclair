@@ -18,6 +18,7 @@ def main():
     provenance_paths = (
         root / "vendor/pingora-core/UPSTREAM.json",
         root / "vendor/pingora-proxy/UPSTREAM.json",
+        root / "vendor/quiche/UPSTREAM.json",
     )
     for provenance_path in provenance_paths:
         provenance = json.loads(provenance_path.read_text())
@@ -48,7 +49,13 @@ def main():
         audit_lock = Path(directory) / "Cargo.lock"
         audit_lock.write_text("[[package]]".join(blocks))
         print("🛡️ Auditing vendored registry origins", flush=True)
-        subprocess.run(["cargo", "audit", "--file", str(audit_lock)], cwd=root, check=True)
+        # 📡 The first audit refreshed the advisory database. Re-fetching it for
+        # the same run adds a second network failure point and no new data.
+        subprocess.run(
+            ["cargo", "audit", "--no-fetch", "--file", str(audit_lock)],
+            cwd=root,
+            check=True,
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,391 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 7c6905a..14b1403 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1444,0 +1445,3 @@ where
++    /// 🔐 Whether at least one packet from the peer was authenticated.
++    received_authenticated_packet: bool,
++
+@@ -2164,0 +2168 @@ impl<F: BufFactory> Connection<F> {
++            received_authenticated_packet: false,
+@@ -3349,0 +3354,5 @@ impl<F: BufFactory> Connection<F> {
++        // 🛡️ RFC 9000 requires reserved bits to be clear after header
++        // protection is removed. Keep the value until packet authentication
++        // succeeds so an unauthenticated packet cannot trigger a close.
++        let reserved_bits = reserved_bits(b.buf()[0], hdr.ty);
++
+@@ -3418,0 +3428,7 @@ impl<F: BufFactory> Connection<F> {
++        // 🛡️ Do not route this through `drop_pkt_on_err`; that helper turns
++        // most later-packet failures into `Done`, but RFC 9000 requires a
++        // PROTOCOL_VIOLATION once an authenticated packet sets a reserved bit.
++        if reserved_bits != 0 {
++            return Err(Error::InvalidPacket);
++        }
++
+@@ -3428,0 +3445,2 @@ impl<F: BufFactory> Connection<F> {
++        self.received_authenticated_packet = true;
++
+@@ -7749,2 +7767,2 @@ impl<F: BufFactory> Connection<F> {
+-        // Close immediately if no packet was processed successfully.
+-        if self.recv_count == 0 {
++        // 🔐 Keep an authenticated first-flight transport error sendable.
++        if self.recv_count == 0 && !self.received_authenticated_packet {
+@@ -8377,0 +8396,8 @@ impl<F: BufFactory> Connection<F> {
++                    // 🔐 A first-flight error after packet authentication needs
++                    // an Initial close the peer can still decrypt.
++                    packet::Epoch::Application
++                        if self.recv_count == 0 &&
++                            self.received_authenticated_packet &&
++                            self.crypto_ctx[packet::Epoch::Initial].has_keys() =>
++                        return Ok(Type::Initial),
++
+@@ -9612,0 +9639,9 @@ fn drop_pkt_on_err(
++/// 🧭 Returns the RFC 9000 reserved bits after header protection is removed.
++fn reserved_bits(first_byte: u8, ty: Type) -> u8 {
++    if ty == Type::Short {
++        first_byte & 0x18
++    } else {
++        first_byte & 0x0c
++    }
++}
++
+diff --git a/src/tests.rs b/src/tests.rs
+index bb09cff..49276a9 100644
+--- a/src/tests.rs
++++ b/src/tests.rs
+@@ -412 +412,2 @@ fn missing_initial_source_connection_id(
+-    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
++    let mut config = test_utils::Pipe::default_config_no_pq(cc_algorithm_name).unwrap();
++    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+@@ -429,0 +431,17 @@ fn missing_initial_source_connection_id(
++
++    let expected = ConnectionError {
++        is_app: false,
++        error_code: WireErrorCode::TransportParameterError as u64,
++        reason: vec![],
++    };
++    assert_eq!(pipe.server.local_error(), Some(&expected));
++    assert!(!pipe.server.is_closed());
++
++    // 🧯 The authenticated first-flight error must leave as an Initial close
++    // rather than disappearing when the connection is marked closed.
++    let mut close = [0; MAX_SEND_UDP_PAYLOAD_SIZE];
++    let (len, _) = pipe.server.send(&mut close).unwrap();
++    let hdr = Header::from_slice(&mut close[..len], pipe.client.source_id().len()).unwrap();
++    assert_eq!(hdr.ty, Type::Initial);
++    assert_eq!(pipe.client_recv(&mut close[..len]), Ok(len));
++    assert_eq!(pipe.client.peer_error(), Some(&expected));
+@@ -14584,0 +14603,16 @@ fn server_qlog() {
++
++#[test]
++fn reserved_bits_long_header_mask() {
++    assert_eq!(reserved_bits(0b1111_1111, Type::Initial), 0x0c);
++    assert_eq!(reserved_bits(0b0000_0000, Type::Initial), 0x00);
++    assert_eq!(reserved_bits(0b0000_1100, Type::Initial), 0x0c);
++    assert_eq!(reserved_bits(0b1111_0011, Type::Initial), 0x00);
++}
++
++#[test]
++fn reserved_bits_short_header_mask() {
++    assert_eq!(reserved_bits(0b1111_1111, Type::Short), 0x18);
++    assert_eq!(reserved_bits(0b0000_0000, Type::Short), 0x00);
++    assert_eq!(reserved_bits(0b0001_1000, Type::Short), 0x18);
++    assert_eq!(reserved_bits(0b1110_0111, Type::Short), 0x00);
++}
+diff --git a/src/h3/mod.rs b/src/h3/mod.rs
+index 41f3795..4fa56ff 100644
+--- a/src/h3/mod.rs
++++ b/src/h3/mod.rs
+@@ -406,0 +407,6 @@ pub enum Error {
++    /// QPACK encoder stream error.
++    QpackEncoderStreamError,
++
++    /// QPACK decoder stream error.
++    QpackDecoderStreamError,
++
+@@ -497,0 +504,4 @@ pub enum WireErrorCode {
++    /// A QPACK encoder stream contained an invalid instruction.
++    QpackEncoderStreamError = 0x201,
++    /// A QPACK decoder stream contained an invalid instruction.
++    QpackDecoderStreamError = 0x202,
+@@ -515 +525,7 @@ impl Error {
+-            Error::BufferTooShort => 0x999,
++            Error::QpackEncoderStreamError =>
++                WireErrorCode::QpackEncoderStreamError as u64,
++            Error::QpackDecoderStreamError =>
++                WireErrorCode::QpackDecoderStreamError as u64,
++            // 🛡️ A truncated frame is a wire-format error, not a private
++            // sentinel that a peer cannot interpret.
++            Error::BufferTooShort => WireErrorCode::FrameError as u64,
+@@ -549,0 +566,2 @@ impl Error {
++            Error::QpackEncoderStreamError => -21,
++            Error::QpackDecoderStreamError => -22,
+@@ -963,0 +982 @@ struct QpackStreams {
++    pub encoder_stream_buf: Vec<u8>,
+@@ -965,0 +985,115 @@ struct QpackStreams {
++    pub decoder_stream_buf: Vec<u8>,
++}
++
++enum QpackInteger {
++    Complete { value: u64, len: usize },
++    Incomplete,
++    Overflow,
++}
++
++/// 🧮 Decodes a QPACK prefixed integer without consuming an incomplete suffix.
++fn qpack_integer(buf: &[u8], prefix_bits: u8) -> QpackInteger {
++    let Some(&first) = buf.first() else {
++        return QpackInteger::Incomplete;
++    };
++    let mask = (1_u8 << prefix_bits) - 1;
++    let mut value = u64::from(first & mask);
++    if value < u64::from(mask) {
++        return QpackInteger::Complete { value, len: 1 };
++    }
++
++    let mut shift = 0_u32;
++    for (index, byte) in buf.iter().copied().enumerate().skip(1) {
++        let Some(chunk) = u64::from(byte & 0x7f).checked_shl(shift) else {
++            return QpackInteger::Overflow;
++        };
++        let Some(next) = value.checked_add(chunk) else {
++            return QpackInteger::Overflow;
++        };
++        value = next;
++
++        if byte & 0x80 == 0 {
++            return QpackInteger::Complete {
++                value,
++                len: index + 1,
++            };
++        }
++
++        shift += 7;
++        if shift >= 63 {
++            return QpackInteger::Overflow;
++        }
++    }
++
++    QpackInteger::Incomplete
++}
++
++fn process_qpack_encoder_stream<F: BufFactory>(
++    conn: &mut super::Connection<F>, streams: &mut QpackStreams,
++    max_table_capacity: u64,
++) -> Result<()> {
++    let mut consumed = 0;
++    while let Some(&first) = streams.encoder_stream_buf.get(consumed) {
++        // 🧱 We do not implement a dynamic QPACK table. With the advertised
++        // capacity at zero, the only valid encoder instruction is setting that
++        // same capacity to zero.
++        if first & 0xe0 != 0x20 {
++            return qpack_stream_error(conn, Error::QpackEncoderStreamError);
++        }
++
++        let (value, len) = match qpack_integer(&streams.encoder_stream_buf[consumed..], 5) {
++            QpackInteger::Complete { value, len } => (value, len),
++            QpackInteger::Incomplete => break,
++            QpackInteger::Overflow =>
++                return qpack_stream_error(conn, Error::QpackEncoderStreamError),
++        };
++        if value > max_table_capacity {
++            return qpack_stream_error(conn, Error::QpackEncoderStreamError);
++        }
++        consumed += len;
++    }
++    streams.encoder_stream_buf.drain(..consumed);
++
++    if streams.encoder_stream_buf.len() > 16 {
++        return qpack_stream_error(conn, Error::QpackEncoderStreamError);
++    }
++    Ok(())
++}
++
++fn process_qpack_decoder_stream<F: BufFactory>(
++    conn: &mut super::Connection<F>, streams: &mut QpackStreams,
++) -> Result<()> {
++    let mut consumed = 0;
++    while let Some(&first) = streams.decoder_stream_buf.get(consumed) {
++        let (prefix_bits, is_increment) = match first >> 6 {
++            0 => (6, true),
++            1 => (7, false),
++            2 => (6, false),
++            _ => return qpack_stream_error(conn, Error::QpackDecoderStreamError),
++        };
++
++        let (value, len) = match qpack_integer(&streams.decoder_stream_buf[consumed..], prefix_bits)
++        {
++            QpackInteger::Complete { value, len } => (value, len),
++            QpackInteger::Incomplete => break,
++            QpackInteger::Overflow =>
++                return qpack_stream_error(conn, Error::QpackDecoderStreamError),
++        };
++        if is_increment && value == 0 {
++            return qpack_stream_error(conn, Error::QpackDecoderStreamError);
++        }
++        consumed += len;
++    }
++    streams.decoder_stream_buf.drain(..consumed);
++
++    if streams.decoder_stream_buf.len() > 16 {
++        return qpack_stream_error(conn, Error::QpackDecoderStreamError);
++    }
++    Ok(())
++}
++
++fn qpack_stream_error<F: BufFactory>(
++    conn: &mut super::Connection<F>, error: Error,
++) -> Result<()> {
++    conn.close(true, error.to_wire(), b"Invalid QPACK stream instruction.")?;
++    Err(error)
+@@ -2920,0 +3055 @@ impl Connection {
++                    let stream_type = stream.ty();
+@@ -2922,3 +3057,3 @@ impl Connection {
+-                    // Read data from the stream and discard immediately.
+-                    //
+-                    // TODO: pass encoder stream data to the QPACK decoder.
++                    // 🧮 Decode enough of each QPACK stream to fail malformed
++                    // capacity and acknowledgement instructions with the
++                    // connection error RFC 9204 requires.
+@@ -2928,2 +3063,2 @@ impl Connection {
+-                        match stream.ty() {
+-                            Some(stream::Type::QpackEncoder) =>
++                        match stream_type {
++                            Some(stream::Type::QpackEncoder) => {
+@@ -2931,2 +3066,6 @@ impl Connection {
+-                                    recv as u64,
+-                            Some(stream::Type::QpackDecoder) =>
++                                    recv as u64;
++                                self.peer_qpack_streams
++                                    .encoder_stream_buf
++                                    .extend_from_slice(&d[..recv]);
++                            },
++                            Some(stream::Type::QpackDecoder) => {
+@@ -2934 +3073,5 @@ impl Connection {
+-                                    recv as u64,
++                                    recv as u64;
++                                self.peer_qpack_streams
++                                    .decoder_stream_buf
++                                    .extend_from_slice(&d[..recv]);
++                            },
+@@ -2937,0 +3081,21 @@ impl Connection {
++                        match stream_type {
++                            Some(stream::Type::QpackEncoder) => {
++                                let max_table_capacity = self
++                                    .local_settings
++                                    .qpack_max_table_capacity
++                                    .unwrap_or(0);
++                                process_qpack_encoder_stream(
++                                    conn,
++                                    &mut self.peer_qpack_streams,
++                                    max_table_capacity,
++                                )?;
++                            },
++                            Some(stream::Type::QpackDecoder) => {
++                                process_qpack_decoder_stream(
++                                    conn,
++                                    &mut self.peer_qpack_streams,
++                                )?;
++                            },
++                            _ => unreachable!(),
++                        }
++
+@@ -3823,0 +3988,13 @@ mod tests {
++    #[test]
++    fn qpack_prefixed_integer_waits_for_its_continuation() {
++        assert!(matches!(qpack_integer(&[], 5), QpackInteger::Incomplete));
++        assert!(matches!(
++            qpack_integer(&[0x1f, 0x80], 5),
++            QpackInteger::Incomplete
++        ));
++        assert!(matches!(
++            qpack_integer(&[0x1f, 0x80, 0x01], 5),
++            QpackInteger::Complete { value: 159, len: 3 }
++        ));
++    }
++
+@@ -5795 +5972 @@ mod tests {
+-    /// Client closes QPACK stream after sending some stuff, which is forbidden.
++    /// Client closes a QPACK stream after an invalid instruction.
+@@ -5809 +5986 @@ mod tests {
+-            Err(Error::ClosedCriticalStream),
++            Err(Error::QpackEncoderStreamError),
+@@ -5840 +6017 @@ mod tests {
+-    /// Client resets QPACK stream after sending some stuff, which is forbidden.
++    /// Client resets a QPACK stream after an invalid instruction.
+@@ -5853 +6030,4 @@ mod tests {
+-        assert_eq!(Err(Error::Done), s.server.poll(&mut s.pipe.server));
++        assert_eq!(
++            Err(Error::QpackEncoderStreamError),
++            s.server.poll(&mut s.pipe.server)
++        );
+@@ -5863 +6043 @@ mod tests {
+-            Err(Error::ClosedCriticalStream),
++            Err(Error::Done),
+@@ -5872,2 +6052,2 @@ mod tests {
+-        // TODO: QPACK instructions are ignored until dynamic table support is
+-        // added so we just test that the data is safely ignored.
++        // 🧮 Repeated zero-capacity instructions are valid but do not mutate
++        // the dynamic table.
+@@ -5879 +6059,2 @@ mod tests {
+-        let d = [0; 20];
++        let e = [0x20; 20];
++        let d = [0x80; 20];
+@@ -5881 +6062 @@ mod tests {
+-        s.pipe.client.stream_send(e_stream_id, &d, false).unwrap();
++        s.pipe.client.stream_send(e_stream_id, &e, false).unwrap();
+diff --git a/src/h3/frame.rs b/src/h3/frame.rs
+index 8ecad44..237192f 100644
+--- a/src/h3/frame.rs
++++ b/src/h3/frame.rs
+@@ -577,0 +578 @@ fn parse_settings_frame(
++    let mut identifiers = std::collections::HashSet::new();
+@@ -587,0 +589,6 @@ fn parse_settings_frame(
++        // 🛡️ RFC 9114 §7.2.4 makes every repeated identifier a
++        // SETTINGS_ERROR, even an unknown one whose value is harmless.
++        if !identifiers.insert(identifier) {
++            return Err(super::Error::SettingsError);
++        }
++
+@@ -771,0 +779,23 @@ mod tests {
++    #[test]
++    fn settings_rejects_duplicate_identifiers() {
++        // 🛡️ The same unknown two-octet setting twice is still invalid.
++        let payload = [0x40, 0x40, 0x00, 0x40, 0x40, 0x00];
++        assert_eq!(
++            Frame::from_bytes(SETTINGS_FRAME_TYPE_ID, payload.len() as u64, &payload),
++            Err(crate::h3::Error::SettingsError)
++        );
++    }
++
++    #[test]
++    fn truncated_settings_is_a_frame_error_on_the_wire() {
++        let payload = [SETTINGS_MAX_FIELD_SECTION_SIZE as u8];
++        assert_eq!(
++            Frame::from_bytes(SETTINGS_FRAME_TYPE_ID, payload.len() as u64, &payload),
++            Err(crate::h3::Error::BufferTooShort)
++        );
++        assert_eq!(
++            crate::h3::Error::BufferTooShort.to_wire(),
++            crate::h3::WireErrorCode::FrameError as u64
++        );
++    }
++
+diff --git a/src/h3/stream.rs b/src/h3/stream.rs
+index 97e018b..a76f8ae 100644
+--- a/src/h3/stream.rs
++++ b/src/h3/stream.rs
+@@ -470 +470,12 @@ impl Stream {
+-                if !(1..=8).contains(&len) {
++                if len == 0 {
++                    return Err(Error::FrameError);
++                }
++
++                // 🛡️ Refuse an implausibly large declared payload before
++                // reserving its buffer. RFC 9114 §7.1 names this class
++                // H3_EXCESSIVE_LOAD rather than a frame-layout error.
++                if len > MAX_STATE_BUF_SIZE as u64 {
++                    return Err(Error::ExcessiveLoad);
++                }
++
++                if len > 8 {

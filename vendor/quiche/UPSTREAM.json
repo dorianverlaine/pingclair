@@ -1,0 +1,14 @@
+{
+  "name": "quiche",
+  "version": "0.30.1",
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "checksum": "8ba5af7b73277657f07f47615a3440f6920bf1b747fecd7ca5e9957ff77c5b98",
+  "archive": "https://static.crates.io/crates/quiche/quiche-0.30.1.crate",
+  "issue": "https://github.com/dorianverlaine/pingclair/issues/282",
+  "patch": "282-h3-conformance.patch",
+  "upstream": [
+    "https://github.com/cloudflare/quiche/issues/2515",
+    "https://github.com/cloudflare/quiche/pull/2521",
+    "https://github.com/cloudflare/quiche/pull/2575"
+  ]
+}

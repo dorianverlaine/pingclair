@@ -43,11 +43,11 @@ follow from it.
 > rejected: its server-side accept API is pub(crate)". **That sentence was
 > wrong**, and wrong in the most damaging way: it stopped everyone after it from
 > looking. Only the internal `quic::start_listener()` is `pub(crate)`; the public
-> facade was there all along — measured against `tokio-quiche 0.19.1` on
-> 2026-07-30: `tokio_quiche::listen()` (`lib.rs:191`), `ServerH3Driver`,
+> facade was there all along — measured against `tokio-quiche 0.23.0` on
+> 2026-11-13: `tokio_quiche::listen()` (`lib.rs:193`), `ServerH3Driver`,
 > `ServerH3Controller`, `InitialQuicConnection`, and `ApplicationOverQuic` are all
-> public. The dependency versions lined up exactly too (`quiche 0.29.3` +
-> `boring 4.22.0`, no `openssl-sys`).
+> public. The dependency versions line up exactly too (`quiche 0.30.1` +
+> `boring 5.2.0`, no `openssl-sys`).
 >
 > **The cost has already been paid**: that sentence is why this project
 > hand-wrote and maintained an entire QUIC transport layer — socket loop,
@@ -91,10 +91,10 @@ follow from it.
 - Middleware parity comes from extracting **transport-neutral logic** (see
   `http_policy.rs`); never force an H1/H2 Session into H3.
 
-> ⚠️ **`tokio-quiche` is pinned to `=0.19.1`.** The "certificates never touch
+> ⚠️ **`tokio-quiche` is pinned to `=0.23.0`.** The "certificates never touch
 > disk" rule above depends on `.zip(params.tls_cert)` at
-> `settings/config.rs:122` and the file-reading branch at `settings/config.rs:224`
-> in the 0.19.1 source. One minor version bump could start genuinely reading
+> `settings/config.rs:131` and the file-reading branch at `settings/config.rs:245`
+> in the 0.23.0 source. One minor version bump could start genuinely reading
 > those paths. Upgrading **requires re-reading both sites first** and confirming
 > that `pingclair-proxy/tests/h3_in_memory_certs.rs` still fails when it should.
 

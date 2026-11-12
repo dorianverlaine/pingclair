@@ -256,26 +256,28 @@ the mechanic that makes it work:
   appears. Writing the citation into the doc comment is what made the mistakes
   visible.
 
-### 🧪 h2spec and h3spec (2026-10-06)
+### 🧪 h2spec and h3spec (checked 2026-11-13)
 
 The conformance suite above pins the clauses this project has already been bitten
 by. The protocol-level suites check the rest, and they are cheap enough to run
 after any H2/H3 change:
 
-| suite | how | state at `4bb3951` |
+| suite | how | latest state |
 | --- | --- | --- |
-| h2spec, TLS | `brew install h2spec`, then `h2spec -h localhost -p <port> -t -k` | **146/146 pass** |
-| h2spec, h2c | `h2spec -h 127.0.0.1 -p <port>` (no `-t`: prior-knowledge cleartext) | 145/146 — §3.5/2 asks for a `GOAWAY` before the close; RFC 9113 §3.4 says the frame **MAY be omitted** for an invalid preface, so the tool is stricter than the standard here |
-| h3spec | prebuilt binary from the h3spec release page, `h3spec <host> <port> -n` | 77 examples, **18 failures**, all QUIC transport-parameter rules — issue #282, blocked on the dependency's error path |
+| h2spec, TLS | `brew install h2spec`, then `h2spec -h localhost -p <port> -t -k` | **146/146 pass** at `4bb3951` |
+| h2spec, h2c | `h2spec -h 127.0.0.1 -p <port>` (no `-t`: prior-knowledge cleartext) | 145/146 at `4bb3951` — §3.5/2 asks for a `GOAWAY` before the close; RFC 9113 §3.4 says the frame **MAY be omitted** for an invalid preface, so the tool is stricter than the standard here |
+| h3spec | `H3SPEC_BINARY=/path/to/h3spec just h3spec` (v0.1.14) | **77/77 pass** on 2026-11-13 |
 
-Two things those numbers say that are easy to misread:
+Three things those numbers say that are easy to misread:
 
-- **Our own HTTP/3 + QPACK layer is the strong half.** Of the 18 h3spec failures,
-  13 are cases the quic-go stack passes — every one a QUIC transport rule
-  *below* our code — while 13 *other* cases are ones quic-go fails and we pass,
-  all HTTP/3 and QPACK rules, which is the layer `quic.rs` owns. Reporting only
-  "18 failures" would hide that split, so compare against a second implementation
-  before drawing a conclusion.
+- **`127.0.0.1` is load-bearing.** `localhost` may resolve to `::1` while the
+  test listener is IPv4; watching the protocol then reports silent timeouts
+  without ever reaching Pingclair. `just h3spec` starts a dual-name listener but
+  targets the literal IPv4 address.
+- **The result used to hide a split root cause.** Before #282, 18 failures covered
+  both first-flight transport closes and HTTP/3 protocol errors. The fixed
+  matrix now proves both the quiche transport close and Pingclair's H3/QPACK
+  handling, including the cases quic-go historically failed.
 - **An h2spec or h3spec failure is not automatically a defect.** §3.5/2 is the
   standing example: the clause permits what the tool flags. Read the section
   cited in the case name, and write the verdict into the issue either way.

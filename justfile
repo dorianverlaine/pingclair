@@ -89,6 +89,11 @@ h3:
     PINGCLAIR_BINARY="{{ target-dir }}/release/pingclair" scripts/test-h3-local-resource-failure-local.sh
     just h3-go-test
 
+# 🧪 Run the external h3spec conformance matrix over literal IPv4.
+h3spec:
+    cargo +{{ rust }} build --locked -p pingclair
+    PINGCLAIR_BINARY="{{ target-dir }}/debug/pingclair" scripts/test-h3spec-local.sh
+
 # 🛰️ Add a pinned Go client to the maintained curl interoperability matrix.
 h3-go:
     cargo +{{ rust }} build --release --locked

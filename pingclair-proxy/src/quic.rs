@@ -483,10 +483,10 @@ fn build_ssl_context_builder(
     //
     // ⚠️ `NO_TICKET` and *only* `NO_TICKET`. Setting the session cache mode
     // here would read as belt and braces and would in fact be nothing: quiche
-    // 0.29.3 overwrites it a moment later, in `Context::from_boring`, which
+    // 0.30.1 overwrites it a moment later, in `Context::from_boring`, which
     // unconditionally calls `SSL_CTX_set_session_cache_mode(ctx,
     // SSL_SESS_CACHE_CLIENT)` to install its client-side session callback
-    // (`src/tls/mod.rs:155` and `:264`). Options, by contrast, accumulate and
+    // (`src/tls/mod.rs:153` and `:271-275`). Options, by contrast, accumulate and
     // quiche never clears them. A comment claiming two protections where one
     // is silently reverted is worse than the single one that works, so the
     // call is gone and the reason is here.
@@ -577,10 +577,10 @@ fn build_ssl_context_builder(
 /// Sentinel handed to `tokio_quiche` in place of on-disk certificate paths.
 ///
 /// `tokio-quiche` only calls [`ConnectionHook::create_custom_ssl_context_builder`]
-/// when `ConnectionParams::tls_cert` is `Some` — verified in 0.19.1 at
-/// `settings/config.rs:122`, the `.zip(params.tls_cert)`. But the paths are
+/// when `ConnectionParams::tls_cert` is `Some` — verified in 0.23.0 at
+/// `settings/config.rs:131`, the `.zip(params.tls_cert)`. But the paths are
 /// only ever *passed to* the hook: the sole reader is `quiche_config_with_tls`
-/// (`settings/config.rs:224`), which is the `else` branch taken when the hook
+/// (`settings/config.rs:245`), which is the `else` branch taken when the hook
 /// returns `None`. A hook that returns `Some(builder)` means these strings are
 /// never opened.
 ///
@@ -1936,7 +1936,7 @@ impl H3App {
     ///
     /// 📌 quiche answers `Done` for a stream it has not instantiated: one the
     /// client opened only implicitly, by opening a higher one, and has not
-    /// sent on (quiche 0.29.3 `Connection::stream_shutdown`). It also answers
+    /// sent on (quiche 0.30.1 `Connection::stream_shutdown`). It also answers
     /// `Done` for a read half already shut, which this never asks for twice;
     /// were it to, the extra overdue entry would wait for bytes quiche no
     /// longer delivers and cost nothing else. Any other error is a stream that
@@ -1984,11 +1984,55 @@ impl H3App {
                 Ok((_, quiche::h3::Event::GoAway)) => (),
                 Err(quiche::h3::Error::Done) => break,
                 Err(e) => {
-                    tracing::error!("🌐 {} HTTP/3 error {:?}", qconn.trace_id(), e);
+                    let error_code = Self::h3_connection_close_code(&e);
+                    tracing::error!(
+                        error = ?e,
+                        error_code,
+                        "🌐 {} HTTP/3 connection error",
+                        qconn.trace_id()
+                    );
+                    // 🧯 quiche validates the message and returns the H3 error,
+                    // but its caller owns the connection-close frame. Leaving
+                    // this as a log-only break makes a malformed peer wait for
+                    // its idle timeout instead of learning why it was refused.
+                    if let Some(error_code) = error_code {
+                        let _ = qconn.close(true, error_code, b"HTTP/3 protocol error");
+                    }
                     break;
                 }
             }
         }
+    }
+
+    /// 🧾 Maps an HTTP/3 protocol error to the application close code its peer
+    /// expects. Transport and flow-control errors either already carry a
+    /// quiche-generated close or are recoverable, so they stay `None`.
+    fn h3_connection_close_code(error: &quiche::h3::Error) -> Option<u64> {
+        use quiche::h3::{Error, WireErrorCode};
+
+        Some(match error {
+            Error::Done | Error::StreamBlocked | Error::TransportError(_) => return None,
+            Error::InternalError => WireErrorCode::InternalError as u64,
+            Error::StreamCreationError => WireErrorCode::StreamCreationError as u64,
+            Error::ClosedCriticalStream => WireErrorCode::ClosedCriticalStream as u64,
+            Error::FrameUnexpected => WireErrorCode::FrameUnexpected as u64,
+            Error::FrameError => WireErrorCode::FrameError as u64,
+            Error::ExcessiveLoad => WireErrorCode::ExcessiveLoad as u64,
+            Error::IdError => WireErrorCode::IdError as u64,
+            Error::SettingsError => WireErrorCode::SettingsError as u64,
+            Error::MissingSettings => WireErrorCode::MissingSettings as u64,
+            Error::RequestRejected => WireErrorCode::RequestRejected as u64,
+            Error::RequestCancelled => WireErrorCode::RequestCancelled as u64,
+            Error::RequestIncomplete => WireErrorCode::RequestIncomplete as u64,
+            Error::MessageError => WireErrorCode::MessageError as u64,
+            Error::ConnectError => WireErrorCode::ConnectError as u64,
+            Error::VersionFallback => WireErrorCode::VersionFallback as u64,
+            Error::QpackDecompressionFailed => 0x200,
+            Error::QpackEncoderStreamError => 0x201,
+            Error::QpackDecoderStreamError => 0x202,
+            // 🛡️ A local buffer failure is ours, not a peer violation.
+            Error::BufferTooShort => WireErrorCode::InternalError as u64,
+        })
     }
 
     /// Handle a request HEADERS event: parse the request, register stream

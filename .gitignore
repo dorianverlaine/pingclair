@@ -91,6 +91,7 @@ vendor/*
 !vendor/foundations-compat/
 !vendor/pingora-core/
 !vendor/pingora-proxy/
+!vendor/quiche/
 
 # 🔬 Verification-day working material: the scripts a Day runs against a clean
 # Linux box, the configurations they drive, and the evidence they produce.

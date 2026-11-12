@@ -122,6 +122,17 @@ chunk from remaining queued on an otherwise quiet connection (#331), while
 QUIC flow-control blocking still waits without spinning. `just h3` now runs
 both the curl and Go client matrices, matching the Linux CI gate.
 
+### 🛰️ HTTP/3 refusals now reach the peer as protocol errors
+
+HTTP/3 now runs on released `tokio-quiche 0.23.0` and `quiche 0.30.1`, removing
+the private BoringSSL compatibility fork. The server sends the required QUIC or
+HTTP/3 `CONNECTION_CLOSE` instead of leaving a malformed peer to time out:
+first-flight transport errors, reserved bits, truncated or duplicate SETTINGS,
+oversized frames, and invalid QPACK encoder or decoder instructions now carry
+their RFC 9114/RFC 9204 error codes. h3spec v0.1.14 passes all **77/77** cases
+when targeted at the literal IPv4 listener; `just h3spec` reproduces the run
+(#282).
+
 ### 🚪 A stalled upload ends when its write budget does
 
 An upstream that accepts a request but stops reading its body now releases the

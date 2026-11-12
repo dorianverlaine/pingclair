@@ -17,6 +17,7 @@ exclude = [
     "vendor/foundations-compat",
     "vendor/pingora-core",
     "vendor/pingora-proxy",
+    "vendor/quiche",
 ]
 
 [workspace.package]
@@ -70,11 +71,11 @@ x509-parser = "0.18"
 # its server-side accept API is pub(crate)" — was WRONG, and it was wrong in the
 # way a rejection note is most harmful: it stopped anyone re-examining the
 # question. Only the internal `quic::start_listener()` is `pub(crate)`. The
-# facade is public, verified against `tokio-quiche 0.19.1` on 2026-07-30:
-# `tokio_quiche::listen()` (lib.rs:191), plus `ServerH3Driver`,
+# facade is public, verified against `tokio-quiche 0.23.0` on 2026-11-13:
+# `tokio_quiche::listen()` (lib.rs:193), plus `ServerH3Driver`,
 # `ServerH3Controller`, `InitialQuicConnection` and `ApplicationOverQuic`.
 #
-# The dependency versions align exactly — it pulls `quiche 0.29.3` and
+# The dependency versions align exactly — it pulls `quiche 0.30.1` and
 # `boring 5.x`, the same ones below, with no `openssl-sys` anywhere — so the
 # single-BoringSSL invariant survives the migration. Verify in this workspace,
 # not in a probe crate: `cargo tree -i boring-sys` must show one BoringSSL graph
@@ -84,7 +85,7 @@ x509-parser = "0.18"
 # 🔐 The blocker was TLS, not the accept API: `ConnectionParams` demands a
 # `TlsCertificatePaths`, which looks like it forces private keys onto disk. It
 # does not. The paths are only handed to `ConnectionHook`; their sole reader,
-# `quiche_config_with_tls` (settings/config.rs:224 in 0.19.1), is the branch
+# `quiche_config_with_tls` (settings/config.rs:243 in 0.23.0), is the branch
 # taken when the hook returns `None`. A hook returning `Some(builder)` means the
 # paths are never opened, so certificates stay in the in-memory `CertTable`.
 # Proven by `pingclair-proxy/tests/h3_in_memory_certs.rs` against real
@@ -126,9 +127,9 @@ boring-sys = "5"
 # tracks the one `boring` itself depends on.
 foreign-types = "0.5"
 # Pinned: the ConnectionHook/tls_cert behaviour documented above was read from
-# `tokio-quiche 0.19.1`'s source. A minor bump could start reading the sentinel
+# `tokio-quiche 0.23.0`'s source. A minor bump could start reading the sentinel
 # paths.
-tokio-quiche = { version = "=0.19.1", default-features = false }
+tokio-quiche = { version = "=0.23.0", default-features = false }
 
 # HTTP
 http = "1"
@@ -183,20 +184,14 @@ arc-swap = "1"
 # 🛡️ Vendoring also removes `source`/`checksum` from the lockfile entry,
 # which makes the crate invisible to `cargo audit` — verified directly.
 [patch.crates-io]
-# 🧷 Cloudflare's BoringSSL 5 support is not released in `tokio-quiche 0.19.1`
-# yet. Pin the reviewed compatibility work from quiche#2446 until upstream
-# publishes it; the commit keeps the package versions at `quiche 0.29.3` and
-# `tokio-quiche 0.19.1`, so this patch can be removed without a code migration
-# once the released dependency graph accepts BoringSSL 5.
-#
-# This is deliberately an immutable commit, not a moving branch. It is the
-# only temporary bridge needed to keep Pingora 0.9 and Pingclair H3 on one
-# `boring-sys` major.
-quiche = { git = "https://github.com/cjpatton/quiche.git", rev = "82152d23d69a2ef77b734346f4bb2eee2475825d" }
-tokio-quiche = { git = "https://github.com/cjpatton/quiche.git", rev = "82152d23d69a2ef77b734346f4bb2eee2475825d" }
+# 🧯 cloudflare/quiche#2515 leaves first-flight transport errors marked
+# unsendable before their Initial CONNECTION_CLOSE can leave the server.
+# `vendor/quiche` carries the bounded #2521 fix on the released 0.30.1 source.
+# Provenance and removal criteria live beside the package.
+quiche = { path = "vendor/quiche" }
 
 # 🛡️ This compatibility crate removes GHSA-2gh3-rmm4-6rq5 without carrying a
-# full fork. `tokio-quiche 0.19.1` still requests Foundations tracing even
+# full fork. `tokio-quiche 0.23.0` still requests Foundations tracing even
 # though it only consumes the settings, logging, metrics, and testing APIs.
 # Remove the shim when that upstream release exposes the safe graph directly.
 foundations = { path = "vendor/foundations-compat" }

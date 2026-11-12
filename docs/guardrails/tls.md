@@ -7,16 +7,16 @@
 - **The reqwest dev dependency stays on rustls.** native-tls/OpenSSL collides at
   link time with quiche's BoringSSL.
 - **Never introduce `pingora-openssl`, `openssl-sys`, or reqwest `native-tls`.**
-  `quiche 0.29`, `boring 4.22`, and Pingora's `boringssl` feature are one
+  `quiche 0.30.1`, `boring 5.2`, and Pingora's `boringssl` feature are one
   BoringSSL linking design; OpenSSL/BoringSSL symbol collisions have previously
   produced **a SIGBUS at startup and link errors on Linux**. These three rules are
   not preferences, they are preconditions for H3 — see "why H3 is pinned to
   quiche/BoringSSL" below.
 
 - 🔓 **`boring-sys` is a direct dependency, and its version moves with `boring`.**
-  `boring` 4.22 does not wrap `X509_STORE_CTX_set_purpose`, which downstream mTLS
+  `boring` 5.2 does not wrap `X509_STORE_CTX_set_purpose`, which downstream mTLS
   needs (see the downstream mTLS section for why), so the workspace declares
-  `boring-sys = "4.22"` and `foreign-types = "0.5"` directly — the latter to get
+  `boring-sys = "5"` and `foreign-types = "0.5"` directly — the latter to get
   `ForeignTypeRef::as_ptr`, which `boring` only `extern crate`s and never
   re-exports. ⚠️ **Two `boring-sys` means two BoringSSL**, which is exactly the
   symbol collision described above. Both using a caret range is deliberate: they
@@ -306,9 +306,9 @@
 
 - 🤡 **quiche overwrites whatever session cache mode you set, so turning
   resumption off on QUIC works only through `SSL_OP_NO_TICKET`.**
-  `Context::from_boring` (quiche 0.29.3, `src/tls/mod.rs:155`) takes your
+  `Context::from_boring` (quiche 0.30.1, `src/tls/mod.rs:153`) takes your
   `SslContextBuilder` and then **unconditionally** calls `set_session_callback()`
-  → `SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT)` (`:264`) to
+  → `SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT)` (`:271-275`) to
   install its own client session callback. The `SslSessionCacheMode::OFF` you set
   on the builder is overwritten on the spot. **Options, by contrast, accumulate**
   and quiche never clears them, so `NO_TICKET` survives.
