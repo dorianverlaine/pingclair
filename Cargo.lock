@@ -3049,8 +3049,6 @@ dependencies = [
 [[package]]
 name = "pingora-core"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a535f47f65fdcb003f9e1df04cd18e614c128dfe9388acce3f211ae38ac14d68"
 dependencies = [
  "ahash",
  "async-trait",

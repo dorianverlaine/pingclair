@@ -19,15 +19,12 @@ use tokio::io::AsyncWriteExt;
 /// origin that speaks first after the client half-closes — a WebSocket close
 /// frame, a last stream chunk — would otherwise be dropped silently.
 #[tokio::test]
-#[ignore = "pingora-proxy 0.9.0 ends an upgraded exchange when the request side \
-            finishes (`if request_done && client_session.was_upgraded()` sets \
-            response_done), and the tunnel loop has no embedder hook"]
 async fn test_a_half_closed_upgrade_still_carries_the_origins_bytes() {
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();
     let upstream_task = tokio::spawn(async move {
         let (mut stream, _) = upstream.accept().await.unwrap();
-        let _ =
+        let request =
             read_until_marker(&mut stream, b"\r\n\r\n", std::time::Duration::from_secs(2)).await;
         stream
             .write_all(
@@ -35,12 +32,20 @@ async fn test_a_half_closed_upgrade_still_carries_the_origins_bytes() {
             )
             .await
             .unwrap();
-        // 🕰️ The client's FIN arrives while the origin is idle, so the payload
-        // below is written to a connection the client has half-closed.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let written = stream.write_all(b"BACKEND-AFTER-CLIENT-FIN").await.is_ok();
+        // 🪝 The proxy must forward the client's FIN as EOF in the request
+        // direction. Only then may the origin write its final tunnel bytes.
+        let mut byte = [0_u8; 1];
+        let saw_eof = matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tokio::io::AsyncReadExt::read(&mut stream, &mut byte),
+            )
+            .await,
+            Ok(Ok(0))
+        );
+        let written = saw_eof && stream.write_all(b"BACKEND-AFTER-CLIENT-FIN").await.is_ok();
         let _ = stream.shutdown().await;
-        written
+        (request, saw_eof, written)
     });
 
     let config = format!(
@@ -89,17 +94,31 @@ async fn test_a_half_closed_upgrade_still_carries_the_origins_bytes() {
         tokio::io::AsyncReadExt::read_to_end(&mut client, &mut received),
     )
     .await;
-    let written = upstream_task.await.unwrap();
+    let (request, saw_eof, written) = upstream_task.await.unwrap();
     server.stop();
 
     assert!(
+        saw_eof,
+        "the origin must receive the client's FIN in the request direction"
+    );
+    assert!(
         written,
-        "the origin must still be able to write after the FIN"
+        "the origin must still be able to write after receiving the FIN"
+    );
+    assert!(
+        String::from_utf8_lossy(&request)
+            .to_ascii_lowercase()
+            .contains("\r\nupgrade: websocket\r\n"),
+        "the upstream request lost its upgrade contract: {}",
+        String::from_utf8_lossy(&request)
     );
     assert!(
         read.is_ok(),
         "the client's read must end when the tunnel does, not hang"
     );
+    if String::from_utf8_lossy(&received) != "BACKEND-AFTER-CLIENT-FIN" {
+        server.print_diagnostics();
+    }
     assert_eq!(
         String::from_utf8_lossy(&received),
         "BACKEND-AFTER-CLIENT-FIN",

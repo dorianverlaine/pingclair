@@ -43,6 +43,14 @@ where
         client_session.read_timeout = peer.options.read_timeout;
         client_session.write_timeout = peer.options.write_timeout;
 
+        if session.downstream_session.is_upgrade_req() {
+            // 🔌 Pingora otherwise turns the client's half-close into a fatal
+            // `ConnectionClosed` error. An upgraded protocol owns both byte
+            // directions independently, so a FIN must leave the response side
+            // free to finish delivering the origin's remaining bytes.
+            session.downstream_session.set_abort_on_close(false);
+        }
+
         // phase 2 send to upstream
 
         let mut req = session.req_header().clone();
@@ -339,7 +347,8 @@ where
                     match send_body_to1(client_session, body).await {
                         Ok(send_done) => {
                             request_done = send_done;
-                            // An upgraded request is terminated when either side is done
+                            // 🔌 Upgraded directions close independently: the request side may
+                            // finish while the origin still has response bytes to send.
                             if request_done && client_session.was_upgraded() {
                                 if !request_body_end_handled && !downstream_pipe_closed {
                                     // The 101 was read while the end of the request body was
@@ -347,9 +356,14 @@ where
                                     // not that the tunnel did, so keep reading from downstream.
                                     request_body_end_handled = true;
                                     request_done = false;
-                                } else {
+                                } else if downstream_pipe_closed {
+                                    // 🚪 The local downstream task has gone away, so no later
+                                    // origin bytes can have a destination.
                                     response_done = true;
                                 }
+                                // A client FIN ends only the request direction. The upgraded
+                                // protocol may still have bytes to send back, so keep reading
+                                // until the origin closes its response direction.
                             }
                         },
                         Err(e) => {
@@ -606,11 +620,6 @@ where
                            }
                         }
                     };
-                    // If the request is websocket, `None` body means the request is closed.
-                    // Set the response to be done as well so that the request completes normally.
-                    if body.is_none() && session.was_upgraded() {
-                        response_state.maybe_set_upstream_done(true);
-                    }
                     // TODO: consider just drain this if serve_from_cache is set
                     let is_body_done = session.is_body_done();
                     let request_done = self.send_body_to_pipe(

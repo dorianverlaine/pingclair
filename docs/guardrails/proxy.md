@@ -1,5 +1,20 @@
 # ⚠️ Pingclair implementation guardrails — proxy, HTTP/3, and streaming
 
+## 🪝 HTTP/1 upgrade half-closes are directional
+
+After `101 Switching Protocols`, HTTP no longer owns the connection: the two
+directions are independent byte streams. A client FIN must shut down only the
+request direction to the origin. Keep reading the origin response until that
+side closes or the downstream task disappears; treating either FIN as the end of
+the whole tunnel silently drops WebSocket close frames and final stream bytes
+(#274).
+
+The state machine lives in the vendored `pingora-proxy` and `pingora-core`
+patches documented in their `PATCHES.md` files. The real-binary regression is
+`pingclair/tests/integration/websocket_upgrade.rs`, and the differential suite
+deliberately records that Pingclair preserves the origin tail while nginx's
+default client-abort policy drops it.
+
 ## 🚀 HTTP/3 implementation guardrails
 
 ### Why H3 is pinned to quiche/BoringSSL (stop re-asking this)

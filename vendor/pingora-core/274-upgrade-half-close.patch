@@ -1,0 +1,25 @@
+diff --git a/src/protocols/http/v1/client.rs b/src/protocols/http/v1/client.rs
+index 5b7b725..469d3b1 100644
+--- a/src/protocols/http/v1/client.rs
++++ b/src/protocols/http/v1/client.rs
+@@ -184,7 +183,0 @@
+-    fn maybe_force_close_body_reader(&mut self) {
+-        if self.upgraded && self.received_upgrade_req_body && !self.body_reader.body_done() {
+-            // request is done, reset the response body to close
+-            self.body_reader.init_content_length(0, b"");
+-        }
+-    }
+-
+@@ -200 +193,11 @@
+-        self.maybe_force_close_body_reader();
++        if self.upgraded && self.received_upgrade_req_body {
++            // 🔌 The request and response directions close independently. Shut
++            // down only the write half so the origin sees EOF and can still send
++            // its remaining upgraded-protocol bytes (RFC 9293 §3.6). Do not
++            // replace the close-delimited response reader with a zero-length
++            // body; that discarded every byte written after the client's FIN.
++            self.underlying_stream
++                .shutdown()
++                .await
++                .or_err(WriteError, "shutting down upgraded request body")?;
++        }

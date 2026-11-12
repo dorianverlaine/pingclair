@@ -169,6 +169,11 @@
   The vendored proxy sends the failure into the response pipeline immediately;
   continuing to read from an origin that stopped making progress leaves the
   client waiting after its write deadline already fired (#329).
+- 🪝 **An upgraded connection must survive a client half-close.** The
+  downstream session tolerates a FIN after the upgrade, and the HTTP/1 client
+  forwards that FIN as a write-half shutdown while keeping its close-delimited
+  response reader alive. A payload written after the FIN is a required
+  regression assertion (#274).
 - 🛡️ **Pingora's header serializer must stay on the patched zstd line.**
   Pingora 0.9.1 requests `zstd 0.14.3` and `zstd-safe 8.2.0`. Older versions
   are affected by the October 2026 RustSec advisories; do not downgrade these

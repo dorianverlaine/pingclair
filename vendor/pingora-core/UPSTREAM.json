@@ -1,0 +1,9 @@
+{
+  "name": "pingora-core",
+  "version": "0.9.1",
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "checksum": "a535f47f65fdcb003f9e1df04cd18e614c128dfe9388acce3f211ae38ac14d68",
+  "archive": "https://static.crates.io/crates/pingora-core/pingora-core-0.9.1.crate",
+  "issue": "https://github.com/dorianverlaine/pingclair/issues/274",
+  "patch": "274-upgrade-half-close.patch"
+}

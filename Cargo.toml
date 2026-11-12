@@ -15,6 +15,7 @@ members = [
 ]
 exclude = [
     "vendor/foundations-compat",
+    "vendor/pingora-core",
     "vendor/pingora-proxy",
 ]
 
@@ -205,6 +206,11 @@ foundations = { path = "vendor/foundations-compat" }
 # to the published 0.9.1 source. Provenance and removal criteria live beside it.
 # `just audit` restores the registry coordinate in a temporary audit lockfile.
 pingora-proxy = { path = "vendor/pingora-proxy" }
+
+# 🔌 Pingora 0.9.1 plus the half-close correctness fix for upgraded HTTP/1
+# sessions. Finishing the client-to-origin direction must not force the
+# origin-to-client reader to zero length. Provenance lives beside the package.
+pingora-core = { path = "vendor/pingora-core" }
 
 [profile.release]
 lto = "fat"

@@ -130,6 +130,15 @@ sides waiting for progress that cannot happen. A complete upstream response
 that arrived first still wins. The write-error path no longer waits for a
 response after the request-body failure that stopped the exchange (#329).
 
+### 🪝 A half-closed upgrade keeps the origin's remaining bytes
+
+An upgraded HTTP/1 connection has two independent directions. A client FIN now
+ends only its request direction; the origin can still send its final WebSocket
+close frame, stream chunk or other payload before closing, and those bytes
+reach the client. Pingora's HTTP/1 client forwards the FIN as a write-half
+shutdown and no longer replaces the close-delimited response reader with a
+zero-length body when the request side finishes (#274).
+
 ### 🛡️ Pingora 0.9.1 closes a connection panic and retires a dependency patch
 
 The Pingora crates now resolve to 0.9.1. This fixes the zero-capacity buffered

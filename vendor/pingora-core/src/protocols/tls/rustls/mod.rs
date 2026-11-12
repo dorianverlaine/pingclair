@@ -1,0 +1,69 @@
+// Copyright 2026 Cloudflare, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+pub mod client;
+pub mod server;
+mod stream;
+
+pub use stream::*;
+
+use crate::utils::tls::WrappedX509;
+use pingora_rustls::CertificateDer;
+
+pub type CaType = [WrappedX509];
+
+/// TLS connection state exposed to post-handshake callbacks.
+///
+/// Provides access to peer certificates and negotiated cipher suite
+/// after a TLS handshake completes. This is the rustls equivalent of
+/// the OpenSSL `SslRef` that is used as `TlsRef` in the boringssl/openssl path.
+#[derive(Debug)]
+pub struct TlsRef {
+    pub(super) peer_certs: Option<Vec<CertificateDer<'static>>>,
+    pub(super) cipher: Option<&'static str>,
+    pub(super) version: Option<&'static str>,
+    pub(super) server_name: Option<String>,
+}
+
+impl TlsRef {
+    /// Returns the peer's leaf certificate in DER encoding, if present.
+    pub fn peer_certificate_der(&self) -> Option<&[u8]> {
+        self.peer_certs
+            .as_ref()
+            .and_then(|certs| certs.first())
+            .map(|cert| cert.as_ref())
+    }
+
+    /// Returns the full peer certificate chain in DER encoding.
+    /// The first entry is the leaf; subsequent entries are intermediates.
+    pub fn peer_cert_chain_der(&self) -> Option<&[CertificateDer<'static>]> {
+        self.peer_certs.as_deref()
+    }
+
+    /// Returns the negotiated cipher suite name, if available.
+    pub fn current_cipher_name(&self) -> Option<&'static str> {
+        self.cipher
+    }
+
+    /// Returns the negotiated TLS protocol version (e.g. "TLSv1.3"), if available.
+    pub fn version(&self) -> Option<&'static str> {
+        self.version
+    }
+
+    /// Returns the SNI hostname sent by the peer, if any. Only populated on
+    /// server-side connections; always `None` on client streams.
+    pub fn server_name(&self) -> Option<&str> {
+        self.server_name.as_deref()
+    }
+}
