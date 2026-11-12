@@ -1,0 +1,73 @@
+diff --git a/src/proxy_h1.rs b/src/proxy_h1.rs
+index 3a24cb8..d6b6821 100644
+--- a/src/proxy_h1.rs
++++ b/src/proxy_h1.rs
+@@ -258,8 +258,7 @@ where
+     {
+         let mut request_done = false;
+         let mut response_done = false;
+-        let mut upstream_can_reuse = true;
+-        let mut send_error = None;
++        let upstream_can_reuse = true;
+         let mut upgraded = false;
+         // The end of the *request body* is not the end of an upgraded tunnel. Exactly one
+         // end-of-body task belongs to the original request, but whether it is handled before
+@@ -278,14 +277,12 @@ where
+                             if !upgraded && client_session.was_upgraded() {
+                                 // upgrade can only happen once
+                                 upgraded = true;
+-                                if send_error.is_none() {
+-                                    // continue receiving from downstream after body mode change
+-                                    // If the request body already ended, that end belonged to the
+-                                    // request and has now been accounted for; the branch below
+-                                    // must not consume a second one.
+-                                    request_body_end_handled = request_done;
+-                                    request_done = false;
+-                                }
++                                // continue receiving from downstream after body mode change
++                                // If the request body already ended, that end belonged to the
++                                // request and has now been accounted for; the branch below
++                                // must not consume a second one.
++                                request_body_end_handled = request_done;
++                                request_done = false;
+                             }
+                             let type_str = task.type_str();
+                             let result = tx.send(task)
+@@ -323,9 +320,11 @@ where
+                             }
+                         },
+                         Err(e) => {
+-                            // Push the error to downstream and then quit
+-                            // Don't care if send fails: downstream already gone
+-                            let _ = tx.send(HttpTask::Failed(send_error.unwrap_or(e).into_up())).await;
++                            // 🚪 Push the error downstream and quit. Waiting for an upstream
++                            // response after its request-body write failed can park forever:
++                            // the write timeout fired precisely because that peer stopped
++                            // making progress.
++                            let _ = tx.send(HttpTask::Failed(e.into_up())).await;
+                             // A response read error means the HTTP/1 message boundary was not
+                             // established successfully, so the connection cannot be reused.
+                             return Ok(false)
+@@ -355,17 +354,16 @@ where
+                         },
+                         Err(e) => {
+                            warn!("send error, draining read buf: {e}");
+-                           request_done = true;
+ 
+                            // Built-in HTTP downstream sessions are expected to reject
+                            // incomplete bodies before reaching this state. A downstream
+                            // session that does not report such an error or an upstream request
+                            // mutation that creates inconsistent framing can still reach it.
+-                           // A complete response can be forwarded, but the partially written
+-                           // HTTP/1 request makes this connection unsafe to reuse.
+-                           upstream_can_reuse = false;
+-                           send_error = Some(e);
+-                           continue
++                           // 🚪 The partially written request makes this upstream unsafe to
++                           // reuse, and the error must reach the downstream response path now
++                           // instead of leaving both sides waiting for progress.
++                           let _ = tx.send(HttpTask::Failed(e)).await;
++                           return Ok(false)
+                         }
+                     }
+                 },

@@ -165,6 +165,10 @@
   See [`vendor/pingora-proxy/PATCHES.md`](../../vendor/pingora-proxy/PATCHES.md)
   for provenance, audit coverage and removal criteria. This does not fix the
   separate tunnel half-close defect (#274).
+- 🚪 **An upstream request-body write failure must end the downstream wait.**
+  The vendored proxy sends the failure into the response pipeline immediately;
+  continuing to read from an origin that stopped making progress leaves the
+  client waiting after its write deadline already fired (#329).
 - 🛡️ **Pingora's header serializer must stay on the patched zstd line.**
   Pingora 0.9.1 requests `zstd 0.14.3` and `zstd-safe 8.2.0`. Older versions
   are affected by the October 2026 RustSec advisories; do not downgrade these

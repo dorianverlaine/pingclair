@@ -258,6 +258,10 @@ mod header_deadline;
 #[path = "integration/body_stall.rs"]
 mod body_stall;
 
+// 🚪 An upstream that never reads the request body must end at its write budget.
+#[path = "integration/upstream_write_timeout.rs"]
+mod upstream_write_timeout;
+
 // ⏱️ An HTTP/2 upload to an upstream or FastCGI that stops halfway.
 #[path = "integration/h2_body_stall.rs"]
 mod h2_body_stall;

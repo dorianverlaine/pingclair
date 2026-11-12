@@ -122,6 +122,14 @@ chunk from remaining queued on an otherwise quiet connection (#331), while
 QUIC flow-control blocking still waits without spinning. `just h3` now runs
 both the curl and Go client matrices, matching the Linux CI gate.
 
+### 🚪 A stalled upload ends when its write budget does
+
+An upstream that accepts a request but stops reading its body now releases the
+client at the configured write timeout with `504`, rather than leaving both
+sides waiting for progress that cannot happen. A complete upstream response
+that arrived first still wins. The write-error path no longer waits for a
+response after the request-body failure that stopped the exchange (#329).
+
 ### 🛡️ Pingora 0.9.1 closes a connection panic and retires a dependency patch
 
 The Pingora crates now resolve to 0.9.1. This fixes the zero-capacity buffered

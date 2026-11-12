@@ -1,13 +1,21 @@
 # 🔌 Pingora HTTP/1 upgrade backport
 
-This directory contains the published **pingora-proxy 0.9.1** crate, with
-only the runtime fix from [upstream PR #947](https://github.com/cloudflare/pingora/pull/947)
-backported to `src/proxy_h1.rs`. It is not a snapshot of the older PR branch.
+This directory contains the published **pingora-proxy 0.9.1** crate with two
+narrow HTTP/1 fixes:
+
+- [upstream PR #947](https://github.com/cloudflare/pingora/pull/947) keeps an
+  upgraded tunnel open when the request body ends after the upstream's `101`;
+- `329-write-timeout.patch` ends such a request as soon as writing its body
+  fails, instead of waiting forever for an upstream response that may never
+  arrive.
+
+It is not a snapshot of either upstream branch.
 `UPSTREAM.json` records the immutable PR commit and registry archive checksum;
-`947-backport.patch` records the complete source change against that archive.
+`947-backport.patch` records the first source change against that archive, and
+`329-write-timeout.patch` applies after it.
 Apply it from the extracted crate root with `git apply --unidiff-zero
-947-backport.patch`; zero context keeps blank context lines out of whitespace
-checks.
+947-backport.patch`, then apply `329-write-timeout.patch` the same way; zero
+context keeps blank context lines out of whitespace checks.
 The original Apache-2.0 license and package metadata are retained.
 
 The original request's empty-body task must be accounted for once, whether it
