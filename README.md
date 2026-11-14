@@ -86,11 +86,15 @@ curl -fsSL https://pingclair.com/install.sh | sudo bash
 ```
 
 The default installer selects the latest stable release, currently `v0.2.3`.
-The alpha preview is available from its exact [GitHub release
-asset](https://github.com/dorianverlaine/pingclair/releases/tag/v0.3.0-alpha.1);
-the [installation guide](https://pingclair.com/start/install/#-install-the-preview)
-shows the checksum-first upgrade. The `v0.1.x` line is unmaintained and should
-not be used for a new deployment.
+The alpha preview uses the same installer and the R2 prerelease channel:
+
+```bash
+curl -fsSL https://releases.pingclair.com/pingclair/install.sh | sudo bash -s -- --prerelease
+```
+
+The [installation guide](https://pingclair.com/start/install/#-install-the-preview)
+describes both channels. The `v0.1.x` line is unmaintained and should not be
+used for a new deployment.
 
 After installation, inspect the service before loading a configuration:
 

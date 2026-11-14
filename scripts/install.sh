@@ -27,8 +27,9 @@ sha256_of() {
 }
 
 # 0. Install mode
-# 🧭 Default is the latest stable release binary. `--main` clones the latest
-# main and compiles it locally (requires Rust).
+# 🧭 Default is the latest stable release binary. `--prerelease` follows the R2
+# prerelease channel, and `--main` clones the latest main and compiles it
+# locally (requires Rust).
 #
 # 📌 A `--dev` mode used to install a rolling development build that CI
 # republished on every push to main. It was removed with that workflow: a
@@ -37,16 +38,31 @@ sha256_of() {
 INSTALL_MODE="release"
 while [ $# -gt 0 ]; do
     case "$1" in
-        --main) INSTALL_MODE="main" ;;
+        --prerelease)
+            if [ "$INSTALL_MODE" = "main" ]; then
+                echo -e "${RED}--prerelease and --main are mutually exclusive.${NC}"
+                exit 1
+            fi
+            INSTALL_MODE="prerelease"
+            ;;
+        --main)
+            if [ "$INSTALL_MODE" = "prerelease" ]; then
+                echo -e "${RED}--prerelease and --main are mutually exclusive.${NC}"
+                exit 1
+            fi
+            INSTALL_MODE="main"
+            ;;
         -h|--help)
-            echo "Usage: $0 [--main]"
+            echo "Usage: $0 [--prerelease | --main]"
             echo "  (default)  Install the latest stable release binary."
+            echo "  --prerelease"
+            echo "             Install the latest alpha, beta, or release candidate."
             echo "  --main     Clone main and compile it locally (requires Rust 1.99+)."
             exit 0
             ;;
         *)
             echo -e "${RED}Unknown option: $1${NC}"
-            echo "Usage: $0 [--main]"
+            echo "Usage: $0 [--prerelease | --main]"
             exit 1
             ;;
     esac
@@ -68,7 +84,7 @@ fi
 echo "Installing runtime dependencies..."
 if command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq
-    apt-get install -y -qq openssl ca-certificates curl jq libssl-dev
+    apt-get install -y -qq openssl ca-certificates curl jq libcap2-bin libssl-dev
 else
     dnf install -y openssl ca-certificates curl jq libcap
 fi
@@ -140,9 +156,14 @@ if [ "$INSTALL_MODE" = "main" ]; then
 else
     # 🧊 releases.pingclair.com first. Its channel document names the tag, every
     # asset, and the sha256 of each one, and the host has no egress fee and a CDN
-    # in front of it — which matters most to users far from GitHub. GitHub stays
-    # the fallback and remains where releases are created.
+    # in front of it — which matters most to users far from GitHub. Stable and
+    # prerelease channels are separate, so an alpha can never move `latest`.
+    # GitHub stays the fallback and remains where releases are created.
     RELEASES_BASE_URL="${PINGCLAIR_RELEASES_BASE_URL:-https://releases.pingclair.com/pingclair}"
+    RELEASE_CHANNEL="latest"
+    if [ "$INSTALL_MODE" = "prerelease" ]; then
+        RELEASE_CHANNEL="prerelease"
+    fi
     TAR_NAME="pingclair-linux-$ASSET_KEY.tar.gz"
     RELEASE_SOURCE=""
     EXPECTED_SHA256=""
@@ -150,7 +171,7 @@ else
     LATEST_RELEASE_URL=""
     LATEST_SUM_URL=""
 
-    CHANNEL_DOCUMENT=$(curl -fsSL --max-time 20 "$RELEASES_BASE_URL/channels/latest" 2>/dev/null || true)
+    CHANNEL_DOCUMENT=$(curl -fsSL --max-time 20 "$RELEASES_BASE_URL/channels/$RELEASE_CHANNEL" 2>/dev/null || true)
     if [ -n "$CHANNEL_DOCUMENT" ]; then
         LATEST_TAG=$(printf '%s' "$CHANNEL_DOCUMENT" | jq -r ".tag_name // empty" 2>/dev/null || true)
         LATEST_RELEASE_URL=$(printf '%s' "$CHANNEL_DOCUMENT" | jq -r ".assets[] | select(.name == \"$TAR_NAME\") | .browser_download_url" 2>/dev/null | head -n 1)
@@ -162,13 +183,22 @@ else
     fi
 
     if [ -z "$RELEASE_SOURCE" ]; then
-        echo -e "${YELLOW}releases.pingclair.com did not answer with a release channel; falling back to GitHub.${NC}"
-        echo "Fetching latest release from $REPO..."
+        echo -e "${YELLOW}releases.pingclair.com did not answer with the $RELEASE_CHANNEL channel; falling back to GitHub.${NC}"
+        echo "Fetching latest $INSTALL_MODE release from $REPO..."
 
         # 🧭 One fetch, not three: the release document names the tag and carries
         # every asset URL, and asking the API again for each of them invites the
         # anonymous rate limit to answer differently halfway through.
-        LATEST_RELEASE=$(curl -s "https://api.github.com/repos/$REPO/releases/latest")
+        if [ "$INSTALL_MODE" = "prerelease" ]; then
+            LATEST_RELEASES=$(curl -s "https://api.github.com/repos/$REPO/releases?per_page=30")
+            LATEST_RELEASE=$(printf '%s' "$LATEST_RELEASES" | jq -c '
+                [.[] | select(.draft == false and .prerelease == true)]
+                | sort_by(.published_at)
+                | last // {}
+            ' 2>/dev/null || printf '{}')
+        else
+            LATEST_RELEASE=$(curl -s "https://api.github.com/repos/$REPO/releases/latest")
+        fi
         LATEST_TAG=$(printf '%s' "$LATEST_RELEASE" | jq -r ".tag_name // empty")
         LATEST_RELEASE_URL=$(printf '%s' "$LATEST_RELEASE" | jq -r ".assets[] | select(.name | contains(\"$ASSET_KEY\") and contains(\"linux\")) | .browser_download_url" | head -n 1)
         LATEST_SUM_URL=$(printf '%s' "$LATEST_RELEASE" | jq -r ".assets[] | select(.name == \"SHA256SUMS-$ASSET_KEY.txt\") | .browser_download_url" | head -n 1)
@@ -187,7 +217,7 @@ else
     esac
 
     if [ -z "$RELEASE_SOURCE" ]; then
-        echo -e "${YELLOW}No binary found for $ARCH in latest release.${NC}"
+        echo -e "${YELLOW}No binary found for $ARCH in the $INSTALL_MODE release channel.${NC}"
         echo "Attempting cargo build fallback (requires Rust)..."
         if command -v cargo &> /dev/null; then
             cargo build --release
