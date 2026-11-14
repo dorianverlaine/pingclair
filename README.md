@@ -27,12 +27,14 @@ kind of option, under nginx's name when nginx has the concept — `deny`,
 `send_timeout`, `keepalive_requests`, `negotiate markdown`
 ([examples/extensions.pingclair](examples/extensions.pingclair)).
 
-The latest release is `v0.2.3`, the newest patch on the 0.2 line. Review the
-[project status](https://pingclair.com/project/status/) before using it for a
-production deployment. Pingclair is pre-1.0: a minor version is where breaking
+The latest stable release is `v0.2.3`, the newest patch on the 0.2 line. The
+[`v0.3.0-alpha.1` preview](https://github.com/dorianverlaine/pingclair/releases/tag/v0.3.0-alpha.1)
+adds the first Layer 4 and broader 0.3 feature set. Review the
+[project status](https://pingclair.com/project/status/) before choosing either
+channel for production. Pingclair is pre-1.0: a minor version is where breaking
 changes live, and a patch release promises nothing breaks.
 
-🔌 The 0.3 development line on `main` supports TCP forwarding with TLS
+🔌 The [`v0.3.0-alpha.1` preview](https://pingclair.com/guides/layer4/) supports TCP forwarding with TLS
 ClientHello SNI/ALPN and source-IP routing. TLS passes through unchanged; it is
 not terminated.
 Opt-in connection access logs and `l4_*` metrics report traffic and session outcomes.
@@ -58,6 +60,9 @@ See the [L4 boundaries](docs/guardrails/layer4.md) for syntax and current limits
   policies, active health checks, retries, circuit breakers, and bounded
   overload queues.
   HTTP/3 cancellation releases upstream requests even while the origin is idle.
+- **Layer 4 TCP routing** — Forward raw TCP by TLS SNI, ALPN, or source address
+  with bounded admission, static or dynamic DNS upstreams, session logs, and
+  `l4_*` metrics. TLS remains end to end.
 - **Static files and FastCGI** — Serve files with conditional and range
   requests, apply gzip or Zstandard compression, and run PHP through FastCGI.
   Canonical file and directory redirects preserve queries and stay on the same origin.
@@ -80,8 +85,12 @@ and `pc` commands:
 curl -fsSL https://pingclair.com/install.sh | sudo bash
 ```
 
-The current release is `v0.2.3`, a patch on the 0.2 line. The `v0.1.x` line is
-unmaintained and should not be used for a new deployment.
+The default installer selects the latest stable release, currently `v0.2.3`.
+The alpha preview is available from its exact [GitHub release
+asset](https://github.com/dorianverlaine/pingclair/releases/tag/v0.3.0-alpha.1);
+the [installation guide](https://pingclair.com/start/install/#-install-the-preview)
+shows the checksum-first upgrade. The `v0.1.x` line is unmaintained and should
+not be used for a new deployment.
 
 After installation, inspect the service before loading a configuration:
 
@@ -289,9 +298,9 @@ the same commands and configuration surface.
 
 ## 📌 Release status
 
-The latest published version is `v0.2.3`. `main` carries the 0.3 development
-line, so the source tree contains behavior the published release does not;
-release documentation describes the published release, not `main`.
+The latest stable version is `v0.2.3`. `v0.3.0-alpha.1` is the first prerelease
+of the 0.3 line; it is published for testing and does not become the `latest`
+channel. `main` continues beyond that tag.
 
 Important boundaries include:
 
@@ -304,6 +313,9 @@ Important boundaries include:
   instances do not share one distributed certificate store.
 - Pingclair is an HTTP server and reverse proxy. It does not provide generic
   `CONNECT` tunnels or advertise extended CONNECT support.
+- Layer 4 support is a bounded TCP subset. UDP, TLS termination, PROXY protocol,
+  wildcard SNI matching, multiple upstreams, health checks, and weighted
+  balancing are outside this alpha.
 - HTTP/2 server push (`push`) is a deliberate non-goal: major browsers have
   removed support for it, so the directive is refused rather than accepted
   and ignored.
@@ -311,7 +323,7 @@ Important boundaries include:
   on request trailers should not be placed behind this release.
 
 Known defects, release-specific limitations, and differences between the
-latest release and `main` are tracked on the
+stable release, alpha preview, and `main` are tracked on the
 [project status page](https://pingclair.com/project/status/) and in the
 [changelog](CHANGELOG.md). Performance results are published only with their
 measurement conditions on the
