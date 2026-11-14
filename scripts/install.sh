@@ -190,14 +190,14 @@ else
         # every asset URL, and asking the API again for each of them invites the
         # anonymous rate limit to answer differently halfway through.
         if [ "$INSTALL_MODE" = "prerelease" ]; then
-            LATEST_RELEASES=$(curl -s "https://api.github.com/repos/$REPO/releases?per_page=30")
+            LATEST_RELEASES=$(curl --connect-timeout 10 --max-time 30 -s "https://api.github.com/repos/$REPO/releases?per_page=30")
             LATEST_RELEASE=$(printf '%s' "$LATEST_RELEASES" | jq -c '
                 [.[] | select(.draft == false and .prerelease == true)]
                 | sort_by(.published_at)
                 | last // {}
             ' 2>/dev/null || printf '{}')
         else
-            LATEST_RELEASE=$(curl -s "https://api.github.com/repos/$REPO/releases/latest")
+            LATEST_RELEASE=$(curl --connect-timeout 10 --max-time 30 -s "https://api.github.com/repos/$REPO/releases/latest")
         fi
         LATEST_TAG=$(printf '%s' "$LATEST_RELEASE" | jq -r ".tag_name // empty")
         LATEST_RELEASE_URL=$(printf '%s' "$LATEST_RELEASE" | jq -r ".assets[] | select(.name | contains(\"$ASSET_KEY\") and contains(\"linux\")) | .browser_download_url" | head -n 1)
@@ -229,7 +229,7 @@ else
         fi
     else
         echo "Downloading $LATEST_RELEASE_URL (from $RELEASE_SOURCE)..."
-        curl -L -o /tmp/pingclair.tar.gz "$LATEST_RELEASE_URL"
+        curl --connect-timeout 10 --max-time 300 -L -o /tmp/pingclair.tar.gz "$LATEST_RELEASE_URL"
         mv /tmp/pingclair.tar.gz "/tmp/$TAR_NAME"
         # 🔐 Verify before unpacking anything into /usr/local/bin: this runs as
         # root from a piped script, so a truncated or substituted download must
@@ -252,7 +252,7 @@ else
                 rm -f "/tmp/$TAR_NAME"
                 exit 1
             fi
-            curl -L -o "/tmp/SHA256SUMS-$ASSET_KEY.txt" "$LATEST_SUM_URL"
+            curl --connect-timeout 10 --max-time 30 -L -o "/tmp/SHA256SUMS-$ASSET_KEY.txt" "$LATEST_SUM_URL"
             if command -v sha256sum >/dev/null 2>&1; then
                 (cd /tmp && sha256sum -c "SHA256SUMS-$ASSET_KEY.txt")
             else
@@ -337,13 +337,13 @@ fi
 BASE_RAW_URL="https://raw.githubusercontent.com/$REPO/main"
 
 echo "Fetching default landing page..."
-curl -s -L -o /var/lib/pingclair/html/index.html "$BASE_RAW_URL/examples/public/index.html" || {
+curl --connect-timeout 10 --max-time 30 -s -L -o /var/lib/pingclair/html/index.html "$BASE_RAW_URL/examples/public/index.html" || {
     echo "Fallback: Creating minimal landing page..."
     echo "<h1>Pingclair is Running!</h1>" > /var/lib/pingclair/html/index.html
 }
 
 echo "Fetching example configuration..."
-curl -s -L -o /etc/Pingclair/Pingclairfile.example "$BASE_RAW_URL/examples/Pingclairfile.example"
+curl --connect-timeout 10 --max-time 30 -s -L -o /etc/Pingclair/Pingclairfile.example "$BASE_RAW_URL/examples/Pingclairfile.example"
 
 # Default Config if missing
 if [ ! -f /etc/Pingclair/Pingclairfile ]; then
